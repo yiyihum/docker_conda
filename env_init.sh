@@ -22,9 +22,10 @@ TASK_ID="$1"
 COMMIT="$2"
 
 # 路径设置
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")  
 EXPR_PATH="/opt/tiger/expr"
 TEST_BED_PATH="${EXPR_PATH}/testbed/${TASK_ID}"
-TEST_PATCH_PATH="./swe-bench-extra/${TASK_ID}/test_patch.diff"
+TEST_PATCH_PATH="${SCRIPT_DIR}/swe-bench-extra/${TASK_ID}/test_patch.diff"
 
 # 测试目录必须存在
 if [ ! -d "$TEST_BED_PATH" ]; then
