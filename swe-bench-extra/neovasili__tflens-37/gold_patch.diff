@@ -1,0 +1,195 @@
+diff --git a/README.md b/README.md
+index 5676c16..1c92c04 100644
+--- a/README.md
++++ b/README.md
+@@ -82,6 +82,8 @@ optional arguments:
+         Applies a regular expression to the type field in order to filter the resources list to output
+   -p FILTER_PROVIDER, --filter-provider FILTER_PROVIDER
+         Applies a regular expression to the provider field in order to filter the resources list to output
++  -d FILTER_MODE, --filter-mode FILTER_MODE
++        Applies a regular expression to the mode field in order to filter the resources list to output
+ ```
+ 
+ ### Examples
+diff --git a/tflens/__main__.py b/tflens/__main__.py
+index fe1ca3d..2e696e3 100644
+--- a/tflens/__main__.py
++++ b/tflens/__main__.py
+@@ -67,6 +67,14 @@ parser.add_argument('-p', '--filter-provider',
+     filter the resources list to output",
+   default="")
+ 
++parser.add_argument('-d', '--filter-mode',
++  type=str,
++  action="store",
++  dest="filter_mode",
++  help="Applies a regular expression to the mode field in order to \
++    filter the resources list to output",
++  default="")
++
+ args = parser.parse_args()
+ 
+ ARGS_REMOTE = args.remote
+@@ -76,6 +84,7 @@ ARGS_FILTER_MODULE = args.filter_module
+ ARGS_FILTER_NAME = args.filter_name
+ ARGS_FILTER_TYPE = args.filter_type
+ ARGS_FILTER_PROVIDER = args.filter_provider
++ARGS_FILER_MODE = args.filter_mode
+ 
+ if not ARGS_FILE_LOCATION:
+   ARGS_FILE_LOCATION = "{}/terraform.tfstate".format(Path().absolute())
+@@ -91,7 +100,8 @@ def main():
+     name_filter_expression=ARGS_FILTER_NAME,
+     type_filter_expression=ARGS_FILTER_TYPE,
+     provider_filter_expression=ARGS_FILTER_PROVIDER,
+-    module_filter_expression=ARGS_FILTER_MODULE
++    module_filter_expression=ARGS_FILTER_MODULE,
++    mode_filter_expression=ARGS_FILER_MODE
+   )
+ 
+   output_router = {
+diff --git a/tflens/controller/tfstate.py b/tflens/controller/tfstate.py
+index 0f4c7a5..bafd4cb 100644
+--- a/tflens/controller/tfstate.py
++++ b/tflens/controller/tfstate.py
+@@ -17,7 +17,8 @@ class TfStateController():
+     name_filter_expression: str=None,
+     type_filter_expression: str=None,
+     provider_filter_expression: str=None,
+-    module_filter_expression: str=None
++    module_filter_expression: str=None,
++    mode_filter_expression: str=None
+   ):
+     self.__tfstate = TfState(
+       content=tfstate_content
+@@ -27,6 +28,7 @@ class TfStateController():
+       type_filter_expression=type_filter_expression,
+       provider_filter_expression=provider_filter_expression,
+       module_filter_expression=module_filter_expression,
++      mode_filter_expression=mode_filter_expression,
+       resources=self.__tfstate.get_resources()
+     ).apply_filter()
+ 
+@@ -59,7 +61,8 @@ class LocalTfStateController(TfStateController):
+     module_filter_expression: str=None,
+     type_filter_expression: str=None,
+     provider_filter_expression: str=None,
+-    name_filter_expression: str=None
++    name_filter_expression: str=None,
++    mode_filter_expression: str=None
+   ):
+     self.__local_tfstate_service = LocalTfStateService(
+       file_location=file_location
+@@ -70,7 +73,8 @@ class LocalTfStateController(TfStateController):
+       name_filter_expression=name_filter_expression,
+       type_filter_expression=type_filter_expression,
+       provider_filter_expression=provider_filter_expression,
+-      module_filter_expression=module_filter_expression
++      module_filter_expression=module_filter_expression,
++      mode_filter_expression=mode_filter_expression
+     )
+ 
+ class RemoteS3TfStateController(TfStateController):
+@@ -81,7 +85,8 @@ class RemoteS3TfStateController(TfStateController):
+     module_filter_expression: str=None,
+     type_filter_expression: str=None,
+     provider_filter_expression: str=None,
+-    name_filter_expression: str=None
++    name_filter_expression: str=None,
++    mode_filter_expression: str=None
+   ):
+     self.__remote_s3_tfstate_service = RemoteS3TfStateService(
+       file_location=file_location
+@@ -92,5 +97,6 @@ class RemoteS3TfStateController(TfStateController):
+       name_filter_expression=name_filter_expression,
+       type_filter_expression=type_filter_expression,
+       provider_filter_expression=provider_filter_expression,
+-      module_filter_expression=module_filter_expression
++      module_filter_expression=module_filter_expression,
++      mode_filter_expression=mode_filter_expression
+     )
+diff --git a/tflens/helper/filter.py b/tflens/helper/filter.py
+index ee86ff3..58bba51 100644
+--- a/tflens/helper/filter.py
++++ b/tflens/helper/filter.py
+@@ -9,7 +9,9 @@ class FilterHelper():
+     self.__object_attribute_value = object_attribute_value
+ 
+   def check_filter(self):
+-    return re.match(self.__filter_expression, self.__object_attribute_value)
++    compiled_pattern = re.compile(self.__filter_expression)
++
++    return compiled_pattern.search(self.__object_attribute_value)
+ 
+ class ModuleFilterHelper(FilterHelper):
+ 
+@@ -40,7 +42,15 @@ class ProviderFilterHelper(FilterHelper):
+   def __init__(self, filter_expression: str, resource: TfStateResource):
+     super().__init__(
+       filter_expression=filter_expression,
+-      object_attribute_value=resource.get_type()
++      object_attribute_value=resource.get_provider()
++    )
++
++class ModeFilterHelper(FilterHelper):
++
++  def __init__(self, filter_expression: str, resource: TfStateResource):
++    super().__init__(
++      filter_expression=filter_expression,
++      object_attribute_value=resource.get_mode()
+     )
+ 
+ class TfStateFilterHelper():
+@@ -51,12 +61,14 @@ class TfStateFilterHelper():
+     type_filter_expression: str=None,
+     provider_filter_expression: str=None,
+     module_filter_expression: str=None,
++    mode_filter_expression: str=None,
+     resources: list=None
+   ):
+     self.__name_filter_expression = name_filter_expression
+     self.__type_filter_expression = type_filter_expression
+     self.__provider_filter_expression = provider_filter_expression
+     self.__module_filter_expression = module_filter_expression
++    self.__mode_filter_expression = mode_filter_expression
+     self.__resources = resources
+ 
+   def apply_filter(self):
+@@ -67,6 +79,7 @@ class TfStateFilterHelper():
+       pass_module_filter = True
+       pass_type_filter = True
+       pass_provider_filter = True
++      pass_mode_filter = True
+ 
+       if self.__name_filter_expression:
+         filter_helper = NameFilterHelper(filter_expression=self.__name_filter_expression, resource=resource)
+@@ -84,7 +97,11 @@ class TfStateFilterHelper():
+         filter_helper = ModuleFilterHelper(filter_expression=self.__module_filter_expression, resource=resource)
+         pass_module_filter = filter_helper.check_filter()
+ 
+-      if pass_module_filter and pass_name_filter and pass_type_filter and pass_provider_filter:
++      if self.__mode_filter_expression:
++        filter_helper = ModeFilterHelper(filter_expression=self.__mode_filter_expression, resource=resource)
++        pass_mode_filter = filter_helper.check_filter()
++
++      if pass_module_filter and pass_name_filter and pass_type_filter and pass_provider_filter and pass_mode_filter:
+         filtered_list.append(resource)
+ 
+     return filtered_list
+diff --git a/tflens/model/tfstate_resource.py b/tflens/model/tfstate_resource.py
+index afd3dbf..fa14840 100644
+--- a/tflens/model/tfstate_resource.py
++++ b/tflens/model/tfstate_resource.py
+@@ -33,6 +33,12 @@ class TfStateResource():
+   def get_type(self):
+     return self.__type
+ 
++  def get_provider(self):
++    return self.__provider
++
++  def get_mode(self):
++    return self.__mode
++
+   def get_parent_module(self):
+     return self.__module.split('.')[1] if self.__module else '-'
+ 

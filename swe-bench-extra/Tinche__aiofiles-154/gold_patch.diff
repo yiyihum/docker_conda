@@ -1,0 +1,288 @@
+diff --git a/README.rst b/README.rst
+index 5ddf859..b7905a0 100644
+--- a/README.rst
++++ b/README.rst
+@@ -96,6 +96,11 @@ and delegate to an executor:
+ 
+ In case of failure, one of the usual exceptions will be raised.
+ 
++``aiofiles.stdin``, ``aiofiles.stdout``, ``aiofiles.stderr``,
++``aiofiles.stdin_bytes``, ``aiofiles.stdout_bytes``, and
++``aiofiles.stderr_bytes`` provide async access to ``sys.stdin``,
++``sys.stdout``, ``sys.stderr``, and their corresponding ``.buffer`` properties.
++
+ The ``aiofiles.os`` module contains executor-enabled coroutine versions of
+ several useful ``os`` functions that deal with files:
+ 
+@@ -180,6 +185,8 @@ History
+   `#146 <https://github.com/Tinche/aiofiles/pull/146>`_
+ * Removed ``aiofiles.tempfile.temptypes.AsyncSpooledTemporaryFile.softspace``.
+   `#151 <https://github.com/Tinche/aiofiles/pull/151>`_
++* Added ``aiofiles.stdin``, ``aiofiles.stdin_bytes``, and other stdio streams.
++  `#154 <https://github.com/Tinche/aiofiles/pull/154>`_
+ 
+ 22.1.0 (2022-09-04)
+ ```````````````````
+diff --git a/src/aiofiles/__init__.py b/src/aiofiles/__init__.py
+index b0114ee..9e75111 100644
+--- a/src/aiofiles/__init__.py
++++ b/src/aiofiles/__init__.py
+@@ -1,5 +1,22 @@
+ """Utilities for asyncio-friendly file handling."""
+-from .threadpool import open
++from .threadpool import (
++    open,
++    stdin,
++    stdout,
++    stderr,
++    stdin_bytes,
++    stdout_bytes,
++    stderr_bytes,
++)
+ from . import tempfile
+ 
+-__all__ = ["open", "tempfile"]
++__all__ = [
++    "open",
++    "tempfile",
++    "stdin",
++    "stdout",
++    "stderr",
++    "stdin_bytes",
++    "stdout_bytes",
++    "stderr_bytes",
++]
+diff --git a/src/aiofiles/base.py b/src/aiofiles/base.py
+index f64d00d..6201d95 100644
+--- a/src/aiofiles/base.py
++++ b/src/aiofiles/base.py
+@@ -1,13 +1,18 @@
+ """Various base classes."""
+ from types import coroutine
+ from collections.abc import Coroutine
++from asyncio import get_running_loop
+ 
+ 
+ class AsyncBase:
+     def __init__(self, file, loop, executor):
+         self._file = file
+-        self._loop = loop
+         self._executor = executor
++        self._ref_loop = loop
++
++    @property
++    def _loop(self):
++        return self._ref_loop or get_running_loop()
+ 
+     def __aiter__(self):
+         """We are our own iterator."""
+@@ -25,6 +30,21 @@ class AsyncBase:
+             raise StopAsyncIteration
+ 
+ 
++class AsyncIndirectBase(AsyncBase):
++    def __init__(self, name, loop, executor, indirect):
++        self._indirect = indirect
++        self._name = name
++        super().__init__(None, loop, executor)
++
++    @property
++    def _file(self):
++        return self._indirect()
++
++    @_file.setter
++    def _file(self, v):
++        pass  # discard writes
++
++
+ class _ContextManager(Coroutine):
+     __slots__ = ("_coro", "_obj")
+ 
+diff --git a/src/aiofiles/threadpool/__init__.py b/src/aiofiles/threadpool/__init__.py
+index 7bb18d7..522b251 100644
+--- a/src/aiofiles/threadpool/__init__.py
++++ b/src/aiofiles/threadpool/__init__.py
+@@ -1,5 +1,6 @@
+ """Handle files using a thread pool executor."""
+ import asyncio
++import sys
+ from types import coroutine
+ 
+ from io import (
+@@ -8,16 +9,32 @@ from io import (
+     BufferedReader,
+     BufferedWriter,
+     BufferedRandom,
++    BufferedIOBase,
+ )
+ from functools import partial, singledispatch
+ 
+-from .binary import AsyncBufferedIOBase, AsyncBufferedReader, AsyncFileIO
+-from .text import AsyncTextIOWrapper
++from .binary import (
++    AsyncBufferedIOBase,
++    AsyncBufferedReader,
++    AsyncFileIO,
++    AsyncIndirectBufferedIOBase,
++    AsyncIndirectBufferedReader,
++    AsyncIndirectFileIO,
++)
++from .text import AsyncTextIOWrapper, AsyncTextIndirectIOWrapper
+ from ..base import AiofilesContextManager
+ 
+ sync_open = open
+ 
+-__all__ = ("open",)
++__all__ = (
++    "open",
++    "stdin",
++    "stdout",
++    "stderr",
++    "stdin_bytes",
++    "stdout_bytes",
++    "stderr_bytes",
++)
+ 
+ 
+ def open(
+@@ -93,6 +110,7 @@ def _(file, *, loop=None, executor=None):
+ 
+ 
+ @wrap.register(BufferedWriter)
++@wrap.register(BufferedIOBase)
+ def _(file, *, loop=None, executor=None):
+     return AsyncBufferedIOBase(file, loop=loop, executor=executor)
+ 
+@@ -105,4 +123,12 @@ def _(file, *, loop=None, executor=None):
+ 
+ @wrap.register(FileIO)
+ def _(file, *, loop=None, executor=None):
+-    return AsyncFileIO(file, loop, executor)
++    return AsyncFileIO(file, loop=loop, executor=executor)
++
++
++stdin = AsyncTextIndirectIOWrapper('sys.stdin', None, None, indirect=lambda: sys.stdin)
++stdout = AsyncTextIndirectIOWrapper('sys.stdout', None, None, indirect=lambda: sys.stdout)
++stderr = AsyncTextIndirectIOWrapper('sys.stderr', None, None, indirect=lambda: sys.stderr)
++stdin_bytes = AsyncIndirectBufferedIOBase('sys.stdin.buffer', None, None, indirect=lambda: sys.stdin.buffer)
++stdout_bytes = AsyncIndirectBufferedIOBase('sys.stdout.buffer', None, None, indirect=lambda: sys.stdout.buffer)
++stderr_bytes = AsyncIndirectBufferedIOBase('sys.stderr.buffer', None, None, indirect=lambda: sys.stderr.buffer)
+diff --git a/src/aiofiles/threadpool/binary.py b/src/aiofiles/threadpool/binary.py
+index 3568ed0..52d0cb3 100644
+--- a/src/aiofiles/threadpool/binary.py
++++ b/src/aiofiles/threadpool/binary.py
+@@ -1,4 +1,4 @@
+-from ..base import AsyncBase
++from ..base import AsyncBase, AsyncIndirectBase
+ from .utils import (
+     delegate_to_executor,
+     proxy_method_directly,
+@@ -26,7 +26,7 @@ from .utils import (
+ @proxy_method_directly("detach", "fileno", "readable")
+ @proxy_property_directly("closed", "raw", "name", "mode")
+ class AsyncBufferedIOBase(AsyncBase):
+-    """The asyncio executor version of io.BufferedWriter."""
++    """The asyncio executor version of io.BufferedWriter and BufferedIOBase."""
+ 
+ 
+ @delegate_to_executor("peek")
+@@ -55,3 +55,54 @@ class AsyncBufferedReader(AsyncBufferedIOBase):
+ @proxy_property_directly("closed", "name", "mode")
+ class AsyncFileIO(AsyncBase):
+     """The asyncio executor version of io.FileIO."""
++
++
++@delegate_to_executor(
++    "close",
++    "flush",
++    "isatty",
++    "read",
++    "read1",
++    "readinto",
++    "readline",
++    "readlines",
++    "seek",
++    "seekable",
++    "tell",
++    "truncate",
++    "writable",
++    "write",
++    "writelines",
++)
++@proxy_method_directly("detach", "fileno", "readable")
++@proxy_property_directly("closed", "raw", "name", "mode")
++class AsyncIndirectBufferedIOBase(AsyncIndirectBase):
++    """The indirect asyncio executor version of io.BufferedWriter and BufferedIOBase."""
++
++
++@delegate_to_executor("peek")
++class AsyncIndirectBufferedReader(AsyncIndirectBufferedIOBase):
++    """The indirect asyncio executor version of io.BufferedReader and Random."""
++
++
++@delegate_to_executor(
++    "close",
++    "flush",
++    "isatty",
++    "read",
++    "readall",
++    "readinto",
++    "readline",
++    "readlines",
++    "seek",
++    "seekable",
++    "tell",
++    "truncate",
++    "writable",
++    "write",
++    "writelines",
++)
++@proxy_method_directly("fileno", "readable")
++@proxy_property_directly("closed", "name", "mode")
++class AsyncIndirectFileIO(AsyncIndirectBase):
++    """The indirect asyncio executor version of io.FileIO."""
+diff --git a/src/aiofiles/threadpool/text.py b/src/aiofiles/threadpool/text.py
+index 41cdbbf..1323009 100644
+--- a/src/aiofiles/threadpool/text.py
++++ b/src/aiofiles/threadpool/text.py
+@@ -1,4 +1,4 @@
+-from ..base import AsyncBase
++from ..base import AsyncBase, AsyncIndirectBase
+ from .utils import (
+     delegate_to_executor,
+     proxy_method_directly,
+@@ -35,3 +35,34 @@ from .utils import (
+ )
+ class AsyncTextIOWrapper(AsyncBase):
+     """The asyncio executor version of io.TextIOWrapper."""
++
++
++@delegate_to_executor(
++    "close",
++    "flush",
++    "isatty",
++    "read",
++    "readable",
++    "readline",
++    "readlines",
++    "seek",
++    "seekable",
++    "tell",
++    "truncate",
++    "write",
++    "writable",
++    "writelines",
++)
++@proxy_method_directly("detach", "fileno", "readable")
++@proxy_property_directly(
++    "buffer",
++    "closed",
++    "encoding",
++    "errors",
++    "line_buffering",
++    "newlines",
++    "name",
++    "mode",
++)
++class AsyncTextIndirectIOWrapper(AsyncIndirectBase):
++    """The indirect asyncio executor version of io.TextIOWrapper."""

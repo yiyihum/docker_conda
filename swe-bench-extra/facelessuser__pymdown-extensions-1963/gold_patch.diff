@@ -1,0 +1,183 @@
+diff --git a/docs/src/dictionary/en-custom.txt b/docs/src/dictionary/en-custom.txt
+index 34bc1ed5..77322537 100644
+--- a/docs/src/dictionary/en-custom.txt
++++ b/docs/src/dictionary/en-custom.txt
+@@ -20,6 +20,8 @@ CommonMark
+ CriticMarkup
+ Ctrl
+ DOM
++De
++Dedent
+ Dicts
+ Donath
+ ElementTree
+@@ -138,6 +140,8 @@ config
+ configs
+ coveragepy
+ customizable
++de
++dedenting
+ deprecations
+ dev
+ deviantart
+diff --git a/docs/src/markdown/about/changelog.md b/docs/src/markdown/about/changelog.md
+index cc7c71f2..25b51414 100644
+--- a/docs/src/markdown/about/changelog.md
++++ b/docs/src/markdown/about/changelog.md
+@@ -2,11 +2,16 @@
+ 
+ ## 9.10
+ 
+-- **NEW**: Blocks: Add new general purpose block extensions meant to be an alternative to: Admonitions, Details, Definition
+-  Lists, and Tabbed. Also adds new HTML plugin for quick wrapping of content with arbitrary HTML elements. General
+-  Purpose blocks are more of a new frame work to create block plugins using special fences.
++- **NEW**: Blocks: Add new experimental general purpose blocks that provide a framework for creating fenced block
++  containers for specialized parsing. A number of extensions utilizing general purpose blocks are included and are meant
++  to be an alternative to (and maybe one day replace): Admonitions, Details, Definition   Lists, and Tabbed. Also adds a
++  new HTML plugin for quick wrapping of content with arbitrary HTML elements.
+ - **NEW**: Highlight: When enabling line spans and/or line anchors, if a code block has an ID associated with it, line
+   ids will be generated using that code ID instead of the code block count.
++- **NEW**: Snippets: Expand section syntax to allow section names with `-` and `_`.
++- **NEW**: Snippets: When `check_paths` is enabled, and a specified section is not found, raise an error.
++- **NEW**: Snippets: Add new experimental feature `dedent_sections` that will de-indent (remove any common leading
++  whitespace from every line in text) from that block of text.
+ 
+ ## 9.10b1
+ 
+diff --git a/docs/src/markdown/extensions/snippets.md b/docs/src/markdown/extensions/snippets.md
+index 0aff31d1..8c3e8137 100644
+--- a/docs/src/markdown/extensions/snippets.md
++++ b/docs/src/markdown/extensions/snippets.md
+@@ -219,6 +219,24 @@ snippets are not allowed to reference local snippet files.
+ URL snippet support was introduced in 9.5.
+ ///
+ 
++## Dedent Subsections
++
++/// new | New 9.10
++///
++
++/// warning | Experimental
++///
++
++By default, when a subsection is extracted from a file via the [section notation](#snippet-sections) or the
++[lines notation](#snippet-lines), the content is inserted exactly how it is extracted. Unfortunately, sometimes you are
++extracting an indented chunk, and you do not intend for that chunk to be indented.
++
++`dedent_subsections` is a recent option that has been added to see if it alleviates the issue. When specifying a
++subsection of a file to insert as a snippet, via "sections" or "lines", that content will have all common leading
++whitespace removed from every line in text.
++
++Depending on how the feature is received, it may be made the default in the future.
++
+ ## Auto-Append Snippets
+ 
+ Snippets is designed as a general way to target a file and inject it into a given Markdown file, but some times,
+@@ -241,3 +259,4 @@ Option                 | Type            | Default          | Description
+ `url_max_size`         | int             | `#!py3 33554432` | Sets an arbitrary max content size. If content length is reported to be larger, and exception will be thrown. Default is ~32 MiB.
+ `url_timeout`          | float           | `#!py3 10.0`     | Passes an arbitrary timeout in seconds to URL requestor. By default this is set to 10 seconds.
+ `url_request_headers`  | {string:string} | `#!py3 {}`       | Passes arbitrary headers to URL requestor. By default this is set to empty map.
++`dedent_subsections`   | bool            | `#!py3 False`    | Remove any common leading whitespace from every line in text of a subsection that is inserted via "sections" or by "lines".
+diff --git a/pymdownx/snippets.py b/pymdownx/snippets.py
+index cf5f903b..44318160 100644
+--- a/pymdownx/snippets.py
++++ b/pymdownx/snippets.py
+@@ -30,6 +30,7 @@ import re
+ import codecs
+ import os
+ from . import util
++import textwrap
+ 
+ MI = 1024 * 1024  # mebibyte (MiB)
+ DEFAULT_URL_SIZE = MI * 32
+@@ -67,12 +68,12 @@ class SnippetPreprocessor(Preprocessor):
+         r'''(?xi)
+         ^.*?
+         (?P<inline_marker>-{1,}8<-{1,}[ \t]+)
+-        \[[ \t]*(?P<type>start|end)[ \t]*:[ \t]*(?P<name>[a-z][0-9a-z]*)[ \t]*\]
++        \[[ \t]*(?P<type>start|end)[ \t]*:[ \t]*(?P<name>[a-z][-_0-9a-z]*)[ \t]*\]
+         .*?$
+         '''
+     )
+ 
+-    RE_SNIPPET_FILE = re.compile(r'(?i)(.*?)(?:(:[0-9]*)?(:[0-9]*)?|(:[a-z][0-9a-z]*)?)$')
++    RE_SNIPPET_FILE = re.compile(r'(?i)(.*?)(?:(:[0-9]*)?(:[0-9]*)?|(:[a-z][-_0-9a-z]*)?)$')
+ 
+     def __init__(self, config, md):
+         """Initialize."""
+@@ -88,6 +89,7 @@ class SnippetPreprocessor(Preprocessor):
+         self.url_max_size = config['url_max_size']
+         self.url_timeout = config['url_timeout']
+         self.url_request_headers = config['url_request_headers']
++        self.dedent_subsections = config['dedent_subsections']
+         self.tab_length = md.tab_length
+         super(SnippetPreprocessor, self).__init__()
+ 
+@@ -96,6 +98,7 @@ class SnippetPreprocessor(Preprocessor):
+ 
+         new_lines = []
+         start = False
++        found = False
+         for l in lines:
+ 
+             # Found a snippet section marker with our specified name
+@@ -105,6 +108,7 @@ class SnippetPreprocessor(Preprocessor):
+                 # We found the start
+                 if not start and m.group('type') == 'start':
+                     start = True
++                    found = True
+                     continue
+ 
+                 # We found the end
+@@ -114,13 +118,21 @@ class SnippetPreprocessor(Preprocessor):
+ 
+                 # We found an end, but no start
+                 else:
+-                    return []
++                    break
+ 
+             # We are currently in a section, so append the line
+             if start:
+                 new_lines.append(l)
+ 
+-        return new_lines
++        if not found and self.check_paths:
++            raise SnippetMissingError("Snippet section '{}' could not be located".format(section))
++
++        return self.dedent(new_lines) if self.dedent_subsections else new_lines
++
++    def dedent(self, lines):
++        """De-indent lines."""
++
++        return textwrap.dedent('\n'.join(lines)).split('\n')
+ 
+     def get_snippet_path(self, path):
+         """Get snippet path."""
+@@ -282,7 +294,7 @@ class SnippetPreprocessor(Preprocessor):
+                             s_lines = [l.rstrip('\r\n') for l in f]
+                             if start is not None or end is not None:
+                                 s = slice(start, end)
+-                                s_lines = s_lines[s]
++                                s_lines = self.dedent(s_lines[s]) if self.dedent_subsections else s_lines[s]
+                             elif section:
+                                 s_lines = self.extract_section(section, s_lines)
+                     else:
+@@ -291,7 +303,7 @@ class SnippetPreprocessor(Preprocessor):
+                             s_lines = self.download(snippet)
+                             if start is not None or end is not None:
+                                 s = slice(start, end)
+-                                s_lines = s_lines[s]
++                                s_lines = self.dedent(s_lines[s]) if self.dedent_subsections else s_lines[s]
+                             elif section:
+                                 s_lines = self.extract_section(section, s_lines)
+                         except SnippetMissingError:
+@@ -346,7 +358,8 @@ class SnippetExtension(Extension):
+             'url_download': [False, "Download external URLs as snippets - Default: \"False\""],
+             'url_max_size': [DEFAULT_URL_SIZE, "External URL max size (0 means no limit)- Default: 32 MiB"],
+             'url_timeout': [DEFAULT_URL_TIMEOUT, 'Defualt URL timeout (0 means no timeout) - Default: 10 sec'],
+-            'url_request_headers': [DEFAULT_URL_REQUEST_HEADERS, "Extra request Headers - Default: {}"]
++            'url_request_headers': [DEFAULT_URL_REQUEST_HEADERS, "Extra request Headers - Default: {}"],
++            'dedent_subsections': [False, "Dedent subsection extractions e.g. 'sections' and/or 'lines'."]
+         }
+ 
+         super(SnippetExtension, self).__init__(*args, **kwargs)

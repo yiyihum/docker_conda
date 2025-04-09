@@ -1,0 +1,117 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 32b7510..b976f79 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -4,6 +4,9 @@ Changes
+ Unreleased
+ ----------
+ 
++- Fixed the transaction manager ``attempts`` method. It didn't stop
++  repeating when there wasn't an error.
++
+ - Corrected ITransaction by removing beforeCommitHook (which is no longer
+   implemented) and removing 'self' from two methods.
+ 
+diff --git a/buildout.cfg b/buildout.cfg
+index fe65737..0fd0713 100644
+--- a/buildout.cfg
++++ b/buildout.cfg
+@@ -1,6 +1,6 @@
+ [buildout]
+ develop = .
+-parts = py
++parts = py sphinx
+ 
+ [test]
+ recipe = zc.recipe.testrunner
+@@ -10,3 +10,10 @@ eggs = transaction [test]
+ recipe = zc.recipe.egg
+ eggs = ${test:eggs}
+ interpreter = py
++
++[sphinx]
++recipe = zc.recipe.egg
++eggs =
++  transaction
++  sphinx
++  repoze.sphinx.autointerface
+diff --git a/docs/convenience.rst b/docs/convenience.rst
+index cb1c1ff..bfc3cc3 100644
+--- a/docs/convenience.rst
++++ b/docs/convenience.rst
+@@ -125,7 +125,7 @@ Of course, other errors are propagated directly:
+     >>> for attempt in transaction.manager.attempts():
+     ...     with attempt:
+     ...         ntry += 1
+-    ...         if ntry == 3:
++    ...         if ntry % 3:
+     ...             raise ValueError(ntry)
+     Traceback (most recent call last):
+     ...
+@@ -135,6 +135,7 @@ We can use the default transaction manager:
+ 
+ .. doctest::
+ 
++    >>> ntry = 0
+     >>> for attempt in transaction.attempts():
+     ...     with attempt as t:
+     ...         t.note('test')
+@@ -143,9 +144,9 @@ We can use the default transaction manager:
+     ...         dm['ntry'] = ntry
+     ...         if ntry % 3:
+     ...             raise Retry(ntry)
+-    3 3
+-    3 4
+-    3 5
++    3 0
++    3 1
++    3 2
+ 
+ Sometimes, a data manager doesn't raise exceptions directly, but
+ wraps other other systems that raise exceptions outside of it's
+@@ -172,9 +173,9 @@ attempted again.
+     ...         dm2['ntry'] = ntry
+     ...         if ntry % 3:
+     ...             raise ValueError('we really should retry this')
+-    6 0
+-    6 1
+-    6 2
++    3 0
++    3 1
++    3 2
+ 
+     >>> dm2['ntry']
+     3
+diff --git a/transaction/_manager.py b/transaction/_manager.py
+index 8f642ba..b4bfbe3 100644
+--- a/transaction/_manager.py
++++ b/transaction/_manager.py
+@@ -144,7 +144,10 @@ class TransactionManager(object):
+         while number:
+             number -= 1
+             if number:
+-                yield Attempt(self)
++                attempt = Attempt(self)
++                yield attempt
++                if attempt.success:
++                    break
+             else:
+                 yield self
+ 
+@@ -167,6 +170,8 @@ class ThreadTransactionManager(TransactionManager, threading.local):
+ 
+ class Attempt(object):
+ 
++    success = False
++
+     def __init__(self, manager):
+         self.manager = manager
+ 
+@@ -186,5 +191,7 @@ class Attempt(object):
+                 self.manager.commit()
+             except:
+                 return self._retry_or_raise(*sys.exc_info())
++            else:
++                self.success = True
+         else:
+             return self._retry_or_raise(t, v, tb)

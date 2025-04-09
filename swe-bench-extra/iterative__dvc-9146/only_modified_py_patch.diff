@@ -1,0 +1,188 @@
+diff --git a/dvc/commands/plots.py b/dvc/commands/plots.py
+--- a/dvc/commands/plots.py
++++ b/dvc/commands/plots.py
+@@ -1,8 +1,9 @@
+ import argparse
+ import logging
+ import os
++from typing import TYPE_CHECKING, Dict, List
+ 
+-from funcy import first
++from funcy import compact, first
+ 
+ from dvc.cli import completion
+ from dvc.cli.command import CmdBase
+@@ -11,14 +12,43 @@
+ from dvc.ui import ui
+ from dvc.utils import format_link
+ 
++if TYPE_CHECKING:
++    from dvc.render.match import RendererWithErrors
++
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def _show_json(renderers, split=False):
++def _show_json(renderers_with_errors: List["RendererWithErrors"], split=False):
+     from dvc.render.convert import to_json
++    from dvc.utils.serialize import encode_exception
++
++    errors: List[Dict] = []
++    data = {}
++
++    for renderer, src_errors, def_errors in renderers_with_errors:
++        name = renderer.name
++        data[name] = to_json(renderer, split)
++        errors.extend(
++            {
++                "name": name,
++                "rev": rev,
++                "source": source,
++                **encode_exception(e),
++            }
++            for rev, per_rev_src_errors in src_errors.items()
++            for source, e in per_rev_src_errors.items()
++        )
++        errors.extend(
++            {
++                "name": name,
++                "rev": rev,
++                **encode_exception(e),
++            }
++            for rev, e in def_errors.items()
++        )
+ 
+-    result = {renderer.name: to_json(renderer, split) for renderer in renderers}
+-    ui.write_json(result, highlight=False)
++    ui.write_json(compact({"errors": errors, "data": data}), highlight=False)
+ 
+ 
+ def _adjust_vega_renderers(renderers):
+@@ -122,15 +152,16 @@ def run(self) -> int:  # noqa: C901, PLR0911, PLR0912
+ 
+             renderers_out = out if self.args.json else os.path.join(out, "static")
+ 
+-            renderers = match_defs_renderers(
++            renderers_with_errors = match_defs_renderers(
+                 data=plots_data,
+                 out=renderers_out,
+                 templates_dir=self.repo.plots.templates_dir,
+             )
+             if self.args.json:
+-                _show_json(renderers, self.args.split)
++                _show_json(renderers_with_errors, self.args.split)
+                 return 0
+ 
++            renderers = [r.renderer for r in renderers_with_errors]
+             _adjust_vega_renderers(renderers)
+             if self.args.show_vega:
+                 renderer = first(filter(lambda r: r.TYPE == "vega", renderers))
+diff --git a/dvc/render/match.py b/dvc/render/match.py
+--- a/dvc/render/match.py
++++ b/dvc/render/match.py
+@@ -1,10 +1,10 @@
+ import os
+ from collections import defaultdict
+-from typing import TYPE_CHECKING, Dict, List, Optional
++from typing import TYPE_CHECKING, DefaultDict, Dict, List, NamedTuple, Optional
+ 
+ import dpath
+ import dpath.options
+-from funcy import last
++from funcy import get_in, last
+ 
+ from dvc.repo.plots import _normpath, infer_data_sources
+ from dvc.utils.plots import get_plot_id
+@@ -13,6 +13,8 @@
+ 
+ if TYPE_CHECKING:
+     from dvc.types import StrPath
++    from dvc_render.base import Renderer
++
+ 
+ dpath.options.ALLOW_EMPTY_STRING_KEYS = True
+ 
+@@ -61,21 +63,31 @@ def get_definition_data(self, target_files, rev):
+         return result
+ 
+ 
+-def match_defs_renderers(
++class RendererWithErrors(NamedTuple):
++    renderer: "Renderer"
++    source_errors: Dict[str, Dict[str, Exception]]
++    definition_errors: Dict[str, Exception]
++
++
++def match_defs_renderers(  # noqa: C901, PLR0912
+     data,
+     out=None,
+     templates_dir: Optional["StrPath"] = None,
+-):
++) -> List[RendererWithErrors]:
+     from dvc_render import ImageRenderer, VegaRenderer
+ 
+     plots_data = PlotsData(data)
+     renderers = []
+     renderer_cls = None
++
+     for plot_id, group in plots_data.group_definitions().items():
+         plot_datapoints: List[Dict] = []
+         props = _squash_plots_properties(group)
+         final_props: Dict = {}
+ 
++        def_errors: Dict[str, Exception] = {}
++        src_errors: DefaultDict[str, Dict[str, Exception]] = defaultdict(dict)
++
+         if out is not None:
+             props["out"] = out
+         if templates_dir is not None:
+@@ -94,13 +106,24 @@ def match_defs_renderers(
+ 
+             converter = _get_converter(renderer_cls, inner_id, props, definitions_data)
+ 
+-            dps, rev_props = converter.flat_datapoints(rev)
++            for src in plot_sources:
++                if error := get_in(data, [rev, "sources", "data", src, "error"]):
++                    src_errors[rev][src] = error
++
++            try:
++                dps, rev_props = converter.flat_datapoints(rev)
++            except Exception as e:  # noqa: BLE001, pylint: disable=broad-except
++                def_errors[rev] = e
++                continue
++
+             if not final_props and rev_props:
+                 final_props = rev_props
+             plot_datapoints.extend(dps)
+ 
+         if "title" not in final_props:
+             final_props["title"] = renderer_id
++
+         if renderer_cls is not None:
+-            renderers.append(renderer_cls(plot_datapoints, renderer_id, **final_props))
++            renderer = renderer_cls(plot_datapoints, renderer_id, **final_props)
++            renderers.append(RendererWithErrors(renderer, dict(src_errors), def_errors))
+     return renderers
+diff --git a/dvc/repo/plots/__init__.py b/dvc/repo/plots/__init__.py
+--- a/dvc/repo/plots/__init__.py
++++ b/dvc/repo/plots/__init__.py
+@@ -20,7 +20,7 @@
+ 
+ import dpath
+ import dpath.options
+-from funcy import distinct, first, project, reraise
++from funcy import first, ldistinct, project, reraise
+ 
+ from dvc.exceptions import DvcException
+ from dvc.utils import error_handler, errored_revisions, onerror_collect
+@@ -356,7 +356,7 @@ def infer_data_sources(plot_id, config=None):
+     if isinstance(x, dict):
+         sources.append(first(x.keys()))
+ 
+-    return distinct(source for source in sources)
++    return ldistinct(source for source in sources)
+ 
+ 
+ def _matches(targets, config_file, plot_id):
+

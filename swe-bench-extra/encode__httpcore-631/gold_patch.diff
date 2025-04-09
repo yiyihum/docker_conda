@@ -1,0 +1,142 @@
+diff --git a/httpcore/_async/connection_pool.py b/httpcore/_async/connection_pool.py
+index 5541689..e6c4ef6 100644
+--- a/httpcore/_async/connection_pool.py
++++ b/httpcore/_async/connection_pool.py
+@@ -301,19 +301,11 @@ class AsyncConnectionPool(AsyncRequestInterface):
+         Close any connections in the pool.
+         """
+         async with self._pool_lock:
+-            requests_still_in_flight = len(self._requests)
+-
+             for connection in self._pool:
+                 await connection.aclose()
+             self._pool = []
+             self._requests = []
+ 
+-            if requests_still_in_flight:
+-                raise RuntimeError(
+-                    f"The connection pool was closed while {requests_still_in_flight} "
+-                    f"HTTP requests/responses were still in-flight."
+-                )
+-
+     async def __aenter__(self) -> "AsyncConnectionPool":
+         return self
+ 
+diff --git a/httpcore/_sync/connection_pool.py b/httpcore/_sync/connection_pool.py
+index 020893d..53536d0 100644
+--- a/httpcore/_sync/connection_pool.py
++++ b/httpcore/_sync/connection_pool.py
+@@ -301,19 +301,11 @@ class ConnectionPool(RequestInterface):
+         Close any connections in the pool.
+         """
+         with self._pool_lock:
+-            requests_still_in_flight = len(self._requests)
+-
+             for connection in self._pool:
+                 connection.close()
+             self._pool = []
+             self._requests = []
+ 
+-            if requests_still_in_flight:
+-                raise RuntimeError(
+-                    f"The connection pool was closed while {requests_still_in_flight} "
+-                    f"HTTP requests/responses were still in-flight."
+-                )
+-
+     def __enter__(self) -> "ConnectionPool":
+         return self
+ 
+diff --git a/httpcore/backends/asyncio.py b/httpcore/backends/asyncio.py
+index 3b8abf1..23f7dce 100644
+--- a/httpcore/backends/asyncio.py
++++ b/httpcore/backends/asyncio.py
+@@ -26,6 +26,7 @@ class AsyncIOStream(AsyncNetworkStream):
+         exc_map = {
+             TimeoutError: ReadTimeout,
+             anyio.BrokenResourceError: ReadError,
++            anyio.ClosedResourceError: ReadError,
+         }
+         with map_exceptions(exc_map):
+             with anyio.fail_after(timeout):
+@@ -43,6 +44,7 @@ class AsyncIOStream(AsyncNetworkStream):
+         exc_map = {
+             TimeoutError: WriteTimeout,
+             anyio.BrokenResourceError: WriteError,
++            anyio.ClosedResourceError: WriteError,
+         }
+         with map_exceptions(exc_map):
+             with anyio.fail_after(timeout):
+diff --git a/httpcore/backends/mock.py b/httpcore/backends/mock.py
+index 8491f6d..9aba0ea 100644
+--- a/httpcore/backends/mock.py
++++ b/httpcore/backends/mock.py
+@@ -2,6 +2,7 @@ import ssl
+ import typing
+ from typing import Optional
+ 
++from .._exceptions import ReadError
+ from .base import AsyncNetworkBackend, AsyncNetworkStream, NetworkBackend, NetworkStream
+ 
+ 
+@@ -17,8 +18,11 @@ class MockStream(NetworkStream):
+     def __init__(self, buffer: typing.List[bytes], http2: bool = False) -> None:
+         self._buffer = buffer
+         self._http2 = http2
++        self._closed = False
+ 
+     def read(self, max_bytes: int, timeout: Optional[float] = None) -> bytes:
++        if self._closed:
++            raise ReadError("Connection closed")
+         if not self._buffer:
+             return b""
+         return self._buffer.pop(0)
+@@ -27,7 +31,7 @@ class MockStream(NetworkStream):
+         pass
+ 
+     def close(self) -> None:
+-        pass
++        self._closed = True
+ 
+     def start_tls(
+         self,
+@@ -68,8 +72,11 @@ class AsyncMockStream(AsyncNetworkStream):
+     def __init__(self, buffer: typing.List[bytes], http2: bool = False) -> None:
+         self._buffer = buffer
+         self._http2 = http2
++        self._closed = False
+ 
+     async def read(self, max_bytes: int, timeout: Optional[float] = None) -> bytes:
++        if self._closed:
++            raise ReadError("Connection closed")
+         if not self._buffer:
+             return b""
+         return self._buffer.pop(0)
+@@ -78,7 +85,7 @@ class AsyncMockStream(AsyncNetworkStream):
+         pass
+ 
+     async def aclose(self) -> None:
+-        pass
++        self._closed = True
+ 
+     async def start_tls(
+         self,
+diff --git a/httpcore/backends/trio.py b/httpcore/backends/trio.py
+index 7786d02..951016c 100644
+--- a/httpcore/backends/trio.py
++++ b/httpcore/backends/trio.py
+@@ -27,6 +27,7 @@ class TrioStream(AsyncNetworkStream):
+         exc_map: ExceptionMapping = {
+             trio.TooSlowError: ReadTimeout,
+             trio.BrokenResourceError: ReadError,
++            trio.ClosedResourceError: ReadError,
+         }
+         with map_exceptions(exc_map):
+             with trio.fail_after(timeout_or_inf):
+@@ -43,6 +44,7 @@ class TrioStream(AsyncNetworkStream):
+         exc_map: ExceptionMapping = {
+             trio.TooSlowError: WriteTimeout,
+             trio.BrokenResourceError: WriteError,
++            trio.ClosedResourceError: WriteError,
+         }
+         with map_exceptions(exc_map):
+             with trio.fail_after(timeout_or_inf):

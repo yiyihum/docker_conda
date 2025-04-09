@@ -1,0 +1,265 @@
+diff --git a/.github/workflows/check-upstream-ed25519.yml b/.github/workflows/check-upstream-ed25519.yml
+index ce01c30..dee5d60 100644
+--- a/.github/workflows/check-upstream-ed25519.yml
++++ b/.github/workflows/check-upstream-ed25519.yml
+@@ -13,7 +13,7 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+     - name: Check out repository
+-      uses: actions/checkout@755da8c3cf115ac066823e79a1e1788f8940201b
++      uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+     - name: Test if ed25519 upstream master HEAD is what we expect
+       id: test_ed25519
+       run: |
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 68a022e..fe24767 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -38,7 +38,7 @@ jobs:
+ 
+     steps:
+       - name: Checkout securesystemslib
+-        uses: actions/checkout@755da8c3cf115ac066823e79a1e1788f8940201b
++        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+ 
+       - name: Set up Python ${{ matrix.python-version }}
+         uses: actions/setup-python@5ccb29d8773c3f3f653e1705f474dfaa8a06a912
+diff --git a/securesystemslib/signer/__init__.py b/securesystemslib/signer/__init__.py
+index 0b06507..d5c816d 100644
+--- a/securesystemslib/signer/__init__.py
++++ b/securesystemslib/signer/__init__.py
+@@ -5,12 +5,12 @@ This module provides extensible interfaces for public keys and signers:
+ Some implementations are provided by default but more can be added by users.
+ """
+ from securesystemslib.signer._gcp_signer import GCPSigner
++from securesystemslib.signer._gpg_signer import GPGSigner
+ from securesystemslib.signer._hsm_signer import HSMSigner
+ from securesystemslib.signer._key import KEY_FOR_TYPE_AND_SCHEME, Key, SSlibKey
+-from securesystemslib.signer._signature import GPGSignature, Signature
++from securesystemslib.signer._signature import Signature
+ from securesystemslib.signer._signer import (
+     SIGNER_FOR_URI_SCHEME,
+-    GPGSigner,
+     SecretsHandler,
+     Signer,
+     SSlibSigner,
+diff --git a/securesystemslib/signer/_gpg_signer.py b/securesystemslib/signer/_gpg_signer.py
+new file mode 100644
+index 0000000..6d48b0e
+--- /dev/null
++++ b/securesystemslib/signer/_gpg_signer.py
+@@ -0,0 +1,75 @@
++"""Signer implementation for OpenPGP """
++from typing import Dict, Optional
++
++import securesystemslib.gpg.functions as gpg
++from securesystemslib.signer._key import Key
++from securesystemslib.signer._signer import SecretsHandler, Signature, Signer
++
++
++class GPGSigner(Signer):
++    """OpenPGP Signer
++
++    Runs command in ``GNUPG`` environment variable to sign, fallback commands are
++    ``gpg2`` and ``gpg``.
++
++    Supported signing schemes are: "pgp+rsa-pkcsv1.5", "pgp+dsa-fips-180-2" and
++    "pgp+eddsa-ed25519", with SHA-256 hashing.
++
++
++    Arguments:
++        keyid: GnuPG local user signing key id. If not passed, the default key is used.
++        homedir: GnuPG home directory path. If not passed, the default homedir is used.
++
++    """
++
++    def __init__(
++        self, keyid: Optional[str] = None, homedir: Optional[str] = None
++    ):
++        self.keyid = keyid
++        self.homedir = homedir
++
++    @classmethod
++    def from_priv_key_uri(
++        cls,
++        priv_key_uri: str,
++        public_key: Key,
++        secrets_handler: Optional[SecretsHandler] = None,
++    ) -> "GPGSigner":
++        raise NotImplementedError("Incompatible with private key URIs")
++
++    @staticmethod
++    def _to_gpg_sig(sig: Signature) -> Dict:
++        """Helper to convert Signature -> internal gpg signature format."""
++        sig_dict = sig.to_dict()
++        sig_dict["signature"] = sig_dict.pop("sig")
++        return sig_dict
++
++    @staticmethod
++    def _from_gpg_sig(sig_dict: Dict) -> Signature:
++        """Helper to convert internal gpg signature format -> Signature."""
++        sig_dict["sig"] = sig_dict.pop("signature")
++        return Signature.from_dict(sig_dict)
++
++    def sign(self, payload: bytes) -> Signature:
++        """Signs payload with ``gpg``.
++
++        Arguments:
++            payload: bytes to be signed.
++
++        Raises:
++            ValueError: The gpg command failed to create a valid signature.
++            OSError: the gpg command is not present or non-executable.
++            securesystemslib.exceptions.UnsupportedLibraryError: The gpg
++                command is not available, or the cryptography library is
++                not installed.
++            securesystemslib.gpg.exceptions.CommandError: The gpg command
++                returned a non-zero exit code.
++            securesystemslib.gpg.exceptions.KeyNotFoundError: The used gpg
++                version is not fully supported.
++
++        Returns:
++            Signature.
++        """
++        return self._from_gpg_sig(
++            gpg.create_signature(payload, self.keyid, self.homedir)
++        )
+diff --git a/securesystemslib/signer/_signature.py b/securesystemslib/signer/_signature.py
+index 190afc3..1869125 100644
+--- a/securesystemslib/signer/_signature.py
++++ b/securesystemslib/signer/_signature.py
+@@ -81,55 +81,3 @@ class Signature:
+             "sig": self.signature,
+             **self.unrecognized_fields,
+         }
+-
+-
+-class GPGSignature(Signature):
+-    """A container class containing information about a gpg signature.
+-
+-    Besides the signature, it also contains other meta information
+-    needed to uniquely identify the key used to generate the signature.
+-
+-    Attributes:
+-        keyid: HEX string used as a unique identifier of the key.
+-        signature: HEX string representing the signature.
+-        other_headers: HEX representation of additional GPG headers.
+-    """
+-
+-    def __init__(
+-        self,
+-        keyid: str,
+-        signature: str,
+-        other_headers: str,
+-    ):
+-        super().__init__(keyid, signature)
+-        self.other_headers = other_headers
+-
+-    @classmethod
+-    def from_dict(cls, signature_dict: Dict) -> "GPGSignature":
+-        """Creates a GPGSignature object from its JSON/dict representation.
+-
+-        Args:
+-            signature_dict: Dict containing valid "keyid", "signature" and
+-                "other_fields" fields.
+-
+-        Raises:
+-            KeyError: If any of the "keyid", "sig" or "other_headers" fields
+-                are missing from the signature_dict.
+-
+-        Returns:
+-            GPGSignature instance.
+-        """
+-
+-        return cls(
+-            signature_dict["keyid"],
+-            signature_dict["signature"],
+-            signature_dict["other_headers"],
+-        )
+-
+-    def to_dict(self) -> Dict:
+-        """Returns the JSON-serializable dictionary representation of self."""
+-        return {
+-            "keyid": self.keyid,
+-            "signature": self.signature,
+-            "other_headers": self.other_headers,
+-        }
+diff --git a/securesystemslib/signer/_signer.py b/securesystemslib/signer/_signer.py
+index 42a8281..6a767ed 100644
+--- a/securesystemslib/signer/_signer.py
++++ b/securesystemslib/signer/_signer.py
+@@ -6,10 +6,9 @@ from abc import ABCMeta, abstractmethod
+ from typing import Callable, Dict, Optional, Type
+ from urllib import parse
+ 
+-import securesystemslib.gpg.functions as gpg
+ import securesystemslib.keys as sslib_keys
+ from securesystemslib.signer._key import Key, SSlibKey
+-from securesystemslib.signer._signature import GPGSignature, Signature
++from securesystemslib.signer._signature import Signature
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -212,62 +211,3 @@ class SSlibSigner(Signer):
+         """
+         sig_dict = sslib_keys.create_signature(self.key_dict, payload)
+         return Signature(**sig_dict)
+-
+-
+-class GPGSigner(Signer):
+-    """A securesystemslib gpg implementation of the "Signer" interface.
+-
+-    Provides a sign method to generate a cryptographic signature with gpg, using
+-    an RSA, DSA or EdDSA private key identified by the keyid on the instance.
+-    """
+-
+-    def __init__(
+-        self, keyid: Optional[str] = None, homedir: Optional[str] = None
+-    ):
+-        self.keyid = keyid
+-        self.homedir = homedir
+-
+-    @classmethod
+-    def from_priv_key_uri(
+-        cls,
+-        priv_key_uri: str,
+-        public_key: Key,
+-        secrets_handler: Optional[SecretsHandler] = None,
+-    ) -> "GPGSigner":
+-        raise NotImplementedError("Incompatible with private key URIs")
+-
+-    def sign(self, payload: bytes) -> GPGSignature:
+-        """Signs a given payload by the key assigned to the GPGSigner instance.
+-
+-        Calls the gpg command line utility to sign the passed content with the
+-        key identified by the passed keyid from the gpg keyring at the passed
+-        homedir.
+-
+-        The executed base command is defined in
+-        securesystemslib.gpg.constants.gpg_sign_command.
+-
+-        Arguments:
+-            payload: The bytes to be signed.
+-
+-        Raises:
+-            securesystemslib.exceptions.FormatError:
+-                If the keyid was passed and does not match
+-                securesystemslib.formats.KEYID_SCHEMA.
+-
+-            ValueError: the gpg command failed to create a valid signature.
+-            OSError: the gpg command is not present or non-executable.
+-            securesystemslib.exceptions.UnsupportedLibraryError: the gpg
+-                command is not available, or the cryptography library is
+-                not installed.
+-            securesystemslib.gpg.exceptions.CommandError: the gpg command
+-                returned a non-zero exit code.
+-            securesystemslib.gpg.exceptions.KeyNotFoundError: the used gpg
+-                version is not fully supported and no public key can be found
+-                for short keyid.
+-
+-        Returns:
+-            Returns a "GPGSignature" class instance.
+-        """
+-
+-        sig_dict = gpg.create_signature(payload, self.keyid, self.homedir)
+-        return GPGSignature(**sig_dict)

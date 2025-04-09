@@ -1,0 +1,304 @@
+diff --git a/conf/config.example.cfg b/conf/config.example.cfg
+index bd9d446..d1d5272 100644
+--- a/conf/config.example.cfg
++++ b/conf/config.example.cfg
+@@ -5,4 +5,3 @@ pw =
+ host = localhost
+ port = 3306
+ db = ispybtest
+-conn_inactivity = 360
+diff --git a/ispyb/__init__.py b/ispyb/__init__.py
+index 3073240..377498b 100644
+--- a/ispyb/__init__.py
++++ b/ispyb/__init__.py
+@@ -6,7 +6,7 @@ except ImportError:
+   import ConfigParser as configparser
+ import logging
+ 
+-__version__ = '4.11.1'
++__version__ = '4.12.0'
+ 
+ _log = logging.getLogger('ispyb')
+ 
+diff --git a/ispyb/connector/mysqlsp/main.py b/ispyb/connector/mysqlsp/main.py
+index f39556a..e5ba3fd 100644
+--- a/ispyb/connector/mysqlsp/main.py
++++ b/ispyb/connector/mysqlsp/main.py
+@@ -1,9 +1,9 @@
+-import datetime
++from __future__ import absolute_import, division, print_function
++
+ import os
+ import sys
+-import traceback
+ import threading
+-import time
++import traceback
+ 
+ import ispyb.interface.connection
+ import mysql.connector
+@@ -17,7 +17,7 @@ class ISPyBMySQLSPConnector(ispyb.interface.connection.IF):
+ 
+   def __init__(self, user=None, pw=None, host='localhost', db=None, port=3306, conn_inactivity=360):
+     self.lock = threading.Lock()
+-    self.connect(user=user, pw=pw, host=host, db=db, port=port, conn_inactivity=conn_inactivity)
++    self.connect(user=user, pw=pw, host=host, db=db, port=port)
+ 
+   def __enter__(self):
+     if hasattr(self, 'conn') and self.conn is not None:
+@@ -30,23 +30,15 @@ class ISPyBMySQLSPConnector(ispyb.interface.connection.IF):
+ 
+   def connect(self, user=None, pw=None, host='localhost', db=None, port=3306, conn_inactivity=360):
+     self.disconnect()
+-    self.user = user
+-    self.pw = pw
+-    self.host = host
+-    self.db = db
+-    self.port = port
+-    self.conn_inactivity = int(conn_inactivity)
+ 
+     self.conn = mysql.connector.connect(user=user,
+         password=pw,
+         host=host,
+         database=db,
+         port=int(port))
+-    if self.conn is not None:
+-        self.conn.autocommit=True
+-    else:
+-        raise ISPyBConnectionException
+-    self.last_activity_ts = time.time()
++    if not self.conn:
++      raise ISPyBConnectionException('Could not connect to database')
++    self.conn.autocommit = True
+ 
+   def __del__(self):
+     self.disconnect()
+@@ -61,17 +53,13 @@ class ISPyBMySQLSPConnector(ispyb.interface.connection.IF):
+     return 'ispyb.sp'
+ 
+   def create_cursor(self, dictionary=False):
+-      if time.time() - self.last_activity_ts > self.conn_inactivity:
+-          # re-connect:
+-          self.connect(self.user, self.pw, self.host, self.db, self.port)
+-      self.last_activity_ts = time.time()
+-      if self.conn is None:
+-          raise ISPyBConnectionException
+-
+-      cursor = self.conn.cursor(dictionary=dictionary)
+-      if cursor is None:
+-          raise ISPyBConnectionException
+-      return cursor
++    if not self.conn:
++      raise ISPyBConnectionException('Not connected to database')
++    self.conn.ping(reconnect=True)
++    cursor = self.conn.cursor(dictionary=dictionary)
++    if not cursor:
++      raise ISPyBConnectionException('Could not create database cursor')
++    return cursor
+ 
+   def call_sp_write(self, procname, args):
+     with self.lock:
+diff --git a/ispyb/model/__future__.py b/ispyb/model/__future__.py
+index f69d9e2..0f9367a 100644
+--- a/ispyb/model/__future__.py
++++ b/ispyb/model/__future__.py
+@@ -15,7 +15,7 @@ import mysql.connector
+ 
+ _db_config = None
+ 
+-def enable(configuration_file):
++def enable(configuration_file, section='ispyb'):
+   '''Enable access to features that are currently under development.'''
+ 
+   global _db, _db_cc, _db_config
+@@ -37,19 +37,46 @@ def enable(configuration_file):
+   cfgparser = configparser.RawConfigParser()
+   if not cfgparser.read(configuration_file):
+     raise RuntimeError('Could not read from configuration file %s' % configuration_file)
+-  cfgsection = dict(cfgparser.items('ispyb'))
++  cfgsection = dict(cfgparser.items(section))
+   host = cfgsection.get('host')
+   port = cfgsection.get('port', 3306)
+-  database = cfgsection.get('database')
+-  username = cfgsection.get('username')
+-  password = cfgsection.get('password')
++  database = cfgsection.get('database', cfgsection.get('db'))
++  username = cfgsection.get('username', cfgsection.get('user'))
++  password = cfgsection.get('password', cfgsection.get('pw'))
+ 
+   # Open a direct MySQL connection
+   _db = mysql.connector.connect(host=host, port=port, user=username, password=password, database=database)
+   _db.autocommit = True
+-  _db_cc = DictionaryContextcursorFactory(_db.cursor)
+   _db_config = configuration_file
+ 
++  class DictionaryCursorContextManager(object):
++    '''This class creates dictionary cursors for mysql.connector connections.
++       By using a context manager it is ensured that cursors are closed
++       immediately after use.
++       Cursors created with this context manager return results as a dictionary
++       and offer a .run() function, which is an alias to .execute that accepts
++       query parameters as function parameters rather than a list.
++    '''
++
++    def __enter__(cm):
++      '''Enter context. Ensure the database is alive and return a cursor
++         with an extra .run() function.'''
++      _db.ping(reconnect=True)
++      cm.cursor = _db.cursor(dictionary=True)
++
++      def flat_execute(stmt, *parameters):
++        '''Pass all given function parameters as a list to the existing
++           .execute() function.'''
++        return cm.cursor.execute(stmt, parameters)
++      setattr(cm.cursor, 'run', flat_execute)
++      return cm.cursor
++
++    def __exit__(cm, *args):
++      '''Leave context. Close cursor. Destroy reference.'''
++      cm.cursor.close()
++      cm.cursor = None
++  _db_cc = DictionaryCursorContextManager
++
+   import ispyb.model.datacollection
+   ispyb.model.datacollection.DataCollection.integrations = _get_linked_autoprocintegration_for_dc
+   import ispyb.model.gridinfo
+@@ -57,52 +84,6 @@ def enable(configuration_file):
+   import ispyb.model.processingprogram
+   ispyb.model.processingprogram.ProcessingProgram.reload = _get_autoprocprogram
+ 
+-class DictionaryContextcursorFactory(object):
+-  '''This class creates dictionary context manager objects for mysql.connector
+-     cursors. By using a context manager it is ensured that cursors are
+-     closed immediately after use.
+-     Context managers created via this factory return results as a dictionary
+-     by default, and offer a .run() function, which is an alias to .execute
+-     that accepts query parameters as function parameters rather than a list.
+-  '''
+-
+-  def __init__(self, cursor_factory_function):
+-    '''Set up the context manager factory.'''
+-
+-    class ContextManager(object):
+-      '''The context manager object which is actually used in the
+-            with .. as ..:
+-         clause.'''
+-
+-      def __init__(cm, parameters):
+-        '''Store any constructor parameters, given as dictionary, so that they
+-           can be passed to the cursor factory later.'''
+-        cm.cursorparams = { 'dictionary': True }
+-        cm.cursorparams.update(parameters)
+-
+-      def __enter__(cm):
+-        '''Enter context. Instantiate and return the actual cursor using the
+-           given constructor, parameters, and an extra .run() function.'''
+-        cm.cursor = cursor_factory_function(**cm.cursorparams)
+-
+-        def flat_execute(stmt, *parameters):
+-          '''Pass all given function parameters as a list to the existing
+-             .execute() function.'''
+-          return cm.cursor.execute(stmt, parameters)
+-        setattr(cm.cursor, 'run', flat_execute)
+-        return cm.cursor
+-
+-      def __exit__(cm, *args):
+-        '''Leave context. Close cursor. Destroy reference.'''
+-        cm.cursor.close()
+-        cm.cursor = None
+-
+-    self._contextmanager_factory = ContextManager
+-
+-  def __call__(self, **parameters):
+-    '''Creates and returns a context manager object.'''
+-    return self._contextmanager_factory(parameters)
+-
+ def _get_gridinfo(self):
+   # https://jira.diamond.ac.uk/browse/MXSW-1173
+   with _db_cc() as cursor:
+diff --git a/ispyb/model/integration.py b/ispyb/model/integration.py
+index 16b57a2..ef33a7d 100644
+--- a/ispyb/model/integration.py
++++ b/ispyb/model/integration.py
+@@ -50,6 +50,12 @@ class IntegrationResult(ispyb.model.DBCache):
+       self._cache_dc = self._db.get_data_collection(self.DCID)
+     return self._cache_dc
+ 
++  @property
++  def unit_cell(self):
++    '''Returns the unit cell model'''
++    return ispyb.model.integration.UnitCell(self._data['cell_a'], self._data['cell_b'],self._data['cell_c'],
++                                            self._data['cell_alpha'], self._data['cell_beta'], self._data['cell_gamma'])
++
+   @property
+   def APIID(self):
+     '''Returns the AutoProcIntegrationID.'''
+@@ -85,3 +91,68 @@ ispyb.model.add_properties(IntegrationResult, (
+     ('detector_distance', 'refinedDetectorDistance'),
+     ('timestamp', 'recordTimeStamp'),
+ ))
++
++class UnitCell():
++  '''An object representing the parameters of the unit cell I.e unit cell edges and angles
++  '''
++
++  def __init__(self, a, b, c, alpha, beta, gamma):
++    '''Unit cell object
++
++       :param a: Edge a
++       :param b: Edge b
++       :param c: Edge c
++       :param alpha: Angle alpha
++       :param beta: Angle beta
++       :param gamma: Angle gamma
++       :return: A unitcell object
++    '''
++    self._a = a
++    self._b = b
++    self._c = c
++    self._alpha = alpha
++    self._beta = beta
++    self._gamma = gamma
++
++   
++  @property
++  def a(self):
++    '''Returns dimension a of unit cell in Angstroms'''
++    return self._a
++
++  @property
++  def b(self):
++    '''Returns dimension b of unit cell in Angstroms'''
++    return self._b
++
++  @property
++  def c(self):
++    '''Returns dimension c of unit cell in Angstroms'''
++    return self._c
++
++  @property
++  def alpha(self):
++    '''Returns angle alpha of unit cell'''
++    return self._alpha
++
++  @property
++  def beta(self):
++    '''Returns angle beta of unit cell'''
++    return self._beta
++
++  @property
++  def gamma(self):
++    '''Returns angle gamma of unit cell'''
++    return self._gamma
++ 
++  def __str__(self):
++    '''Returns a pretty-printed object representation.'''
++    return ('\n'.join((
++      '  a         : {uc.a}',
++      '  b         : {uc.b}',
++      '  c         : {uc.c}',
++      '  alpha     : {uc.alpha}',
++      '  beta      : {uc.beta}',
++      '  gamma     : {uc.gamma}',
++    ))).format(uc=self)
++

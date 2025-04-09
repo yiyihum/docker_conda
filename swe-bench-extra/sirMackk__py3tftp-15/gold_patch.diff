@@ -1,0 +1,138 @@
+diff --git a/.github/workflows/actions.yml b/.github/workflows/actions.yml
+new file mode 100644
+index 0000000..8386936
+--- /dev/null
++++ b/.github/workflows/actions.yml
+@@ -0,0 +1,21 @@
++name: Run Python tests
++on: [push]
++jobs:
++  verify:
++    runs-on: ${{ matrix.os }}
++    strategy:
++      matrix:
++        os: [ubuntu-latest] # TODO: add 'windows-latest'
++        python-version: ['3.5'] # TODO: add '3.9'
++    steps:
++      - uses: actions/checkout@v2
++      - name: Setup Python
++        uses: actions/setup-python@v2
++        with:
++          python-version: ${{ matrix.python-version }}
++
++      # Install packages
++      - run: pip install coverage==4.1 flake8==3.5.0
++
++      # Run tests
++      - run: .github/workflows/test.sh
+diff --git a/.travis/run.sh b/.github/workflows/test.sh
+similarity index 95%
+rename from .travis/run.sh
+rename to .github/workflows/test.sh
+index f549b1f..7f24792 100755
+--- a/.travis/run.sh
++++ b/.github/workflows/test.sh
+@@ -22,4 +22,4 @@ timeout=15
+ 
+ timeout -s SIGINT "${timeout}" python -m py3tftp --host 127.0.0.1 &> /dev/null &
+ sleep 1
+-timeout -s SIGINT "${timeout}" python -m unittest discover -s tests/acceptance -p *_test.py
++timeout -s SIGINT "${timeout}" python -m unittest discover -s tests/acceptance -p *_test.py
+\ No newline at end of file
+diff --git a/.travis.yml b/.travis.yml
+deleted file mode 100644
+index 5be3b48..0000000
+--- a/.travis.yml
++++ /dev/null
+@@ -1,10 +0,0 @@
+-language: python
+-python:
+-  - "3.5"
+-
+-install: pip install coverage==4.1 flake8==3.5.0
+-
+-script: ./.travis/run.sh
+-
+-notifications:
+-  email: false
+diff --git a/py3tftp/file_io.py b/py3tftp/file_io.py
+index ff17b31..edaf72a 100644
+--- a/py3tftp/file_io.py
++++ b/py3tftp/file_io.py
+@@ -1,5 +1,5 @@
+ import os
+-import os.path as opath
++from pathlib import Path
+ from .netascii import Netascii
+ 
+ 
+@@ -7,11 +7,21 @@ def sanitize_fname(fname):
+     """
+     Ensures that fname is a path under the current working directory.
+     """
+-    root_dir = os.getcwd()
+-    return opath.join(
+-        bytes(root_dir, encoding='ascii'),
+-        opath.normpath(
+-            b'/' + fname).lstrip(b'/'))
++    # Remove root (/) and parent (..) directory references.
++    path = os.fsdecode(fname).lstrip('./')
++    abs_path = Path.cwd() / path
++
++    # Verify that the formed path is under the current working directory.
++    try:
++        abs_path.relative_to(Path.cwd())
++    except ValueError:
++        raise FileNotFoundError
++
++    # Verify that we are not accesing a reserved file.
++    if abs_path.is_reserved():
++        raise FileNotFoundError
++
++    return abs_path
+ 
+ 
+ class FileReader(object):
+@@ -25,9 +35,9 @@ class FileReader(object):
+     """
+ 
+     def __init__(self, fname, chunk_size=0, mode=None):
++        self._f = None
+         self.fname = sanitize_fname(fname)
+         self.chunk_size = chunk_size
+-        self._f = None
+         self._f = self._open_file()
+         self.finished = False
+ 
+@@ -35,10 +45,10 @@ class FileReader(object):
+             self._f = Netascii(self._f)
+ 
+     def _open_file(self):
+-        return open(self.fname, 'rb')
++        return self.fname.open('rb')
+ 
+     def file_size(self):
+-        return os.stat(self.fname).st_size
++        return self.fname.stat().st_size
+ 
+     def read_chunk(self, size=None):
+         size = size or self.chunk_size
+@@ -66,16 +76,16 @@ class FileWriter(object):
+     When it goes out of scope, it ensures the file is closed.
+     """
+     def __init__(self, fname, chunk_size, mode=None):
++        self._f = None
+         self.fname = sanitize_fname(fname)
+         self.chunk_size = chunk_size
+-        self._f = None
+         self._f = self._open_file()
+ 
+         if mode == b'netascii':
+             self._f = Netascii(self._f)
+ 
+     def _open_file(self):
+-        return open(self.fname, 'xb')
++        return self.fname.open('xb')
+ 
+     def _flush(self):
+         if self._f:

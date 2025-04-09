@@ -1,0 +1,195 @@
+diff --git a/mobly/base_test.py b/mobly/base_test.py
+index 5233aa5..649f6d5 100644
+--- a/mobly/base_test.py
++++ b/mobly/base_test.py
+@@ -17,6 +17,7 @@ import copy
+ import functools
+ import inspect
+ import logging
++import sys
+ 
+ from mobly import logger
+ from mobly import records
+@@ -175,6 +176,19 @@ class BaseTestClass(object):
+         Implementation is optional.
+         """
+ 
++    def _teardown_class(self):
++        """Proxy function to guarantee the base implementation of
++        teardown_class is called.
++        """
++        record = records.TestResultRecord('teardown_class', self.TAG)
++        record.test_begin()
++        try:
++            self.teardown_class()
++        except Exception as e:
++            record.test_error(e)
++            record.update_record()
++            self.results.add_class_error(record)
++
+     def teardown_class(self):
+         """Teardown function that will be called after all the selected tests in
+         the test class have been executed.
+@@ -316,7 +330,7 @@ class BaseTestClass(object):
+ 
+         Executes setup_test, the test method, and teardown_test; then creates a
+         records.TestResultRecord object with the execution information and adds
+-        the record to the test class's test results.
++        the record to the test class's test result s.
+ 
+         Args:
+             test_name: Name of the test.
+@@ -330,7 +344,12 @@ class BaseTestClass(object):
+         teardown_test_failed = False
+         try:
+             try:
+-                self._setup_test(test_name)
++                try:
++                    self._setup_test(test_name)
++                except signals.TestFailure as e:
++                    new_e = signals.TestError(e.details, e.extras)
++                    _, _, new_e.__traceback__ = sys.exc_info()
++                    raise new_e
+                 if args or kwargs:
+                     test_method(*args, **kwargs)
+                 else:
+@@ -563,7 +582,7 @@ class BaseTestClass(object):
+             # Skip all tests peacefully.
+             e.details = 'setup_class aborted due to: %s' % e.details
+             self._skip_remaining_tests(e)
+-            self._safe_exec_func(self.teardown_class)
++            self._teardown_class()
+             return self.results
+         except Exception as e:
+             # Setup class failed for unknown reasons.
+@@ -577,7 +596,7 @@ class BaseTestClass(object):
+             self.summary_writer.dump(class_record.to_dict(),
+                                      records.TestSummaryEntryType.RECORD)
+             self._skip_remaining_tests(e)
+-            self._safe_exec_func(self.teardown_class)
++            self._teardown_class()
+             return self.results
+         # Run tests in order.
+         try:
+@@ -594,7 +613,7 @@ class BaseTestClass(object):
+             setattr(e, 'results', self.results)
+             raise e
+         finally:
+-            self._safe_exec_func(self.teardown_class)
++            self._teardown_class()
+             logging.info('Summary for test class %s: %s', self.TAG,
+                          self.results.summary_str())
+ 
+diff --git a/tests/mobly/base_test_test.py b/tests/mobly/base_test_test.py
+index bd7dce9..d615f3f 100755
+--- a/tests/mobly/base_test_test.py
++++ b/tests/mobly/base_test_test.py
+@@ -203,6 +203,28 @@ class BaseTestTest(unittest.TestCase):
+         teardown_class_call_check.assert_called_once_with("heehee")
+         on_fail_call_check.assert_called_once_with("haha")
+ 
++    def test_teardown_class_fail_by_exception(self):
++        class MockBaseTest(base_test.BaseTestClass):
++            def test_something(self):
++                pass
++
++            def teardown_class(self):
++                raise Exception(MSG_EXPECTED_EXCEPTION)
++
++        bt_cls = MockBaseTest(self.mock_test_cls_configs)
++        bt_cls.run()
++        test_record = bt_cls.results.passed[0]
++        class_record = bt_cls.results.error[0]
++        self.assertFalse(bt_cls.results.is_all_pass)
++        self.assertEqual(class_record.test_name, 'teardown_class')
++        self.assertEqual(class_record.details, MSG_EXPECTED_EXCEPTION)
++        self.assertIsNotNone(class_record.begin_time)
++        self.assertIsNotNone(class_record.end_time)
++        self.assertIsNone(class_record.extras)
++        expected_summary = ('Error 1, Executed 1, Failed 0, Passed 1, '
++                            'Requested 1, Skipped 0')
++        self.assertEqual(bt_cls.results.summary_str(), expected_summary)
++
+     def test_setup_test_fail_by_exception(self):
+         mock_on_fail = mock.Mock()
+ 
+@@ -223,6 +245,10 @@ class BaseTestTest(unittest.TestCase):
+         actual_record = bt_cls.results.error[0]
+         self.assertEqual(actual_record.test_name, self.mock_test_name)
+         self.assertEqual(actual_record.details, MSG_EXPECTED_EXCEPTION)
++        self.assertTrue('in setup_test\n    '
++                        'raise Exception(MSG_EXPECTED_EXCEPTION)\n'
++                        'Exception: This is an expected exception.\n' in
++                        actual_record.stacktrace)
+         self.assertIsNone(actual_record.extras)
+         expected_summary = ("Error 1, Executed 1, Failed 0, Passed 0, "
+                             "Requested 1, Skipped 0")
+@@ -239,11 +265,13 @@ class BaseTestTest(unittest.TestCase):
+ 
+         bt_cls = MockBaseTest(self.mock_test_cls_configs)
+         bt_cls.run(test_names=["test_something"])
+-        actual_record = bt_cls.results.failed[0]
++        actual_record = bt_cls.results.error[0]
+         self.assertEqual(actual_record.test_name, self.mock_test_name)
+         self.assertEqual(actual_record.details, MSG_EXPECTED_EXCEPTION)
++        # Make sure the full stacktrace of `setup_test` is preserved.
++        self.assertTrue('self.setup_test()' in actual_record.stacktrace)
+         self.assertIsNone(actual_record.extras)
+-        expected_summary = ("Error 0, Executed 1, Failed 1, Passed 0, "
++        expected_summary = ("Error 1, Executed 1, Failed 0, Passed 0, "
+                             "Requested 1, Skipped 0")
+         self.assertEqual(bt_cls.results.summary_str(), expected_summary)
+ 
+@@ -407,6 +435,7 @@ class BaseTestTest(unittest.TestCase):
+ 
+     def test_procedure_function_gets_correct_record(self):
+         on_fail_mock = mock.MagicMock()
++
+         class MockBaseTest(base_test.BaseTestClass):
+             def on_fail(self, record):
+                 on_fail_mock.record = record
+@@ -418,12 +447,16 @@ class BaseTestTest(unittest.TestCase):
+         bt_cls.run()
+         actual_record = bt_cls.results.failed[0]
+         self.assertEqual(actual_record.test_name, 'test_something')
+-        self.assertEqual(on_fail_mock.record.test_name, actual_record.test_name)
+-        self.assertEqual(on_fail_mock.record.begin_time, actual_record.begin_time)
++        self.assertEqual(on_fail_mock.record.test_name,
++                         actual_record.test_name)
++        self.assertEqual(on_fail_mock.record.begin_time,
++                         actual_record.begin_time)
+         self.assertEqual(on_fail_mock.record.end_time, actual_record.end_time)
+-        self.assertEqual(on_fail_mock.record.stacktrace, actual_record.stacktrace)
++        self.assertEqual(on_fail_mock.record.stacktrace,
++                         actual_record.stacktrace)
+         self.assertEqual(on_fail_mock.record.extras, actual_record.extras)
+-        self.assertEqual(on_fail_mock.record.extra_errors, actual_record.extra_errors)
++        self.assertEqual(on_fail_mock.record.extra_errors,
++                         actual_record.extra_errors)
+         # But they are not the same object.
+         self.assertIsNot(on_fail_mock.record, actual_record)
+ 
+@@ -989,6 +1022,23 @@ class BaseTestTest(unittest.TestCase):
+         self.assertEqual(actual_record.details, MSG_EXPECTED_EXCEPTION)
+         self.assertEqual(actual_record.extras, MOCK_EXTRA)
+ 
++    def test_skip_in_setup_test(self):
++        class MockBaseTest(base_test.BaseTestClass):
++            def setup_test(self):
++                asserts.skip(MSG_EXPECTED_EXCEPTION, extras=MOCK_EXTRA)
++
++            def test_func(self):
++                never_call()
++
++        bt_cls = MockBaseTest(self.mock_test_cls_configs)
++        bt_cls.run(test_names=["test_func"])
++        actual_record = bt_cls.results.skipped[0]
++        self.assertIsNotNone(actual_record.begin_time)
++        self.assertIsNotNone(actual_record.end_time)
++        self.assertEqual(actual_record.test_name, "test_func")
++        self.assertEqual(actual_record.details, MSG_EXPECTED_EXCEPTION)
++        self.assertEqual(actual_record.extras, MOCK_EXTRA)
++
+     def test_unpack_userparams_required(self):
+         """Missing a required param should raise an error."""
+         required = ["some_param"]

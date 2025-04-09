@@ -1,0 +1,128 @@
+diff --git a/tests/generate_config_test.py b/tests/generate_config_test.py
+index 889b074..3449297 100644
+--- a/tests/generate_config_test.py
++++ b/tests/generate_config_test.py
+@@ -1,6 +1,8 @@
+ from __future__ import absolute_import
+ from __future__ import unicode_literals
+ 
++import re
++
+ import jsonschema.exceptions
+ import pytest
+ 
+@@ -18,12 +20,14 @@ def test_with_all_options_specified():
+         'metric_package_names': ['my_package'],
+         'repo': '.',
+         'database': 'database.db',
++        'exclude': '^vendor/',
+     })
+     assert ret == GenerateOptions(
+         skip_default_metrics=True,
+         metric_package_names=['my_package'],
+         repo='.',
+         database='database.db',
++        exclude=re.compile(b'^vendor/'),
+     )
+ 
+ 
+@@ -34,17 +38,5 @@ def test_minimal_defaults():
+         metric_package_names=[],
+         repo='./',
+         database='database.db',
+-    )
+-
+-
+-def test_none_for_tempdir_allowed():
+-    ret = GenerateOptions.from_yaml({
+-        'repo': 'repo',
+-        'database': 'database.db',
+-    })
+-    assert ret == GenerateOptions(
+-        skip_default_metrics=False,
+-        metric_package_names=[],
+-        repo='repo',
+-        database='database.db',
++        exclude=re.compile(b'^$'),
+     )
+diff --git a/tests/generate_test.py b/tests/generate_test.py
+index 2f05015..62eb1c6 100644
+--- a/tests/generate_test.py
++++ b/tests/generate_test.py
+@@ -3,12 +3,11 @@ from __future__ import unicode_literals
+ 
+ import collections
+ import io
+-import os
+ import os.path
++import re
+ import sqlite3
+ 
+ import pytest
+-import yaml
+ 
+ from git_code_debt.discovery import get_metric_parsers_from_args
+ from git_code_debt.generate import _get_metrics_inner
+@@ -43,7 +42,7 @@ def test_get_metrics_inner_first_commit(cloneable_with_commits):
+     with repo_parser.repo_checked_out():
+         metrics = _get_metrics_inner((
+             None, cloneable_with_commits.commits[0],
+-            repo_parser, [LinesOfCodeParser],
++            repo_parser, [LinesOfCodeParser], re.compile(b'^$'),
+         ))
+         assert Metric(name='TotalLinesOfCode', value=0) in metrics
+ 
+@@ -54,7 +53,7 @@ def test_get_metrics_inner_nth_commit(cloneable_with_commits):
+         metrics = _get_metrics_inner((
+             cloneable_with_commits.commits[-2],
+             cloneable_with_commits.commits[-1],
+-            repo_parser, [LinesOfCodeParser],
++            repo_parser, [LinesOfCodeParser], re.compile(b'^$'),
+         ))
+         assert Metric(name='TotalLinesOfCode', value=2) in metrics
+ 
+@@ -73,18 +72,6 @@ def test_generate_integration(sandbox, cloneable):
+     main(('-C', sandbox.gen_config(repo=cloneable)))
+ 
+ 
+-def test_generate_integration_config_file(sandbox, cloneable, tempdir_factory):
+-    tmpdir = tempdir_factory.get()
+-    config_filename = os.path.join(tmpdir, 'generate_config.yaml')
+-    with io.open(config_filename, 'w') as config_file:
+-        yaml.dump(
+-            {'repo': cloneable, 'database': sandbox.db_path},
+-            stream=config_file,
+-        )
+-    with cwd(tmpdir):
+-        main([])
+-
+-
+ def test_main_database_does_not_exist(sandbox, cloneable):
+     new_db_path = os.path.join(sandbox.directory, 'new.db')
+     cfg = sandbox.gen_config(database=new_db_path, repo=cloneable)
+@@ -157,6 +144,25 @@ def test_moves_handled_properly(sandbox, cloneable):
+     assert not main(('-C', sandbox.gen_config(repo=cloneable)))
+ 
+ 
++def test_exclude_pattern(sandbox, cloneable_with_commits):
++    cfg = sandbox.gen_config(
++        repo=cloneable_with_commits.path, exclude='\.tmpl$',
++    )
++    assert not main(('-C', cfg))
++    with sandbox.db() as db:
++        query = (
++            'SELECT running_value\n'
++            'FROM metric_data\n'
++            'INNER JOIN metric_names ON\n'
++            '    metric_data.metric_id == metric_names.id\n'
++            'WHERE sha = ? AND name = "TotalLinesOfCode"\n'
++        )
++        sha = cloneable_with_commits.commits[-1].sha
++        val, = db.execute(query, (sha,)).fetchone()
++        # 2 lines of code from test.py, 0 lines from foo.tmpl (2 lines)
++        assert val == 2
++
++
+ def test_get_options_from_config_no_config_file():
+     with pytest.raises(SystemExit):
+         get_options_from_config('i-dont-exist')

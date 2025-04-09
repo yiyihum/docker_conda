@@ -1,0 +1,160 @@
+diff --git a/tests/settings.py b/tests/settings.py
+index 5c29306..892b914 100644
+--- a/tests/settings.py
++++ b/tests/settings.py
+@@ -14,6 +14,12 @@ import os
+ 
+ # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
+ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++# For testing with pathlib.Path based BASE_DIR
++# from pathlib import Path
++# BASE_DIR = Path(__file__).resolve().parent.parent
++
++# Get a string representation of BASE_DIR in case it's provided as a Path
++BASE_DIR_STR = str(BASE_DIR)
+ 
+ # Quick-start development settings - unsuitable for production
+ # See https://docs.djangoproject.com/en/2.1/howto/deployment/checklist/
+@@ -76,7 +82,7 @@ WSGI_APPLICATION = 'tests.wsgi.application'
+ DATABASES = {
+     'default': {
+         'ENGINE': 'django.db.backends.sqlite3',
+-        'NAME': os.path.join(BASE_DIR, 'filepond_tests.db'),
++        'NAME': os.path.join(BASE_DIR_STR, 'filepond_tests.db'),
+     }
+ }
+ 
+@@ -126,7 +132,7 @@ STATIC_URL = '/static/'
+ # The URL base used for the URL import
+ URL_BASE = r'^fp/'
+ 
+-DJANGO_DRF_FILEPOND_FILE_STORE_PATH = os.path.join(BASE_DIR, 'filestore')
++DJANGO_DRF_FILEPOND_FILE_STORE_PATH = os.path.join(BASE_DIR_STR, 'filestore')
+ 
+ LOGGING = {
+     'version': 1,
+diff --git a/tests/test_process_view.py b/tests/test_process_view.py
+index 938b4ae..ee555af 100644
+--- a/tests/test_process_view.py
++++ b/tests/test_process_view.py
+@@ -26,6 +26,8 @@ except ImportError:
+     from mock import patch, MagicMock, ANY
+ 
+ LOG = logging.getLogger(__name__)
++
++
+ #
+ # New tests for checking file storage outside of BASE_DIR (see #18)
+ #
+@@ -44,8 +46,10 @@ LOG = logging.getLogger(__name__)
+ # test_new_chunked_upload_request: Check that a new chunked upload request
+ #    results in handle_upload being called on the chunked uploader class.
+ #
+-
+-
++# UPDATE: June 2021:
++# test_process_data_BASE_DIR_pathlib: Tests the upload process when BASE_DIR
++#    is set as a pathlib.Path object as it is by default in more recent Django
++#    versions - at present, django-drf-filepond uses regular strings for paths
+ class ProcessTestCase(TestCase):
+ 
+     def setUp(self):
+@@ -57,6 +61,31 @@ class ProcessTestCase(TestCase):
+     def test_process_data(self):
+         self._process_data()
+ 
++    def test_process_data_BASE_DIR_pathlib(self):
++        # In recent Django versions, BASE_DIR is set by default to
++        # Path(__file__).resolve().parent.parent when creating a new project
++        # using django-admin. Older versions of Django, in use when
++        # django-drf-filepond was originally created used regular strings
++        # for paths. Need to be able to handle both.
++        # Set modified BASE_DIR using context manager - on older Python
++        # versions that don't have pathlib support, fall back to strings
++        OLD_BASE_DIR = drf_filepond_settings.BASE_DIR
++        try:
++            from pathlib import Path
++            NEW_BASE_DIR = Path(__file__).resolve().parent.parent
++            LOG.debug('PATHLIB TEST: Old BASE_DIR: %s   NEW_BASE_DIR: %s' %
++                      (repr(drf_filepond_settings.BASE_DIR),
++                       repr(NEW_BASE_DIR)))
++            drf_filepond_settings.BASE_DIR = NEW_BASE_DIR
++        except ImportError:
++            LOG.debug('NO PATHLIB SUPPORT FOR PATHLIB TEST. '
++                      'FALLING BACK TO USING REGULAR STRING PATHS...')
++
++        try:
++            self._process_data()
++        finally:
++            drf_filepond_settings.BASE_DIR = OLD_BASE_DIR
++
+     def test_UPLOAD_TMP_not_set(self):
+         upload_tmp = drf_filepond_settings.UPLOAD_TMP
+         delattr(drf_filepond_settings, 'UPLOAD_TMP')
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index def0044..1ba0cad 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -7,7 +7,9 @@ from rest_framework.request import Request
+ import shortuuid
+ from six import text_type
+ 
+-from django_drf_filepond.utils import _get_user, _get_file_id
++import django_drf_filepond.drf_filepond_settings as local_settings
++from django_drf_filepond.utils import _get_user, _get_file_id, \
++    get_local_settings_base_dir
+ 
+ 
+ # Python 2/3 support
+@@ -27,6 +29,15 @@ LOG = logging.getLogger(__name__)
+ # test_get_file_id: Test that get_file_id returns an ID that corresponds to
+ #    the 22-character specification.
+ #
++# test_get_base_dir_with_str: Test that when the local settings BASE_DIR
++#    is a string, a string is returned.
++#
++# test_get_base_dir_with_path: Test that when the local settings BASE_DIR
++#    is a Path object, a string is returned.
++#
++# test_get_base_dir_join_path: Test that when the local settings BASE_DIR
++#    is a Path object, a string is returned.
++#
+ class UtilsTestCase(TestCase):
+ 
+     def test_get_user_regular(self):
+@@ -48,3 +59,35 @@ class UtilsTestCase(TestCase):
+         id_format = re.compile('^([%s]){22}$' % (shortuuid.get_alphabet()))
+         self.assertRegex(fid, id_format, ('The generated ID does not match '
+                                           'the defined ID format.'))
++
++    def test_get_base_dir_with_str(self):
++        test_dir_name = '/tmp/testdir'
++        old_base_dir = local_settings.BASE_DIR
++        try:
++            local_settings.BASE_DIR = test_dir_name
++            bd = get_local_settings_base_dir()
++            self.assertIsInstance(
++                bd, str, 'The base directory is not a string.')
++            self.assertEqual(
++                bd, test_dir_name, 'The test directory name doesn\'t match.')
++        finally:
++            local_settings.BASE_DIR = old_base_dir
++
++    def test_get_base_dir_with_path(self):
++        try:
++            from pathlib import Path
++            test_dir_name = Path('/tmp/testdir')
++        except ImportError:
++            test_dir_name = '/tmp/testdir'
++
++        old_base_dir = local_settings.BASE_DIR
++        try:
++            local_settings.BASE_DIR = test_dir_name
++            bd = get_local_settings_base_dir()
++            self.assertIsInstance(
++                bd, str, 'The base directory is not a string.')
++            self.assertEqual(
++                bd, str(test_dir_name),
++                'The test directory name doesn\'t match.')
++        finally:
++            local_settings.BASE_DIR = old_base_dir

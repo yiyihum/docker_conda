@@ -1,0 +1,203 @@
+diff --git a/babel/messages/extract.py b/babel/messages/extract.py
+index 4f0f649..c19dd5a 100644
+--- a/babel/messages/extract.py
++++ b/babel/messages/extract.py
+@@ -16,9 +16,10 @@
+     :license: BSD, see LICENSE for more details.
+ """
+ import ast
++import io
+ import os
+-from os.path import relpath
+ import sys
++from os.path import relpath
+ from tokenize import generate_tokens, COMMENT, NAME, OP, STRING
+ 
+ from babel.util import parse_encoding, parse_future_flags, pathmatch
+@@ -532,7 +533,7 @@ def _parse_python_string(value, encoding, future_flags):
+     return None
+ 
+ 
+-def extract_javascript(fileobj, keywords, comment_tags, options):
++def extract_javascript(fileobj, keywords, comment_tags, options, lineno=1):
+     """Extract messages from JavaScript source code.
+ 
+     :param fileobj: the seekable, file-like object the messages should be
+@@ -544,7 +545,11 @@ def extract_javascript(fileobj, keywords, comment_tags, options):
+     :param options: a dictionary of additional options (optional)
+                     Supported options are:
+                     * `jsx` -- set to false to disable JSX/E4X support.
+-                    * `template_string` -- set to false to disable ES6 template string support.
++                    * `template_string` -- if `True`, supports gettext(`key`)
++                    * `parse_template_string` -- if `True` will parse the
++                                                 contents of javascript
++                                                 template strings.
++    :param lineno: line number offset (for parsing embedded fragments)
+     """
+     from babel.messages.jslexer import Token, tokenize, unquote_string
+     funcname = message_lineno = None
+@@ -556,12 +561,12 @@ def extract_javascript(fileobj, keywords, comment_tags, options):
+     last_token = None
+     call_stack = -1
+     dotted = any('.' in kw for kw in keywords)
+-
+     for token in tokenize(
+         fileobj.read().decode(encoding),
+         jsx=options.get("jsx", True),
+         template_string=options.get("template_string", True),
+-        dotted=dotted
++        dotted=dotted,
++        lineno=lineno
+     ):
+         if (  # Turn keyword`foo` expressions into keyword("foo") calls:
+             funcname and  # have a keyword...
+@@ -573,7 +578,11 @@ def extract_javascript(fileobj, keywords, comment_tags, options):
+             call_stack = 0
+             token = Token('operator', ')', token.lineno)
+ 
+-        if token.type == 'operator' and token.value == '(':
++        if options.get('parse_template_string') and not funcname and token.type == 'template_string':
++            for item in parse_template_string(token.value, keywords, comment_tags, options, token.lineno):
++                yield item
++
++        elif token.type == 'operator' and token.value == '(':
+             if funcname:
+                 message_lineno = token.lineno
+                 call_stack += 1
+@@ -665,3 +674,41 @@ def extract_javascript(fileobj, keywords, comment_tags, options):
+             funcname = token.value
+ 
+         last_token = token
++
++
++def parse_template_string(template_string, keywords, comment_tags, options, lineno=1):
++    """Parse JavaScript template string.
++
++    :param template_string: the template string to be parsed
++    :param keywords: a list of keywords (i.e. function names) that should be
++                     recognized as translation functions
++    :param comment_tags: a list of translator tags to search for and include
++                         in the results
++    :param options: a dictionary of additional options (optional)
++    :param lineno: starting line number (optional)
++    """
++    from babel.messages.jslexer import line_re
++    prev_character = None
++    level = 0
++    inside_str = False
++    expression_contents = ''
++    for character in template_string[1:-1]:
++        if not inside_str and character in ('"', "'", '`'):
++            inside_str = character
++        elif inside_str == character and prev_character != r'\\':
++            inside_str = False
++        if level:
++            expression_contents += character
++        if not inside_str:
++            if character == '{' and prev_character == '$':
++                level += 1
++            elif level and character == '}':
++                level -= 1
++                if level == 0 and expression_contents:
++                    expression_contents = expression_contents[0:-1]
++                    fake_file_obj = io.BytesIO(expression_contents.encode())
++                    for item in extract_javascript(fake_file_obj, keywords, comment_tags, options, lineno):
++                        yield item
++                    lineno += len(line_re.findall(expression_contents))
++                    expression_contents = ''
++        prev_character = character
+diff --git a/babel/messages/jslexer.py b/babel/messages/jslexer.py
+index 1264b2d..886f69d 100644
+--- a/babel/messages/jslexer.py
++++ b/babel/messages/jslexer.py
+@@ -151,17 +151,17 @@ def unquote_string(string):
+     return u''.join(result)
+ 
+ 
+-def tokenize(source, jsx=True, dotted=True, template_string=True):
++def tokenize(source, jsx=True, dotted=True, template_string=True, lineno=1):
+     """
+     Tokenize JavaScript/JSX source.  Returns a generator of tokens.
+ 
+     :param jsx: Enable (limited) JSX parsing.
+     :param dotted: Read dotted names as single name token.
+     :param template_string: Support ES6 template strings
++    :param lineno: starting line number (optional)
+     """
+     may_divide = False
+     pos = 0
+-    lineno = 1
+     end = len(source)
+     rules = get_rules(jsx=jsx, dotted=dotted, template_string=template_string)
+ 
+diff --git a/babel/numbers.py b/babel/numbers.py
+index 2221e95..da5936d 100644
+--- a/babel/numbers.py
++++ b/babel/numbers.py
+@@ -17,6 +17,7 @@
+ # TODO:
+ #  Padding and rounding increments in pattern:
+ #  - https://www.unicode.org/reports/tr35/ (Appendix G.6)
++from __future__ import annotations
+ import decimal
+ import re
+ from datetime import date as date_, datetime as datetime_
+@@ -431,7 +432,7 @@ def format_compact_decimal(number, *, format_type="short", locale=LC_NUMERIC, fr
+     u'123万'
+     >>> format_compact_decimal(2345678, format_type="long", locale="mk")
+     u'2 милиони'
+-    >>> format_compact_decimal(21098765, format_type="long", locale="mk")
++    >>> format_compact_decimal(21000000, format_type="long", locale="mk")
+     u'21 милион'
+ 
+     :param number: the number to format
+@@ -469,11 +470,15 @@ def _get_compact_format(number, compact_format, locale, fraction_digits=0):
+             # equal to the number of 0's in the pattern minus 1
+             number = number / (magnitude // (10 ** (pattern.count("0") - 1)))
+             # round to the number of fraction digits requested
+-            number = round(number, fraction_digits)
++            rounded = round(number, fraction_digits)
+             # if the remaining number is singular, use the singular format
+             plural_form = locale.plural_form(abs(number))
+-            plural_form = plural_form if plural_form in compact_format else "other"
++            if plural_form not in compact_format:
++                plural_form = "other"
++            if number == 1 and "1" in compact_format:
++                plural_form = "1"
+             format = compact_format[plural_form][str(magnitude)]
++            number = rounded
+             break
+     return number, format
+ 
+@@ -960,17 +965,19 @@ def parse_pattern(pattern):
+     return NumberPattern(pattern, (pos_prefix, neg_prefix),
+                          (pos_suffix, neg_suffix), grouping,
+                          int_prec, frac_prec,
+-                         exp_prec, exp_plus)
++                         exp_prec, exp_plus, number)
+ 
+ 
+ class NumberPattern:
+ 
+     def __init__(self, pattern, prefix, suffix, grouping,
+-                 int_prec, frac_prec, exp_prec, exp_plus):
++                 int_prec, frac_prec, exp_prec, exp_plus,
++                 number_pattern: str | None = None):
+         # Metadata of the decomposed parsed pattern.
+         self.pattern = pattern
+         self.prefix = prefix
+         self.suffix = suffix
++        self.number_pattern = number_pattern
+         self.grouping = grouping
+         self.int_prec = int_prec
+         self.frac_prec = frac_prec
+@@ -1115,7 +1122,7 @@ class NumberPattern:
+ 
+         retval = ''.join([
+             self.prefix[is_negative],
+-            number,
++            number if self.number_pattern != '' else '',
+             self.suffix[is_negative]])
+ 
+         if u'¤' in retval:
+

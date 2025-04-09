@@ -1,0 +1,133 @@
+diff --git a/test/__main__.py b/test/__main__.py
+index 1df003a3..4e14ca62 100644
+--- a/test/__main__.py
++++ b/test/__main__.py
+@@ -43,7 +43,6 @@ if __name__ == '__main__':
+     args = parser.parse_args()
+ 
+     logging.info(f"Using {OBJECTS} for objects storage.")
+-    logging.info(f"Using {OUTPUT_DIR} for output images storage.")
+     logging.info(f"Using {OSBUILD} for building images.")
+ 
+     f30_boot = IntegrationTestCase(
+diff --git a/test/integration_tests/build.py b/test/integration_tests/build.py
+index f8802086..38084dc4 100644
+--- a/test/integration_tests/build.py
++++ b/test/integration_tests/build.py
+@@ -1,3 +1,4 @@
++import json
+ import logging
+ import subprocess
+ import sys
+@@ -5,8 +6,8 @@ import sys
+ from .config import *
+ 
+ 
+-def run_osbuild(pipeline: str, build_pipeline: str, check=True):
+-    cmd = OSBUILD + ["--store", OBJECTS, "-o", OUTPUT_DIR, pipeline]
++def run_osbuild(pipeline: str, build_pipeline: str):
++    cmd = OSBUILD + ["--json", "--store", OBJECTS, pipeline]
+     if build_pipeline:
+         cmd += ["--build-pipeline", build_pipeline]
+     logging.info(f"Running osbuild: {cmd}")
+@@ -17,10 +18,10 @@ def run_osbuild(pipeline: str, build_pipeline: str, check=True):
+         print(osbuild.stderr.decode())
+         print(f"{BOLD}STDOUT{RESET}")
+         print(osbuild.stdout.decode())
+-        if check:
+-            sys.exit(1)
++        sys.exit(1)
+ 
+-    return osbuild.returncode
++    result = json.loads(osbuild.stdout.decode())
++    return result["tree_id"], result.get("output_id")
+ 
+ 
+ def build_testing_image(pipeline_full_path, build_pipeline_full_path):
+diff --git a/test/integration_tests/config.py b/test/integration_tests/config.py
+index 9f57ee9c..b956e500 100644
+--- a/test/integration_tests/config.py
++++ b/test/integration_tests/config.py
+@@ -7,5 +7,4 @@ RESET = "\033[0m"
+ BOLD = "\033[1m"
+ RED = "\033[31m"
+ OBJECTS = os.environ.get("OBJECTS", ".osbuild-test")
+-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output-test")
+ OSBUILD = os.environ.get("OSBUILD", "python3 -m osbuild --libdir .").split(' ')
+diff --git a/test/integration_tests/run.py b/test/integration_tests/run.py
+index 7b04e469..0a87a762 100644
+--- a/test/integration_tests/run.py
++++ b/test/integration_tests/run.py
+@@ -11,7 +11,7 @@ def run_image(file_name: str):
+     silence = ["-nographic", "-monitor", "none", "-serial", "none"]
+     serial = ["-chardev", "stdio,id=stdio", "-device", "virtio-serial", "-device", "virtserialport,chardev=stdio"]
+     cmd = ["qemu-system-x86_64", "-m", "1024", "-snapshot"] + \
+-          acceleration + silence + serial + [f"{OUTPUT_DIR}/{file_name}"]
++          acceleration + silence + serial + [file_name]
+     logging.info(f"Booting image: {cmd}")
+     return subprocess.run(cmd, capture_output=True, timeout=EXPECTED_TIME_TO_BOOT, encoding="utf-8", check=True)
+ 
+@@ -19,7 +19,7 @@ def run_image(file_name: str):
+ @contextlib.contextmanager
+ def extract_image(file_name: str):
+     extract_dir = tempfile.mkdtemp(prefix="osbuild-")
+-    archive = path.join(os.getcwd(), OUTPUT_DIR, file_name)
++    archive = path.join(os.getcwd(), file_name)
+     subprocess.run(["tar", "xf", archive], cwd=extract_dir, check=True)
+     try:
+         yield extract_dir
+diff --git a/test/integration_tests/test_case.py b/test/integration_tests/test_case.py
+index e6f03970..37907c55 100644
+--- a/test/integration_tests/test_case.py
++++ b/test/integration_tests/test_case.py
+@@ -5,6 +5,7 @@ from typing import List, Callable, Any
+ from . import evaluate_test, rel_path
+ from .build import run_osbuild
+ from .run import run_image, extract_image
++from test.integration_tests.config import *
+ 
+ 
+ class IntegrationTestType(Enum):
+@@ -22,18 +23,18 @@ class IntegrationTestCase:
+     type: IntegrationTestType
+ 
+     def run(self):
+-        run_osbuild(rel_path(f"pipelines/{self.pipeline}"), self.build_pipeline)
++        tree_id, output_id = run_osbuild(rel_path(f"pipelines/{self.pipeline}"), self.build_pipeline)
+         if self.type == IntegrationTestType.BOOT_WITH_QEMU:
+-            self.run_and_test()
++            self.run_and_test(output_id)
+         else:
+-            self.extract_and_test()
++            self.extract_and_test(output_id)
+ 
+-    def run_and_test(self):
+-        r = run_image(self.output_image)
++    def run_and_test(self, output_id):
++        r = run_image(f"{OBJECTS}/refs/{output_id}/{self.output_image}")
+         for test in self.test_cases:
+             evaluate_test(test, r.stdout)
+ 
+-    def extract_and_test(self):
+-        with extract_image(self.output_image) as fstree:
++    def extract_and_test(self, output_id):
++        with extract_image(f"{OBJECTS}/refs/{output_id}/{self.output_image}") as fstree:
+             for test in self.test_cases:
+                 evaluate_test(lambda: test(fstree), name=test.__name__)
+diff --git a/test/test_osbuild.py b/test/test_osbuild.py
+index 63d2024c..b7c89abd 100644
+--- a/test/test_osbuild.py
++++ b/test/test_osbuild.py
+@@ -35,9 +35,9 @@ class TestDescriptions(unittest.TestCase):
+         name = "org.osbuild.test"
+         options = { "one": 1 }
+         cases = [
+-            (osbuild.Assembler(name, {}), {"name": name}),
+-            (osbuild.Assembler(name, None), {"name": name}),
+-            (osbuild.Assembler(name, options), {"name": name, "options": options}),
++            (osbuild.Assembler(name, None, None, {}), {"name": name}),
++            (osbuild.Assembler(name, None, None, None), {"name": name}),
++            (osbuild.Assembler(name, None, None, options), {"name": name, "options": options}),
+         ]
+         for assembler, description in cases:
+             with self.subTest(description):

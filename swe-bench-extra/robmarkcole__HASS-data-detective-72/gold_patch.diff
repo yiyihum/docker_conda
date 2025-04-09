@@ -1,0 +1,97 @@
+diff --git a/detective/config.py b/detective/config.py
+index 1548e2b..346bff4 100644
+--- a/detective/config.py
++++ b/detective/config.py
+@@ -51,6 +51,7 @@ def _secret_yaml(loader, node):
+ 
+ def _stub_dict(constructor, node):
+     """Stub a constructor with a dictionary."""
++    print("Unsupported YAML found: {} {}".format(node.tag, node.value))
+     return {}
+ 
+ 
+@@ -83,11 +84,18 @@ def load_hass_config(path):
+ def db_url_from_hass_config(path):
+     """Find the recorder database url from a HASS config dir."""
+     config = load_hass_config(path)
+-    default = "sqlite:///{}".format(os.path.join(path, "home-assistant_v2.db"))
++    default_path = os.path.join(path, "home-assistant_v2.db")
++    default_url = "sqlite:///{}".format(default_path)
+ 
+     recorder = config.get("recorder")
+ 
+-    if not recorder:
+-        return default
++    if recorder:
++        db_url = recorder.get("db_url")
++        if db_url is not None:
++            return db_url
+ 
+-    return recorder.get("db_url", default)
++    if not os.path.isfile(default_path):
++        raise ValueError(
++            "Unable to determine DB url from hass config at {}".format(path))
++
++    return default_url
+diff --git a/detective/core.py b/detective/core.py
+index 9e2b5be..e3d228c 100644
+--- a/detective/core.py
++++ b/detective/core.py
+@@ -1,12 +1,14 @@
+ """
+ Classes and functions for parsing home-assistant data.
+ """
++from urllib.parse import urlparse
++from typing import List
+ 
+-from . import config, functions
+ import matplotlib.pyplot as plt
+ import pandas as pd
+ from sqlalchemy import create_engine, text
+-from typing import List
++
++from . import config, functions
+ 
+ 
+ def db_from_hass_config(path=None, **kwargs):
+@@ -18,6 +20,10 @@ def db_from_hass_config(path=None, **kwargs):
+     return HassDatabase(url, **kwargs)
+ 
+ 
++def get_db_type(url):
++    return urlparse(url).scheme.split('+')[0]
++
++
+ class HassDatabase:
+     """
+     Initializing the parser fetches all of the data from the database and
+@@ -31,7 +37,8 @@ class HassDatabase:
+         url : str
+             The URL to the database.
+         """
+-        self._url = url
++        self.url = url
++
+         self._master_df = None
+         self._domains = None
+         self._entities = None
+@@ -41,9 +48,19 @@ class HassDatabase:
+             if fetch_entities:
+                 self.fetch_entities()
+         except Exception as exc:
++            if isinstance(exc, ImportError):
++                raise RuntimeError(
++                    "The right dependency to connect to your database is "
++                    "missing. Please make sure that it is installed."
++                )
++
+             print(exc)
+             raise
+ 
++
++        self.db_type = get_db_type(url)
++
++
+     def perform_query(self, query):
+         """Perform a query, where query is a string."""
+         try:

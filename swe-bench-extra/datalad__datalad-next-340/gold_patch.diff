@@ -1,0 +1,342 @@
+diff --git a/changelog.d/20230508_072605_michael.hanke_cerror.md b/changelog.d/20230508_072605_michael.hanke_cerror.md
+new file mode 100644
+index 0000000..3301441
+--- /dev/null
++++ b/changelog.d/20230508_072605_michael.hanke_cerror.md
+@@ -0,0 +1,15 @@
++### 💫 Enhancements and new features
++
++- `Constraint` implementations now raise `ConstraintError` consistently
++  on a violation. This now makes it possible to distinguish properly
++  handled violations from improper implementation of such checks.
++  Moreover, `raise_for()` is now used consistently, providing
++  uniform, structured information on such violations.
++  `ConstraintError` is derived from `ValueError` (the exception
++  that was previously (mostly) raised. Therefore, client-code should
++  continue to work without modification, unless a specific wording
++  of an exception message is relied upon. In few cases, an implicit
++  `TypeError` (e.g., `EnsureIterableof`) has been replaced by an
++  explicit `ConstraintError`, and client code needs to be adjusted.
++  The underlying exception continues to be available via
++  `ConstraintError.caused_by`. (by @mih)
+diff --git a/datalad_next/constraints/__init__.py b/datalad_next/constraints/__init__.py
+index d910e28..05442fd 100644
+--- a/datalad_next/constraints/__init__.py
++++ b/datalad_next/constraints/__init__.py
+@@ -1,5 +1,38 @@
+ """Data validation, coercion, and parameter documentation
+ 
++This module provides a set of uniform classes to validate and document
++particular aspects of inputs. In a nutshell, each of these
++:class:`~datalad_next.constraints.base.Constraint` class:
++
++- focuses on a specific aspect, such as data type coercion,
++  or checking particular input properties
++- is instantiated with a set of parameters to customize
++  such an instance for a particular task
++- performs its task by receiving an input via its ``__call__()``
++  method
++- provides default auto-documentation that can be customized
++  by wrapping an instance in
++  :class:`~datalad_next.constraints.compound.WithDescription`
++
++Individual ``Constraint`` instances can be combined with logical AND
++(:class:`~datalad_next.constraints.base.AllOf`) and OR
++(:class:`~datalad_next.constraints.base.AnyOf`) operations to form arbitrarily
++complex constructs.
++
++On (validation/coercion) error, instances raise
++:class:`~datalad_next.constraints.exceptions.ConstraintError`) via their
++``raise_for()`` method. This approach to error reporting helps to communicate
++standard (yet customizable) error messages, aids structured error reporting,
++and is capable of communication the underlying causes of an error in full
++detail without the need to generate long textual descriptions.
++
++:class:`~datalad_next.constraints.parameter.EnsureCommandParameterization` is a
++particular variant of a ``Constraint`` that is capable of validating a complete
++parameterization of a command (or function), for each parameter individually,
++and for arbitrary combinations of parameters. It puts a particular emphasis on
++structured error reporting.
++
++
+ .. currentmodule:: datalad_next.constraints
+ .. autosummary::
+    :toctree: generated
+diff --git a/datalad_next/constraints/basic.py b/datalad_next/constraints/basic.py
+index 186b4f8..0d9c56b 100644
+--- a/datalad_next/constraints/basic.py
++++ b/datalad_next/constraints/basic.py
+@@ -43,7 +43,11 @@ class EnsureValue(Constraint):
+         if value == self._target_value:
+             return value
+         else:
+-            raise ValueError(f"value must be {self._target_value!r}")
++            self.raise_for(
++                value,
++                "must be {target_value!r}",
++                target_value=self._target_value,
++            )
+ 
+     def short_description(self):
+         return f'{self._target_value!r}'
+@@ -120,9 +124,7 @@ class EnsureBool(Constraint):
+                 return False
+             elif value in ('1', 'yes', 'on', 'enable', 'true'):
+                 return True
+-        raise ValueError(
+-            "value '{}' must be convertible to boolean".format(
+-                value))
++        self.raise_for(value, "must be convertible to boolean")
+ 
+     def long_description(self):
+         return 'value must be convertible to type bool'
+@@ -162,14 +164,17 @@ class EnsureStr(Constraint):
+             # do not perform a blind conversion ala str(), as almost
+             # anything can be converted and the result is most likely
+             # unintended
+-            raise ValueError("%s is not a string" % repr(value))
++            self.raise_for(value, "must be a string")
+         if len(value) < self._min_len:
+-            raise ValueError("%r is shorter than of minimal length %d"
+-                             % (value, self._min_len))
++            self.raise_for(value, "must have minimum length {len}",
++                                 len=self._min_len)
+         if self._match:
+             if not self._match.match(value):
+-                raise ValueError(
+-                    f'{value} does not match {self._match.pattern}')
++                self.raise_for(
++                    value,
++                    'does not match {pattern}',
++                    pattern=self._match.pattern,
++                )
+         return value
+ 
+     def long_description(self):
+@@ -203,8 +208,11 @@ class EnsureStrPrefix(EnsureStr):
+     def __call__(self, value):
+         super().__call__(value)
+         if not value.startswith(self._prefix):
+-            raise ValueError("%r does not start with '%s'"
+-                             % (value, self._prefix))
++            self.raise_for(
++                value,
++                "does not start with {prefix!r}",
++                prefix=self._prefix,
++            )
+         return value
+ 
+     def long_description(self):
+@@ -226,7 +234,7 @@ class EnsureCallable(Constraint):
+         if hasattr(value, '__call__'):
+             return value
+         else:
+-            raise ValueError("value must be a callable")
++            self.raise_for(value, "must be a callable")
+ 
+     def short_description(self):
+         return 'callable'
+@@ -285,7 +293,7 @@ class EnsureKeyChoice(EnsureChoice):
+ 
+     def __call__(self, value):
+         if self._key not in value:
+-            raise ValueError("value not dict-like")
++            self.raise_for(value, "must be dict-like")
+         super(EnsureKeyChoice, self).__call__(value[self._key])
+         return value
+ 
+@@ -382,7 +390,7 @@ class EnsurePath(Constraint):
+         ref:
+           If set, defines a reference Path any given path is compared to. The
+           comparison operation is given by `ref_is`.
+-        ref_is: {'parent-or-identical'}
++        ref_is: {'parent-or-same-as', 'parent-of'}
+           Comparison operation to perform when `ref` is given.
+         dsarg: DatasetParameter, optional
+           If given, incoming paths are resolved in the following fashion:
+@@ -399,6 +407,8 @@ class EnsurePath(Constraint):
+         self._ref = ref
+         self._ref_is = ref_is
+         self._dsarg = dsarg
++        assert self._ref_is in ('parent-or-same-as', 'parent-of'), \
++            'Unrecognized `ref_is` operation label'
+ 
+     def __call__(self, value):
+         # turn it into the target type to make everything below
+@@ -410,9 +420,9 @@ class EnsurePath(Constraint):
+         if self._is_format is not None:
+             is_abs = path.is_absolute()
+             if self._is_format == 'absolute' and not is_abs:
+-                raise ValueError(f'{path} is not an absolute path')
++                self.raise_for(path, 'is not an absolute path')
+             elif self._is_format == 'relative' and is_abs:
+-                raise ValueError(f'{path} is not a relative path')
++                self.raise_for(path, 'is not a relative path')
+ 
+         # resolve relative paths against a dataset, if given
+         if self._dsarg:
+@@ -430,24 +440,30 @@ class EnsurePath(Constraint):
+                 pass
+         if self._lexists is not None:
+             if self._lexists and mode is None:
+-                raise ValueError(f'{path} does not exist')
++                self.raise_for(path, 'does not exist')
+             elif not self._lexists and mode is not None:
+-                raise ValueError(f'{path} does (already) exist')
++                self.raise_for(path, 'does (already) exist')
+         if self._is_mode is not None:
+             if not self._is_mode(mode):
+-                raise ValueError(f'{path} does not match desired mode')
++                self.raise_for(path, 'does not match desired mode')
+         if self._ref:
+             ok = True
+             if self._ref_is == 'parent-or-same-as':
+                 ok = (path == self._ref or self._ref in path.parents)
+             elif self._ref_is == 'parent-of':
+                 ok = self._ref in path.parents
+-            else:
+-                raise ValueError('Unknown `ref_is` operation label')
++            else:  # pragma: nocover
++                # this code cannot be reached with normal usage.
++                # it is prevented by an assertion in __init__()
++                raise RuntimeError('Unknown `ref_is` operation label')
+ 
+             if not ok:
+-                raise ValueError(
+-                    f'{self._ref} is not {self._ref_is} {path}')
++                self.raise_for(
++                    path,
++                    '{ref} is not {ref_is} {path}',
++                    ref=self._ref,
++                    ref_is=self._ref_is,
++                )
+         return path
+ 
+     def for_dataset(self, dataset: DatasetParameter) -> Constraint:
+diff --git a/datalad_next/constraints/compound.py b/datalad_next/constraints/compound.py
+index 2b2b2ae..99fe8d6 100644
+--- a/datalad_next/constraints/compound.py
++++ b/datalad_next/constraints/compound.py
+@@ -73,21 +73,32 @@ class EnsureIterableOf(Constraint):
+         return self._item_constraint
+ 
+     def __call__(self, value):
+-        iter = self._iter_type(
+-            self._item_constraint(i) for i in value
+-        )
++        try:
++            iter = self._iter_type(
++                self._item_constraint(i) for i in value
++            )
++        except TypeError as e:
++            self.raise_for(
++                value,
++                "cannot coerce to target (item) type",
++                __caused_by__=e,
++            )
+         if self._min_len is not None or self._max_len is not None:
+             # only do this if necessary, generators will not support
+             # __len__, for example
+             iter_len = len(iter)
+             if self._min_len is not None and iter_len < self._min_len:
+-                raise ValueError(
+-                    f'Length-{iter_len} iterable is shorter than '
+-                    f'required minimum length {self._min_len}')
++                self.raise_for(
++                    iter,
++                    'must have minimum length {len}',
++                    len=self._min_len,
++                )
+             if self._max_len is not None and iter_len > self._max_len:
+-                raise ValueError(
+-                    f'Length-{iter_len} iterable is longer than '
+-                    f'required maximum length {self._max_len}')
++                self.raise_for(
++                    iter,
++                    'must not exceed maximum length {len}',
++                    len=self._max_len,
++                )
+         return iter
+ 
+     def short_description(self):
+diff --git a/datalad_next/constraints/dataset.py b/datalad_next/constraints/dataset.py
+index 7d4bb38..1b9752b 100644
+--- a/datalad_next/constraints/dataset.py
++++ b/datalad_next/constraints/dataset.py
+@@ -70,21 +70,20 @@ class EnsureDataset(Constraint):
+         # anticipate what require_dataset() could handle and fail if we got
+         # something else
+         elif not isinstance(value, (str, PurePath, type(None))):
+-            raise TypeError(f"Cannot create Dataset from {type(value)}")
++            self.raise_for(
++                value, "cannot create Dataset from {type}", type=type(value)
++            )
+         else:
+             ds = self._require_dataset(value)
+         assert ds
+         if self._installed is not None:
+             is_installed = ds.is_installed()
+             if self._installed is False and is_installed:
+-                raise ValueError(f'{ds} already exists locally')
++                self.raise_for(ds, 'already exists locally')
+             if self._installed and not is_installed:
+-                # for uniformity with require_dataset() below, use
+-                # this custom exception
+-                raise NoDatasetFound(f'{ds} is not installed')
++                self.raise_for(ds, 'not installed')
+         if self._require_id and not ds.id:
+-            raise NoDatasetFound(f'{ds} does not have a valid '
+-                                 f'datalad-id')
++            self.raise_for(ds, 'does not have a valid datalad-id')
+         return DatasetParameter(value, ds)
+ 
+     def short_description(self) -> str:
+diff --git a/datalad_next/constraints/exceptions.py b/datalad_next/constraints/exceptions.py
+index b7022fa..a3e4d9a 100644
+--- a/datalad_next/constraints/exceptions.py
++++ b/datalad_next/constraints/exceptions.py
+@@ -100,8 +100,16 @@ class ConstraintError(ValueError):
+         return self.args[1]
+ 
+     @property
+-    def caused_by(self):
+-        return self.context.get('__caused_by__', None)
++    def caused_by(self) -> Tuple[Exception] | None:
++        """Returns a tuple of any underlying exceptions that caused a violation
++        """
++        cb = self.context.get('__caused_by__', None)
++        if cb is None:
++            return
++        elif isinstance(cb, Exception):
++            return (cb,)
++        else:
++            return tuple(cb)
+ 
+     @property
+     def value(self):
+diff --git a/datalad_next/constraints/git.py b/datalad_next/constraints/git.py
+index 31c773e..ead342b 100644
+--- a/datalad_next/constraints/git.py
++++ b/datalad_next/constraints/git.py
+@@ -35,7 +35,7 @@ class EnsureGitRefName(Constraint):
+     def __call__(self, value: str) -> str:
+         if not value:
+             # simple, do here
+-            raise ValueError('refname must not be empty')
++            self.raise_for(value, 'refname must not be empty')
+ 
+         from datalad.runner import GitRunner, StdOutCapture
+         from datalad_next.exceptions import CommandError
+@@ -54,7 +54,11 @@ class EnsureGitRefName(Constraint):
+         try:
+             out = runner.run(cmd, protocol=StdOutCapture)
+         except CommandError as e:
+-            raise ValueError(f'{value} is not a valid refname') from e
++            self.raise_for(
++                value,
++                'is not a valid refname',
++                __caused_by__=e,
++            )
+ 
+         if self._normalize:
+             return out['stdout'].strip()

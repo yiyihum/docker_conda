@@ -1,0 +1,216 @@
+diff --git a/README.rst b/README.rst
+index ab1abc7..d1a9369 100644
+--- a/README.rst
++++ b/README.rst
+@@ -43,7 +43,11 @@ ASGI server.
+ 
+ Note that exactly what threads things run in is very specific, and aimed to
+ keep maximum compatibility with old synchronous code. See
+-"Synchronous code & Threads" below for a full explanation.
++"Synchronous code & Threads" below for a full explanation. By default,
++``sync_to_async`` will run all synchronous code in the program in the same
++thread for safety reasons; you can disable this for more performance with
++``@sync_to_async(thread_sensitive=False)``, but make sure that your code does
++not rely on anything bound to threads (like database connections) when you do.
+ 
+ 
+ Threadlocal replacement
+diff --git a/asgiref/sync.py b/asgiref/sync.py
+index a46f7d4..97b5d31 100644
+--- a/asgiref/sync.py
++++ b/asgiref/sync.py
+@@ -61,9 +61,17 @@ class AsyncToSync:
+             except RuntimeError:
+                 # There's no event loop in this thread. Look for the threadlocal if
+                 # we're inside SyncToAsync
+-                self.main_event_loop = getattr(
+-                    SyncToAsync.threadlocal, "main_event_loop", None
++                main_event_loop_pid = getattr(
++                    SyncToAsync.threadlocal, "main_event_loop_pid", None
+                 )
++                # We make sure the parent loop is from the same process - if
++                # they've forked, this is not going to be valid any more (#194)
++                if main_event_loop_pid and main_event_loop_pid == os.getpid():
++                    self.main_event_loop = getattr(
++                        SyncToAsync.threadlocal, "main_event_loop", None
++                    )
++                else:
++                    self.main_event_loop = None
+ 
+     def __call__(self, *args, **kwargs):
+         # You can't call AsyncToSync from a thread with a running event loop
+@@ -247,7 +255,7 @@ class SyncToAsync:
+     # Single-thread executor for thread-sensitive code
+     single_thread_executor = ThreadPoolExecutor(max_workers=1)
+ 
+-    def __init__(self, func, thread_sensitive=False):
++    def __init__(self, func, thread_sensitive=True):
+         self.func = func
+         functools.update_wrapper(self, func)
+         self._thread_sensitive = thread_sensitive
+@@ -312,6 +320,7 @@ class SyncToAsync:
+         """
+         # Set the threadlocal for AsyncToSync
+         self.threadlocal.main_event_loop = loop
++        self.threadlocal.main_event_loop_pid = os.getpid()
+         # Set the task mapping (used for the locals module)
+         current_thread = threading.current_thread()
+         if AsyncToSync.launch_map.get(source_task) == current_thread:
+@@ -356,6 +365,11 @@ class SyncToAsync:
+             return None
+ 
+ 
+-# Lowercase is more sensible for most things
+-sync_to_async = SyncToAsync
++# Lowercase aliases (and decorator friendliness)
+ async_to_sync = AsyncToSync
++
++
++def sync_to_async(func=None, thread_sensitive=True):
++    if func is None:
++        return lambda f: SyncToAsync(f, thread_sensitive=thread_sensitive)
++    return SyncToAsync(func, thread_sensitive=thread_sensitive)
+diff --git a/asgiref/wsgi.py b/asgiref/wsgi.py
+index 8811118..40fba20 100644
+--- a/asgiref/wsgi.py
++++ b/asgiref/wsgi.py
+@@ -29,6 +29,7 @@ class WsgiToAsgiInstance:
+     def __init__(self, wsgi_application):
+         self.wsgi_application = wsgi_application
+         self.response_started = False
++        self.response_content_length = None
+ 
+     async def __call__(self, scope, receive, send):
+         if scope["type"] != "http":
+@@ -114,6 +115,11 @@ class WsgiToAsgiInstance:
+             (name.lower().encode("ascii"), value.encode("ascii"))
+             for name, value in response_headers
+         ]
++        # Extract content-length
++        self.response_content_length = None
++        for name, value in response_headers:
++            if name.lower() == "content-length":
++                self.response_content_length = int(value)
+         # Build and send response start message.
+         self.response_start = {
+             "type": "http.response.start",
+@@ -130,14 +136,25 @@ class WsgiToAsgiInstance:
+         # Translate the scope and incoming request body into a WSGI environ
+         environ = self.build_environ(self.scope, body)
+         # Run the WSGI app
++        bytes_sent = 0
+         for output in self.wsgi_application(environ, self.start_response):
+             # If this is the first response, include the response headers
+             if not self.response_started:
+                 self.response_started = True
+                 self.sync_send(self.response_start)
++            # If the application supplies a Content-Length header
++            if self.response_content_length is not None:
++                # The server should not transmit more bytes to the client than the header allows
++                bytes_allowed = self.response_content_length - bytes_sent
++                if len(output) > bytes_allowed:
++                    output = output[:bytes_allowed]
+             self.sync_send(
+                 {"type": "http.response.body", "body": output, "more_body": True}
+             )
++            bytes_sent += len(output)
++            # The server should stop iterating over the response when enough data has been sent
++            if bytes_sent == self.response_content_length:
++                break
+         # Close connection
+         if not self.response_started:
+             self.response_started = True
+diff --git a/docs/conf.py b/docs/conf.py
+index 40499c5..6935f11 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -55,9 +55,9 @@ author = 'ASGI Team'
+ # built documents.
+ #
+ # The short X.Y version.
+-version = '2.0'
++version = '3.0'
+ # The full version, including alpha/beta/rc tags.
+-release = '2.0'
++release = '3.0'
+ 
+ # The language for content autogenerated by Sphinx. Refer to documentation
+ # for a list of supported languages.
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 372ba20..aaf5764 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -77,3 +77,54 @@ and treat it as if the client had made a request.
+ 
+ The ASGI server should set the pseudo ``:authority`` header value to
+ be the same value as the request that triggered the push promise.
++
++Zero Copy Send
++--------------
++
++Zero Copy Send allows you to send the contents of a file descriptor to the
++HTTP client with zero copy (where the underlying OS directly handles the data
++transfer from a source file or socket without loading it into Python and
++writing it out again).
++
++ASGI servers that implement this extension will provide
++``http.response.zerocopysend`` in the extensions part of the scope::
++
++    "scope": {
++        ...
++        "extensions": {
++            "http.response.zerocopysend": {},
++        },
++    }
++
++The ASGI framework can initiate a zero-copy send by sending a message with
++the following keys. This message can be sent at any time after the
++*Response Start* message but before the final *Response Body* message,
++and can be mixed with ``http.response.body``. It can also be called
++multiple times in one response. Except for the characteristics of
++zero-copy, it should behave the same as ordinary ``http.response.body``.
++
++Keys:
++
++* ``type`` (*Unicode string*): ``"http.response.zerocopysend"``
++
++* ``file`` (*file descriptor object*): An opened file descriptor object
++  with an underlying OS file descriptor that can be used to call
++  ``os.sendfile``. (e.g. not BytesIO)
++
++* ``offset`` (*int*): Optional. If this value exists, it will specify
++  the offset at which sendfile starts to read data from ``file``.
++  Otherwise, it will be read from the current position of ``file``.
++
++* ``count`` (*int*): Optional. ``count`` is the number of bytes to
++  copy between the file descriptors. If omitted, the file will be read until
++  its end.
++
++* ``more_body`` (*bool*): Signifies if there is additional content
++  to come (as part of a Response Body message). If ``False``, response
++  will be taken as complete and closed, and any further messages on
++  the channel will be ignored. Optional; if missing defaults to
++  ``False``.
++
++After calling this extension to respond, the ASGI application itself should
++actively close the used file descriptor - ASGI servers are not responsible for
++closing descriptors.
+diff --git a/docs/implementations.rst b/docs/implementations.rst
+index 8b4da65..b4043af 100644
+--- a/docs/implementations.rst
++++ b/docs/implementations.rst
+@@ -75,3 +75,14 @@ Starlette
+ 
+ Starlette is a minimalist ASGI library for writing against basic but powerful
+ ``Request`` and ``Response`` classes. Supports HTTP.
++
++
++rpc.py
++------
++
++*Beta* / https://github.com/abersheeran/rpc.py
++
++An easy-to-use and powerful RPC framework. RPC server base on WSGI & ASGI, client base 
++on ``httpx``. Supports synchronous functions, asynchronous functions, synchronous 
++generator functions, and asynchronous generator functions. Optional use of Type hint 
++for type conversion. Optional OpenAPI document generation.

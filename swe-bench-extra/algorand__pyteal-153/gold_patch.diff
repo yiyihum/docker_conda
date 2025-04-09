@@ -1,0 +1,237 @@
+diff --git a/pyteal/ast/__init__.py b/pyteal/ast/__init__.py
+index 9712dc7..fbc12cd 100644
+--- a/pyteal/ast/__init__.py
++++ b/pyteal/ast/__init__.py
+@@ -6,6 +6,7 @@ from .leafexpr import LeafExpr
+ from .addr import Addr
+ from .bytes import Bytes
+ from .int import Int, EnumInt
++from .methodsig import MethodSignature
+ 
+ # properties
+ from .arg import Arg
+@@ -126,6 +127,7 @@ __all__ = [
+     "Bytes",
+     "Int",
+     "EnumInt",
++    "MethodSignature",
+     "Arg",
+     "TxnType",
+     "TxnField",
+diff --git a/pyteal/ast/methodsig.py b/pyteal/ast/methodsig.py
+new file mode 100644
+index 0000000..de9bd97
+--- /dev/null
++++ b/pyteal/ast/methodsig.py
+@@ -0,0 +1,43 @@
++from typing import TYPE_CHECKING
++from pyteal.errors import TealInputError
++
++from pyteal.types import TealType
++
++from ..types import TealType
++from ..ir import TealOp, Op, TealBlock
++from .leafexpr import LeafExpr
++
++if TYPE_CHECKING:
++    from ..compiler import CompileOptions
++
++
++class MethodSignature(LeafExpr):
++    """An expression that represents an ABI method selector"""
++
++    def __init__(self, methodName: str) -> None:
++        """Create a new method selector for ABI method call.
++
++        Args:
++            methodName: A string containing a valid ABI method signature
++        """
++        super().__init__()
++        if type(methodName) is not str:
++            raise TealInputError(
++                "invalid input type {} to Method".format(type(methodName))
++            )
++        elif len(methodName) == 0:
++            raise TealInputError("invalid input empty string to Method")
++        self.methodName = methodName
++
++    def __teal__(self, options: "CompileOptions"):
++        op = TealOp(self, Op.method_signature, '"{}"'.format(self.methodName))
++        return TealBlock.FromOp(options, op)
++
++    def __str__(self) -> str:
++        return "(method: {})".format(self.methodName)
++
++    def type_of(self) -> TealType:
++        return TealType.bytes
++
++
++MethodSignature.__module__ = "pyteal"
+diff --git a/pyteal/ast/subroutine.py b/pyteal/ast/subroutine.py
+index 5c1a211..69dd54e 100644
+--- a/pyteal/ast/subroutine.py
++++ b/pyteal/ast/subroutine.py
+@@ -10,7 +10,6 @@ from .seq import Seq
+ from .scratchvar import ScratchVar
+ 
+ if TYPE_CHECKING:
+-    from ..ir import TealSimpleBlock
+     from ..compiler import CompileOptions
+ 
+ 
+@@ -19,7 +18,10 @@ class SubroutineDefinition:
+     nextSubroutineId = 0
+ 
+     def __init__(
+-        self, implementation: Callable[..., Expr], returnType: TealType
++        self,
++        implementation: Callable[..., Expr],
++        returnType: TealType,
++        nameStr: str = None,
+     ) -> None:
+         super().__init__()
+         self.id = SubroutineDefinition.nextSubroutineId
+@@ -53,6 +55,7 @@ class SubroutineDefinition:
+         self.returnType = returnType
+ 
+         self.declaration: Optional["SubroutineDeclaration"] = None
++        self.__name = self.implementation.__name__ if nameStr is None else nameStr
+ 
+     def getDeclaration(self) -> "SubroutineDeclaration":
+         if self.declaration is None:
+@@ -61,7 +64,7 @@ class SubroutineDefinition:
+         return self.declaration
+ 
+     def name(self) -> str:
+-        return self.implementation.__name__
++        return self.__name
+ 
+     def argumentCount(self) -> int:
+         return len(self.implementationParams)
+@@ -181,7 +184,7 @@ class Subroutine:
+             ])
+     """
+ 
+-    def __init__(self, returnType: TealType) -> None:
++    def __init__(self, returnType: TealType, name: str = None) -> None:
+         """Define a new subroutine with the given return type.
+ 
+         Args:
+@@ -189,9 +192,10 @@ class Subroutine:
+                 TealType.none indicates that this subroutine does not return any value.
+         """
+         self.returnType = returnType
++        self.name = name
+ 
+     def __call__(self, fnImplementation: Callable[..., Expr]) -> Callable[..., Expr]:
+-        subroutine = SubroutineDefinition(fnImplementation, self.returnType)
++        subroutine = SubroutineDefinition(fnImplementation, self.returnType, self.name)
+ 
+         @wraps(fnImplementation)
+         def subroutineCall(*args: Expr, **kwargs) -> Expr:
+diff --git a/pyteal/compiler/constants.py b/pyteal/compiler/constants.py
+index 6d54e66..3642194 100644
+--- a/pyteal/compiler/constants.py
++++ b/pyteal/compiler/constants.py
+@@ -7,11 +7,7 @@ from algosdk import encoding
+ from ..ir import (
+     Op,
+     TealOp,
+-    TealLabel,
+     TealComponent,
+-    TealBlock,
+-    TealSimpleBlock,
+-    TealConditionalBlock,
+ )
+ from ..util import unescapeStr, correctBase32Padding
+ from ..errors import TealInternalError
+@@ -94,6 +90,28 @@ def extractAddrValue(op: TealOp) -> Union[str, bytes]:
+     return value
+ 
+ 
++def extractMethodSigValue(op: TealOp) -> bytes:
++    """Extract the constant value being loaded by a TealOp whose op is Op.method.
++
++    Returns:
++        The bytes of method selector computed from the method signature that the op is loading.
++    """
++    if len(op.args) != 1 or type(op.args[0]) != str:
++        raise TealInternalError("Unexpected args in method opcode: {}".format(op.args))
++
++    methodSignature = cast(str, op.args[0])
++    if methodSignature[0] == methodSignature[-1] and methodSignature.startswith('"'):
++        methodSignature = methodSignature[1:-1]
++    else:
++        raise TealInternalError(
++            "Method signature opcode error: signatue {} not wrapped with double-quotes".format(
++                methodSignature
++            )
++        )
++    methodSelector = encoding.checksum(bytes(methodSignature, "utf-8"))[:4]
++    return methodSelector
++
++
+ def createConstantBlocks(ops: List[TealComponent]) -> List[TealComponent]:
+     """Convert TEAL code from using pseudo-ops for constants to using assembled constant blocks.
+ 
+@@ -124,6 +142,9 @@ def createConstantBlocks(ops: List[TealComponent]) -> List[TealComponent]:
+         elif basicOp == Op.addr:
+             addrValue = extractAddrValue(op)
+             byteFreqs[addrValue] = byteFreqs.get(addrValue, 0) + 1
++        elif basicOp == Op.method_signature:
++            methodValue = extractMethodSigValue(op)
++            byteFreqs[methodValue] = byteFreqs.get(methodValue, 0) + 1
+ 
+     assembled: List[TealComponent] = []
+ 
+@@ -177,12 +198,22 @@ def createConstantBlocks(ops: List[TealComponent]) -> List[TealComponent]:
+                     assembled.append(TealOp(op.expr, Op.intc, index, "//", *op.args))
+                 continue
+ 
+-            if basicOp == Op.byte or basicOp == Op.addr:
+-                byteValue = (
+-                    extractBytesValue(op)
+-                    if basicOp == Op.byte
+-                    else extractAddrValue(op)
+-                )
++            if (
++                basicOp == Op.byte
++                or basicOp == Op.addr
++                or basicOp == Op.method_signature
++            ):
++                if basicOp == Op.byte:
++                    byteValue = extractBytesValue(op)
++                elif basicOp == Op.addr:
++                    byteValue = extractAddrValue(op)
++                elif basicOp == Op.method_signature:
++                    byteValue = extractMethodSigValue(op)
++                else:
++                    raise TealInternalError(
++                        "Expect a byte-like constant opcode, get {}".format(op)
++                    )
++
+                 if byteFreqs[byteValue] == 1:
+                     encodedValue = (
+                         ("0x" + byteValue.hex())
+diff --git a/pyteal/ir/ops.py b/pyteal/ir/ops.py
+index 19f3b54..bb5d404 100644
+--- a/pyteal/ir/ops.py
++++ b/pyteal/ir/ops.py
+@@ -74,6 +74,7 @@ class Op(Enum):
+     bytec_3             = OpType("bytec_3",             Mode.Signature | Mode.Application, 2)
+     byte                = OpType("byte",                Mode.Signature | Mode.Application, 2)
+     addr                = OpType("addr",                Mode.Signature | Mode.Application, 2)
++    method_signature    = OpType("method",              Mode.Signature | Mode.Application, 2)
+     arg                 = OpType("arg",                 Mode.Signature,                    2)
+     txn                 = OpType("txn",                 Mode.Signature | Mode.Application, 2)
+     global_             = OpType("global",              Mode.Signature | Mode.Application, 2)
+diff --git a/pyteal/ir/tealop.py b/pyteal/ir/tealop.py
+index 9207231..b136023 100644
+--- a/pyteal/ir/tealop.py
++++ b/pyteal/ir/tealop.py
+@@ -1,4 +1,4 @@
+-from typing import cast, Union, List, Optional, TYPE_CHECKING
++from typing import Union, List, Optional, TYPE_CHECKING
+ 
+ from .tealcomponent import TealComponent
+ from .labelref import LabelReference

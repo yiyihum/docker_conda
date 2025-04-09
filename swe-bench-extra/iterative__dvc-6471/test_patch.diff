@@ -1,0 +1,167 @@
+diff --git a/tests/dir_helpers.py b/tests/dir_helpers.py
+--- a/tests/dir_helpers.py
++++ b/tests/dir_helpers.py
+@@ -67,6 +67,8 @@
+     "erepo_dir",
+     "git_dir",
+     "git_init",
++    "git_upstream",
++    "git_downstream",
+ ]
+ 
+ 
+@@ -407,3 +409,23 @@ def git_dir(make_tmp_dir):
+     path = make_tmp_dir("git-erepo", scm=True)
+     path.scm.commit("init repo")
+     return path
++
++
++@pytest.fixture
++def git_upstream(tmp_dir, erepo_dir, git_dir, request):
++    remote = erepo_dir if "dvc" in request.fixturenames else git_dir
++    url = "file://{}".format(remote.resolve().as_posix())
++    tmp_dir.scm.gitpython.repo.create_remote("upstream", url)
++    remote.remote = "upstream"
++    remote.url = url
++    return remote
++
++
++@pytest.fixture
++def git_downstream(tmp_dir, erepo_dir, git_dir, request):
++    remote = erepo_dir if "dvc" in request.fixturenames else git_dir
++    url = "file://{}".format(tmp_dir.resolve().as_posix())
++    remote.scm.gitpython.repo.create_remote("upstream", url)
++    remote.remote = "upstream"
++    remote.url = url
++    return remote
+diff --git a/tests/func/experiments/conftest.py b/tests/func/experiments/conftest.py
+--- a/tests/func/experiments/conftest.py
++++ b/tests/func/experiments/conftest.py
+@@ -88,21 +88,3 @@ def checkpoint_stage(tmp_dir, scm, dvc, mocker):
+     scm.commit("init")
+     stage.iterations = DEFAULT_ITERATIONS
+     return stage
+-
+-
+-@pytest.fixture
+-def git_upstream(tmp_dir, erepo_dir):
+-    url = "file://{}".format(erepo_dir.resolve().as_posix())
+-    tmp_dir.scm.gitpython.repo.create_remote("upstream", url)
+-    erepo_dir.remote = "upstream"
+-    erepo_dir.url = url
+-    return erepo_dir
+-
+-
+-@pytest.fixture
+-def git_downstream(tmp_dir, erepo_dir):
+-    url = "file://{}".format(tmp_dir.resolve().as_posix())
+-    erepo_dir.scm.gitpython.repo.create_remote("upstream", url)
+-    erepo_dir.remote = "upstream"
+-    erepo_dir.url = url
+-    return erepo_dir
+diff --git a/tests/func/experiments/test_remove.py b/tests/func/experiments/test_remove.py
+--- a/tests/func/experiments/test_remove.py
++++ b/tests/func/experiments/test_remove.py
+@@ -90,3 +90,29 @@ def test_remove_all(tmp_dir, scm, dvc, exp_stage):
+     assert len(dvc.experiments.stash) == 2
+     assert scm.get_ref(str(ref_info2)) is None
+     assert scm.get_ref(str(ref_info1)) is None
++
++
++@pytest.mark.parametrize("use_url", [True, False])
++def test_remove_remote(tmp_dir, scm, dvc, exp_stage, git_upstream, use_url):
++    remote = git_upstream.url if use_url else git_upstream.remote
++
++    ref_info_list = []
++    exp_list = []
++    for i in range(3):
++        results = dvc.experiments.run(
++            exp_stage.addressing, params=[f"foo={i}"]
++        )
++        exp = first(results)
++        exp_list.append(exp)
++        ref_info = first(exp_refs_by_rev(scm, exp))
++        ref_info_list.append(ref_info)
++        dvc.experiments.push(remote, ref_info.name)
++        assert git_upstream.scm.get_ref(str(ref_info)) == exp
++
++    dvc.experiments.remove(
++        remote=remote, exp_names=[str(ref_info_list[0]), ref_info_list[1].name]
++    )
++
++    assert git_upstream.scm.get_ref(str(ref_info_list[0])) is None
++    assert git_upstream.scm.get_ref(str(ref_info_list[1])) is None
++    assert git_upstream.scm.get_ref(str(ref_info_list[2])) == exp_list[2]
+diff --git a/tests/unit/command/test_experiments.py b/tests/unit/command/test_experiments.py
+--- a/tests/unit/command/test_experiments.py
++++ b/tests/unit/command/test_experiments.py
+@@ -253,15 +253,17 @@ def test_experiments_pull(dvc, scm, mocker):
+ 
+ 
+ @pytest.mark.parametrize(
+-    "queue,clear_all",
+-    [(True, False), (False, True)],
++    "queue,clear_all,remote",
++    [(True, False, None), (False, True, None), (False, False, True)],
+ )
+-def test_experiments_remove(dvc, scm, mocker, queue, clear_all):
++def test_experiments_remove(dvc, scm, mocker, queue, clear_all, remote):
+     if queue:
+-        args = "--queue"
++        args = ["--queue"]
+     if clear_all:
+-        args = "--all"
+-    cli_args = parse_args(["experiments", "remove", args])
++        args = ["--all"]
++    if remote:
++        args = ["--git-remote", "myremote", "exp-123", "exp-234"]
++    cli_args = parse_args(["experiments", "remove"] + args)
+     assert cli_args.func == CmdExperimentsRemove
+ 
+     cmd = cli_args.func(cli_args)
+@@ -270,7 +272,8 @@ def test_experiments_remove(dvc, scm, mocker, queue, clear_all):
+     assert cmd.run() == 0
+     m.assert_called_once_with(
+         cmd.repo,
+-        exp_names=[],
++        exp_names=["exp-123", "exp-234"] if remote else [],
+         queue=queue,
+         clear_all=clear_all,
++        remote="myremote" if remote else None,
+     )
+diff --git a/tests/unit/repo/experiments/__init__.py b/tests/unit/repo/experiments/__init__.py
+new file mode 100644
+diff --git a/tests/unit/repo/experiments/test_utils.py b/tests/unit/repo/experiments/test_utils.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/repo/experiments/test_utils.py
+@@ -0,0 +1,27 @@
++import pytest
++
++from dvc.repo.experiments.base import EXPS_NAMESPACE, ExpRefInfo
++from dvc.repo.experiments.utils import resolve_exp_ref
++
++
++def commit_exp_ref(tmp_dir, scm, file="foo", contents="foo", name="foo"):
++    tmp_dir.scm_gen(file, contents, commit="init")
++    rev = scm.get_rev()
++    ref = "/".join([EXPS_NAMESPACE, "ab", "c123", name])
++    scm.gitpython.set_ref(ref, rev)
++    return ref, rev
++
++
++@pytest.mark.parametrize("use_url", [True, False])
++@pytest.mark.parametrize("name_only", [True, False])
++def test_resolve_exp_ref(tmp_dir, scm, git_upstream, name_only, use_url):
++    ref, _ = commit_exp_ref(tmp_dir, scm)
++    ref_info = resolve_exp_ref(scm, "foo" if name_only else ref)
++    assert isinstance(ref_info, ExpRefInfo)
++    assert str(ref_info) == ref
++
++    scm.push_refspec(git_upstream.url, ref, ref)
++    remote = git_upstream.url if use_url else git_upstream.remote
++    remote_ref_info = resolve_exp_ref(scm, "foo" if name_only else ref, remote)
++    assert isinstance(remote_ref_info, ExpRefInfo)
++    assert str(remote_ref_info) == ref
+diff --git a/tests/unit/stage/__init__.py b/tests/unit/stage/__init__.py
+new file mode 100644

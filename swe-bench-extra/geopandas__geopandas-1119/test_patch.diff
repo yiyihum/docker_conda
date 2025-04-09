@@ -1,0 +1,132 @@
+diff --git a/geopandas/tests/test_crs.py b/geopandas/tests/test_crs.py
+index f32cb23..e08ca88 100644
+--- a/geopandas/tests/test_crs.py
++++ b/geopandas/tests/test_crs.py
+@@ -1,6 +1,11 @@
++from distutils.version import LooseVersion
++
+ import numpy as np
+ 
++from shapely.geometry import Point
++
+ from geopandas import GeoDataFrame, points_from_xy
++from geopandas.geoseries import _PYPROJ_VERSION
+ 
+ from geopandas.testing import assert_geodataframe_equal
+ import pytest
+@@ -94,3 +99,22 @@ def test_transform2(epsg4326, epsg26918):
+     # can't check for CRS equality, as the formats differ although representing
+     # the same CRS
+     assert_geodataframe_equal(df, utm, check_less_precise=True, check_crs=False)
++
++
++@pytest.mark.skipif(
++    _PYPROJ_VERSION < LooseVersion("2.2.0"),
++    reason="EPSG strings without +init= won't work on previous versions of pyproj.",
++)
++def test_crs_axis_order__always_xy():
++    df = GeoDataFrame(geometry=[Point(-1683723, 6689139)], crs="epsg:26918")
++    lonlat = df.to_crs("epsg:4326")
++    test_lonlat = GeoDataFrame(
++        geometry=[Point(-110.1399901, 55.1350011)], crs="epsg:4326"
++    )
++    assert_geodataframe_equal(lonlat, test_lonlat, check_less_precise=True)
++
++
++def test_skip_exact_same():
++    df = df_epsg26918()
++    utm = df.to_crs(df.crs)
++    assert_geodataframe_equal(df, utm, check_less_precise=True)
+diff --git a/geopandas/tests/test_plotting.py b/geopandas/tests/test_plotting.py
+index b3c5839..223a486 100644
+--- a/geopandas/tests/test_plotting.py
++++ b/geopandas/tests/test_plotting.py
+@@ -6,7 +6,15 @@ import warnings
+ import numpy as np
+ 
+ from shapely.affinity import rotate
+-from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon
++from shapely.geometry import (
++    MultiPolygon,
++    Polygon,
++    LineString,
++    Point,
++    MultiPoint,
++    MultiLineString,
++)
++
+ 
+ from geopandas import GeoDataFrame, GeoSeries, read_file
+ from geopandas.datasets import get_path
+@@ -189,6 +197,10 @@ class TestPointPlotting:
+         expected_colors = [cmap(0)] * self.N + [cmap(1)] * self.N
+         _check_colors(2, ax.collections[0].get_facecolors(), expected_colors)
+ 
++        ax = self.df2.plot(color=["r", "b"])
++        # colors are repeated for all components within a MultiPolygon
++        _check_colors(2, ax.collections[0].get_facecolors(), ["r"] * 10 + ["b"] * 10)
++
+ 
+ class TestPointZPlotting:
+     def setup_method(self):
+@@ -212,6 +224,12 @@ class TestLineStringPlotting:
+         )
+         self.df = GeoDataFrame({"geometry": self.lines, "values": values})
+ 
++        multiline1 = MultiLineString(self.lines.loc["A":"B"].values)
++        multiline2 = MultiLineString(self.lines.loc["C":"D"].values)
++        self.df2 = GeoDataFrame(
++            {"geometry": [multiline1, multiline2], "values": [0, 1]}
++        )
++
+     def test_single_color(self):
+ 
+         ax = self.lines.plot(color="green")
+@@ -246,6 +264,23 @@ class TestLineStringPlotting:
+             assert ls[0] == exp_ls[0]
+             assert ls[1] == exp_ls[1]
+ 
++    def test_multilinestrings(self):
++
++        # MultiLineStrings
++        ax = self.df2.plot()
++        assert len(ax.collections[0].get_paths()) == 4
++        _check_colors(4, ax.collections[0].get_facecolors(), [MPL_DFT_COLOR] * 4)
++
++        ax = self.df2.plot("values")
++        cmap = plt.get_cmap(lut=2)
++        # colors are repeated for all components within a MultiLineString
++        expected_colors = [cmap(0), cmap(0), cmap(1), cmap(1)]
++        _check_colors(4, ax.collections[0].get_facecolors(), expected_colors)
++
++        ax = self.df2.plot(color=["r", "b"])
++        # colors are repeated for all components within a MultiLineString
++        _check_colors(4, ax.collections[0].get_facecolors(), ["r", "r", "b", "b"])
++
+ 
+ class TestPolygonPlotting:
+     def setup_method(self):
+@@ -372,6 +407,10 @@ class TestPolygonPlotting:
+         expected_colors = [cmap(0), cmap(0), cmap(1), cmap(1)]
+         _check_colors(4, ax.collections[0].get_facecolors(), expected_colors)
+ 
++        ax = self.df2.plot(color=["r", "b"])
++        # colors are repeated for all components within a MultiPolygon
++        _check_colors(4, ax.collections[0].get_facecolors(), ["r", "r", "b", "b"])
++
+ 
+ class TestPolygonZPlotting:
+     def setup_method(self):
+@@ -673,6 +712,12 @@ class TestPlotCollections:
+         _check_colors(self.N, coll.get_edgecolor(), ["g"] * self.N)
+         ax.cla()
+ 
++        # default: color can be passed as a list
++        coll = plot_polygon_collection(ax, self.polygons, color=["g", "b", "r"])
++        _check_colors(self.N, coll.get_facecolor(), ["g", "b", "r"])
++        _check_colors(self.N, coll.get_edgecolor(), ["g", "b", "r"])
++        ax.cla()
++
+         # only setting facecolor keeps default for edgecolor
+         coll = plot_polygon_collection(ax, self.polygons, facecolor="g")
+         _check_colors(self.N, coll.get_facecolor(), ["g"] * self.N)

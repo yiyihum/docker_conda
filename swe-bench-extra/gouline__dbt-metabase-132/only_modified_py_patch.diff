@@ -1,0 +1,190 @@
+diff --git a/dbtmetabase/metabase.py b/dbtmetabase/metabase.py
+index 9c7f3b8..0dade1f 100644
+--- a/dbtmetabase/metabase.py
++++ b/dbtmetabase/metabase.py
+@@ -19,7 +19,7 @@ from typing import (
+ from dbtmetabase.models import exceptions
+ 
+ from .logger.logging import logger
+-from .models.metabase import MetabaseModel, MetabaseColumn, ModelType
++from .models.metabase import MetabaseModel, MetabaseColumn, ModelType, NullValue
+ 
+ 
+ class MetabaseClient:
+@@ -384,7 +384,7 @@ class MetabaseClient:
+         column_visibility = column.visibility_type or "normal"
+ 
+         # Preserve this relationship by default
+-        if api_field["fk_target_field_id"] is not None and fk_target_field_id is None:
++        if api_field["fk_target_field_id"] and not fk_target_field_id:
+             fk_target_field_id = api_field["fk_target_field_id"]
+ 
+         body_field = {}
+@@ -394,14 +394,15 @@ class MetabaseClient:
+             body_field["description"] = column_description
+         if api_field.get("visibility_type") != column_visibility:
+             body_field["visibility_type"] = column_visibility
+-        if (
+-            column.semantic_type
+-            and api_field.get(semantic_type_key) != column.semantic_type
+-        ):
+-            body_field[semantic_type_key] = column.semantic_type
+         if api_field.get("fk_target_field_id") != fk_target_field_id:
+             body_field["fk_target_field_id"] = fk_target_field_id
+ 
++        # Allow explicit null type to override detected one
++        if api_field.get(semantic_type_key) != column.semantic_type and (
++            column.semantic_type or column.semantic_type is NullValue
++        ):
++            body_field[semantic_type_key] = column.semantic_type or None
++
+         if body_field:
+             # Update with new values
+             self.api(
+diff --git a/dbtmetabase/models/metabase.py b/dbtmetabase/models/metabase.py
+index a93a1b8..d05d424 100644
+--- a/dbtmetabase/models/metabase.py
++++ b/dbtmetabase/models/metabase.py
+@@ -60,3 +60,13 @@ class MetabaseModel:
+         return None
+ 
+     columns: Sequence[MetabaseColumn] = field(default_factory=list)
++
++
++class _NullValue(str):
++    """Explicitly null field value."""
++
++    def __eq__(self, other: object) -> bool:
++        return other is None
++
++
++NullValue = _NullValue()
+diff --git a/dbtmetabase/parsers/dbt.py b/dbtmetabase/parsers/dbt.py
+index c86c064..42cd902 100644
+--- a/dbtmetabase/parsers/dbt.py
++++ b/dbtmetabase/parsers/dbt.py
+@@ -1,8 +1,8 @@
+ from abc import ABCMeta, abstractmethod
+ from os.path import expanduser
+-from typing import Optional, MutableMapping, Iterable, Tuple, List
++from typing import Optional, Mapping, MutableMapping, Iterable, Tuple, List
+ 
+-from ..models.metabase import MetabaseModel
++from ..models.metabase import METABASE_META_FIELDS, MetabaseModel, NullValue
+ 
+ 
+ class DbtReader(metaclass=ABCMeta):
+@@ -44,3 +44,22 @@ class DbtReader(metaclass=ABCMeta):
+         docs_url: Optional[str] = None,
+     ) -> Tuple[List[MetabaseModel], MutableMapping]:
+         pass
++
++    @staticmethod
++    def read_meta_fields(obj: Mapping) -> Mapping:
++        """Reads meta fields from a schem object.
++
++        Args:
++            obj (Mapping): Schema object.
++
++        Returns:
++            Mapping: Field values.
++        """
++
++        vals = {}
++        meta = obj.get("meta", [])
++        for field in METABASE_META_FIELDS:
++            if f"metabase.{field}" in meta:
++                value = meta[f"metabase.{field}"]
++                vals[field] = value if value is not None else NullValue
++        return vals
+diff --git a/dbtmetabase/parsers/dbt_folder.py b/dbtmetabase/parsers/dbt_folder.py
+index 9fdde6b..a58acea 100644
+--- a/dbtmetabase/parsers/dbt_folder.py
++++ b/dbtmetabase/parsers/dbt_folder.py
+@@ -3,8 +3,7 @@ import yaml
+ from pathlib import Path
+ from typing import List, Iterable, Mapping, MutableMapping, Optional, Tuple
+ 
+-from ..models.metabase import METABASE_META_FIELDS, ModelType
+-from ..models.metabase import MetabaseModel, MetabaseColumn
++from ..models.metabase import MetabaseModel, MetabaseColumn, ModelType
+ from ..logger.logging import logger
+ from .dbt import DbtReader
+ 
+@@ -227,11 +226,8 @@ class DbtFolderReader(DbtReader):
+                         metabase_column.fk_target_field,
+                     )
+ 
+-        if "meta" in column:
+-            meta = column.get("meta", [])
+-            for field in METABASE_META_FIELDS:
+-                if f"metabase.{field}" in meta:
+-                    setattr(metabase_column, field, meta[f"metabase.{field}"])
++        for field, value in DbtReader.read_meta_fields(column).items():
++            setattr(metabase_column, field, value)
+ 
+         return metabase_column
+ 
+@@ -246,7 +242,6 @@ class DbtFolderReader(DbtReader):
+             str -- Name of the reference.
+         """
+ 
+-        # matches = re.findall(r"ref\(['\"]([\w\_\-\ ]+)['\"]\)", text)
+         # We are catching the rightmost argument of either source or ref which is ultimately the table name
+         matches = re.findall(r"['\"]([\w\_\-\ ]+)['\"][ ]*\)$", text.strip())
+         if matches:
+diff --git a/dbtmetabase/parsers/dbt_manifest.py b/dbtmetabase/parsers/dbt_manifest.py
+index f043c74..7136dc6 100644
+--- a/dbtmetabase/parsers/dbt_manifest.py
++++ b/dbtmetabase/parsers/dbt_manifest.py
+@@ -1,8 +1,7 @@
+ import json
+ from typing import List, Tuple, Mapping, Optional, MutableMapping
+ 
+-from ..models.metabase import METABASE_META_FIELDS, ModelType
+-from ..models.metabase import MetabaseModel, MetabaseColumn
++from ..models.metabase import MetabaseModel, MetabaseColumn, ModelType
+ from ..logger.logging import logger
+ from .dbt import DbtReader
+ 
+@@ -297,7 +296,7 @@ class DbtManifestReader(DbtReader):
+             unique_id=unique_id,
+             source=source,
+             dbt_name=dbt_name,
+-            **DbtManifestReader._read_meta_fields(model),
++            **DbtReader.read_meta_fields(model),
+         )
+ 
+     @staticmethod
+@@ -320,7 +319,7 @@ class DbtManifestReader(DbtReader):
+         metabase_column = MetabaseColumn(
+             name=column_name,
+             description=column_description,
+-            **DbtManifestReader._read_meta_fields(column),
++            **DbtReader.read_meta_fields(column),
+         )
+ 
+         if relationship:
+@@ -335,21 +334,3 @@ class DbtManifestReader(DbtReader):
+             )
+ 
+         return metabase_column
+-
+-    @staticmethod
+-    def _read_meta_fields(obj: Mapping) -> Mapping:
+-        """Reads meta fields from a schem object.
+-
+-        Args:
+-            obj (Mapping): Schema object.
+-
+-        Returns:
+-            Mapping: Field values.
+-        """
+-
+-        meta = obj.get("meta", [])
+-        return {
+-            k: meta[f"metabase.{k}"]
+-            for k in METABASE_META_FIELDS
+-            if f"metabase.{k}" in meta
+-        }
+

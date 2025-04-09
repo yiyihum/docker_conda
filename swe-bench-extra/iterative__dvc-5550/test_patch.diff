@@ -1,0 +1,171 @@
+diff --git a/tests/func/params/test_diff.py b/tests/func/params/test_diff.py
+--- a/tests/func/params/test_diff.py
++++ b/tests/func/params/test_diff.py
+@@ -64,19 +64,6 @@ def test_diff_deleted(tmp_dir, scm, dvc):
+     }
+ 
+ 
+-def test_diff_deleted_config(tmp_dir, scm, dvc):
+-    tmp_dir.gen("params.yaml", "foo: bar")
+-    dvc.run(cmd="echo params.yaml", params=["foo"], single_stage=True)
+-    scm.add(["params.yaml", "Dvcfile"])
+-    scm.commit("bar")
+-
+-    (tmp_dir / "params.yaml").unlink()
+-
+-    assert dvc.params.diff() == {
+-        "params.yaml": {"foo": {"old": "bar", "new": None}}
+-    }
+-
+-
+ def test_diff_list(tmp_dir, scm, dvc):
+     tmp_dir.gen("params.yaml", "foo:\n- bar\n- baz")
+     dvc.run(cmd="echo params.yaml", params=["foo"], single_stage=True)
+diff --git a/tests/func/params/test_show.py b/tests/func/params/test_show.py
+--- a/tests/func/params/test_show.py
++++ b/tests/func/params/test_show.py
+@@ -80,20 +80,31 @@ def test_show_branch(tmp_dir, scm, dvc):
+     }
+ 
+ 
+-def test_pipeline_tracked_params(tmp_dir, scm, dvc, run_copy):
++def test_pipeline_params(tmp_dir, scm, dvc, run_copy):
+     from dvc.dvcfile import PIPELINE_FILE
+ 
+-    tmp_dir.gen({"foo": "foo", "params.yaml": "foo: bar\nxyz: val"})
++    tmp_dir.gen(
++        {"foo": "foo", "params.yaml": "foo: bar\nxyz: val\nabc: ignore"}
++    )
+     run_copy("foo", "bar", name="copy-foo-bar", params=["foo,xyz"])
+     scm.add(["params.yaml", PIPELINE_FILE])
+     scm.commit("add stage")
+ 
+-    tmp_dir.scm_gen("params.yaml", "foo: baz\nxyz: val", commit="baz")
+-    tmp_dir.scm_gen("params.yaml", "foo: qux\nxyz: val", commit="qux")
++    tmp_dir.scm_gen(
++        "params.yaml", "foo: baz\nxyz: val\nabc: ignore", commit="baz"
++    )
++    tmp_dir.scm_gen(
++        "params.yaml", "foo: qux\nxyz: val\nabc: ignore", commit="qux"
++    )
+ 
+-    assert dvc.params.show(revs=["master"]) == {
++    assert dvc.params.show(revs=["master"], deps=True) == {
+         "master": {"params.yaml": {"foo": "qux", "xyz": "val"}}
+     }
++    assert dvc.params.show(revs=["master"]) == {
++        "master": {
++            "params.yaml": {"foo": "qux", "xyz": "val", "abc": "ignore"}
++        }
++    }
+ 
+ 
+ def test_show_no_repo(tmp_dir):
+diff --git a/tests/unit/command/test_experiments.py b/tests/unit/command/test_experiments.py
+--- a/tests/unit/command/test_experiments.py
++++ b/tests/unit/command/test_experiments.py
+@@ -38,6 +38,7 @@ def test_experiments_diff(dvc, scm, mocker):
+             "HEAD~10",
+             "HEAD~1",
+             "--all",
++            "--param-deps",
+             "--show-json",
+             "--show-md",
+             "--old",
+@@ -53,7 +54,7 @@ def test_experiments_diff(dvc, scm, mocker):
+     assert cmd.run() == 0
+ 
+     m.assert_called_once_with(
+-        cmd.repo, a_rev="HEAD~10", b_rev="HEAD~1", all=True
++        cmd.repo, a_rev="HEAD~10", b_rev="HEAD~1", all=True, param_deps=True
+     )
+ 
+ 
+@@ -66,6 +67,7 @@ def test_experiments_show(dvc, scm, mocker):
+             "--all-branches",
+             "--all-commits",
+             "--sha",
++            "--param-deps",
+             "-n",
+             "1",
+         ]
+@@ -84,6 +86,7 @@ def test_experiments_show(dvc, scm, mocker):
+         all_commits=True,
+         sha_only=True,
+         num=1,
++        param_deps=True,
+     )
+ 
+ 
+diff --git a/tests/unit/command/test_params.py b/tests/unit/command/test_params.py
+--- a/tests/unit/command/test_params.py
++++ b/tests/unit/command/test_params.py
+@@ -18,6 +18,7 @@ def test_params_diff(dvc, mocker):
+             "--show-json",
+             "--show-md",
+             "--no-path",
++            "--deps",
+         ]
+     )
+     assert cli_args.func == CmdParamsDiff
+@@ -33,6 +34,21 @@ def test_params_diff(dvc, mocker):
+         b_rev="HEAD~1",
+         targets=["target"],
+         all=True,
++        deps=True,
++    )
++
++
++def test_params_diff_from_cli(dvc, mocker):
++    cli_args = parse_args(["params", "diff"])
++    assert cli_args.func == CmdParamsDiff
++
++    cmd = cli_args.func(cli_args)
++    m = mocker.patch("dvc.repo.params.diff.diff", return_value={})
++
++    assert cmd.run() == 0
++
++    m.assert_called_once_with(
++        cmd.repo, a_rev=None, b_rev=None, all=False, targets=None, deps=False,
+     )
+ 
+ 
+diff --git a/tests/unit/test_params.py b/tests/unit/test_params.py
+--- a/tests/unit/test_params.py
++++ b/tests/unit/test_params.py
+@@ -6,23 +6,28 @@
+ def test_params_order(tmp_dir, dvc):
+     tmp_dir.gen(
+         {
+-            "params.yaml": dumps_yaml({"p1": 1}),
+-            "p1.yaml": dumps_yaml({"p2": 1}),
+-            "sub": {"p2.yaml": dumps_yaml({"p3": 1})},
++            "params.yaml": dumps_yaml({"p": 1}),
++            "params1.yaml": dumps_yaml({"p1": 1}),
++            "sub": {"params2.yaml": dumps_yaml({"p2": 1})},
+         }
+     )
+ 
+-    p2_path = os.path.join("sub", "p2.yaml")
++    params_path = os.path.join("..", "params.yaml")
++    p2_path = os.path.join("sub", "params2.yaml")
+     dvc.stage.add(
+-        params=[{p2_path: ["p3"]}, {"p1.yaml": ["p2"]}],
++        params=[{p2_path: ["p2"]}, {"params1.yaml": ["p1"]}],
+         cmd="cmd1",
+         name="stage1",
+     )
+     with (tmp_dir / "sub").chdir():
+-        dvc.stage.add(params=["p1"], cmd="cmd2", name="stage2")
++        dvc.stage.add(params=[{params_path: ["p"]}], cmd="cmd2", name="stage2")
+ 
+     # params are sorted during dumping, therefore p1 is first
+-    assert list(dvc.params.show()[""]) == ["p1.yaml", p2_path, "params.yaml"]
++    assert list(dvc.params.show()[""]) == [
++        "params1.yaml",
++        p2_path,
++        "params.yaml",
++    ]
+ 
+ 
+ def test_repro_unicode(tmp_dir, dvc):

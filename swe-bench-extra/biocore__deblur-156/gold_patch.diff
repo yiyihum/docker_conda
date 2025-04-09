@@ -1,0 +1,121 @@
+diff --git a/ChangeLog.md b/ChangeLog.md
+index ea3e5aa..a8981f9 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -4,6 +4,8 @@
+ 
+ ### Features
+ 
++* Added `--left-trim-length` to allow for trimming nucleotides on the 5' end of each sequence. Please see [issue #154](https://github.com/biocore/deblur/issues/154) for more information.
++
+ ### Backward-incompatible changes [stable]
+ 
+ ### Performance enhancements
+diff --git a/deblur/workflow.py b/deblur/workflow.py
+index 6eb21f7..0f7d55a 100644
+--- a/deblur/workflow.py
++++ b/deblur/workflow.py
+@@ -100,7 +100,7 @@ def sequence_generator(input_fp):
+         yield (record.metadata['id'], str(record))
+ 
+ 
+-def trim_seqs(input_seqs, trim_len):
++def trim_seqs(input_seqs, trim_len, left_trim_len):
+     """Trim FASTA sequences to specified length.
+ 
+     Parameters
+@@ -109,6 +109,9 @@ def trim_seqs(input_seqs, trim_len):
+         The list of input sequences in (label, sequence) format
+     trim_len : int
+         Sequence trimming length. Specify a value of -1 to disable trimming.
++    left_trim_len : int
++        Sequence trimming from the 5' end. A value of 0 will disable this trim.
++
+ 
+     Returns
+     -------
+@@ -132,7 +135,7 @@ def trim_seqs(input_seqs, trim_len):
+             yield label, seq
+         elif len(seq) >= trim_len:
+             okseqs += 1
+-            yield label, seq[:trim_len]
++            yield label, seq[left_trim_len:trim_len]
+ 
+     if okseqs < 0.01*totseqs:
+         logger = logging.getLogger(__name__)
+@@ -771,8 +774,8 @@ def create_otu_table(output_fp, deblurred_list,
+ 
+ 
+ def launch_workflow(seqs_fp, working_dir, mean_error, error_dist,
+-                    indel_prob, indel_max, trim_length, min_size, ref_fp,
+-                    ref_db_fp, threads_per_sample=1,
++                    indel_prob, indel_max, trim_length, left_trim_length,
++                    min_size, ref_fp, ref_db_fp, threads_per_sample=1,
+                     sim_thresh=None, coverage_thresh=None):
+     """Launch full deblur workflow for a single post split-libraries fasta file
+ 
+@@ -792,6 +795,8 @@ def launch_workflow(seqs_fp, working_dir, mean_error, error_dist,
+         maximal indel number
+     trim_length: integer
+         sequence trim length
++    left_trim_length: integer
++        trim the first n reads
+     min_size: integer
+         upper limit on sequence abundance (discard sequences below limit)
+     ref_fp: tuple
+@@ -823,7 +828,8 @@ def launch_workflow(seqs_fp, working_dir, mean_error, error_dist,
+     with open(output_trim_fp, 'w') as out_f:
+         for label, seq in trim_seqs(
+                 input_seqs=sequence_generator(seqs_fp),
+-                trim_len=trim_length):
++                trim_len=trim_length,
++                left_trim_len=left_trim_length):
+             out_f.write(">%s\n%s\n" % (label, seq))
+     # Step 2: Dereplicate sequences
+     output_derep_fp = join(working_dir,
+diff --git a/scripts/deblur b/scripts/deblur
+index bd9704d..f5d9dcc 100755
+--- a/scripts/deblur
++++ b/scripts/deblur
+@@ -420,6 +420,10 @@ def build_biom_table(seqs_fp, output_biom_fp, min_reads, file_type, log_level,
+                     "trim-length will be discarded. A value of -1 can be "
+                     "specified to skip trimming; this assumes all sequences "
+                     "have an identical length."))
++@click.option('--left-trim-length', required=False, type=int,
++              show_default=True, default=0,
++              help=("Trim the first N bases from every sequence. A value of 0 "
++                    "disables this trim."))
+ @click.option('--pos-ref-fp', required=False, multiple=True,
+               default=[], show_default=False,
+               type=click.Path(resolve_path=True, readable=True, exists=True,
+@@ -518,9 +522,9 @@ def build_biom_table(seqs_fp, output_biom_fp, min_reads, file_type, log_level,
+ def workflow(seqs_fp, output_dir, pos_ref_fp, pos_ref_db_fp,
+              neg_ref_fp, neg_ref_db_fp, overwrite,
+              mean_error, error_dist, indel_prob, indel_max,
+-             trim_length, min_reads, min_size, threads_per_sample,
+-             keep_tmp_files, log_level, log_file, jobs_to_start,
+-             is_worker_thread):
++             trim_length, left_trim_length, min_reads, min_size,
++             threads_per_sample, keep_tmp_files, log_level, log_file,
++             jobs_to_start, is_worker_thread):
+     """Launch deblur workflow"""
+     start_log(level=log_level * 10, filename=log_file)
+     logger = logging.getLogger(__name__)
+@@ -623,6 +627,7 @@ def workflow(seqs_fp, output_dir, pos_ref_fp, pos_ref_db_fp,
+                     mean_error=mean_error,
+                     error_dist=error_dist, indel_prob=indel_prob,
+                     indel_max=indel_max, trim_length=trim_length,
++                    left_trim_length=left_trim_length,
+                     min_size=min_size, ref_fp=ref_fp, ref_db_fp=ref_db_fp,
+                     threads_per_sample=threads_per_sample)
+                 if deblurred_file_name is None:
+@@ -651,7 +656,8 @@ def workflow(seqs_fp, output_dir, pos_ref_fp, pos_ref_db_fp,
+ 
+     # also create biom tables with
+     # only sequences matching the pos_ref_fp sequences (reference-hit.biom)
+-    # and only sequences not matching the pos_ref_fp sequences (reference-non-hit.biom)
++    # and only sequences not matching the pos_ref_fp sequences
++    # (reference-non-hit.biom)
+     tmp_files = remove_artifacts_from_biom_table(output_fp, outputfasta_fp,
+                                                  pos_ref_fp, output_dir,
+                                                  pos_ref_db_fp,

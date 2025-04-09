@@ -1,0 +1,187 @@
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..17dd8e7
+--- /dev/null
++++ b/tests/__init__.py
+@@ -0,0 +1,13 @@
++# Copyright 2020 Canonical Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+diff --git a/tests/test_jujucrashdump_crashdump.py b/tests/test_jujucrashdump_crashdump.py
+new file mode 100644
+index 0000000..158352c
+--- /dev/null
++++ b/tests/test_jujucrashdump_crashdump.py
+@@ -0,0 +1,77 @@
++# Copyright 2020 Canonical Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import mock
++
++import tests.utils as utils
++
++import jujucrashdump.crashdump as crashdump
++
++class TestCrashCollector(utils.BaseTestCase):
++
++    def setUp(self):
++        self.target = crashdump.CrashCollector('aModel', 42, ['extra_dir'])
++        self._patches = {}
++        self._patches_start = {}
++
++    def tearDown(self):
++        self.target = None
++        for k, v in self._patches.items():
++            v.stop()
++            setattr(self, k, None)
++        self._patches = None
++        self._patches_start = None
++
++    def patch_target(self, attr, return_value=None):
++        mocked = mock.patch.object(self.target, attr)
++        self._patches[attr] = mocked
++        started = mocked.start()
++        started.return_value = return_value
++        self._patches_start[attr] = started
++        setattr(self, attr, started)
++
++    def test_create_unit_tarballs(self):
++        self.patch_object(crashdump, 'DIRECTORIES')
++        self.target.uniq = 'fake-uuid'
++        self.patch_target('_run_all')
++        self.DIRECTORIES.__iter__.return_value = ['dir']
++        self.target.create_unit_tarballs()
++        self._run_all.assert_called_once_with(
++            'sudo find dir extra_dir /var/lib/lxd/containers/*/rootfsdir '
++            '/var/lib/lxd/containers/*/rootfsextra_dir -mount -type f '
++            '-size -42c -o -size 42c 2>/dev/null | '
++            'sudo tar -pcf /tmp/juju-dump-fake-uuid.tar '
++            '--files-from - 2>/dev/null;'
++            'sudo tar --append -f /tmp/juju-dump-fake-uuid.tar '
++            '-C /tmp/fake-uuid/cmd_output . || true;'
++            'sudo tar --append -f /tmp/juju-dump-fake-uuid.tar '
++            '-C /tmp/fake-uuid/ journalctl || true;'
++            'sudo tar --append -f /tmp/juju-dump-fake-uuid.tar '
++            '-C /tmp/fake-uuid/addon_output . || true')
++        self._run_all.reset_mock()
++        self.target.exclude = ('exc0', 'exc1')
++        self.target.create_unit_tarballs()
++        self._run_all.assert_called_once_with(
++            'sudo find dir extra_dir /var/lib/lxd/containers/*/rootfsdir '
++            '/var/lib/lxd/containers/*/rootfsextra_dir -mount -type f '
++            '-size -42c -o -size 42c 2>/dev/null | '
++            'sudo tar -pcf /tmp/juju-dump-fake-uuid.tar '
++            '--exclude exc0 --exclude exc1 '
++            '--files-from - 2>/dev/null;'
++            'sudo tar --append -f /tmp/juju-dump-fake-uuid.tar '
++            '-C /tmp/fake-uuid/cmd_output . || true;'
++            'sudo tar --append -f /tmp/juju-dump-fake-uuid.tar '
++            '-C /tmp/fake-uuid/ journalctl || true;'
++            'sudo tar --append -f /tmp/juju-dump-fake-uuid.tar '
++            '-C /tmp/fake-uuid/addon_output . || true')
+diff --git a/tests/utils.py b/tests/utils.py
+new file mode 100644
+index 0000000..7ac4699
+--- /dev/null
++++ b/tests/utils.py
+@@ -0,0 +1,79 @@
++# Copyright 2016 Canonical Ltd
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Unit test helpers from https://github.com/openstack/charms.openstack/"""
++
++import contextlib
++import io
++import mock
++import unittest
++
++
++@contextlib.contextmanager
++def patch_open():
++    '''Patch open() to allow mocking both open() itself and the file that is
++    yielded.
++
++    Yields the mock for "open" and "file", respectively.'''
++    mock_open = mock.MagicMock(spec=open)
++    mock_file = mock.MagicMock(spec=io.FileIO)
++
++    @contextlib.contextmanager
++    def stub_open(*args, **kwargs):
++        mock_open(*args, **kwargs)
++        yield mock_file
++
++    with mock.patch('builtins.open', stub_open):
++        yield mock_open, mock_file
++
++
++class BaseTestCase(unittest.TestCase):
++
++    def setUp(self):
++        self._patches = {}
++        self._patches_start = {}
++
++    def tearDown(self):
++        for k, v in self._patches.items():
++            v.stop()
++            setattr(self, k, None)
++        self._patches = None
++        self._patches_start = None
++
++    def patch_object(self, obj, attr, return_value=None, name=None, new=None,
++                     **kwargs):
++        if name is None:
++            name = attr
++        if new is not None:
++            mocked = mock.patch.object(obj, attr, new=new, **kwargs)
++        else:
++            mocked = mock.patch.object(obj, attr, **kwargs)
++        self._patches[name] = mocked
++        started = mocked.start()
++        if new is None:
++            started.return_value = return_value
++        self._patches_start[name] = started
++        setattr(self, name, started)
++
++    def patch(self, item, return_value=None, name=None, new=None, **kwargs):
++        if name is None:
++            raise RuntimeError("Must pass 'name' to .patch()")
++        if new is not None:
++            mocked = mock.patch(item, new=new, **kwargs)
++        else:
++            mocked = mock.patch(item, **kwargs)
++        self._patches[name] = mocked
++        started = mocked.start()
++        if new is None:
++            started.return_value = return_value
++        self._patches_start[name] = started
++        setattr(self, name, started)

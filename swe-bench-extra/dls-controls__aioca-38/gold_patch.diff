@@ -1,0 +1,144 @@
+diff --git a/.github/workflows/code.yml b/.github/workflows/code.yml
+index b26b076..95e0c7c 100644
+--- a/.github/workflows/code.yml
++++ b/.github/workflows/code.yml
+@@ -42,7 +42,7 @@ jobs:
+ 
+       - name: Install Python Dependencies
+         run: |
+-          pip install pipenv build
++          pip install pipenv==2022.4.8 build
+           pipenv install --dev --${{ matrix.pipenv }} --python $(python -c 'import sys; print(sys.executable)') && pipenv graph
+ 
+       - name: Create Sdist and Wheel
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 9522c2b..8245674 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -9,7 +9,9 @@ and this project adheres to `Semantic Versioning <https://semver.org/spec/v2.0.0
+ Unreleased_
+ -----------
+ 
+-Nothing yet
++Added: 
++
++- `Add methods to allow inspecting Channels <../../pull/38>`_
+ 
+ 1.6_ - 2023-04-06
+ -----------------
+diff --git a/aioca/__init__.py b/aioca/__init__.py
+index 11d056e..90ba0a4 100644
+--- a/aioca/__init__.py
++++ b/aioca/__init__.py
+@@ -24,12 +24,14 @@ from epicscorelibs.ca.dbr import (
+ from ._catools import (
+     CAInfo,
+     CANothing,
++    ChannelInfo,
+     Subscription,
+     caget,
+     cainfo,
+     camonitor,
+     caput,
+     connect,
++    get_channel_infos,
+     purge_channel_caches,
+     run,
+ )
+@@ -45,6 +47,8 @@ __all__ = [
+     "cainfo",  # Returns ca_info describing PV connection
+     "CAInfo",  # Ca info object
+     "CANothing",  # No value
++    "ChannelInfo",  # Information about a particular channel
++    "get_channel_infos",  # Return information about all channels
+     "purge_channel_caches",  # Get rid of old channels
+     "run",  # Run one aioca coroutine and clean up
+     # The version of aioca
+diff --git a/aioca/_catools.py b/aioca/_catools.py
+index 6b99166..dfb96a8 100644
+--- a/aioca/_catools.py
++++ b/aioca/_catools.py
+@@ -54,6 +54,9 @@ class ValueEvent(Generic[T]):
+         self._event.set()
+         self.value = value
+ 
++    def is_set(self) -> bool:
++        return self._event.is_set()
++
+     def clear(self):
+         self._event.clear()
+         self.value = RuntimeError("No value set")
+@@ -252,6 +255,14 @@ class Channel(object):
+         """Removes the given subscription from the list of receivers."""
+         self.__subscriptions.remove(subscription)
+ 
++    def count_subscriptions(self) -> int:
++        """Return the number of currently active subscriptions for this Channel"""
++        return len(self.__subscriptions)
++
++    def connected(self) -> bool:
++        """Return whether this Channel is currently connected to a PV"""
++        return self.__connect_event.is_set()
++
+     async def wait(self):
+         """Waits for the channel to become connected if not already connected."""
+         await self.__connect_event.wait()
+@@ -278,6 +289,9 @@ class ChannelCache(object):
+             self.__channels[name] = channel
+             return channel
+ 
++    def get_channels(self) -> List[Channel]:
++        return list(self.__channels.values())
++
+     def purge(self):
+         """Purges all the channels in the cache: closes them right now.  Will
+         cause other channel access to fail, so only to be done on shutdown."""
+@@ -1081,6 +1095,32 @@ def get_channel(pv: str) -> Channel:
+     return channel
+ 
+ 
++class ChannelInfo:
++    """Information about a particular Channel
++
++    Attributes:
++        name: Process Variable name the Channel is targeting
++        connected: True if the Channel is currently connected
++        subscriber_count: Number of clients subscribed to this Channel"""
++
++    name: str
++    connected: bool
++    subscriber_count: int
++
++    def __init__(self, name, connected, subscriber_count):
++        self.name = name
++        self.connected = connected
++        self.subscriber_count = subscriber_count
++
++
++def get_channel_infos() -> List[ChannelInfo]:
++    """Return information about all Channels"""
++    return [
++        ChannelInfo(channel.name, channel.connected(), channel.count_subscriptions())
++        for channel in _Context.get_channel_cache().get_channels()
++    ]
++
++
+ # Another delicacy arising from relying on asynchronous CA event dispatching is
+ # that we need to manually flush IO events such as caget commands.  To ensure
+ # that large blocks of channel access activity really are aggregated we used to
+diff --git a/docs/api.rst b/docs/api.rst
+index 2a58dc4..ec0888a 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -141,6 +141,11 @@ event loop. A convenience function is provided to do this:
+ 
+ .. autofunction:: run
+ 
++.. autoclass:: ChannelInfo()
++    :members:
++
++.. autofunction:: get_channel_infos
++
+ ..  _Values:
+ 
+ Working with Values

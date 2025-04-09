@@ -1,0 +1,105 @@
+diff --git a/msrest/configuration.py b/msrest/configuration.py
+index 7b47b39..4b46b56 100644
+--- a/msrest/configuration.py
++++ b/msrest/configuration.py
+@@ -44,6 +44,19 @@ from .pipeline import (
+ from .version import msrest_version
+ 
+ 
++def default_session_configuration_callback(session, global_config, local_config, **kwargs):
++    """Configuration callback if you need to change default session configuration.
++
++    :param requests.Session session: The session.
++    :param Configuration global_config: The global configuration.
++    :param dict local_config: The on-the-fly configuration passed on the call.
++    :param dict kwargs: The current computed values for session.request method.
++    :return: Must return kwargs, to be passed to session.request. If None is return, initial kwargs will be used.
++    :rtype: dict
++    """
++    return kwargs
++
++
+ class Configuration(object):
+     """Client configuration.
+ 
+@@ -79,6 +92,8 @@ class Configuration(object):
+         # - kwargs['msrest']['session'] with the current session
+         self.hooks = []
+ 
++        self.session_configuration_callback = default_session_configuration_callback
++
+         self._config = configparser.ConfigParser()
+         self._config.optionxform = str
+ 
+diff --git a/msrest/serialization.py b/msrest/serialization.py
+index 1902ca2..cc03063 100644
+--- a/msrest/serialization.py
++++ b/msrest/serialization.py
+@@ -350,6 +350,7 @@ class Serializer(object):
+             }
+         self.dependencies = dict(classes) if classes else {}
+         self.key_transformer = full_restapi_key_transformer
++        self.client_side_validation = True
+ 
+     def _serialize(self, target_obj, data_type=None, **kwargs):
+         """Serialize data into a string according to type.
+@@ -440,9 +441,10 @@ class Serializer(object):
+                 raise_with_traceback(
+                     SerializationError, "Unable to build a model: "+str(err), err)
+ 
+-        errors = _recursive_validate(data_type, data)
+-        if errors:
+-            raise errors[0]
++        if self.client_side_validation:
++            errors = _recursive_validate(data_type, data)
++            if errors:
++                raise errors[0]
+         return self._serialize(data, data_type, **kwargs)
+ 
+     def url(self, name, data, data_type, **kwargs):
+@@ -454,7 +456,8 @@ class Serializer(object):
+         :raises: TypeError if serialization fails.
+         :raises: ValueError if data is None
+         """
+-        data = self.validate(data, name, required=True, **kwargs)
++        if self.client_side_validation:
++            data = self.validate(data, name, required=True, **kwargs)
+         try:
+             output = self.serialize_data(data, data_type, **kwargs)
+             if data_type == 'bool':
+@@ -478,7 +481,8 @@ class Serializer(object):
+         :raises: TypeError if serialization fails.
+         :raises: ValueError if data is None
+         """
+-        data = self.validate(data, name, required=True, **kwargs)
++        if self.client_side_validation:
++            data = self.validate(data, name, required=True, **kwargs)
+         try:
+             if data_type in ['[str]']:
+                 data = ["" if d is None else d for d in data]
+@@ -504,7 +508,8 @@ class Serializer(object):
+         :raises: TypeError if serialization fails.
+         :raises: ValueError if data is None
+         """
+-        data = self.validate(data, name, required=True, **kwargs)
++        if self.client_side_validation:
++            data = self.validate(data, name, required=True, **kwargs)
+         try:
+             if data_type in ['[str]']:
+                 data = ["" if d is None else d for d in data]
+diff --git a/msrest/service_client.py b/msrest/service_client.py
+index d0e6fdb..eed50c5 100644
+--- a/msrest/service_client.py
++++ b/msrest/service_client.py
+@@ -145,6 +145,11 @@ class ServiceClient(object):
+         for protocol in self._protocols:
+             session.mount(protocol,
+                           requests.adapters.HTTPAdapter(max_retries=max_retries))
++
++        output_kwargs = self.config.session_configuration_callback(session, self.config, config, **kwargs)
++        if output_kwargs is not None:
++            kwargs = output_kwargs
++
+         return kwargs
+ 
+     def send_formdata(self, request, headers=None, content=None, **config):

@@ -1,0 +1,106 @@
+diff --git a/config/urls.py b/config/urls.py
+index 0bffaba..4e37443 100644
+--- a/config/urls.py
++++ b/config/urls.py
+@@ -29,6 +29,7 @@ urlpatterns = [
+     re_path(
+         r"^about/", TemplateView.as_view(template_name="pages/about.html"), name="about"
+     ),
++    re_path(r"^revoke_task", views.revoke_task, name="revoke_task"),
+     # Django Admin, use {% url 'admin:index' %}
+     re_path(settings.ADMIN_URL, admin.site.urls),
+     # User management
+diff --git a/django_structlog/celery/receivers.py b/django_structlog/celery/receivers.py
+index dc14f2d..b976582 100644
+--- a/django_structlog/celery/receivers.py
++++ b/django_structlog/celery/receivers.py
+@@ -79,8 +79,16 @@ def receiver_task_failure(
+ def receiver_task_revoked(
+     request=None, terminated=None, signum=None, expired=None, **kwargs
+ ):
++    metadata = getattr(request, "__django_structlog__", {}).copy()
++    metadata["task_id"] = request.id
++    metadata["task"] = request.task
++
+     logger.warning(
+-        "task_revoked", terminated=terminated, signum=signum, expired=expired
++        "task_revoked",
++        terminated=terminated,
++        signum=signum,
++        expired=expired,
++        **metadata,
+     )
+ 
+ 
+diff --git a/django_structlog_demo_project/home/views.py b/django_structlog_demo_project/home/views.py
+index e1c77a4..00f5a27 100644
+--- a/django_structlog_demo_project/home/views.py
++++ b/django_structlog_demo_project/home/views.py
+@@ -35,6 +35,12 @@ def log_with_standard_logger(request):
+     return HttpResponse(status=200)
+ 
+ 
++def revoke_task(request):
++    async_result = successful_task.apply_async(countdown=1)
++    async_result.revoke()
++    return HttpResponse(status=201)
++
++
+ async def async_view(request):
+     for num in range(1, 2):
+         await asyncio.sleep(1)
+diff --git a/django_structlog_demo_project/templates/pages/home.html b/django_structlog_demo_project/templates/pages/home.html
+index 119c101..8bba5da 100644
+--- a/django_structlog_demo_project/templates/pages/home.html
++++ b/django_structlog_demo_project/templates/pages/home.html
+@@ -34,6 +34,13 @@
+         <button type="submit" form="form5">Standard logger</button>
+     </div>
+ 
++    <div>
++        <form action="{% url 'revoke_task' %}" method="post" id="form6" target="dummyframe">
++            {% csrf_token %}
++        </form>
++        <button type="submit" form="form6">Revoke task</button>
++    </div>
++
+     <div>
+         <form action="{% url 'async_view' %}" method="post" id="form6" target="dummyframe">
+             {% csrf_token %}
+diff --git a/docs/changelog.rst b/docs/changelog.rst
+index 7240ad3..95d9a02 100644
+--- a/docs/changelog.rst
++++ b/docs/changelog.rst
+@@ -10,6 +10,9 @@ See: :ref:`upgrade_6.0`
+     - Python 3.12 support
+     - Add support of logging :ref:`commands`
+ 
++*Fixes:*
++    - Add missing metadata when a task is revoked. See `#317 <https://github.com/jrobichaud/django-structlog/issues/317>`_. Special thanks to `@badziyoussef <https://github.com/badziyoussef>`_.
++
+ *Changes:*
+     - Drop support of python 3.7
+     - Drop legacy code still supporting celery < 4
+diff --git a/docs/events.rst b/docs/events.rst
+index 90c9e1d..5f2551f 100644
+--- a/docs/events.rst
++++ b/docs/events.rst
+@@ -88,7 +88,7 @@ Task Events
+ +--------------------+-------------+------------------------------------------------+
+ | task_not_found     | ERROR       | Celery app did not discover the requested task |
+ +--------------------+-------------+------------------------------------------------+
+-| task_task_rejected | ERROR       | Task could not be enqueued                     |
++| task_rejected      | ERROR       | Task could not be enqueued                     |
+ +--------------------+-------------+------------------------------------------------+
+ 
+ \* if task threw an expected exception, it will logged as ``INFO``. See `Celery's Task.throws <https://docs.celeryproject.org/en/latest/userguide/tasks.html#Task.throws>`_
+@@ -136,5 +136,9 @@ These metadata appear once along with their associated event
+ +------------------+------------------+----------------------------------------+
+ | task_revoked     | expired          | see Celery's documentation             |
+ +------------------+------------------+----------------------------------------+
++| task_revoked     | task_id          | id of the task being revoked           |
+++------------------+------------------+----------------------------------------+
++| task_revoked     | task             | name of the task being revoked         |
+++------------------+------------------+----------------------------------------+
+ 
+ \* if task threw an expected exception, ``exception`` will be omitted. See `Celery's Task.throws <https://docs.celeryproject.org/en/latest/userguide/tasks.html#Task.throws>`_

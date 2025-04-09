@@ -1,0 +1,234 @@
+diff --git a/traits_futures/i_pingee.py b/traits_futures/i_pingee.py
+new file mode 100644
+index 0000000..969f171
+--- /dev/null
++++ b/traits_futures/i_pingee.py
+@@ -0,0 +1,87 @@
++# (C) Copyright 2018-2021 Enthought, Inc., Austin, TX
++# All rights reserved.
++#
++# This software is provided without warranty under the terms of the BSD
++# license included in LICENSE.txt and may be redistributed only under
++# the conditions described in the aforementioned license. The license
++# is also available online at http://www.enthought.com/licenses/BSD.txt
++#
++# Thanks for using Enthought open source!
++
++"""
++Interface for the toolkit-specific pingee and pinger classes.
++"""
++
++import abc
++
++
++class IPingee(abc.ABC):
++    """
++    Interface for toolkit-specific pingee classes.
++
++    An IPingee instance provides a toolkit-specific cross-thread pinging
++    mechanism. The pingee is owned by the main thread, but may be shared
++    with background threads for the sole purpose of allowing those background
++    threads to create linked pingers.
++
++    Whenever a ping is received from a linked ``IPinger`` instance, the pingee
++    ensures that under a running event loop, the ``on_ping`` callable is
++    eventually called. The ``on_ping`` callable will always be called on the
++    main thread.
++
++    Parameters
++    ----------
++    on_ping : callable
++        Zero-argument callable that's called on the main thread
++        every time a ping is received.
++    """
++
++    @abc.abstractmethod
++    def connect(self):
++        """
++        Prepare pingee to receive pings.
++
++        Not thread-safe. This method should only be called in the main thread.
++        """
++
++    @abc.abstractmethod
++    def disconnect(self):
++        """
++        Undo any connections made in the connect method.
++
++        Not thread-safe. This method should only be called in the main thread.
++        """
++
++
++class IPinger(abc.ABC):
++    """
++    Interface for toolkit-specific pinger classes.
++
++    An IPinger instance emits pings targeting a particular IPingee instance.
++
++    Parameters
++    ----------
++    pingee : IPingee
++        The target receiver for the pings. The receiver should already
++        be connected.
++    """
++
++    @abc.abstractmethod
++    def connect(self):
++        """
++        Connect to the ping receiver. No pings should be sent before
++        this method is called.
++        """
++
++    @abc.abstractmethod
++    def disconnect(self):
++        """
++        Disconnect from the ping receiver. No pings should be sent after
++        calling this method.
++        """
++
++    @abc.abstractmethod
++    def ping(self):
++        """
++        Send a ping to the receiver.
++        """
+diff --git a/traits_futures/multiprocessing_router.py b/traits_futures/multiprocessing_router.py
+index 58e4687..983eddc 100644
+--- a/traits_futures/multiprocessing_router.py
++++ b/traits_futures/multiprocessing_router.py
+@@ -73,6 +73,7 @@ from traits_futures.i_message_router import (
+     IMessageRouter,
+     IMessageSender,
+ )
++from traits_futures.i_pingee import IPingee
+ from traits_futures.toolkit_support import toolkit
+ 
+ logger = logging.getLogger(__name__)
+@@ -382,7 +383,7 @@ class MultiprocessingRouter(HasRequiredTraits):
+     _receivers = Dict(Int(), Instance(MultiprocessingReceiver))
+ 
+     #: Receiver for the "message_sent" signal.
+-    _pingee = Instance(Pingee)
++    _pingee = Instance(IPingee)
+ 
+     #: Router status: True if running, False if stopped.
+     _running = Bool(False)
+diff --git a/traits_futures/multithreading_router.py b/traits_futures/multithreading_router.py
+index 97c9433..1934621 100644
+--- a/traits_futures/multithreading_router.py
++++ b/traits_futures/multithreading_router.py
+@@ -34,6 +34,7 @@ from traits_futures.i_message_router import (
+     IMessageRouter,
+     IMessageSender,
+ )
++from traits_futures.i_pingee import IPingee
+ from traits_futures.toolkit_support import toolkit
+ 
+ logger = logging.getLogger(__name__)
+@@ -313,7 +314,7 @@ class MultithreadingRouter(HasStrictTraits):
+     _receivers = Dict(Int(), Instance(MultithreadingReceiver))
+ 
+     #: Receiver for the "message_sent" signal.
+-    _pingee = Instance(Pingee)
++    _pingee = Instance(IPingee)
+ 
+     #: Router status: True if running, False if stopped.
+     _running = Bool(False)
+diff --git a/traits_futures/null/pinger.py b/traits_futures/null/pinger.py
+index eee44a7..5efd880 100644
+--- a/traits_futures/null/pinger.py
++++ b/traits_futures/null/pinger.py
+@@ -17,12 +17,15 @@ the main thread execute a (fixed, parameterless) callback.
+ 
+ import asyncio
+ 
++from traits_futures.i_pingee import IPingee, IPinger
+ 
++
++@IPingee.register
+ class Pingee:
+     """
+     Receiver for pings.
+ 
+-    Whenever a ping is received from a linked Pingee, the receiver
++    Whenever a ping is received from a linked Pinger, the receiver
+     calls the given fixed parameterless callable.
+ 
+     The ping receiver must be connected (using the ``connect``) method
+@@ -52,6 +55,7 @@ class Pingee:
+         del self._event_loop
+ 
+ 
++@IPinger.register
+ class Pinger:
+     """
+     Ping emitter, which can send pings to a receiver in a thread-safe manner.
+diff --git a/traits_futures/qt/pinger.py b/traits_futures/qt/pinger.py
+index a917150..caf307b 100644
+--- a/traits_futures/qt/pinger.py
++++ b/traits_futures/qt/pinger.py
+@@ -17,6 +17,8 @@ the main thread execute a (fixed, parameterless) callback.
+ 
+ from pyface.qt.QtCore import QObject, Qt, Signal, Slot
+ 
++from traits_futures.i_pingee import IPingee, IPinger
++
+ 
+ class _Signaller(QObject):
+     """
+@@ -26,11 +28,12 @@ class _Signaller(QObject):
+     ping = Signal()
+ 
+ 
++@IPingee.register
+ class Pingee(QObject):
+     """
+     Receiver for pings.
+ 
+-    Whenever a ping is received from a linked Pingee, the receiver
++    Whenever a ping is received from a linked Pinger, the receiver
+     calls the given fixed parameterless callable.
+ 
+     The ping receiver must be connected (using the ``connect``) method
+@@ -65,6 +68,7 @@ class Pingee(QObject):
+         pass
+ 
+ 
++@IPinger.register
+ class Pinger:
+     """
+     Ping emitter, which can send pings to a receiver in a thread-safe manner.
+diff --git a/traits_futures/wx/pinger.py b/traits_futures/wx/pinger.py
+index 784d9c7..746b6f6 100644
+--- a/traits_futures/wx/pinger.py
++++ b/traits_futures/wx/pinger.py
+@@ -17,6 +17,8 @@ the main thread execute a (fixed, parameterless) callback.
+ 
+ import wx.lib.newevent
+ 
++from traits_futures.i_pingee import IPingee, IPinger
++
+ # Note: we're not using the more obvious spelling
+ #   _PingEvent, _PingEventBinder = wx.lib.newevent.NewEvent()
+ # here because that confuses Sphinx's autodoc mocking.
+@@ -28,6 +30,7 @@ _PingEvent = _PingEventPair[0]
+ _PingEventBinder = _PingEventPair[1]
+ 
+ 
++@IPinger.register
+ class Pinger:
+     """
+     Ping emitter, which can send pings to a receiver in a thread-safe manner.
+@@ -63,11 +66,12 @@ class Pinger:
+         wx.PostEvent(self.pingee, _PingEvent())
+ 
+ 
++@IPingee.register
+ class Pingee(wx.EvtHandler):
+     """
+     Receiver for pings.
+ 
+-    Whenever a ping is received from a linked Pingee, the receiver
++    Whenever a ping is received from a linked Pinger, the receiver
+     calls the given fixed parameterless callable.
+ 
+     The ping receiver must be connected (using the ``connect``) method

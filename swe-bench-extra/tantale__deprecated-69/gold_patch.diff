@@ -1,0 +1,377 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index ec2f685..1e43f51 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -28,6 +28,8 @@ Fix
+ 
+ - Resolve Python 2.7 support issue introduced in v1.2.14 in ``sphinx.py``.
+ 
++- Fix #69: Add ``extra_stacklevel`` argument for interoperating with other wrapper functions (refer to #68 for a concrete use case).
++
+ Other
+ -----
+ 
+diff --git a/deprecated/classic.py b/deprecated/classic.py
+index 6ca3f27..84f683c 100644
+--- a/deprecated/classic.py
++++ b/deprecated/classic.py
+@@ -17,7 +17,7 @@ import wrapt
+ try:
+     # If the C extension for wrapt was compiled and wrapt/_wrappers.pyd exists, then the
+     # stack level that should be passed to warnings.warn should be 2. However, if using
+-    # a pure python wrapt, a extra stacklevel is required.
++    # a pure python wrapt, an extra stacklevel is required.
+     import wrapt._wrappers
+ 
+     _routine_stacklevel = 2
+@@ -83,7 +83,7 @@ class ClassicAdapter(wrapt.AdapterFactory):
+            return x + y
+     """
+ 
+-    def __init__(self, reason="", version="", action=None, category=DeprecationWarning):
++    def __init__(self, reason="", version="", action=None, category=DeprecationWarning, extra_stacklevel=0):
+         """
+         Construct a wrapper adapter.
+ 
+@@ -97,23 +97,33 @@ class ClassicAdapter(wrapt.AdapterFactory):
+             If you follow the `Semantic Versioning <https://semver.org/>`_,
+             the version number has the format "MAJOR.MINOR.PATCH".
+ 
+-        :type  action: str
++        :type  action: Literal["default", "error", "ignore", "always", "module", "once"]
+         :param action:
+             A warning filter used to activate or not the deprecation warning.
+             Can be one of "error", "ignore", "always", "default", "module", or "once".
+-            If ``None`` or empty, the the global filtering mechanism is used.
++            If ``None`` or empty, the global filtering mechanism is used.
+             See: `The Warnings Filter`_ in the Python documentation.
+ 
+-        :type  category: type
++        :type  category: Type[Warning]
+         :param category:
+             The warning category to use for the deprecation warning.
+             By default, the category class is :class:`~DeprecationWarning`,
+             you can inherit this class to define your own deprecation warning category.
++
++        :type  extra_stacklevel: int
++        :param extra_stacklevel:
++            Number of additional stack levels to consider instrumentation rather than user code.
++            With the default value of 0, the warning refers to where the class was instantiated
++            or the function was called.
++
++        .. versionchanged:: 1.2.15
++            Add the *extra_stacklevel* parameter.
+         """
+         self.reason = reason or ""
+         self.version = version or ""
+         self.action = action
+         self.category = category
++        self.extra_stacklevel = extra_stacklevel
+         super(ClassicAdapter, self).__init__()
+ 
+     def get_deprecated_msg(self, wrapped, instance):
+@@ -161,12 +171,13 @@ class ClassicAdapter(wrapt.AdapterFactory):
+ 
+             def wrapped_cls(cls, *args, **kwargs):
+                 msg = self.get_deprecated_msg(wrapped, None)
++                stacklevel = _class_stacklevel + self.extra_stacklevel
+                 if self.action:
+                     with warnings.catch_warnings():
+                         warnings.simplefilter(self.action, self.category)
+-                        warnings.warn(msg, category=self.category, stacklevel=_class_stacklevel)
++                        warnings.warn(msg, category=self.category, stacklevel=stacklevel)
+                 else:
+-                    warnings.warn(msg, category=self.category, stacklevel=_class_stacklevel)
++                    warnings.warn(msg, category=self.category, stacklevel=stacklevel)
+                 if old_new1 is object.__new__:
+                     return old_new1(cls)
+                 # actually, we don't know the real signature of *old_new1*
+@@ -174,6 +185,24 @@ class ClassicAdapter(wrapt.AdapterFactory):
+ 
+             wrapped.__new__ = staticmethod(wrapped_cls)
+ 
++        elif inspect.isroutine(wrapped):
++            @wrapt.decorator
++            def wrapper_function(wrapped_, instance_, args_, kwargs_):
++                msg = self.get_deprecated_msg(wrapped_, instance_)
++                stacklevel = _routine_stacklevel + self.extra_stacklevel
++                if self.action:
++                    with warnings.catch_warnings():
++                        warnings.simplefilter(self.action, self.category)
++                        warnings.warn(msg, category=self.category, stacklevel=stacklevel)
++                else:
++                    warnings.warn(msg, category=self.category, stacklevel=stacklevel)
++                return wrapped_(*args_, **kwargs_)
++
++            return wrapper_function(wrapped)
++
++        else:
++            raise TypeError(repr(type(wrapped)))
++
+         return wrapped
+ 
+ 
+@@ -226,7 +255,7 @@ def deprecated(*args, **kwargs):
+            return x + y
+ 
+     The *category* keyword argument allow you to specify the deprecation warning class of your choice.
+-    By default, :exc:`DeprecationWarning` is used but you can choose :exc:`FutureWarning`,
++    By default, :exc:`DeprecationWarning` is used, but you can choose :exc:`FutureWarning`,
+     :exc:`PendingDeprecationWarning` or a custom subclass.
+ 
+     .. code-block:: python
+@@ -240,7 +269,7 @@ def deprecated(*args, **kwargs):
+ 
+     The *action* keyword argument allow you to locally change the warning filtering.
+     *action* can be one of "error", "ignore", "always", "default", "module", or "once".
+-    If ``None``, empty or missing, the the global filtering mechanism is used.
++    If ``None``, empty or missing, the global filtering mechanism is used.
+     See: `The Warnings Filter`_ in the Python documentation.
+ 
+     .. code-block:: python
+@@ -252,6 +281,9 @@ def deprecated(*args, **kwargs):
+        def some_old_function(x, y):
+            return x + y
+ 
++    The *extra_stacklevel* keyword argument allows you to specify additional stack levels
++    to consider instrumentation rather than user code. With the default value of 0, the
++    warning refers to where the class was instantiated or the function was called.
+     """
+     if args and isinstance(args[0], string_types):
+         kwargs['reason'] = args[0]
+@@ -261,32 +293,9 @@ def deprecated(*args, **kwargs):
+         raise TypeError(repr(type(args[0])))
+ 
+     if args:
+-        action = kwargs.get('action')
+-        category = kwargs.get('category', DeprecationWarning)
+         adapter_cls = kwargs.pop('adapter_cls', ClassicAdapter)
+         adapter = adapter_cls(**kwargs)
+-
+         wrapped = args[0]
+-        if inspect.isclass(wrapped):
+-            wrapped = adapter(wrapped)
+-            return wrapped
+-
+-        elif inspect.isroutine(wrapped):
+-
+-            @wrapt.decorator(adapter=adapter)
+-            def wrapper_function(wrapped_, instance_, args_, kwargs_):
+-                msg = adapter.get_deprecated_msg(wrapped_, instance_)
+-                if action:
+-                    with warnings.catch_warnings():
+-                        warnings.simplefilter(action, category)
+-                        warnings.warn(msg, category=category, stacklevel=_routine_stacklevel)
+-                else:
+-                    warnings.warn(msg, category=category, stacklevel=_routine_stacklevel)
+-                return wrapped_(*args_, **kwargs_)
+-
+-            return wrapper_function(wrapped)
+-
+-        else:
+-            raise TypeError(repr(type(wrapped)))
++        return adapter(wrapped)
+ 
+     return functools.partial(deprecated, **kwargs)
+diff --git a/deprecated/sphinx.py b/deprecated/sphinx.py
+index be6dce9..70ef050 100644
+--- a/deprecated/sphinx.py
++++ b/deprecated/sphinx.py
+@@ -22,8 +22,6 @@ when the function/method is called or the class is constructed.
+ import re
+ import textwrap
+ 
+-import wrapt
+-
+ from deprecated.classic import ClassicAdapter
+ from deprecated.classic import deprecated as _classic_deprecated
+ 
+@@ -48,6 +46,7 @@ class SphinxAdapter(ClassicAdapter):
+         version="",
+         action=None,
+         category=DeprecationWarning,
++        extra_stacklevel=0,
+         line_length=70,
+     ):
+         """
+@@ -67,29 +66,40 @@ class SphinxAdapter(ClassicAdapter):
+             If you follow the `Semantic Versioning <https://semver.org/>`_,
+             the version number has the format "MAJOR.MINOR.PATCH".
+ 
+-        :type  action: str
++        :type  action: Literal["default", "error", "ignore", "always", "module", "once"]
+         :param action:
+             A warning filter used to activate or not the deprecation warning.
+             Can be one of "error", "ignore", "always", "default", "module", or "once".
+-            If ``None`` or empty, the the global filtering mechanism is used.
++            If ``None`` or empty, the global filtering mechanism is used.
+             See: `The Warnings Filter`_ in the Python documentation.
+ 
+-        :type  category: type
++        :type  category: Type[Warning]
+         :param category:
+             The warning category to use for the deprecation warning.
+             By default, the category class is :class:`~DeprecationWarning`,
+             you can inherit this class to define your own deprecation warning category.
+ 
++        :type  extra_stacklevel: int
++        :param extra_stacklevel:
++            Number of additional stack levels to consider instrumentation rather than user code.
++            With the default value of 0, the warning refers to where the class was instantiated
++            or the function was called.
++
+         :type  line_length: int
+         :param line_length:
+             Max line length of the directive text. If non nul, a long text is wrapped in several lines.
++
++        .. versionchanged:: 1.2.15
++            Add the *extra_stacklevel* parameter.
+         """
+         if not version:
+             # https://github.com/tantale/deprecated/issues/40
+             raise ValueError("'version' argument is required in Sphinx directives")
+         self.directive = directive
+         self.line_length = line_length
+-        super(SphinxAdapter, self).__init__(reason=reason, version=version, action=action, category=category)
++        super(SphinxAdapter, self).__init__(
++            reason=reason, version=version, action=action, category=category, extra_stacklevel=extra_stacklevel
++        )
+ 
+     def __call__(self, wrapped):
+         """
+@@ -102,7 +112,7 @@ class SphinxAdapter(ClassicAdapter):
+         # -- build the directive division
+         fmt = ".. {directive}:: {version}" if self.version else ".. {directive}::"
+         div_lines = [fmt.format(directive=self.directive, version=self.version)]
+-        width = self.line_length - 3 if self.line_length > 3 else 2 ** 16
++        width = self.line_length - 3 if self.line_length > 3 else 2**16
+         reason = textwrap.dedent(self.reason).strip()
+         for paragraph in reason.splitlines():
+             if paragraph:
+@@ -153,7 +163,7 @@ class SphinxAdapter(ClassicAdapter):
+ 
+         """
+         msg = super(SphinxAdapter, self).get_deprecated_msg(wrapped, instance)
+-        # Strip Sphinx cross reference syntax (like ":function:", ":py:func:" and ":py:meth:")
++        # Strip Sphinx cross-reference syntax (like ":function:", ":py:func:" and ":py:meth:")
+         # Possible values are ":role:`foo`", ":domain:role:`foo`"
+         # where ``role`` and ``domain`` should match "[a-zA-Z]+"
+         msg = re.sub(r"(?: : [a-zA-Z]+ )? : [a-zA-Z]+ : (`[^`]*`)", r"\1", msg, flags=re.X)
+@@ -163,7 +173,7 @@ class SphinxAdapter(ClassicAdapter):
+ def versionadded(reason="", version="", line_length=70):
+     """
+     This decorator can be used to insert a "versionadded" directive
+-    in your function/class docstring in order to documents the
++    in your function/class docstring in order to document the
+     version of the project which adds this new functionality in your library.
+ 
+     :param str reason:
+@@ -193,7 +203,7 @@ def versionadded(reason="", version="", line_length=70):
+ def versionchanged(reason="", version="", line_length=70):
+     """
+     This decorator can be used to insert a "versionchanged" directive
+-    in your function/class docstring in order to documents the
++    in your function/class docstring in order to document the
+     version of the project which modifies this functionality in your library.
+ 
+     :param str reason:
+@@ -222,7 +232,7 @@ def versionchanged(reason="", version="", line_length=70):
+ def deprecated(reason="", version="", line_length=70, **kwargs):
+     """
+     This decorator can be used to insert a "deprecated" directive
+-    in your function/class docstring in order to documents the
++    in your function/class docstring in order to document the
+     version of the project which deprecates this functionality in your library.
+ 
+     :param str reason:
+@@ -242,17 +252,26 @@ def deprecated(reason="", version="", line_length=70, **kwargs):
+     -   "action":
+         A warning filter used to activate or not the deprecation warning.
+         Can be one of "error", "ignore", "always", "default", "module", or "once".
+-        If ``None``, empty or missing, the the global filtering mechanism is used.
++        If ``None``, empty or missing, the global filtering mechanism is used.
+ 
+     -   "category":
+         The warning category to use for the deprecation warning.
+         By default, the category class is :class:`~DeprecationWarning`,
+         you can inherit this class to define your own deprecation warning category.
+ 
++    -   "extra_stacklevel":
++        Number of additional stack levels to consider instrumentation rather than user code.
++        With the default value of 0, the warning refers to where the class was instantiated
++        or the function was called.
++
++
+     :return: a decorator used to deprecate a function.
+ 
+     .. versionchanged:: 1.2.13
+        Change the signature of the decorator to reflect the valid use cases.
++
++    .. versionchanged:: 1.2.15
++        Add the *extra_stacklevel* parameter.
+     """
+     directive = kwargs.pop('directive', 'deprecated')
+     adapter_cls = kwargs.pop('adapter_cls', SphinxAdapter)
+diff --git a/docs/source/tutorial.rst b/docs/source/tutorial.rst
+index 86cf056..00fb237 100644
+--- a/docs/source/tutorial.rst
++++ b/docs/source/tutorial.rst
+@@ -242,3 +242,28 @@ function will raise an exception because the *action* is set to "error".
+      File "path/to/deprecated/classic.py", line 274, in wrapper_function
+        warnings.warn(msg, category=category, stacklevel=_stacklevel)
+    DeprecationWarning: Call to deprecated function (or staticmethod) foo. (do not call it)
++
++
++Modifying the deprecated code reference
++---------------------------------------
++
++By default, when a deprecated function or class is called, the warning message indicates the location of the caller.
++
++The ``extra_stacklevel`` parameter allows customizing the stack level reference in the deprecation warning message.
++
++This parameter is particularly useful in scenarios where you have a factory or utility function that creates deprecated
++objects or performs deprecated operations. By specifying an ``extra_stacklevel`` value, you can control the stack level
++at which the deprecation warning is emitted, making it appear as if the calling function is the deprecated one,
++rather than the actual deprecated entity.
++
++For example, if you have a factory function ``create_object()`` that creates deprecated objects, you can use
++the ``extra_stacklevel`` parameter to emit the deprecation warning at the calling location. This provides clearer and
++more actionable deprecation messages, allowing developers to identify and update the code that invokes the deprecated
++functionality.
++
++For instance:
++
++.. literalinclude:: tutorial/warning_ctrl/extra_stacklevel_demo.py
++
++Please note that the ``extra_stacklevel`` value should be an integer indicating the number of stack levels to skip
++when emitting the deprecation warning.
+diff --git a/docs/source/tutorial/warning_ctrl/extra_stacklevel_demo.py b/docs/source/tutorial/warning_ctrl/extra_stacklevel_demo.py
+new file mode 100644
+index 0000000..3c0516c
+--- /dev/null
++++ b/docs/source/tutorial/warning_ctrl/extra_stacklevel_demo.py
+@@ -0,0 +1,24 @@
++import warnings
++
++from deprecated import deprecated
++
++
++@deprecated(version='1.0', extra_stacklevel=1)
++class MyObject(object):
++    def __init__(self, name):
++        self.name = name
++
++    def __str__(self):
++        return "object: {name}".format(name=self.name)
++
++
++def create_object(name):
++    return MyObject(name)
++
++
++if __name__ == '__main__':
++    warnings.filterwarnings("default", category=DeprecationWarning)
++    # warn here:
++    print(create_object("orange"))
++    # and also here:
++    print(create_object("banane"))

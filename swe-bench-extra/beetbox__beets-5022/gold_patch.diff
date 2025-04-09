@@ -1,0 +1,177 @@
+diff --git a/beets/ui/commands.py b/beets/ui/commands.py
+index 63f25fca..26eb5320 100755
+--- a/beets/ui/commands.py
++++ b/beets/ui/commands.py
+@@ -1506,6 +1506,20 @@ import_cmd.parser.add_option(
+     action="store_false",
+     help="do not skip already-imported directories",
+ )
++import_cmd.parser.add_option(
++    "-R",
++    "--incremental-skip-later",
++    action="store_true",
++    dest="incremental_skip_later",
++    help="do not record skipped files during incremental import",
++)
++import_cmd.parser.add_option(
++    "-r",
++    "--noincremental-skip-later",
++    action="store_false",
++    dest="incremental_skip_later",
++    help="record skipped files during incremental import",
++)
+ import_cmd.parser.add_option(
+     "--from-scratch",
+     dest="from_scratch",
+diff --git a/beetsplug/mbsubmit.py b/beetsplug/mbsubmit.py
+index e4c0f372..d215e616 100644
+--- a/beetsplug/mbsubmit.py
++++ b/beetsplug/mbsubmit.py
+@@ -21,11 +21,13 @@ implemented by MusicBrainz yet.
+ [1] https://wiki.musicbrainz.org/History:How_To_Parse_Track_Listings
+ """
+ 
++import subprocess
+ 
+ from beets import ui
+ from beets.autotag import Recommendation
+ from beets.plugins import BeetsPlugin
+ from beets.ui.commands import PromptChoice
++from beets.util import displayable_path
+ from beetsplug.info import print_data
+ 
+ 
+@@ -37,6 +39,7 @@ class MBSubmitPlugin(BeetsPlugin):
+             {
+                 "format": "$track. $title - $artist ($length)",
+                 "threshold": "medium",
++                "picard_path": "picard",
+             }
+         )
+ 
+@@ -56,7 +59,21 @@ class MBSubmitPlugin(BeetsPlugin):
+ 
+     def before_choose_candidate_event(self, session, task):
+         if task.rec <= self.threshold:
+-            return [PromptChoice("p", "Print tracks", self.print_tracks)]
++            return [
++                PromptChoice("p", "Print tracks", self.print_tracks),
++                PromptChoice("o", "Open files with Picard", self.picard),
++            ]
++
++    def picard(self, session, task):
++        paths = []
++        for p in task.paths:
++            paths.append(displayable_path(p))
++        try:
++            picard_path = self.config["picard_path"].as_str()
++            subprocess.Popen([picard_path] + paths)
++            self._log.info("launched picard from\n{}", picard_path)
++        except OSError as exc:
++            self._log.error(f"Could not open picard, got error:\n{exc}")
+ 
+     def print_tracks(self, session, task):
+         for i in sorted(task.items, key=lambda i: i.track):
+diff --git a/docs/changelog.rst b/docs/changelog.rst
+index c69ec82f..74b925e2 100644
+--- a/docs/changelog.rst
++++ b/docs/changelog.rst
+@@ -17,6 +17,7 @@ Major new features:
+ 
+ New features:
+ 
++* :doc:`plugins/mbsubmit`: add new prompt choices helping further to submit unmatched tracks to MusicBrainz faster.
+ * :doc:`plugins/spotify`: We now fetch track's ISRC, EAN, and UPC identifiers from Spotify when using the ``spotifysync`` command.
+   :bug:`4992`
+ * :doc:`plugins/discogs`: supply a value for the `cover_art_url` attribute, for use by `fetchart`.
+@@ -146,6 +147,7 @@ New features:
+ * :doc:`/plugins/lyrics`: Add LRCLIB as a new lyrics provider and a new
+   `synced` option to prefer synced lyrics over plain lyrics.
+ * :ref:`import-cmd`: Expose import.quiet_fallback as CLI option.
++* :ref:`import-cmd`: Expose `import.incremental_skip_later` as CLI option.
+ 
+ Bug fixes:
+ 
+diff --git a/docs/plugins/mbsubmit.rst b/docs/plugins/mbsubmit.rst
+index 5cb9be8f..0e86ddc6 100644
+--- a/docs/plugins/mbsubmit.rst
++++ b/docs/plugins/mbsubmit.rst
+@@ -1,23 +1,40 @@
+ MusicBrainz Submit Plugin
+ =========================
+ 
+-The ``mbsubmit`` plugin provides an extra prompt choice during an import
+-session and a ``mbsubmit`` command that prints the tracks of the current
+-album in a format that is parseable by MusicBrainz's `track parser`_.
++The ``mbsubmit`` plugin provides extra prompt choices when an import session
++fails to find a good enough match for a release. Additionally, it provides an
++``mbsubmit`` command that prints the tracks of the current album in a format
++that is parseable by MusicBrainz's `track parser`_. The prompt choices are:
++
++- Print the tracks to stdout in a format suitable for MusicBrainz's `track
++  parser`_.
++
++- Open the program `Picard`_ with the unmatched folder as an input, allowing
++  you to start submitting the unmatched release to MusicBrainz with many input
++  fields already filled in, thanks to Picard reading the preexisting tags of
++  the files.
++
++For the last option, `Picard`_ is assumed to be installed and available on the
++machine including a ``picard`` executable. Picard developers list `download
++options`_. `other GNU/Linux distributions`_ may distribute Picard via their
++package manager as well.
+ 
+ .. _track parser: https://wiki.musicbrainz.org/History:How_To_Parse_Track_Listings
++.. _Picard: https://picard.musicbrainz.org/
++.. _download options: https://picard.musicbrainz.org/downloads/
++.. _other GNU/Linux distributions: https://repology.org/project/picard-tagger/versions
+ 
+ Usage
+ -----
+ 
+ Enable the ``mbsubmit`` plugin in your configuration (see :ref:`using-plugins`)
+-and select the ``Print tracks`` choice which is by default displayed when no
+-strong recommendations are found for the album::
++and select one of the options mentioned above. Here the option ``Print tracks``
++choice is demonstrated::
+ 
+     No matching release found for 3 tracks.
+     For help, see: https://beets.readthedocs.org/en/latest/faq.html#nomatch
+     [U]se as-is, as Tracks, Group albums, Skip, Enter search, enter Id, aBort,
+-    Print tracks? p
++    Print tracks, Open files with Picard? p
+     01. An Obscure Track - An Obscure Artist (3:37)
+     02. Another Obscure Track - An Obscure Artist (2:05)
+     03. The Third Track - Another Obscure Artist (3:02)
+@@ -53,6 +70,11 @@ file. The following options are available:
+   Default: ``medium`` (causing the choice to be displayed for all albums that
+   have a recommendation of medium strength or lower). Valid values: ``none``,
+   ``low``, ``medium``, ``strong``.
++- **picard_path**: The path to the ``picard`` executable. Could be an absolute
++  path, and if not, ``$PATH`` is consulted. The default value is simply
++  ``picard``. Windows users will have to find and specify the absolute path to
++  their ``picard.exe``. That would probably be:
++  ``C:\Program Files\MusicBrainz Picard\picard.exe``.
+ 
+ Please note that some values of the ``threshold`` configuration option might
+ require other ``beets`` command line switches to be enabled in order to work as
+diff --git a/docs/reference/cli.rst b/docs/reference/cli.rst
+index a2997c70..8caf7076 100644
+--- a/docs/reference/cli.rst
++++ b/docs/reference/cli.rst
+@@ -115,6 +115,15 @@ Optional command flags:
+   time, when no subdirectories will be skipped. So consider enabling the
+   ``incremental`` configuration option.
+ 
++* If you don't want to record skipped files during an *incremental* import, use
++  the ``--incremental-skip-later`` flag which corresponds to the 
++  ``incremental_skip_later`` configuration option.
++  Setting the flag prevents beets from persisting skip decisions during a
++  non-interactive import so that a user can make a decision regarding
++  previously skipped files during a subsequent interactive import run.
++  To record skipped files during incremental import explicitly, use the
++  ``--noincremental-skip-later`` option.
++
+ * When beets applies metadata to your music, it will retain the value of any
+   existing tags that weren't overwritten, and import them into the database. You
+   may prefer to only use existing metadata for finding matches, and to erase it

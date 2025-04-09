@@ -1,0 +1,152 @@
+diff --git a/starlette/formparsers.py b/starlette/formparsers.py
+index 4d6580c..6d83320 100644
+--- a/starlette/formparsers.py
++++ b/starlette/formparsers.py
+@@ -1,9 +1,11 @@
+-from enum import Enum
+-from starlette.datastructures import Headers
+-import asyncio
+ import io
+-import tempfile
+ import typing
++import asyncio
++import tempfile
++from enum import Enum
++from urllib.parse import unquote
++
++from starlette.datastructures import Headers
+ 
+ try:
+     from multipart.multipart import parse_options_header
+@@ -69,27 +71,22 @@ class FormParser:
+         self.messages = []  # type: typing.List[typing.Tuple[FormMessage, bytes]]
+ 
+     def on_field_start(self) -> None:
+-        print("on_field_start")
+         message = (FormMessage.FIELD_START, b"")
+         self.messages.append(message)
+ 
+     def on_field_name(self, data: bytes, start: int, end: int) -> None:
+-        print("on_field_name")
+         message = (FormMessage.FIELD_NAME, data[start:end])
+         self.messages.append(message)
+ 
+     def on_field_data(self, data: bytes, start: int, end: int) -> None:
+-        print("on_field_data")
+         message = (FormMessage.FIELD_DATA, data[start:end])
+         self.messages.append(message)
+ 
+     def on_field_end(self) -> None:
+-        print("on_field_end")
+         message = (FormMessage.FIELD_END, b"")
+         self.messages.append(message)
+ 
+     def on_end(self) -> None:
+-        print("on_end")
+         message = (FormMessage.END, b"")
+         self.messages.append(message)
+ 
+@@ -127,7 +124,9 @@ class FormParser:
+                 elif message_type == FormMessage.FIELD_DATA:
+                     field_value += message_bytes
+                 elif message_type == FormMessage.FIELD_END:
+-                    result[field_name.decode("latin-1")] = field_value.decode("latin-1")
++                    result[field_name.decode("latin-1")] = unquote(
++                        field_value.decode("latin-1")
++                    )
+                 elif message_type == FormMessage.END:
+                     pass
+ 
+diff --git a/starlette/responses.py b/starlette/responses.py
+index 3471fbf..09ac58f 100644
+--- a/starlette/responses.py
++++ b/starlette/responses.py
+@@ -1,15 +1,16 @@
+-import hashlib
+ import os
+-import typing
+ import json
+-
++import stat
++import typing
++import hashlib
++import http.cookies
+ from email.utils import formatdate
+ from mimetypes import guess_type
++from urllib.parse import quote_plus
++
+ from starlette.background import BackgroundTask
+ from starlette.datastructures import MutableHeaders, URL
+ from starlette.types import Receive, Send
+-from urllib.parse import quote_plus
+-import http.cookies
+ 
+ try:
+     import aiofiles
+@@ -227,8 +228,15 @@ class FileResponse(Response):
+ 
+     async def __call__(self, receive: Receive, send: Send) -> None:
+         if self.stat_result is None:
+-            stat_result = await aio_stat(self.path)
+-            self.set_stat_headers(stat_result)
++            try:
++                stat_result = await aio_stat(self.path)
++                self.set_stat_headers(stat_result)
++            except FileNotFoundError:
++                raise RuntimeError(f"File at path {self.path} does not exist.")
++            else:
++                mode = stat_result.st_mode
++                if not stat.S_ISREG(mode):
++                    raise RuntimeError(f"File at path {self.path} is not a file.")
+         await send(
+             {
+                 "type": "http.response.start",
+diff --git a/starlette/staticfiles.py b/starlette/staticfiles.py
+index eb8f748..b9b54cf 100644
+--- a/starlette/staticfiles.py
++++ b/starlette/staticfiles.py
+@@ -7,17 +7,6 @@ from starlette.responses import PlainTextResponse, FileResponse, Response
+ from starlette.types import Send, Receive, Scope, ASGIInstance
+ 
+ 
+-class StaticFile:
+-    def __init__(self, *, path: str) -> None:
+-        self.path = path
+-
+-    def __call__(self, scope: Scope) -> ASGIInstance:
+-        assert scope["type"] == "http"
+-        if scope["method"] not in ("GET", "HEAD"):
+-            return PlainTextResponse("Method Not Allowed", status_code=405)
+-        return _StaticFileResponder(scope, path=self.path)
+-
+-
+ class StaticFiles:
+     def __init__(self, *, directory: str) -> None:
+         self.directory = directory
+@@ -39,25 +28,6 @@ class StaticFiles:
+         return _StaticFilesResponder(scope, path=path, check_directory=check_directory)
+ 
+ 
+-class _StaticFileResponder:
+-    def __init__(self, scope: Scope, path: str) -> None:
+-        self.scope = scope
+-        self.path = path
+-
+-    async def __call__(self, receive: Receive, send: Send) -> None:
+-        try:
+-            stat_result = await aio_stat(self.path)
+-        except FileNotFoundError:
+-            raise RuntimeError("StaticFile at path '%s' does not exist." % self.path)
+-        else:
+-            mode = stat_result.st_mode
+-            if not stat.S_ISREG(mode):
+-                raise RuntimeError("StaticFile at path '%s' is not a file." % self.path)
+-
+-        response = FileResponse(self.path, stat_result=stat_result)
+-        await response(receive, send)
+-
+-
+ class _StaticFilesResponder:
+     def __init__(self, scope: Scope, path: str, check_directory: str = None) -> None:
+         self.scope = scope
+

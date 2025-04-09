@@ -1,0 +1,193 @@
+diff --git a/changelog.txt b/changelog.txt
+index 3d171bac..7c598d41 100644
+--- a/changelog.txt
++++ b/changelog.txt
+@@ -25,6 +25,7 @@ Added
+ +++++
+ 
+  - Adds an ``H5Store`` class, useful for storing array-like data with an HDF5 backend. Accessible via ``with job.data:`` or ``with project.data:``.
++ - Adds the ``signac.get_job()`` and the ``signac.Project.get_job()`` functions which allow users to get a job handle by switching into or providing the job's workspace directory.
+  - Add automatic cast of numpy arrays to lists when storing them within a `JSONDict`, e.g., a `job.statepoint` or `job.document`.
+  - Enable `Collection` class to manage collections stored in gzip files.
+  - Enable deleting of `JSONDict` keys through the attribute interface, e.g., `del job.doc.foo`.
+diff --git a/signac/__init__.py b/signac/__init__.py
+index 1104dd20..ec64fe41 100644
+--- a/signac/__init__.py
++++ b/signac/__init__.py
+@@ -21,6 +21,7 @@ from .contrib import Project
+ from .contrib import TemporaryProject
+ from .contrib import get_project
+ from .contrib import init_project
++from .contrib import get_job
+ from .contrib import fetch
+ from .contrib import export_one
+ from .contrib import export
+@@ -46,7 +47,7 @@ __version__ = '0.9.5'
+ 
+ __all__ = ['__version__', 'contrib', 'db', 'errors', 'warnings', 'sync',
+            'cite',
+-           'Project', 'TemporaryProject', 'get_project', 'init_project',
++           'Project', 'TemporaryProject', 'get_project', 'init_project', 'get_job',
+            'get_database', 'fetch', 'fetch_one',
+            'export_one', 'export', 'export_to_mirror',
+            'Collection',
+diff --git a/signac/__main__.py b/signac/__main__.py
+index 0dcd74f8..dcf5fa02 100644
+--- a/signac/__main__.py
++++ b/signac/__main__.py
+@@ -95,7 +95,7 @@ Total transfer volume:       {stats.volume}
+ SHELL_BANNER = """Python {python_version}
+ signac {signac_version}
+ 
+-Project:\t{project_id}
++Project:\t{project_id}{job_banner}
+ Root:\t\t{root_path}
+ Workspace:\t{workspace_path}
+ Size:\t\t{size}
+@@ -558,6 +558,7 @@ def _main_import_interactive(project, origin, args):
+                     python_version=sys.version,
+                     signac_version=__version__,
+                     project_id=project.get_id(),
++                    job_banner='',
+                     root_path=project.root_directory(),
+                     workspace_path=project.workspace(),
+                     size=len(project),
+@@ -958,7 +959,13 @@ def main_shell(args):
+             for _id in _jobs:
+                 yield project.open_job(id=_id)
+ 
+-        job = _open_job_by_id(project, list(_jobs)[0]) if len(_jobs) == 1 else None
++        if len(_jobs) == 1:
++            job = _open_job_by_id(project, list(_jobs)[0])
++        else:
++            try:
++                job = project.get_job()
++            except LookupError:
++                job = None
+ 
+         local_ns = dict(
+             project=project, pr=project,
+@@ -988,6 +995,7 @@ def main_shell(args):
+                     python_version=sys.version,
+                     signac_version=__version__,
+                     project_id=project.get_id(),
++                    job_banner='\nJob:\t\t{job._id}'.format(job=job) if job is not None else '',
+                     root_path=project.root_directory(),
+                     workspace_path=project.workspace(),
+                     size=len(project)))
+diff --git a/signac/contrib/__init__.py b/signac/contrib/__init__.py
+index 8db2b3a8..c886d89d 100644
+--- a/signac/contrib/__init__.py
++++ b/signac/contrib/__init__.py
+@@ -7,7 +7,7 @@ import logging
+ from . import indexing
+ from .project import Project
+ from .project import TemporaryProject
+-from .project import get_project, init_project
++from .project import get_project, init_project, get_job
+ from .indexing import BaseCrawler
+ from .indexing import RegexFileCrawler
+ from .indexing import JSONCrawler
+@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
+ 
+ __all__ = [
+     'indexing',
+-    'Project', 'TemporaryProject', 'get_project', 'init_project',
++    'Project', 'TemporaryProject', 'get_project', 'init_project', 'get_job',
+     'BaseCrawler', 'RegexFileCrawler', 'JSONCrawler', 'SignacProjectCrawler',
+     'MasterCrawler', 'fetch', 'fetch_one', 'fetched',
+     'export_one', 'export', 'export_to_mirror', 'export_pymongo',
+diff --git a/signac/contrib/job.py b/signac/contrib/job.py
+index bebf23d1..beb986fa 100644
+--- a/signac/contrib/job.py
++++ b/signac/contrib/job.py
+@@ -92,7 +92,7 @@ class Job(object):
+         return self._id
+ 
+     def __hash__(self):
+-        return hash(self._wd)
++        return hash(os.path.realpath(self._wd))
+ 
+     def __str__(self):
+         "Returns the job's id."
+diff --git a/signac/contrib/project.py b/signac/contrib/project.py
+index 4c4bf49a..e68a52ff 100644
+--- a/signac/contrib/project.py
++++ b/signac/contrib/project.py
+@@ -1518,7 +1518,7 @@ class Project(object):
+         :param search:
+             If True, search for project configurations inside and above
+             the specified root directory, otherwise only return projects
+-            with a root directory identical to the specified root arugment.
++            with a root directory identical to the specified root argument.
+         :type search: bool
+         :returns: The project handle.
+         :raises LookupError: If no project configuration can be found.
+@@ -1531,6 +1531,38 @@ class Project(object):
+                 "Unable to determine project id for path '{}'.".format(os.path.abspath(root)))
+         return cls(config=config)
+ 
++    @classmethod
++    def get_job(cls, root=None):
++        """Find a Job in or above the current working directory (or provided path).
++
++        :param root: The job root directory.
++            If no root directory is given, the current working directory is
++            assumed to be the job directory.
++        :type root: str
++        :returns: The job handle.
++        :raises LookupError: If this job cannot be found."""
++        if root is None:
++            root = os.getcwd()
++        root = os.path.abspath(root)
++
++        # Ensure the root path exists, which is not guaranteed by the regex match
++        if not os.path.exists(root):
++            raise LookupError("Path does not exist: '{}'.".format(root))
++
++        # Find the last match instance of a job id
++        results = list(re.finditer(JOB_ID_REGEX, root))
++        if len(results) == 0:
++            raise LookupError("Could not find a job id in path '{}'.".format(root))
++        match = results[-1]
++        job_id = match.group(0)
++        job_root = root[:match.end()]
++
++        # Find a project *above* the root directory (avoid finding nested projects)
++        project = cls.get_project(os.path.join(job_root, os.pardir))
++
++        # Return the matched job id from the found project
++        return project.open_job(id=job_id)
++
+ 
+ @contextmanager
+ def TemporaryProject(name=None, cls=None, **kwargs):
+@@ -1836,6 +1868,28 @@ def get_project(root=None, search=True):
+         with a root directory identical to the specified root arugment.
+     :type search: bool
+     :returns: The project handle.
++    :rtype: :py:class:`~.Project`
+     :raises LookupError: If no project configuration can be found.
+     """
+     return Project.get_project(root=root, search=search)
++
++
++def get_job(root=None):
++    """Find a Job in or above the current working directory (or provided path).
++
++    :param root: The job root directory.
++        If no root directory is given, the current working directory is
++        assumed to be within the current job workspace directory.
++    :type root: str
++    :returns: The job handle.
++    :raises LookupError: If this job cannot be found.
++
++    For example, when the current directory is a job workspace directory:
++
++    .. code-block:: python
++
++        >>> signac.get_job()
++        signac.contrib.job.Job(project=..., statepoint={...})
++
++    """
++    return Project.get_job(root=root)

@@ -1,0 +1,420 @@
+diff --git a/jacquard/experiments/commands.py b/jacquard/experiments/commands.py
+index ffeb602..cf7e84b 100644
+--- a/jacquard/experiments/commands.py
++++ b/jacquard/experiments/commands.py
+@@ -3,8 +3,10 @@
+ import yaml
+ import pathlib
+ import datetime
++import dateutil.tz
+ 
+ from jacquard.commands import BaseCommand
++from .experiment import Experiment
+ 
+ 
+ class Launch(BaseCommand):
+@@ -25,26 +27,20 @@ class Launch(BaseCommand):
+     def handle(self, config, options):
+         """Run command."""
+         with config.storage.transaction() as store:
+-            try:
+-                experiment_config = store[
+-                    'experiments/%s' % options.experiment
+-                ]
+-            except KeyError:
+-                print("Experiment %r not configured" % options.experiment)
+-                return
++            experiment = Experiment.from_store(store, options.experiment)
+ 
+             current_experiments = store.get('active-experiments', [])
+ 
+-            if options.experiment in current_experiments:
+-                print("Experiment %r already launched!" % options.experiment)
++            if experiment.id in current_experiments:
++                print("Experiment %r already launched!" % experiment.id)
+                 return
+ 
+             store['active-experiments'] = (
+                 current_experiments + [options.experiment]
+             )
+ 
+-            experiment_config['launched'] = str(datetime.datetime.utcnow())
+-            store['experiments/%s' % options.experiment] = experiment_config
++            experiment.launched = datetime.datetime.now(dateutil.tz.tzutc())
++            experiment.save(store)
+ 
+ 
+ class Conclude(BaseCommand):
+@@ -78,13 +74,7 @@ class Conclude(BaseCommand):
+     def handle(self, config, options):
+         """Run command."""
+         with config.storage.transaction() as store:
+-            try:
+-                experiment_config = store[
+-                    'experiments/%s' % options.experiment
+-                ]
+-            except KeyError:
+-                print("Experiment %r not configured" % options.experiment)
+-                return
++            experiment = Experiment.from_store(store, options.experiment)
+ 
+             current_experiments = store.get('active-experiments', [])
+ 
+@@ -98,18 +88,12 @@ class Conclude(BaseCommand):
+                 defaults = store.get('defaults', {})
+ 
+                 # Find branch matching ID
+-                for branch in experiment_config['branches']:
+-                    if branch['id'] == options.branch:
+-                        defaults.update(branch['settings'])
+-                        break
+-                else:
+-                    print("Cannot find branch %r" % options.branch)
+-                    return
++                defaults.update(experiment.branch(options.branch)['settings'])
+ 
+                 store['defaults'] = defaults
+ 
+-            experiment_config['concluded'] = str(datetime.datetime.utcnow())
+-            store['experiments/%s' % options.experiment] = experiment_config
++            experiment.concluded = datetime.datetime.now(dateutil.tz.tzutc())
++            experiment.save(store)
+ 
+             store['active-experiments'] = current_experiments
+ 
+@@ -146,15 +130,46 @@ class Load(BaseCommand):
+             print("No branches specified.")
+             return
+ 
+-        experiment_id = definition['id']
++        experiment = Experiment.from_json(definition)
+ 
+         with config.storage.transaction() as store:
+             live_experiments = store.get('active-experiments', ())
+ 
+-            if experiment_id in live_experiments:
++            if experiment.id in live_experiments:
+                 print(
+-                    "Experiment %r is live, refusing to edit" % experiment_id,
++                    "Experiment %r is live, refusing to edit" % experiment.id,
+                 )
+                 return
+ 
+-            store['experiments/%s' % experiment_id] = definition
++            experiment.save(store)
++
++
++class ListExperiments(BaseCommand):
++    """
++    List all experiments.
++
++    Mostly useful in practice when one cannot remember the ID of an experiment.
++    """
++
++    help = "list all experiments"
++
++    def handle(self, config, options):
++        """Run command."""
++        with config.storage.transaction() as store:
++            for experiment in Experiment.enumerate(store):
++                if experiment.name == experiment.id:
++                    title = experiment.id
++                else:
++                    title = '%s: %s' % (experiment.id, experiment.name)
++                print(title)
++                print('=' * len(title))
++                print()
++                if experiment.launched:
++                    print('Launched: %s' % experiment.launched)
++                    if experiment.concluded:
++                        print('Concluded: %s' % experiment.concluded)
++                    else:
++                        print('In progress')
++                else:
++                    print('Not yet launched')
++                print()
+diff --git a/jacquard/experiments/experiment.py b/jacquard/experiments/experiment.py
+new file mode 100644
+index 0000000..0c732e7
+--- /dev/null
++++ b/jacquard/experiments/experiment.py
+@@ -0,0 +1,124 @@
++"""Experiment definition abstraction class."""
++
++import contextlib
++import dateutil.parser
++
++
++class Experiment(object):
++    """
++    The definition of an experiment.
++
++    This is essentially a plain-old-data class with utility methods for
++    canonical serialisation and deserialisation of various flavours.
++    """
++
++    def __init__(
++        self,
++        experiment_id,
++        branches,
++        *,
++        constraints=None,
++        name=None,
++        launched=None,
++        concluded=None
++    ):
++        """Base constructor. Takes all the arguments."""
++        self.id = experiment_id
++        self.branches = branches
++        self.constraints = constraints or {}
++        self.name = name or self.id
++        self.launched = launched
++        self.concluded = concluded
++
++    @classmethod
++    def from_json(cls, obj):
++        """
++        Create instance from a JSON-esque definition.
++
++        Required keys: id, branches
++
++        Optional keys: name, constraints, launched, concluded
++        """
++        kwargs = {}
++
++        with contextlib.suppress(KeyError):
++            kwargs['name'] = obj['name']
++
++        with contextlib.suppress(KeyError):
++            kwargs['constraints'] = obj['constraints']
++
++        with contextlib.suppress(KeyError):
++            kwargs['launched'] = dateutil.parser.parse(obj['launched'])
++
++        with contextlib.suppress(KeyError):
++            kwargs['concluded'] = dateutil.parser.parse(obj['concluded'])
++
++        return cls(obj['id'], obj['branches'], **kwargs)
++
++    @classmethod
++    def from_store(cls, store, experiment_id):
++        """Create instance from a store lookup by ID."""
++        json_repr = dict(store['experiments/%s' % experiment_id])
++        # Be resilient to missing ID
++        if 'id' not in json_repr:
++            json_repr['id'] = experiment_id
++        return cls.from_json(json_repr)
++
++    @classmethod
++    def enumerate(cls, store):
++        """
++        Iterator over all named experiments in a store.
++
++        Includes inactive experiments.
++        """
++        prefix = 'experiments/'
++
++        for key in store:
++            if not key.startswith(prefix):
++                continue
++
++            experiment_id = key[len(prefix):]
++            yield cls.from_store(store, experiment_id)
++
++    def to_json(self):
++        """Serialise as canonical JSON."""
++        representation = {
++            'id': self.id,
++            'branches': self.branches,
++            'constraints': self.constraints,
++            'name': self.name,
++            'launched': str(self.launched),
++            'concluded': str(self.concluded),
++        }
++
++        if not representation['constraints']:
++            del representation['constraints']
++
++        if representation['name'] == self.id:
++            del representation['name']
++
++        if representation['launched'] == 'None':
++            del representation['launched']
++
++        if representation['concluded'] == 'None':
++            del representation['concluded']
++
++        return representation
++
++    def save(self, store):
++        """Save into the given store using the ID as the key."""
++        store['experiments/%s' % self.id] = self.to_json()
++
++    def branch(self, branch_id):
++        """
++        Get the branch with a given ID.
++
++        In case of multiple branches with the same ID (which should Never Ever
++        Happen), behaviour is undefined.
++
++        If there is no such branch, LookupErrors will materialise.
++        """
++        for branch in self.branches:
++            if branch['id'] == branch_id:
++                return branch
++        raise LookupError("No such branch: %r" % branch_id)
+diff --git a/jacquard/service/wsgi.py b/jacquard/service/wsgi.py
+index 594e003..b0745da 100644
+--- a/jacquard/service/wsgi.py
++++ b/jacquard/service/wsgi.py
+@@ -7,6 +7,7 @@ import werkzeug.exceptions
+ from jacquard.users import get_settings
+ from jacquard.users.settings import branch_hash
+ from jacquard.experiments.constraints import meets_constraints
++from jacquard.experiments.experiment import Experiment
+ 
+ 
+ def on_root(config):
+@@ -44,23 +45,17 @@ def on_experiments(config):
+     """
+     with config.storage.transaction() as store:
+         active_experiments = store.get('active-experiments', ())
+-        experiments = []
+-
+-        for key in store:
+-            if not key.startswith('experiments/'):
+-                continue
+-            definition = store[key]
+-            experiments.append(definition)
++        experiments = list(Experiment.enumerate(store))
+ 
+     return [
+         {
+-            'id': experiment['id'],
+-            'url': '/experiment/%s' % experiment['id'],
++            'id': experiment.id,
++            'url': '/experiment/%s' % experiment.id,
+             'state':
+                 'active'
+-                if experiment['id'] in active_experiments
++                if experiment.id in active_experiments
+                 else 'inactive',
+-            'name': experiment.get('name', experiment['id']),
++            'name': experiment.name,
+         }
+         for experiment in experiments
+     ]
+@@ -78,15 +73,13 @@ def on_experiment(config, experiment):
+     Provided for reporting tooling which runs statistics.
+     """
+     with config.storage.transaction() as store:
+-        experiment_config = store['experiments/%s' % experiment]
++        experiment_config = Experiment.from_store(store, experiment)
+ 
+-    branch_ids = [branch['id'] for branch in experiment_config['branches']]
++    branch_ids = [branch['id'] for branch in experiment_config.branches]
+     branches = {x: [] for x in branch_ids}
+ 
+-    constraints = experiment_config.get('constraints', {})
+-
+     for user_entry in config.directory.all_users():
+-        if not meets_constraints(constraints, user_entry):
++        if not meets_constraints(experiment_config.constraints, user_entry):
+             continue
+ 
+         branch_id = branch_ids[
+@@ -97,10 +90,10 @@ def on_experiment(config, experiment):
+         branches[branch_id].append(user_entry.id)
+ 
+     return {
+-        'id': experiment_config['id'],
+-        'name': experiment_config.get('name', experiment_config['id']),
+-        'launched': experiment_config.get('launched'),
+-        'concluded': experiment_config.get('concluded'),
++        'id': experiment_config.id,
++        'name': experiment_config.name,
++        'launched': experiment_config.launched,
++        'concluded': experiment_config.concluded,
+         'branches': branches,
+     }
+ 
+diff --git a/jacquard/storage/dummy.py b/jacquard/storage/dummy.py
+index c3e4c34..ca7dfc4 100644
+--- a/jacquard/storage/dummy.py
++++ b/jacquard/storage/dummy.py
+@@ -24,6 +24,10 @@ class DummyStore(StorageEngine):
+         else:
+             self.data = {}
+ 
++    def __getitem__(self, key):
++        """Direct item access. This is for test usage."""
++        return json.loads(self.data.get(key, 'null'))
++
+     def begin(self):
+         """Begin transaction."""
+         pass
+diff --git a/jacquard/users/settings.py b/jacquard/users/settings.py
+index 21c1687..1063f88 100644
+--- a/jacquard/users/settings.py
++++ b/jacquard/users/settings.py
+@@ -2,6 +2,7 @@
+ 
+ import hashlib
+ 
++from jacquard.experiments.experiment import Experiment
+ from jacquard.experiments.constraints import meets_constraints
+ 
+ 
+@@ -20,32 +21,30 @@ def get_settings(user_id, storage, directory=None):
+         live_experiments = store.get('active-experiments', [])
+ 
+         experiment_definitions = [
+-            {**store['experiments/%s' % x], 'id': x}
++            Experiment.from_store(store, x)
+             for x in live_experiments
+         ]
+         overrides = store.get('overrides/%s' % user_id, {})
+ 
+     experiment_settings = {}
+ 
+-    for experiment_def in experiment_definitions:
+-        constraints = experiment_def.get('constraints', {})
+-
+-        if constraints:
++    for experiment in experiment_definitions:
++        if experiment.constraints:
+             if directory is None:
+                 raise ValueError(
+                     "Cannot evaluate constraints on experiment %r "
+-                    "with no directory" % experiment_def['id'],
++                    "with no directory" % experiment.id,
+                 )
+ 
+             user_entry = directory.lookup(user_id)
+ 
+-            if not meets_constraints(constraints, user_entry):
++            if not meets_constraints(experiment.constraints, user_entry):
+                 continue
+ 
+-        branch = experiment_def['branches'][branch_hash(
+-            experiment_def['id'],
++        branch = experiment.branches[branch_hash(
++            experiment.id,
+             user_id,
+-        ) % len(experiment_def['branches'])]
++        ) % len(experiment.branches)]
+         experiment_settings.update(branch['settings'])
+ 
+     return {**defaults, **experiment_settings, **overrides}
+diff --git a/setup.py b/setup.py
+index 760e76f..d0102b6 100644
+--- a/setup.py
++++ b/setup.py
+@@ -68,6 +68,7 @@ setup(
+             'launch = jacquard.experiments.commands:Launch',
+             'conclude = jacquard.experiments.commands:Conclude',
+             'load-experiment = jacquard.experiments.commands:Load',
++            'list = jacquard.experiments.commands:ListExperiments',
+             'list-users = jacquard.directory.commands:ListUsers',
+         ),
+         'jacquard.directory_engines': (

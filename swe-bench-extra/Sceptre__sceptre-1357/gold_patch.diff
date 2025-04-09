@@ -1,0 +1,276 @@
+diff --git a/docs/_source/docs/hooks.rst b/docs/_source/docs/hooks.rst
+index a1eeef6..9a3bc82 100644
+--- a/docs/_source/docs/hooks.rst
++++ b/docs/_source/docs/hooks.rst
+@@ -44,23 +44,105 @@ Available Hooks
+ cmd
+ ~~~
+ 
+-Executes the argument string in the shell as a Python subprocess.
+-
+-For more information about how this works, see the `subprocess documentation`_
++Executes a command through the shell.
+ 
+ Syntax:
+ 
+ .. code-block:: yaml
+ 
++   # Default shell.
+    <hook_point>:
+      - !cmd <shell_command>
+ 
+-Example:
++   # Another shell.
++   <hook_point>:
++     - !cmd
++         run: <shell_command>
++         shell: <shell_name_or_path>
++
++Pass the command string as the only argument to use the default shell.
++
++On POSIX the default shell is ``sh``. On Windows it's usually ``cmd.exe``, but ``%ComSpec%`` may
++override that.
++
++Write the command string as you would type it at the shell prompt. This includes quotes and
++backslashes to escape filenames with spaces in them. To minimize escaping, you can use YAML plain
++strings like the following examples.
++
++.. code-block:: yaml
++
++   hooks:
++     before_update:
++       - !cmd echo "Hello, world!"
++
++A successful command prints its standard output messages between status messages from Sceptre.
++
++.. code-block::
++
++   [2023-09-03 01:06:28] - test - Launching Stack
++   [2023-09-03 01:06:29] - test - Stack is in the CREATE_COMPLETE state
++   Hello, world!
++   [2023-09-03 01:06:31] - test - Updating Stack
++   [2023-09-03 01:06:31] - test - No updates to perform.
++
++Pass named arguments to use a different shell. Here the command string is called ``run`` and the
++shell executable is called ``shell``.
++
++Write the executable name as you would type it at an interactive prompt to start the shell. For
++example, if Bash is in the system path, you can write ``bash``; otherwise, you need to write the
++absolute path such as ``/bin/bash``.
++
++.. code-block:: yaml
++
++   hooks:
++     before_update:
++       - !cmd
++           run: echo "Hello, $0!"
++           shell: bash
++
++.. code-block:: text
++
++   [2023-09-04 00:29:42] - test - Launching Stack
++   [2023-09-04 00:29:43] - test - Stack is in the CREATE_COMPLETE state
++   Hello, bash!
++   [2023-09-04 00:29:43] - test - Updating Stack
++   [2023-09-04 00:29:43] - test - No updates to perform.
++
++You can use PowerShell in the same way.
++
++.. code-block:: yaml
++
++   hooks:
++     before_update:
++       - !cmd
++           run: Write-Output "Hello, Posh!"
++           shell: pwsh
++
++.. code-block:: text
++
++   [2023-09-04 00:44:32] - test - Launching Stack
++   [2023-09-04 00:44:33] - test - Stack is in the CREATE_COMPLETE state
++   Hello, Posh!
++   [2023-09-04 00:44:34] - test - Updating Stack
++   [2023-09-04 00:44:34] - test - No updates to perform.
++
++If the shell command fails, so does Sceptre. Its output sits between Sceptre's status
++messages and a Python traceback.
+ 
+ .. code-block:: yaml
+ 
+-   before_create:
+-     - !cmd "echo hello"
++   hooks:
++     before_update:
++       - !cmd missing_command
++
++.. code-block:: text
++
++   [2023-09-04 00:46:25] - test - Launching Stack
++   [2023-09-04 00:46:26] - test - Stack is in the CREATE_COMPLETE state
++   /bin/sh: 1: missing_command: not found
++   Traceback (most recent call last):
++   <snip>
++   subprocess.CalledProcessError: Command 'missing_command' returned non-zero exit status 127.
+ 
+ asg_scaling_processes
+ ~~~~~~~~~~~~~~~~~~~~~
+diff --git a/sceptre/cli/list.py b/sceptre/cli/list.py
+index 6f11bd2..c9b7b0c 100644
+--- a/sceptre/cli/list.py
++++ b/sceptre/cli/list.py
+@@ -5,6 +5,8 @@ from sceptre.context import SceptreContext
+ from sceptre.cli.helpers import catch_exceptions, write
+ from sceptre.plan.plan import SceptrePlan
+ 
++from typing import List, Dict
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -46,12 +48,67 @@ def list_resources(ctx, path):
+     write(responses, context.output_format)
+ 
+ 
++# flake8: noqa: C901
++def write_outputs(export, responses, plan, context):
++    """
++    Helper function for list outputs.
++    """
++    # Legacy. This option was added in the initial commit of the project,
++    # although its intended use case is unclear. It may relate to a feature
++    # that had been removed prior to the initial commit.
++    if export == "envvar":
++        for response in responses:
++            for stack in response.values():
++                for output in stack:
++                    write(
++                        "export SCEPTRE_{0}='{1}'".format(
++                            output.get("OutputKey"), output.get("OutputValue")
++                        ),
++                        "text",
++                    )
++
++    # Format outputs as !stack_output references.
++    elif export == "stackoutput":
++        for response in responses:
++            for stack_name, stack in response.items():
++                for output in stack:
++                    write(
++                        "!stack_output {0}.yaml::{1} [{2}]".format(
++                            stack_name,
++                            output.get("OutputKey"),
++                            output.get("OutputValue"),
++                        ),
++                        "text",
++                    )
++
++    # Format outputs as !stack_output_external references.
++    elif export == "stackoutputexternal":
++        stack_names = {stack.name: stack.external_name for stack in plan.graph}
++        for response in responses:
++            for stack_name, stack in response.items():
++                for output in stack:
++                    write(
++                        "!stack_output_external {0}::{1} [{2}]".format(
++                            stack_names[stack_name],
++                            output.get("OutputKey"),
++                            output.get("OutputValue"),
++                        ),
++                        "text",
++                    )
++
++    # Legacy. The output here is somewhat confusing in that
++    # outputs are organised in keys that only have meaning inside
++    # Sceptre.
++    else:
++        write(responses, context.output_format)
++
++
+ @list_group.command(name="outputs")
+ @click.argument("path")
+ @click.option(
+     "-e",
+     "--export",
+-    type=click.Choice(["envvar"]),
++    type=click.Choice(["envvar", "stackoutput", "stackoutputexternal"]),
+     help="Specify the export formatting.",
+ )
+ @click.pass_context
+@@ -60,7 +117,6 @@ def list_outputs(ctx, path, export):
+     """
+     List outputs for stack.
+     \f
+-
+     :param path: Path to execute the command on.
+     :type path: str
+     :param export: Specify the export formatting.
+@@ -79,18 +135,7 @@ def list_outputs(ctx, path, export):
+     plan = SceptrePlan(context)
+     responses = [response for response in plan.describe_outputs().values() if response]
+ 
+-    if export == "envvar":
+-        for response in responses:
+-            for stack in response.values():
+-                for output in stack:
+-                    write(
+-                        "export SCEPTRE_{0}='{1}'".format(
+-                            output.get("OutputKey"), output.get("OutputValue")
+-                        ),
+-                        "text",
+-                    )
+-    else:
+-        write(responses, context.output_format)
++    write_outputs(export, responses, plan, context)
+ 
+ 
+ @list_group.command(name="change-sets")
+diff --git a/sceptre/hooks/cmd.py b/sceptre/hooks/cmd.py
+index 5ec3216..8292e87 100644
+--- a/sceptre/hooks/cmd.py
++++ b/sceptre/hooks/cmd.py
+@@ -13,16 +13,37 @@ class Cmd(Hook):
+ 
+     def run(self):
+         """
+-        Runs the argument string in a subprocess.
++        Executes a command through the shell.
+ 
+-        :raises: sceptre.exceptions.InvalidTaskArgumentTypeException
+-        :raises: subprocess.CalledProcessError
++        See hooks documentation for details.
++
++        :raises: sceptre.exceptions.InvalidHookArgumentTypeError invalid input
++        :raises: CalledProcessError failed command
++        :raises: FileNotFoundError missing shell
++        :raises: PermissionError non-executable shell
+         """
+         envs = self.stack.connection_manager.create_session_environment_variables()
+-        try:
+-            subprocess.check_call(self.argument, shell=True, env=envs)
+-        except TypeError:
++
++        if isinstance(self.argument, str) and self.argument != "":
++            command_to_run = self.argument
++            shell = None
++
++        elif (
++            isinstance(self.argument, dict)
++            and set(self.argument) == {"run", "shell"}
++            and isinstance(self.argument["run"], str)
++            and isinstance(self.argument["shell"], str)
++            and self.argument["run"] != ""
++            and self.argument["shell"] != ""
++        ):
++            command_to_run = self.argument["run"]
++            shell = self.argument["shell"]
++
++        else:
+             raise InvalidHookArgumentTypeError(
+-                'The argument "{0}" is the wrong type - cmd hooks require '
+-                "arguments of type string.".format(self.argument)
++                "A cmd hook requires either a string argument or an object with "
++                "`run` and `shell` keys with string values. "
++                f"You gave `{self.argument!r}`."
+             )
++
++        subprocess.check_call(command_to_run, shell=True, env=envs, executable=shell)

@@ -1,0 +1,142 @@
+diff --git a/msgpack/_unpacker.pyx b/msgpack/_unpacker.pyx
+index a5403d8..2163425 100644
+--- a/msgpack/_unpacker.pyx
++++ b/msgpack/_unpacker.pyx
+@@ -27,6 +27,7 @@ cdef extern from "unpack.h":
+         bint use_list
+         bint raw
+         bint has_pairs_hook # call object_hook with k-v pairs
++        bint strict_map_key
+         PyObject* object_hook
+         PyObject* list_hook
+         PyObject* ext_hook
+@@ -56,7 +57,7 @@ cdef extern from "unpack.h":
+ cdef inline init_ctx(unpack_context *ctx,
+                      object object_hook, object object_pairs_hook,
+                      object list_hook, object ext_hook,
+-                     bint use_list, bint raw,
++                     bint use_list, bint raw, bint strict_map_key,
+                      const char* encoding, const char* unicode_errors,
+                      Py_ssize_t max_str_len, Py_ssize_t max_bin_len,
+                      Py_ssize_t max_array_len, Py_ssize_t max_map_len,
+@@ -64,6 +65,7 @@ cdef inline init_ctx(unpack_context *ctx,
+     unpack_init(ctx)
+     ctx.user.use_list = use_list
+     ctx.user.raw = raw
++    ctx.user.strict_map_key = strict_map_key
+     ctx.user.object_hook = ctx.user.list_hook = <PyObject*>NULL
+     ctx.user.max_str_len = max_str_len
+     ctx.user.max_bin_len = max_bin_len
+@@ -140,7 +142,7 @@ cdef inline int get_data_from_buffer(object obj,
+         return 1
+ 
+ def unpackb(object packed, object object_hook=None, object list_hook=None,
+-            bint use_list=True, bint raw=True,
++            bint use_list=True, bint raw=True, bint strict_map_key=False,
+             encoding=None, unicode_errors=None,
+             object_pairs_hook=None, ext_hook=ExtType,
+             Py_ssize_t max_str_len=1024*1024,
+@@ -180,7 +182,7 @@ def unpackb(object packed, object object_hook=None, object list_hook=None,
+     get_data_from_buffer(packed, &view, &buf, &buf_len, &new_protocol)
+     try:
+         init_ctx(&ctx, object_hook, object_pairs_hook, list_hook, ext_hook,
+-                 use_list, raw, cenc, cerr,
++                 use_list, raw, strict_map_key, cenc, cerr,
+                  max_str_len, max_bin_len, max_array_len, max_map_len, max_ext_len)
+         ret = unpack_construct(&ctx, buf, buf_len, &off)
+     finally:
+@@ -236,6 +238,11 @@ cdef class Unpacker(object):
+ 
+         *encoding* option which is deprecated overrides this option.
+ 
++    :param bool strict_map_key:
++        If true, only str or bytes are accepted for map (dict) keys.
++        It's False by default for backward-compatibility.
++        But it will be True from msgpack 1.0.
++
+     :param callable object_hook:
+         When specified, it should be callable.
+         Unpacker calls it with a dict argument after unpacking msgpack map.
+@@ -318,7 +325,7 @@ cdef class Unpacker(object):
+         self.buf = NULL
+ 
+     def __init__(self, file_like=None, Py_ssize_t read_size=0,
+-                 bint use_list=True, bint raw=True,
++                 bint use_list=True, bint raw=True, bint strict_map_key=False,
+                  object object_hook=None, object object_pairs_hook=None, object list_hook=None,
+                  encoding=None, unicode_errors=None, Py_ssize_t max_buffer_size=0,
+                  object ext_hook=ExtType,
+@@ -366,7 +373,7 @@ cdef class Unpacker(object):
+             cerr = unicode_errors
+ 
+         init_ctx(&self.ctx, object_hook, object_pairs_hook, list_hook,
+-                 ext_hook, use_list, raw, cenc, cerr,
++                 ext_hook, use_list, raw, strict_map_key, cenc, cerr,
+                  max_str_len, max_bin_len, max_array_len,
+                  max_map_len, max_ext_len)
+ 
+diff --git a/msgpack/fallback.py b/msgpack/fallback.py
+index 9c767a7..ae2fcfc 100644
+--- a/msgpack/fallback.py
++++ b/msgpack/fallback.py
+@@ -179,6 +179,11 @@ class Unpacker(object):
+ 
+         *encoding* option which is deprecated overrides this option.
+ 
++    :param bool strict_map_key:
++        If true, only str or bytes are accepted for map (dict) keys.
++        It's False by default for backward-compatibility.
++        But it will be True from msgpack 1.0.
++
+     :param callable object_hook:
+         When specified, it should be callable.
+         Unpacker calls it with a dict argument after unpacking msgpack map.
+@@ -241,7 +246,7 @@ class Unpacker(object):
+     Other exceptions can be raised during unpacking.
+     """
+ 
+-    def __init__(self, file_like=None, read_size=0, use_list=True, raw=True,
++    def __init__(self, file_like=None, read_size=0, use_list=True, raw=True, strict_map_key=False,
+                  object_hook=None, object_pairs_hook=None, list_hook=None,
+                  encoding=None, unicode_errors=None, max_buffer_size=0,
+                  ext_hook=ExtType,
+@@ -286,6 +291,7 @@ class Unpacker(object):
+             raise ValueError("read_size must be smaller than max_buffer_size")
+         self._read_size = read_size or min(self._max_buffer_size, 16*1024)
+         self._raw = bool(raw)
++        self._strict_map_key = bool(strict_map_key)
+         self._encoding = encoding
+         self._unicode_errors = unicode_errors
+         self._use_list = use_list
+@@ -633,6 +639,8 @@ class Unpacker(object):
+                 ret = {}
+                 for _ in xrange(n):
+                     key = self._unpack(EX_CONSTRUCT)
++                    if self._strict_map_key and type(key) not in (Unicode, bytes):
++                        raise ValueError("%s is not allowed for map key" % str(type(key)))
+                     ret[key] = self._unpack(EX_CONSTRUCT)
+                 if self._object_hook is not None:
+                     ret = self._object_hook(ret)
+diff --git a/msgpack/unpack.h b/msgpack/unpack.h
+index 63e5543..85dbbed 100644
+--- a/msgpack/unpack.h
++++ b/msgpack/unpack.h
+@@ -23,6 +23,7 @@ typedef struct unpack_user {
+     bool use_list;
+     bool raw;
+     bool has_pairs_hook;
++    bool strict_map_key;
+     PyObject *object_hook;
+     PyObject *list_hook;
+     PyObject *ext_hook;
+@@ -188,6 +189,10 @@ static inline int unpack_callback_map(unpack_user* u, unsigned int n, msgpack_un
+ 
+ static inline int unpack_callback_map_item(unpack_user* u, unsigned int current, msgpack_unpack_object* c, msgpack_unpack_object k, msgpack_unpack_object v)
+ {
++    if (u->strict_map_key && !PyUnicode_CheckExact(k) && !PyBytes_CheckExact(k)) {
++        PyErr_Format(PyExc_ValueError, "%.100s is not allowed for map key", Py_TYPE(k)->tp_name);
++        return -1;
++    }
+     if (u->has_pairs_hook) {
+         msgpack_unpack_object item = PyTuple_Pack(2, k, v);
+         if (!item)

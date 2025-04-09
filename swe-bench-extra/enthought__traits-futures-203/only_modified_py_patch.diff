@@ -1,0 +1,186 @@
+diff --git a/traits_futures/base_future.py b/traits_futures/base_future.py
+index 6a44e4a..8eb52f7 100644
+--- a/traits_futures/base_future.py
++++ b/traits_futures/base_future.py
+@@ -17,9 +17,7 @@ from traits.api import (
+     Bool,
+     Callable,
+     Enum,
+-    Event,
+     HasStrictTraits,
+-    on_trait_change,
+     Property,
+     provides,
+     Str,
+@@ -116,12 +114,6 @@ class BaseFuture(HasStrictTraits):
+     #: it will be consistent with the ``state``.
+     done = Property(Bool())
+ 
+-    #: Event trait providing custom messages from the background task.
+-    #: Subclasses of ``BaseFuture`` can listen to this trait and interpret
+-    #: the messages in whatever way they like. Each message takes the
+-    #: form ``(message_type, message_args)``.
+-    message = Event(Tuple(Str(), Any()))
+-
+     @property
+     def result(self):
+         """
+@@ -142,11 +134,11 @@ class BaseFuture(HasStrictTraits):
+             If the task is still executing, or was cancelled, or raised an
+             exception instead of returning a result.
+         """
+-        if self._state != COMPLETED:
++        if self.state != COMPLETED:
+             raise AttributeError(
+                 "No result available. Task has not yet completed, "
+                 "or was cancelled, or failed with an exception. "
+-                "Task state is {}".format(self._state)
++                "Task state is {}".format(self.state)
+             )
+         return self._result
+ 
+@@ -171,7 +163,7 @@ class BaseFuture(HasStrictTraits):
+             If the task is still executing, or was cancelled, or completed
+             without raising an exception.
+         """
+-        if self._state != FAILED:
++        if self.state != FAILED:
+             raise AttributeError(
+                 "No exception information available. Task has "
+                 "not yet completed, or was cancelled, or completed "
+@@ -199,11 +191,15 @@ class BaseFuture(HasStrictTraits):
+                 "Can only cancel a waiting or executing task. "
+                 "Task state is {}".format(self.state)
+             )
+-        self._cancel()
+         self._user_cancelled()
+ 
+-    @on_trait_change("message")
+-    def dispatch_message(self, message):
++    # Semi-private methods ####################################################
++
++    # These methods represent the state transitions in response to external
++    # events. They're used by the FutureWrapper, but are not intended for use
++    # by the users of Traits Futures.
++
++    def _dispatch_message(self, message):
+         """
+         Automate dispatch of different types of message.
+ 
+@@ -216,7 +212,14 @@ class BaseFuture(HasStrictTraits):
+ 
+         If the future is already in ``CANCELLING`` state, no message is
+         dispatched.
++
++        Parameters
++        ----------
++        message : tuple(str, object)
++            Message from the background task, in the form (message_type,
++            message_args).
+         """
++
+         if self._state == CANCELLING_AFTER_STARTED:
+             # Ignore messages that arrive after a cancellation request.
+             return
+@@ -229,12 +232,6 @@ class BaseFuture(HasStrictTraits):
+                 "Unexpected custom message in state {!r}".format(self._state)
+             )
+ 
+-    # Semi-private methods ####################################################
+-
+-    # These methods represent the state transitions in response to external
+-    # events. They're used by the FutureWrapper, but are not intended for use
+-    # by the users of Traits Futures.
+-
+     def _task_started(self, none):
+         """
+         Update state when the background task has started processing.
+@@ -290,9 +287,11 @@ class BaseFuture(HasStrictTraits):
+         state.
+         """
+         if self._state == INITIALIZED:
++            self._cancel()
+             self._cancel = None
+             self._state = CANCELLING_BEFORE_STARTED
+         elif self._state == EXECUTING:
++            self._cancel()
+             self._cancel = None
+             self._state = CANCELLING_AFTER_STARTED
+         else:
+diff --git a/traits_futures/i_parallel_context.py b/traits_futures/i_parallel_context.py
+index 81a5a7a..7b5da62 100644
+--- a/traits_futures/i_parallel_context.py
++++ b/traits_futures/i_parallel_context.py
+@@ -57,18 +57,6 @@ class IParallelContext(abc.ABC):
+             the ``set`` and ``is_set`` methods from that API.
+         """
+ 
+-    @abc.abstractmethod
+-    def queue(self):
+-        """
+-        Return a shareable queue suitable for this context.
+-
+-        Returns
+-        -------
+-        queue : queue-like
+-            A queue that can be shared safely with workers. This package
+-            relies only on the ``put`` and ``get`` methods of the queue.
+-        """
+-
+     @abc.abstractmethod
+     def message_router(self):
+         """
+diff --git a/traits_futures/multithreading_context.py b/traits_futures/multithreading_context.py
+index e2ad4e8..b1e2936 100644
+--- a/traits_futures/multithreading_context.py
++++ b/traits_futures/multithreading_context.py
+@@ -13,7 +13,6 @@ Context providing multithreading-friendly worker pools, events, and routers.
+ """
+ 
+ import concurrent.futures
+-import queue
+ import threading
+ 
+ from traits_futures.i_parallel_context import IParallelContext
+@@ -55,17 +54,6 @@ class MultithreadingContext(IParallelContext):
+         """
+         return threading.Event()
+ 
+-    def queue(self):
+-        """
+-        Return a shareable queue suitable for this context.
+-
+-        Returns
+-        -------
+-        queue : queue-like
+-            A queue that can be shared safely with workers.
+-        """
+-        return queue.Queue()
+-
+     def message_router(self):
+         """
+         Return a message router suitable for use in this context.
+diff --git a/traits_futures/wrappers.py b/traits_futures/wrappers.py
+index 7f30227..72f927b 100644
+--- a/traits_futures/wrappers.py
++++ b/traits_futures/wrappers.py
+@@ -72,15 +72,12 @@ class FutureWrapper(HasStrictTraits):
+         message_kind, message = message
+ 
+         if message_kind == CUSTOM:
+-            self.future.message = message
+-        elif message_kind == CONTROL:
++            self.future._dispatch_message(message)
++        else:
++            assert message_kind == CONTROL
+             message_type, message_arg = message
+             method_name = "_task_{}".format(message_type)
+             getattr(self.future, method_name)(message_arg)
+-        else:
+-            raise RuntimeError(
+-                "Unrecognised message kind: {}".format(message_kind)
+-            )
+ 
+ 
+ class BackgroundTaskWrapper:
+

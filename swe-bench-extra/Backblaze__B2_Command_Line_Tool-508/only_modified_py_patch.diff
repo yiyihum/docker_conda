@@ -1,0 +1,225 @@
+diff --git a/b2/bucket.py b/b2/bucket.py
+index b148b96..1873cbc 100644
+--- a/b2/bucket.py
++++ b/b2/bucket.py
+@@ -444,8 +444,11 @@ class Bucket(object):
+         part_ranges = choose_part_ranges(content_length, minimum_part_size)
+ 
+         # Check for unfinished files with same name
+-        unfinished_file, finished_parts = self._find_unfinished_file(
+-            upload_source, file_name, file_info, part_ranges
++        unfinished_file, finished_parts = self._find_unfinished_file_if_possible(
++            upload_source,
++            file_name,
++            file_info,
++            part_ranges,
+         )
+ 
+         # Tell B2 we're going to upload a file if necessary
+@@ -477,40 +480,43 @@ class Bucket(object):
+         response = self.api.session.finish_large_file(file_id, part_sha1_array)
+         return FileVersionInfoFactory.from_api_response(response)
+ 
+-    def _find_unfinished_file(self, upload_source, file_name, file_info, part_ranges):
++    def _find_unfinished_file_if_possible(self, upload_source, file_name, file_info, part_ranges):
+         """
+-        Find an unfinished file which may be used to resume a large file upload. The
++        Find an unfinished file that may be used to resume a large file upload. The
+         file is found using the filename and comparing the uploaded parts against
+         the local file.
++
++        This is only possible if the application key being used allows listFiles access.
+         """
+-        for file_ in self.list_unfinished_large_files():
+-            if file_.file_name == file_name and file_.file_info == file_info:
+-                files_match = True
+-                finished_parts = {}
+-                for part in self.list_parts(file_.file_id):
+-                    # Compare part sizes
+-                    offset, part_length = part_ranges[part.part_number - 1]
+-                    if part_length != part.content_length:
+-                        files_match = False
+-                        break
+-
+-                    # Compare hash
+-                    with upload_source.open() as f:
+-                        f.seek(offset)
+-                        sha1_sum = hex_sha1_of_stream(f, part_length)
+-                    if sha1_sum != part.content_sha1:
+-                        files_match = False
+-                        break
+-
+-                    # Save part
+-                    finished_parts[part.part_number] = part
+-
+-                # Skip not matching files or unfinished files with no uploaded parts
+-                if not files_match or not finished_parts:
+-                    continue
+-
+-                # Return first matched file
+-                return file_, finished_parts
++        if 'listFiles' in self.api.account_info.get_allowed()['capabilities']:
++            for file_ in self.list_unfinished_large_files():
++                if file_.file_name == file_name and file_.file_info == file_info:
++                    files_match = True
++                    finished_parts = {}
++                    for part in self.list_parts(file_.file_id):
++                        # Compare part sizes
++                        offset, part_length = part_ranges[part.part_number - 1]
++                        if part_length != part.content_length:
++                            files_match = False
++                            break
++
++                        # Compare hash
++                        with upload_source.open() as f:
++                            f.seek(offset)
++                            sha1_sum = hex_sha1_of_stream(f, part_length)
++                        if sha1_sum != part.content_sha1:
++                            files_match = False
++                            break
++
++                        # Save part
++                        finished_parts[part.part_number] = part
++
++                    # Skip not matching files or unfinished files with no uploaded parts
++                    if not files_match or not finished_parts:
++                        continue
++
++                    # Return first matched file
++                    return file_, finished_parts
+         return None, {}
+ 
+     def _upload_part(
+diff --git a/b2/console_tool.py b/b2/console_tool.py
+index 0eb38c8..063d919 100644
+--- a/b2/console_tool.py
++++ b/b2/console_tool.py
+@@ -137,7 +137,7 @@ class Command(object):
+     FORBID_LOGGING_ARGUMENTS = False
+ 
+     # Parsers for each argument.  Each should be a function that
+-    # takes a string and returns the vaule.
++    # takes a string and returns the value.
+     ARG_PARSER = {}
+ 
+     def __init__(self, console_tool):
+@@ -287,7 +287,7 @@ class CancelAllUnfinishedLargeFiles(Command):
+     b2 cancel-all-unfinished-large-files <bucketName>
+ 
+         Lists all large files that have been started but not
+-        finsished and cancels them.  Any parts that have been
++        finished and cancels them.  Any parts that have been
+         uploaded will be deleted.
+ 
+         Requires capability: writeFiles
+@@ -445,9 +445,9 @@ class DeleteFileVersion(Command):
+         Specifying the fileName is more efficient than leaving it out.
+         If you omit the fileName, it requires an initial query to B2
+         to get the file name, before making the call to delete the
+-        file.
++        file.  This extra query requires the readFiles capability.
+ 
+-        Requires capability: deleteFiles
++        Requires capability: deleteFiles, readFiles (if file name not provided)
+     """
+ 
+     OPTIONAL_BEFORE = ['fileName']
+@@ -1016,6 +1016,7 @@ class Sync(Command):
+             [--threads N] [--noProgress] [--dryRun ] [--allowEmptySource ] \\
+             [--excludeRegex <regex> [--includeRegex <regex>]] \\
+             [--excludeDirRegex <regex>] \\
++            [--excludeAllSymlinks ] \\
+             <source> <destination>
+ 
+         Copies multiple files from source to destination.  Optionally
+@@ -1056,6 +1057,9 @@ class Sync(Command):
+ 
+         Note that --includeRegex cannot be used without --excludeRegex.
+ 
++        You can specify --excludeAllSymlinks to skip symlinks when
++        syncing from a local source.
++
+         When a directory is excluded by using --excludeDirRegex, all of
+         the files within it are excluded, even if they match an --includeRegex
+         pattern.   This means that there is no need to look inside excluded
+@@ -1067,7 +1071,7 @@ class Sync(Command):
+         a trailing '/', so don't include on in your regular expression.
+ 
+         Multiple regex rules can be applied by supplying them as pipe
+-        delimitered instructions. Note that the regex for this command
++        delimited instructions. Note that the regex for this command
+         is Python regex. Reference: https://docs.python.org/2/library/re.html.
+ 
+         Regular expressions are considered a match if they match a substring
+@@ -1132,7 +1136,13 @@ class Sync(Command):
+     """
+ 
+     OPTION_FLAGS = [
+-        'delete', 'noProgress', 'skipNewer', 'replaceNewer', 'dryRun', 'allowEmptySource'
++        'delete',
++        'noProgress',
++        'skipNewer',
++        'replaceNewer',
++        'dryRun',
++        'allowEmptySource',
++        'excludeAllSymlinks',
+     ]
+     OPTION_ARGS = ['keepDays', 'threads', 'compareVersions', 'compareThreshold']
+     REQUIRED = ['source', 'destination']
+@@ -1156,6 +1166,7 @@ class Sync(Command):
+             exclude_dir_regexes=args.excludeDirRegex,
+             exclude_file_regexes=args.excludeRegex,
+             include_file_regexes=args.includeRegex,
++            exclude_all_symlinks=args.excludeAllSymlinks,
+         )
+         sync_folders(
+             source_folder=source,
+diff --git a/b2/sync/folder.py b/b2/sync/folder.py
+index 609e279..fbbd89a 100644
+--- a/b2/sync/folder.py
++++ b/b2/sync/folder.py
+@@ -169,6 +169,10 @@ class LocalFolder(AbstractFolder):
+             if not is_file_readable(local_path, reporter):
+                 continue
+ 
++            if policies_manager.exclude_all_symlinks and os.path.islink(local_path):
++                reporter.symlink_skipped(local_path)
++                continue
++
+             if os.path.isdir(local_path):
+                 name += six.u('/')
+                 if policies_manager.should_exclude_directory(b2_path):
+diff --git a/b2/sync/report.py b/b2/sync/report.py
+index d1f0ea8..f46dd03 100644
+--- a/b2/sync/report.py
++++ b/b2/sync/report.py
+@@ -198,6 +198,9 @@ class SyncReport(object):
+             'WARNING: %s could not be accessed (no permissions to read?)' % (path,)
+         )
+ 
++    def symlink_skipped(self, path):
++        pass
++
+ 
+ class SyncFileReporter(AbstractProgressListener):
+     """
+diff --git a/b2/sync/scan_policies.py b/b2/sync/scan_policies.py
+index dfb9413..d3d2299 100644
+--- a/b2/sync/scan_policies.py
++++ b/b2/sync/scan_policies.py
+@@ -73,6 +73,7 @@ class ScanPoliciesManager(object):
+         exclude_dir_regexes=tuple(),
+         exclude_file_regexes=tuple(),
+         include_file_regexes=tuple(),
++        exclude_all_symlinks=False,
+     ):
+         self._exclude_dir_set = RegexSet(exclude_dir_regexes)
+         self._exclude_file_because_of_dir_set = RegexSet(
+@@ -80,6 +81,7 @@ class ScanPoliciesManager(object):
+         )
+         self._exclude_file_set = RegexSet(exclude_file_regexes)
+         self._include_file_set = RegexSet(include_file_regexes)
++        self.exclude_all_symlinks = exclude_all_symlinks
+ 
+     def should_exclude_file(self, file_path):
+         """

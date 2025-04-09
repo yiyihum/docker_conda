@@ -1,0 +1,128 @@
+diff --git a/docs/manpage.rst b/docs/manpage.rst
+index ee2348cd..3b458538 100644
+--- a/docs/manpage.rst
++++ b/docs/manpage.rst
+@@ -68,6 +68,21 @@ This happens recursively so that if test ``T1`` depends on ``T2`` and ``T2`` dep
+    The value of this attribute is not required to be non-zero for GPU tests.
+    Tests may or may not make use of it.
+ 
++   .. deprecated:: 4.4
++
++      Please use ``-E 'not num_gpus_per_node'`` instead.
++
++.. option:: -E, --filter-expr=EXPR
++
++   Select only tests that satisfy the given expression.
++
++   The expression ``EXPR`` can be any valid Python expression on the test variables or parameters.
++   For example, ``-E num_tasks > 10`` will select all tests, whose :attr:`~reframe.core.pipeline.RegressionTest.num_tasks` exceeds ``10``.
++   You may use any test variable in expression, even user-defined.
++   Multiple variables can also be included such as ``-E num_tasks >= my_param``, where ``my_param`` is user-defined parameter.
++
++   .. versionadded:: 4.4
++
+ .. option:: --failed
+ 
+    Select only the failed test cases for a previous run.
+@@ -77,6 +92,7 @@ This happens recursively so that if test ``T1`` depends on ``T2`` and ``T2`` dep
+ 
+    .. versionadded:: 3.4
+ 
++
+ .. option:: --gpu-only
+ 
+    Select tests that can run on GPUs.
+@@ -84,6 +100,10 @@ This happens recursively so that if test ``T1`` depends on ``T2`` and ``T2`` dep
+    These are all tests with :attr:`num_gpus_per_node` greater than zero.
+    This option and :option:`--cpu-only` are mutually exclusive.
+ 
++   .. deprecated:: 4.4
++
++      Please use ``-E num_gpus_per_node`` instead.
++
+ .. option:: --maintainer=MAINTAINER
+ 
+    Filter tests by maintainer.
+@@ -101,6 +121,7 @@ This happens recursively so that if test ``T1`` depends on ``T2`` and ``T2`` dep
+       The ``MAINTAINER`` pattern is matched anywhere in the maintainer's name and not at its beginning.
+       If you want to match at the beginning of the name, you should prepend ``^``.
+ 
++
+ .. option:: -n, --name=NAME
+ 
+    Filter tests by name.
+diff --git a/reframe/frontend/cli.py b/reframe/frontend/cli.py
+index 7b4ea826..8c59a680 100644
+--- a/reframe/frontend/cli.py
++++ b/reframe/frontend/cli.py
+@@ -356,6 +356,10 @@ def main():
+         metavar='PATTERN', default=[],
+         help='Exclude checks whose name matches PATTERN'
+     )
++    select_options.add_argument(
++        '-E', '--filter-expr', action='store', metavar='EXPR',
++        help='Select checks that satisfy the expression EXPR'
++    )
+ 
+     # Action options
+     action_options.add_argument(
+@@ -1048,6 +1052,16 @@ def main():
+             f'Filtering test cases(s) by tags: {len(testcases)} remaining'
+         )
+ 
++        if options.filter_expr:
++            testcases = filter(filters.validates(options.filter_expr),
++                               testcases)
++
++            testcases = list(testcases)
++            printer.verbose(
++                f'Filtering test cases(s) by {options.filter_expr}: '
++                f'{len(testcases)} remaining'
++            )
++
+         # Filter test cases by maintainers
+         for maint in options.maintainers:
+             testcases = filter(filters.have_maintainer(maint), testcases)
+@@ -1059,8 +1073,12 @@ def main():
+             sys.exit(1)
+ 
+         if options.gpu_only:
++            printer.warning('the `--gpu-only` option is deprecated; '
++                            'please use `-E num_gpus_per_node` instead')
+             testcases = filter(filters.have_gpu_only(), testcases)
+         elif options.cpu_only:
++            printer.warning('the `--cpu-only` option is deprecated; '
++                            'please use `-E "not num_gpus_per_node"` instead')
+             testcases = filter(filters.have_cpu_only(), testcases)
+ 
+         testcases = list(testcases)
+diff --git a/reframe/frontend/filters.py b/reframe/frontend/filters.py
+index f6e80741..2bcc1052 100644
+--- a/reframe/frontend/filters.py
++++ b/reframe/frontend/filters.py
+@@ -109,16 +109,18 @@ def have_maintainer(patt):
+ 
+ 
+ def have_gpu_only():
+-    def _fn(case):
+-        # NOTE: This takes into account num_gpus_per_node being None
+-        return case.check.num_gpus_per_node
+-
+-    return _fn
++    return validates('num_gpus_per_node')
+ 
+ 
+ def have_cpu_only():
++    return validates('not num_gpus_per_node')
++
++
++def validates(expr):
+     def _fn(case):
+-        # NOTE: This takes into account num_gpus_per_node being None
+-        return not case.check.num_gpus_per_node
++        try:
++            return eval(expr, None, case.check.__dict__)
++        except Exception as err:
++            raise ReframeError(f'invalid expression `{expr}`') from err
+ 
+     return _fn

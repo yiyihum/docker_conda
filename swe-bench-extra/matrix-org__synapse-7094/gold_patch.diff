@@ -1,0 +1,175 @@
+diff --git a/changelog.d/7094.misc b/changelog.d/7094.misc
+new file mode 100644
+index 000000000..aa093ee3c
+--- /dev/null
++++ b/changelog.d/7094.misc
+@@ -0,0 +1,1 @@
++Improve performance when making HTTPS requests to sygnal, sydent, etc, by sharing the SSL context object between connections.
+diff --git a/synapse/crypto/context_factory.py b/synapse/crypto/context_factory.py
+index e93f0b370..a5a2a7815 100644
+--- a/synapse/crypto/context_factory.py
++++ b/synapse/crypto/context_factory.py
+@@ -75,7 +75,7 @@ class ServerContextFactory(ContextFactory):
+ 
+ 
+ @implementer(IPolicyForHTTPS)
+-class ClientTLSOptionsFactory(object):
++class FederationPolicyForHTTPS(object):
+     """Factory for Twisted SSLClientConnectionCreators that are used to make connections
+     to remote servers for federation.
+ 
+@@ -103,15 +103,15 @@ class ClientTLSOptionsFactory(object):
+         # let us do).
+         minTLS = _TLS_VERSION_MAP[config.federation_client_minimum_tls_version]
+ 
+-        self._verify_ssl = CertificateOptions(
++        _verify_ssl = CertificateOptions(
+             trustRoot=trust_root, insecurelyLowerMinimumTo=minTLS
+         )
+-        self._verify_ssl_context = self._verify_ssl.getContext()
+-        self._verify_ssl_context.set_info_callback(self._context_info_cb)
++        self._verify_ssl_context = _verify_ssl.getContext()
++        self._verify_ssl_context.set_info_callback(_context_info_cb)
+ 
+-        self._no_verify_ssl = CertificateOptions(insecurelyLowerMinimumTo=minTLS)
+-        self._no_verify_ssl_context = self._no_verify_ssl.getContext()
+-        self._no_verify_ssl_context.set_info_callback(self._context_info_cb)
++        _no_verify_ssl = CertificateOptions(insecurelyLowerMinimumTo=minTLS)
++        self._no_verify_ssl_context = _no_verify_ssl.getContext()
++        self._no_verify_ssl_context.set_info_callback(_context_info_cb)
+ 
+     def get_options(self, host: bytes):
+ 
+@@ -136,23 +136,6 @@ class ClientTLSOptionsFactory(object):
+ 
+         return SSLClientConnectionCreator(host, ssl_context, should_verify)
+ 
+-    @staticmethod
+-    def _context_info_cb(ssl_connection, where, ret):
+-        """The 'information callback' for our openssl context object."""
+-        # we assume that the app_data on the connection object has been set to
+-        # a TLSMemoryBIOProtocol object. (This is done by SSLClientConnectionCreator)
+-        tls_protocol = ssl_connection.get_app_data()
+-        try:
+-            # ... we further assume that SSLClientConnectionCreator has set the
+-            # '_synapse_tls_verifier' attribute to a ConnectionVerifier object.
+-            tls_protocol._synapse_tls_verifier.verify_context_info_cb(
+-                ssl_connection, where
+-            )
+-        except:  # noqa: E722, taken from the twisted implementation
+-            logger.exception("Error during info_callback")
+-            f = Failure()
+-            tls_protocol.failVerification(f)
+-
+     def creatorForNetloc(self, hostname, port):
+         """Implements the IPolicyForHTTPS interace so that this can be passed
+         directly to agents.
+@@ -160,6 +143,43 @@ class ClientTLSOptionsFactory(object):
+         return self.get_options(hostname)
+ 
+ 
++@implementer(IPolicyForHTTPS)
++class RegularPolicyForHTTPS(object):
++    """Factory for Twisted SSLClientConnectionCreators that are used to make connections
++    to remote servers, for other than federation.
++
++    Always uses the same OpenSSL context object, which uses the default OpenSSL CA
++    trust root.
++    """
++
++    def __init__(self):
++        trust_root = platformTrust()
++        self._ssl_context = CertificateOptions(trustRoot=trust_root).getContext()
++        self._ssl_context.set_info_callback(_context_info_cb)
++
++    def creatorForNetloc(self, hostname, port):
++        return SSLClientConnectionCreator(hostname, self._ssl_context, True)
++
++
++def _context_info_cb(ssl_connection, where, ret):
++    """The 'information callback' for our openssl context objects.
++
++    Note: Once this is set as the info callback on a Context object, the Context should
++    only be used with the SSLClientConnectionCreator.
++    """
++    # we assume that the app_data on the connection object has been set to
++    # a TLSMemoryBIOProtocol object. (This is done by SSLClientConnectionCreator)
++    tls_protocol = ssl_connection.get_app_data()
++    try:
++        # ... we further assume that SSLClientConnectionCreator has set the
++        # '_synapse_tls_verifier' attribute to a ConnectionVerifier object.
++        tls_protocol._synapse_tls_verifier.verify_context_info_cb(ssl_connection, where)
++    except:  # noqa: E722, taken from the twisted implementation
++        logger.exception("Error during info_callback")
++        f = Failure()
++        tls_protocol.failVerification(f)
++
++
+ @implementer(IOpenSSLClientConnectionCreator)
+ class SSLClientConnectionCreator(object):
+     """Creates openssl connection objects for client connections.
+diff --git a/synapse/http/client.py b/synapse/http/client.py
+index d4c285445..379754582 100644
+--- a/synapse/http/client.py
++++ b/synapse/http/client.py
+@@ -244,9 +244,6 @@ class SimpleHttpClient(object):
+         pool.maxPersistentPerHost = max((100 * CACHE_SIZE_FACTOR, 5))
+         pool.cachedConnectionTimeout = 2 * 60
+ 
+-        # The default context factory in Twisted 14.0.0 (which we require) is
+-        # BrowserLikePolicyForHTTPS which will do regular cert validation
+-        # 'like a browser'
+         self.agent = ProxyAgent(
+             self.reactor,
+             connectTimeout=15,
+diff --git a/synapse/http/federation/matrix_federation_agent.py b/synapse/http/federation/matrix_federation_agent.py
+index 647d26dc5..f5f917f5a 100644
+--- a/synapse/http/federation/matrix_federation_agent.py
++++ b/synapse/http/federation/matrix_federation_agent.py
+@@ -45,7 +45,7 @@ class MatrixFederationAgent(object):
+     Args:
+         reactor (IReactor): twisted reactor to use for underlying requests
+ 
+-        tls_client_options_factory (ClientTLSOptionsFactory|None):
++        tls_client_options_factory (FederationPolicyForHTTPS|None):
+             factory to use for fetching client tls options, or none to disable TLS.
+ 
+         _srv_resolver (SrvResolver|None):
+diff --git a/synapse/server.py b/synapse/server.py
+index fd2f69e92..1b980371d 100644
+--- a/synapse/server.py
++++ b/synapse/server.py
+@@ -26,7 +26,6 @@ import logging
+ import os
+ 
+ from twisted.mail.smtp import sendmail
+-from twisted.web.client import BrowserLikePolicyForHTTPS
+ 
+ from synapse.api.auth import Auth
+ from synapse.api.filtering import Filtering
+@@ -35,6 +34,7 @@ from synapse.appservice.api import ApplicationServiceApi
+ from synapse.appservice.scheduler import ApplicationServiceScheduler
+ from synapse.config.homeserver import HomeServerConfig
+ from synapse.crypto import context_factory
++from synapse.crypto.context_factory import RegularPolicyForHTTPS
+ from synapse.crypto.keyring import Keyring
+ from synapse.events.builder import EventBuilderFactory
+ from synapse.events.spamcheck import SpamChecker
+@@ -310,7 +310,7 @@ class HomeServer(object):
+         return (
+             InsecureInterceptableContextFactory()
+             if self.config.use_insecure_ssl_client_just_for_testing_do_not_use
+-            else BrowserLikePolicyForHTTPS()
++            else RegularPolicyForHTTPS()
+         )
+ 
+     def build_simple_http_client(self):
+@@ -420,7 +420,7 @@ class HomeServer(object):
+         return PusherPool(self)
+ 
+     def build_http_client(self):
+-        tls_client_options_factory = context_factory.ClientTLSOptionsFactory(
++        tls_client_options_factory = context_factory.FederationPolicyForHTTPS(
+             self.config
+         )
+         return MatrixFederationHttpClient(self, tls_client_options_factory)

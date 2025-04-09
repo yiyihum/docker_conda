@@ -1,0 +1,106 @@
+diff --git a/tests/compile/test_builders.py b/tests/compile/test_builders.py
+index a552c7a09..9d894aae7 100644
+--- a/tests/compile/test_builders.py
++++ b/tests/compile/test_builders.py
+@@ -3,6 +3,7 @@ from functools import partial
+ import numpy as np
+ import pytest
+ 
++import aesara.tensor as at
+ from aesara.compile import shared
+ from aesara.compile.builders import OpFromGraph
+ from aesara.compile.function import function
+@@ -29,6 +30,12 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
+     def test_valid_input(self):
+         x, y, z = matrices("xyz")
+ 
++        with pytest.raises(ValueError, match="Expected at least.*"):
++            OpFromGraph([x], [x])()
++
++        with pytest.raises(ValueError, match=r"Expected 1 input\(s\)"):
++            OpFromGraph([x], [x]).make_node()
++
+         with pytest.raises(TypeError):
+             OpFromGraph((x,), (x,))
+ 
+@@ -451,6 +458,39 @@ class TestOpFromGraph(unittest_tools.InferShapeTester):
+         grad_f = grad(f, y)
+         assert grad_f.tag.test_value is not None
+ 
++    def test_make_node_shared(self):
++        """Make sure we can provide `OpFromGraph.make_node` new shared inputs and get a valid `OpFromGraph`."""
++
++        x = at.scalar("x")
++        y = shared(1.0, name="y")
++
++        test_ofg = OpFromGraph([x], [x + y])
++        assert test_ofg.inputs == [x]
++        assert test_ofg.shared_inputs == [y]
++
++        out = test_ofg(x)
++
++        y_clone = y.clone()
++        assert y_clone != y
++        y_clone.name = "y_clone"
++
++        out_new = test_ofg.make_node(*(out.owner.inputs[:1] + [y_clone])).outputs[0]
++
++        assert out_new.owner.op.inputs == [x]
++        assert out_new.owner.op.shared_inputs == [y_clone]
++
++        out_fn = function([x], out_new)
++
++        assert np.array_equal(out_fn(1.0), 2.0)
++
++        y_clone.set_value(2.0)
++
++        assert np.array_equal(out_fn(1.0), 3.0)
++
++        # This should also work, because the containers are the same:
++        # y.set_value(1.0)
++        # assert np.array_equal(out_fn(1.0), 2.0)
++
+ 
+ def test_debugprint():
+     x, y, z = matrices("xyz")
+diff --git a/tests/scan/test_opt.py b/tests/scan/test_opt.py
+index 06eb27372..af14b7930 100644
+--- a/tests/scan/test_opt.py
++++ b/tests/scan/test_opt.py
+@@ -4,6 +4,7 @@ import pytest
+ import aesara
+ import aesara.tensor.basic as at
+ from aesara import function, scan, shared
++from aesara.compile.builders import OpFromGraph
+ from aesara.compile.io import In
+ from aesara.compile.mode import get_default_mode
+ from aesara.configdefaults import config
+@@ -550,6 +551,28 @@ class TestPushOutNonSeqScan:
+         utt.assert_allclose(output_opt[0], output_no_opt[0])
+         utt.assert_allclose(output_opt[1], output_no_opt[1])
+ 
++    def test_OpFromGraph_shared(self):
++        """Make sure that a simple `OpFromGraph` with a shared variable can be pushed out."""
++
++        y = shared(1.0, name="y")
++
++        test_ofg = OpFromGraph([], [1 + y])
++
++        def inner_func():
++            return test_ofg()
++
++        out, out_updates = aesara.scan(inner_func, n_steps=10)
++
++        out_fn = function([], out, updates=out_updates)
++
++        res = out_fn()
++        assert np.array_equal(res, np.repeat(2.0, 10))
++
++        y.set_value(2.0)
++
++        res = out_fn()
++        assert np.array_equal(res, np.repeat(3.0, 10))
++
+ 
+ class TestPushOutAddScan:
+     """

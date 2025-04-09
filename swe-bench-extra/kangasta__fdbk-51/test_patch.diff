@@ -1,0 +1,186 @@
+diff --git a/tst/test_data_tools.py b/tst/test_data_tools.py
+index d35e951..c253a03 100644
+--- a/tst/test_data_tools.py
++++ b/tst/test_data_tools.py
+@@ -1,10 +1,14 @@
+ from unittest import TestCase
+ from unittest.mock import Mock, patch
+ 
+-from fdbk.data_tools import functions
++from fdbk.data_tools import aggregate, functions
++from fdbk.utils.messages import method_not_supported
+ 
+-def generate_test_numbers(N=10):
+-    return [dict(number=i) for i in range(N)]
++def _test_timestamp(i):
++    return f'2020-08-23T00:{i // 60:02}:{i % 60:02}Z'
++
++def generate_test_data(N=10):
++    return [dict(number=i, number2=i*2, letter=chr(ord('A') + i), timestamp=_test_timestamp(i)) for i in range(N)]
+ 
+ class DataToolsTest(TestCase):
+     def test_summary_funcs_return_none_on_empty_data(self):
+@@ -12,7 +16,7 @@ class DataToolsTest(TestCase):
+             self.assertIsNone(fn([], 'field'))
+ 
+     def test_value_functions(self):
+-        data = generate_test_numbers()
++        data = generate_test_data()
+ 
+         tests = [
+             ('average', 4.5,),
+@@ -27,4 +31,40 @@ class DataToolsTest(TestCase):
+             result = functions.get(type_)(data, 'number')
+ 
+             self.assertEqual(result.get('payload').get('type'), type_)
+-            self.assertEqual(result.get('payload').get('value'), value)
+\ No newline at end of file
++            self.assertEqual(result.get('payload').get('value'), value)
++
++    def test_aggregate(self):
++        data = generate_test_data(51)
++        aggregated, warnings = aggregate(data, 5)
++
++        for i in range(1,5):
++            self.assertEqual(aggregated[i].get('timestamp'), _test_timestamp(i*10))
++            num = 5.5 + 10 * i
++            self.assertEqual(aggregated[i].get('number'), num)
++            self.assertEqual(aggregated[i].get('number2'), num * 2)
++
++    def test_aggregate_min(self):
++        data = generate_test_data(51)
++        aggregated, warnings = aggregate(data, 5, 'min')
++
++        for i in range(1,5):
++            self.assertEqual(aggregated[i].get('timestamp'), _test_timestamp(i*10))
++            num = 1 + 10 * i
++            self.assertEqual(aggregated[i].get('number'), num)
++            self.assertEqual(aggregated[i].get('number2'), num * 2)
++
++    def test_aggregate_empty_window(self):
++        data = generate_test_data(5)
++        aggregated, warnings = aggregate(data, 10, 'max')
++
++        for i in range(1, 5):
++            self.assertNotEqual(aggregated[i].get('timestamp'), _test_timestamp(i))
++            self.assertEqual(aggregated[i].get('number'), i)
++            self.assertEqual(aggregated[i].get('number2'), i * 2)
++
++    def test_aggregate_unknown_data_tool(self):
++        data = generate_test_data(5)
++        aggregated, warnings = aggregate(data, 10, 'horse')
++
++        self.assertEqual(aggregated, [])
++        self.assertEqual(warnings, [method_not_supported('horse')])
+diff --git a/tst/test_db_connection.py b/tst/test_db_connection.py
+index 187b103..9f30c96 100644
+--- a/tst/test_db_connection.py
++++ b/tst/test_db_connection.py
+@@ -271,4 +271,30 @@ class DBConnectionTest(TestCase):
+         self.assertEqual(overview["fields"], ["number"])
+ 
+         self.assertEqual(len(overview["statistics"]), 3)
+-        self.assertEqual(overview["statistics"][0]["payload"]["unit"], "scalar")
+\ No newline at end of file
++        self.assertEqual(overview["statistics"][0]["payload"]["unit"], "scalar")
++
++    def test_summary_overview_aggregate(self):
++        data_tools = [
++            {"field":"number", "method":"line"},
++        ]
++
++        units_d = {"field":"number", "unit":"scalar"}
++
++        C = DictConnection()
++        topic_id = C.add_topic(
++            "topic",
++            description="description",
++            fields=["number"],
++            data_tools=data_tools,
++            units=[units_d]
++        )
++        for i in range(10):
++            C.add_data(topic_id, {"number": i})
++
++        result = C.get_overview(aggregate_to=3)
++        data = result["statistics"][0]["payload"]["data"]["datasets"][0]["data"]
++        self.assertEqual(len(data), 3)
++
++        result = C.get_summary(topic_id, aggregate_to=3)
++        data = result["statistics"][0]["payload"]["data"]["datasets"][0]["data"]
++        self.assertEqual(len(data), 3)
+diff --git a/tst/test_server_handlers.py b/tst/test_server_handlers.py
+index 2d3dfc3..cc3f550 100644
+--- a/tst/test_server_handlers.py
++++ b/tst/test_server_handlers.py
+@@ -10,7 +10,7 @@ from fdbk.server import parse_filter_parameters, ServerHandlers
+ class ServerHandlersTest(TestCase):
+     def _assert_status(self, expected_status, function, *args, **kwargs):
+         data, status = function(*args, **kwargs)
+-        self.assertEqual(status, expected_status)
++        self.assertEqual(status, expected_status, f'data={str(data)}')
+         return data
+ 
+     def _create_topic(self, server_handlers, topic):
+@@ -22,14 +22,23 @@ class ServerHandlersTest(TestCase):
+             since="2020-04-26T19:18:14.123456Z",
+             until="2020-04-26T19:18:14.123456Z",
+             limit="123",
++            aggregate_to="25",
++            aggregate_with="min",
+             asd="asd"
+         )
+ 
+-        parsed = parse_filter_parameters(params)
+-        self.assertEqual(parsed.get("since"), datetime(2020,4,26,19,18,14,123456, tzutc()))
+-        self.assertEqual(parsed.get("until"), datetime(2020,4,26,19,18,14,123456, tzutc()))
+-        self.assertEqual(parsed.get("limit"), 123)
+-        self.assertIsNone(parsed.get("asd"))
++        for include_aggretate in (True, False):
++            parsed = parse_filter_parameters(params, include_aggretate)
++            self.assertEqual(parsed.get("since"), datetime(2020,4,26,19,18,14,123456, tzutc()))
++            self.assertEqual(parsed.get("until"), datetime(2020,4,26,19,18,14,123456, tzutc()))
++            self.assertEqual(parsed.get("limit"), 123)
++            if include_aggretate:
++                self.assertEqual(parsed.get("aggregate_to"), 25)
++                self.assertEqual(parsed.get("aggregate_with"), "min")
++            else:
++                self.assertIsNone(parsed.get("aggregate_to"))
++                self.assertIsNone(parsed.get("aggregate_with"))
++            self.assertIsNone(parsed.get("asd"))
+ 
+     def test_parse_filter_parameters_catches_parsing_error(self):
+         parsed = parse_filter_parameters(dict(limit="cow"))
+@@ -47,12 +56,15 @@ class ServerHandlersTest(TestCase):
+         s = ServerHandlers(DictConnection())
+         self._assert_status(200, s.add_topic, dict(name="topic"))
+ 
+-    def test_add_data_get_data_and_get_latest_and_get_summary(self):
++    def test_add_data_get_data_and_get_latest_and_get_summary_get_overview(self):
+         s = ServerHandlers(DictConnection())
+ 
+         self._assert_status(404, s.get_latest, None)
+ 
+-        topic_id = self._create_topic(s, dict(name="topic", fields=["number"]))
++        data_tools = [
++            {"field":"number", "method":"line"},
++        ]
++        topic_id = self._create_topic(s, dict(name="topic", fields=["number"], data_tools=data_tools))
+ 
+         self._assert_status(404, s.get_latest, topic_id)
+ 
+@@ -71,6 +83,14 @@ class ServerHandlersTest(TestCase):
+ 
+         self._assert_status(200, s.get_summary, topic_id, {})
+ 
++        for i in range(5):
++            self._assert_status(200, s.add_data, topic_id, dict(number=i))
++
++        response = self._assert_status(200, s.get_overview, None, dict(aggregate_to=3))
++        data = response["statistics"][0]["payload"]["data"]["datasets"][0]["data"]
++        self.assertLessEqual(len(data), 3)
++
++
+     def test_add_data_validations(self):
+         s = ServerHandlers(DictConnection())
+ 

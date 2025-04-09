@@ -1,0 +1,99 @@
+diff --git a/httpx/decoders.py b/httpx/decoders.py
+index 3ae822b..22c6104 100644
+--- a/httpx/decoders.py
++++ b/httpx/decoders.py
+@@ -211,6 +211,67 @@ class TextDecoder:
+         return result
+ 
+ 
++class LineDecoder:
++    """
++    Handles incrementally reading lines from text.
++
++    Uses universal line decoding, supporting any of `\n`, `\r`, or `\r\n`
++    as line endings, normalizing to `\n`.
++    """
++
++    def __init__(self) -> None:
++        self.buffer = ""
++
++    def decode(self, text: str) -> typing.List[str]:
++        lines = []
++
++        if text.startswith("\n") and self.buffer and self.buffer[-1] == "\r":
++            # Handle the case where we have an "\r\n" split across
++            # our previous input, and our new chunk.
++            lines.append(self.buffer[:-1] + "\n")
++            self.buffer = ""
++            text = text[1:]
++
++        while text:
++            num_chars = len(text)
++            for idx in range(num_chars):
++                char = text[idx]
++                next_char = None if idx + 1 == num_chars else text[idx + 1]
++                if char == "\n":
++                    lines.append(self.buffer + text[: idx + 1])
++                    self.buffer = ""
++                    text = text[idx + 1 :]
++                    break
++                elif char == "\r" and next_char == "\n":
++                    lines.append(self.buffer + text[:idx] + "\n")
++                    self.buffer = ""
++                    text = text[idx + 2 :]
++                    break
++                elif char == "\r" and next_char is not None:
++                    lines.append(self.buffer + text[:idx] + "\n")
++                    self.buffer = ""
++                    text = text[idx + 1 :]
++                    break
++                elif next_char is None:
++                    self.buffer = text
++                    text = ""
++                    break
++
++        return lines
++
++    def flush(self) -> typing.List[str]:
++        if self.buffer.endswith("\r"):
++            # Handle the case where we had a trailing '\r', which could have
++            # been a '\r\n' pair.
++            lines = [self.buffer[:-1] + "\n"]
++        elif self.buffer:
++            lines = [self.buffer]
++        else:
++            lines = []
++        self.buffer = ""
++        return lines
++
++
+ SUPPORTED_DECODERS = {
+     "identity": IdentityDecoder,
+     "gzip": GZipDecoder,
+diff --git a/httpx/models.py b/httpx/models.py
+index 5469efc..33cfb83 100644
+--- a/httpx/models.py
++++ b/httpx/models.py
+@@ -17,6 +17,7 @@ from .decoders import (
+     SUPPORTED_DECODERS,
+     Decoder,
+     IdentityDecoder,
++    LineDecoder,
+     MultiDecoder,
+     TextDecoder,
+ )
+@@ -936,6 +937,14 @@ class Response:
+             yield decoder.decode(chunk)
+         yield decoder.flush()
+ 
++    async def stream_lines(self) -> typing.AsyncIterator[str]:
++        decoder = LineDecoder()
++        async for text in self.stream_text():
++            for line in decoder.decode(text):
++                yield line
++        for line in decoder.flush():
++            yield line
++
+     async def raw(self) -> typing.AsyncIterator[bytes]:
+         """
+         A byte-iterator over the raw response content.

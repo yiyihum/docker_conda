@@ -1,0 +1,221 @@
+diff --git a/nornir/core/__init__.py b/nornir/core/__init__.py
+index 8df1d34..08a112f 100644
+--- a/nornir/core/__init__.py
++++ b/nornir/core/__init__.py
+@@ -1,12 +1,12 @@
+ import logging
+ import logging.config
+ from multiprocessing.dummy import Pool
+-from typing import Type
+ 
+ from nornir.core.configuration import Config
+-from nornir.core.connections import ConnectionPlugin
+ from nornir.core.task import AggregatedResult, Task
+-from nornir.plugins import connections
++from nornir.plugins.connections import register_default_connection_plugins
++
++register_default_connection_plugins()
+ 
+ 
+ class Data(object):
+@@ -16,12 +16,10 @@ class Data(object):
+ 
+     Attributes:
+         failed_hosts (list): Hosts that have failed to run a task properly
+-        available_connections (dict): Dictionary holding available connection plugins
+     """
+ 
+     def __init__(self):
+         self.failed_hosts = set()
+-        self.available_connections = connections.available_connections
+ 
+     def recover_host(self, host):
+         """Remove ``host`` from list of failed hosts."""
+@@ -47,8 +45,6 @@ class Nornir(object):
+         dry_run(``bool``): Whether if we are testing the changes or not
+         config (:obj:`nornir.core.configuration.Config`): Configuration object
+         config_file (``str``): Path to Yaml configuration file
+-        available_connections (``dict``): dict of connection types that will be made available.
+-            Defaults to :obj:`nornir.plugins.tasks.connections.available_connections`
+ 
+     Attributes:
+         inventory (:obj:`nornir.core.inventory.Inventory`): Inventory to work with
+@@ -58,14 +54,7 @@ class Nornir(object):
+     """
+ 
+     def __init__(
+-        self,
+-        inventory,
+-        dry_run,
+-        config=None,
+-        config_file=None,
+-        available_connections=None,
+-        logger=None,
+-        data=None,
++        self, inventory, dry_run, config=None, config_file=None, logger=None, data=None
+     ):
+         self.logger = logger or logging.getLogger("nornir")
+ 
+@@ -81,9 +70,6 @@ class Nornir(object):
+ 
+         self.configure_logging()
+ 
+-        if available_connections is not None:
+-            self.data.available_connections = available_connections
+-
+     def __enter__(self):
+         return self
+ 
+@@ -238,10 +224,6 @@ class Nornir(object):
+         """ Return a dictionary representing the object. """
+         return {"data": self.data.to_dict(), "inventory": self.inventory.to_dict()}
+ 
+-    def get_connection_type(self, connection: str) -> Type[ConnectionPlugin]:
+-        """Returns the class for the given connection type."""
+-        return self.data.available_connections[connection]
+-
+     def close_connections(self, on_good=True, on_failed=False):
+         def close_connections_task(task):
+             task.host.close_connections()
+diff --git a/nornir/core/connections.py b/nornir/core/connections.py
+index fe50090..5e26397 100644
+--- a/nornir/core/connections.py
++++ b/nornir/core/connections.py
+@@ -1,8 +1,12 @@
+ from abc import ABC, abstractmethod
+-from typing import Any, Dict, NoReturn, Optional
++from typing import Any, Dict, NoReturn, Optional, Type
+ 
+ 
+ from nornir.core.configuration import Config
++from nornir.core.exceptions import (
++    ConnectionPluginAlreadyRegistered,
++    ConnectionPluginNotRegistered,
++)
+ 
+ 
+ class ConnectionPlugin(ABC):
+@@ -53,4 +57,63 @@ class UnestablishedConnection(object):
+ 
+ 
+ class Connections(Dict[str, ConnectionPlugin]):
+-    pass
++    available: Dict[str, Type[ConnectionPlugin]] = {}
++
++    @classmethod
++    def register(cls, name: str, plugin: Type[ConnectionPlugin]) -> None:
++        """Registers a connection plugin with a specified name
++
++        Args:
++            name: name of the connection plugin to register
++            plugin: defined connection plugin class
++
++        Raises:
++            :obj:`nornir.core.exceptions.ConnectionPluginAlreadyRegistered` if
++                another plugin with the specified name was already registered
++        """
++        existing_plugin = cls.available.get(name)
++        if existing_plugin is None:
++            cls.available[name] = plugin
++        elif existing_plugin != plugin:
++            raise ConnectionPluginAlreadyRegistered(
++                f"Connection plugin {plugin.__name__} can't be registered as "
++                f"{name!r} because plugin {existing_plugin.__name__} "
++                f"was already registered under this name"
++            )
++
++    @classmethod
++    def deregister(cls, name: str) -> None:
++        """Deregisters a registered connection plugin by its name
++
++        Args:
++            name: name of the connection plugin to deregister
++
++        Raises:
++            :obj:`nornir.core.exceptions.ConnectionPluginNotRegistered`
++        """
++        if name not in cls.available:
++            raise ConnectionPluginNotRegistered(
++                f"Connection {name!r} is not registered"
++            )
++        cls.available.pop(name)
++
++    @classmethod
++    def deregister_all(cls) -> None:
++        """Deregisters all registered connection plugins"""
++        cls.available = {}
++
++    @classmethod
++    def get_plugin(cls, name: str) -> Type[ConnectionPlugin]:
++        """Fetches the connection plugin by name if already registered
++
++        Args:
++            name: name of the connection plugin
++
++        Raises:
++            :obj:`nornir.core.exceptions.ConnectionPluginNotRegistered`
++        """
++        if name not in cls.available:
++            raise ConnectionPluginNotRegistered(
++                f"Connection {name!r} is not registered"
++            )
++        return cls.available[name]
+diff --git a/nornir/core/exceptions.py b/nornir/core/exceptions.py
+index cbceb40..e1683be 100644
+--- a/nornir/core/exceptions.py
++++ b/nornir/core/exceptions.py
+@@ -14,6 +14,14 @@ class ConnectionNotOpen(ConnectionException):
+     pass
+ 
+ 
++class ConnectionPluginAlreadyRegistered(ConnectionException):
++    pass
++
++
++class ConnectionPluginNotRegistered(ConnectionException):
++    pass
++
++
+ class CommandError(Exception):
+     """
+     Raised when there is a command error.
+diff --git a/nornir/core/inventory.py b/nornir/core/inventory.py
+index 4330e86..3e2d8c5 100644
+--- a/nornir/core/inventory.py
++++ b/nornir/core/inventory.py
+@@ -329,7 +329,7 @@ class Host(object):
+         if connection in self.connections:
+             raise ConnectionAlreadyOpen(connection)
+ 
+-        self.connections[connection] = self.nornir.get_connection_type(connection)()
++        self.connections[connection] = self.connections.get_plugin(connection)()
+         if default_to_host_attributes:
+             conn_params = self.get_connection_parameters(connection)
+             self.connections[connection].open(
+diff --git a/nornir/plugins/connections/__init__.py b/nornir/plugins/connections/__init__.py
+index 5fc891f..fb14988 100644
+--- a/nornir/plugins/connections/__init__.py
++++ b/nornir/plugins/connections/__init__.py
+@@ -1,16 +1,10 @@
+-from typing import Dict, TYPE_CHECKING, Type
+-
+-
+ from .napalm import Napalm
+ from .netmiko import Netmiko
+ from .paramiko import Paramiko
+-
+-if TYPE_CHECKING:
+-    from nornir.core.connections import ConnectionPlugin  # noqa
++from nornir.core.connections import Connections
+ 
+ 
+-available_connections: Dict[str, Type["ConnectionPlugin"]] = {
+-    "napalm": Napalm,
+-    "netmiko": Netmiko,
+-    "paramiko": Paramiko,
+-}
++def register_default_connection_plugins() -> None:
++    Connections.register("napalm", Napalm)
++    Connections.register("netmiko", Netmiko)
++    Connections.register("paramiko", Paramiko)
+

@@ -1,0 +1,179 @@
+diff --git a/geopandas/io/tests/test_arrow.py b/geopandas/io/tests/test_arrow.py
+index 62657b9..ffe889a 100644
+--- a/geopandas/io/tests/test_arrow.py
++++ b/geopandas/io/tests/test_arrow.py
+@@ -105,8 +105,8 @@ def test_crs_metadata_datum_ensemble():
+ 
+ def test_write_metadata_invalid_spec_version():
+     gdf = geopandas.GeoDataFrame(geometry=[box(0, 0, 10, 10)], crs="EPSG:4326")
+-    with pytest.raises(ValueError, match="version must be one of"):
+-        _create_metadata(gdf, version="invalid")
++    with pytest.raises(ValueError, match="schema_version must be one of"):
++        _create_metadata(gdf, schema_version="invalid")
+ 
+ 
+ def test_encode_metadata():
+@@ -259,7 +259,7 @@ def test_to_parquet_does_not_pass_engine_along(mock_to_parquet):
+     # assert that engine keyword is not passed through to _to_parquet (and thus
+     # parquet.write_table)
+     mock_to_parquet.assert_called_with(
+-        df, "", compression="snappy", index=None, version=None
++        df, "", compression="snappy", index=None, schema_version=None
+     )
+ 
+ 
+@@ -679,9 +679,10 @@ def test_write_read_default_crs(tmpdir, format):
+ 
+ 
+ @pytest.mark.parametrize(
+-    "format,version", product(["feather", "parquet"], [None] + SUPPORTED_VERSIONS)
++    "format,schema_version",
++    product(["feather", "parquet"], [None] + SUPPORTED_VERSIONS),
+ )
+-def test_write_spec_version(tmpdir, format, version):
++def test_write_spec_version(tmpdir, format, schema_version):
+     if format == "feather":
+         from pyarrow.feather import read_table
+ 
+@@ -691,7 +692,7 @@ def test_write_spec_version(tmpdir, format, version):
+     filename = os.path.join(str(tmpdir), f"test.{format}")
+     gdf = geopandas.GeoDataFrame(geometry=[box(0, 0, 10, 10)], crs="EPSG:4326")
+     write = getattr(gdf, f"to_{format}")
+-    write(filename, version=version)
++    write(filename, schema_version=schema_version)
+ 
+     # ensure that we can roundtrip data regardless of version
+     read = getattr(geopandas, f"read_{format}")
+@@ -700,10 +701,10 @@ def test_write_spec_version(tmpdir, format, version):
+ 
+     table = read_table(filename)
+     metadata = json.loads(table.schema.metadata[b"geo"])
+-    assert metadata["version"] == version or METADATA_VERSION
++    assert metadata["version"] == schema_version or METADATA_VERSION
+ 
+     # verify that CRS is correctly handled between versions
+-    if version == "0.1.0":
++    if schema_version == "0.1.0":
+         assert metadata["columns"]["geometry"]["crs"] == gdf.crs.to_wkt()
+ 
+     else:
+@@ -712,6 +713,46 @@ def test_write_spec_version(tmpdir, format, version):
+         assert metadata["columns"]["geometry"]["crs"] == crs_expected
+ 
+ 
++@pytest.mark.parametrize(
++    "format,version", product(["feather", "parquet"], [None] + SUPPORTED_VERSIONS)
++)
++def test_write_deprecated_version_parameter(tmpdir, format, version):
++    if format == "feather":
++        from pyarrow.feather import read_table
++
++        version = version or 2
++
++    else:
++        from pyarrow.parquet import read_table
++
++        version = version or "2.6"
++
++    filename = os.path.join(str(tmpdir), f"test.{format}")
++    gdf = geopandas.GeoDataFrame(geometry=[box(0, 0, 10, 10)], crs="EPSG:4326")
++    write = getattr(gdf, f"to_{format}")
++
++    if version in SUPPORTED_VERSIONS:
++        with pytest.warns(
++            FutureWarning,
++            match="the `version` parameter has been replaced with `schema_version`",
++        ):
++            write(filename, version=version)
++
++    else:
++        # no warning raised if not one of the captured versions
++        write(filename, version=version)
++
++    table = read_table(filename)
++    metadata = json.loads(table.schema.metadata[b"geo"])
++
++    if version in SUPPORTED_VERSIONS:
++        # version is captured as a parameter
++        assert metadata["version"] == version
++    else:
++        # version is passed to underlying writer
++        assert metadata["version"] == METADATA_VERSION
++
++
+ @pytest.mark.parametrize("version", ["0.1.0", "0.4.0"])
+ def test_read_versioned_file(version):
+     """
+diff --git a/geopandas/tests/test_geodataframe.py b/geopandas/tests/test_geodataframe.py
+index a1a02ae..3cff510 100644
+--- a/geopandas/tests/test_geodataframe.py
++++ b/geopandas/tests/test_geodataframe.py
+@@ -1220,6 +1220,25 @@ class TestConstructor:
+         with pytest.raises(ValueError):
+             GeoDataFrame(df3, geometry="geom")
+ 
++    @pytest.mark.parametrize("dtype", ["geometry", "object"])
++    def test_multiindex_with_geometry_label(self, dtype):
++        # DataFrame with MultiIndex where "geometry" label corresponds to
++        # multiple columns
++        df = pd.DataFrame([[Point(0, 0), Point(1, 1)], [Point(2, 2), Point(3, 3)]])
++        df = df.astype(dtype)
++        df.columns = pd.MultiIndex.from_product([["geometry"], [0, 1]])
++        # don't error in constructor
++        gdf = GeoDataFrame(df)
++        # Getting the .geometry column gives GeoDataFrame for both columns
++        # (but with first MultiIndex level removed)
++        # TODO should this give an error instead?
++        result = gdf.geometry
++        assert result.shape == gdf.shape
++        assert result.columns.tolist() == [0, 1]
++        assert_frame_equal(result, gdf["geometry"])
++        result = gdf[["geometry"]]
++        assert_frame_equal(result, gdf if dtype == "geometry" else pd.DataFrame(gdf))
++
+ 
+ def test_geodataframe_crs():
+     gdf = GeoDataFrame(columns=["geometry"])
+diff --git a/geopandas/tests/test_op_output_types.py b/geopandas/tests/test_op_output_types.py
+index 3a4155c..5a447f3 100644
+--- a/geopandas/tests/test_op_output_types.py
++++ b/geopandas/tests/test_op_output_types.py
+@@ -289,6 +289,11 @@ def test_expanddim_in_unstack():
+     else:  # pandas GH37369, unstack doesn't call finalize
+         assert unstack._geometry_column_name == "geometry"
+ 
++    # https://github.com/geopandas/geopandas/issues/2486
++    s.name = "geometry"
++    unstack = s.unstack()
++    assert_object(unstack, GeoDataFrame, None, None)
++
+ 
+ # indexing /  constructor_sliced tests
+ 
+diff --git a/geopandas/tests/test_pandas_methods.py b/geopandas/tests/test_pandas_methods.py
+index 252af1d..552d53b 100644
+--- a/geopandas/tests/test_pandas_methods.py
++++ b/geopandas/tests/test_pandas_methods.py
+@@ -655,6 +655,22 @@ def test_df_apply_returning_series(df):
+ 
+     result = df.apply(lambda row: row.value1, axis=1)
+     assert_series_equal(result, df["value1"].rename(None))
++    # https://github.com/geopandas/geopandas/issues/2480
++    result = df.apply(lambda x: float("NaN"), axis=1)
++    assert result.dtype == "float64"
++    # assert list of nones is not promoted to GeometryDtype
++    result = df.apply(lambda x: None, axis=1)
++    assert result.dtype == "object"
++
++
++def test_pivot(df):
++    # https://github.com/geopandas/geopandas/issues/2057
++    # pivot failing due to creating a MultiIndex
++    result = df.pivot(columns="value1")
++    expected = GeoDataFrame(pd.DataFrame(df).pivot(columns="value1"))
++    # TODO assert_geodataframe_equal crashes
++    assert isinstance(result, GeoDataFrame)
++    assert_frame_equal(result, expected)
+ 
+ 
+ def test_preserve_attrs(df):

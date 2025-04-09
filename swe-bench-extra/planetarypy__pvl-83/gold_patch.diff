@@ -1,0 +1,334 @@
+diff --git a/HISTORY.rst b/HISTORY.rst
+index 8641dfd..230387b 100644
+--- a/HISTORY.rst
++++ b/HISTORY.rst
+@@ -41,9 +41,24 @@ Added
+   milisecond time precision (not microsecond as ODL allows), and does
+   not allow times with a +HH:MM timezone specifier.  It does assume
+   any time without a timezone specifier is a UTC time.
++* Added a ``real_cls`` parameter to the decoder classes, so that users can specify
++  an arbitrary type with which real numbers in the PVL-text could be returned in
++  the dict-like from the loaders (defaults to ``float`` as you'd expect).
++* The encoders now support a broader range of real types to complement the decoders.
++
++Changed
+++++++++
++* Improved some build and test functionality.
++* Moved the is_identifier() static function from the ODLEncoder to the ODLDecoder
++  where it probably should have always been.
++
+ 
+ Fixed
+ +++++
++* Very long Python ``str`` objects that otherwise qualified as ODL/PDS3 Symbol Strings,
++  would get written out with single-quotes, but they would then be split across lines
++  via the formatter, so they should be written as Text Strings with double-quotes.
++  Better protections have been put in place.
+ * pvl.decoder.ODLDecoder now will return both "aware" and "naive"
+   datetime objects (as appropriate) since "local" times without a
+   timezone are allowed under ODL.
+@@ -58,13 +73,6 @@ Fixed
+   precision.
+ 
+ 
+-Changed
+-+++++++
+-* Improved some build and test functionality.
+-* Moved the is_identifier() static function from the ODLEncoder to the ODLDecoder
+-  where it probably should have always been.
+-
+-
+ 1.1.0 (2020-12-04)
+ ------------------
+ 
+diff --git a/docs/parsing.rst b/docs/parsing.rst
+index 8805747..5b26a7d 100644
+--- a/docs/parsing.rst
++++ b/docs/parsing.rst
+@@ -258,3 +258,44 @@ This is very similar to parsing PVL text from a file, but you use
+  Quantity(value=50.784875, units='DEG')
+ 
+ Of course, other kinds of URLs, like file, ftp, rsync, sftp and more can be used.
++
++
++---------------------------
++Return non-standard objects
++---------------------------
++
++The "loaders" return a dict-like filled with Python objects based on the types inferred from the
++PVL-text.  Sometimes you may want the `pvl` library to return different types in the dict-like,
++and `pvl` has some limited capacity for that (so far just real and quantity types).
++
++Normally real number values in the PVL-text will be returned as Python :class:`float` objects.
++However, what if you wanted all of the real values to be returned in the dict-like as Python
++:class:`decimal.Decimal` objects (because you wanted to preserve numeric precision)?  You can
++do that by providing the object type you want via the ``real_cls`` argument of a decoder constructor,
++like so::
++
++ >>> from decimal import Decimal
++ >>> import pvl
++ >>> text = "gigawatts = 1.210"
++ >>>
++ >>> flo = pvl.loads(text)
++ >>> print(flo)
++ PVLModule([
++   ('gigawatts', 1.21)
++ ])
++ >>>
++ >>> print(type(flo["gigawatts"]))
++ <class 'float'>
++ >>> dec = pvl.loads(text, decoder=pvl.decoder.OmniDecoder(real_cls=Decimal))
++ >>> print(dec)
++ PVLModule([
++   ('gigawatts', Decimal('1.210'))
++ ])
++ >>> print(type(dec["gigawatts"]))
++ <class 'decimal.Decimal'>
++
++Any class that can be passed a :class:`str` object to initialize an object can be provided to
++``real_cls``, but it should emit a :class:`ValueError` if it is given a string that should not
++be converted to a real number value.
++
++To learn more about quantity classes in `pvl`, please see :ref:`quantities`.
+\ No newline at end of file
+diff --git a/docs/quantities.rst b/docs/quantities.rst
+index 1ae2f19..edf24d7 100644
+--- a/docs/quantities.rst
++++ b/docs/quantities.rst
+@@ -1,3 +1,5 @@
++.. _quantities:
++
+ ============================
+ Quantities: Values and Units
+ ============================
+diff --git a/pvl/decoder.py b/pvl/decoder.py
+index 22382b7..c98dd86 100644
+--- a/pvl/decoder.py
++++ b/pvl/decoder.py
+@@ -9,7 +9,7 @@ referred to as the Blue Book with a date of June 2000.
+ A decoder deals with converting strings given to it (typically
+ by the parser) to the appropriate Python type.
+ """
+-# Copyright 2015, 2017, 2019-2020, ``pvl`` library authors.
++# Copyright 2015, 2017, 2019-2021, ``pvl`` library authors.
+ #
+ # Reuse is permitted under the terms of the license.
+ # The AUTHORS file and the LICENSE file are at the
+@@ -17,6 +17,7 @@ by the parser) to the appropriate Python type.
+ 
+ import re
+ from datetime import datetime, timedelta, timezone
++from decimal import InvalidOperation
+ from itertools import repeat, chain
+ from warnings import warn
+ 
+@@ -56,9 +57,12 @@ class PVLDecoder(object):
+     :param quantity_cls: defaults to :class:`pvl.collections.Quantity`, but
+         could be any class object that takes two arguments, where the
+         first is the value, and the second is the units value.
++
++    :param real_cls: defaults to :class:`float`, but could be any class object
++        that can be constructed from a `str` object.
+     """
+ 
+-    def __init__(self, grammar=None, quantity_cls=None):
++    def __init__(self, grammar=None, quantity_cls=None, real_cls=None):
+         self.errors = []
+ 
+         if grammar is None:
+@@ -73,6 +77,11 @@ class PVLDecoder(object):
+         else:
+             self.quantity_cls = quantity_cls
+ 
++        if real_cls is None:
++            self.real_cls = float
++        else:
++            self.real_cls = real_cls
++
+     def decode(self, value: str):
+         """Returns a Python object based on *value*."""
+         return self.decode_simple_value(value)
+@@ -83,6 +92,15 @@ class PVLDecoder(object):
+ 
+          <Simple-Value> ::= (<Date-Time> | <Numeric> | <String>)
+         """
++        if value.casefold() == self.grammar.none_keyword.casefold():
++            return None
++
++        if value.casefold() == self.grammar.true_keyword.casefold():
++            return True
++
++        if value.casefold() == self.grammar.false_keyword.casefold():
++            return False
++
+         for d in (
+             self.decode_quoted_string,
+             self.decode_non_decimal,
+@@ -94,15 +112,6 @@ class PVLDecoder(object):
+             except ValueError:
+                 pass
+ 
+-        if value.casefold() == self.grammar.none_keyword.casefold():
+-            return None
+-
+-        if value.casefold() == self.grammar.true_keyword.casefold():
+-            return True
+-
+-        if value.casefold() == self.grammar.false_keyword.casefold():
+-            return False
+-
+         return self.decode_unquoted_string(value)
+ 
+     def decode_unquoted_string(self, value: str) -> str:
+@@ -160,16 +169,18 @@ class PVLDecoder(object):
+                 return str(value[1:-1])
+         raise ValueError(f'The object "{value}" is not a PVL Quoted String.')
+ 
+-    @staticmethod
+-    def decode_decimal(value: str):
+-        """Returns a Python ``int`` or ``float`` as appropriate
++    def decode_decimal(self, value: str):
++        """Returns a Python ``int`` or ``self.real_cls`` object, as appropriate
+         based on *value*.  Raises a ValueError otherwise.
+         """
+-        # Returns int or float
++        # Returns int or real_cls
+         try:
+             return int(value, base=10)
+         except ValueError:
+-            return float(value)
++            try:
++                return self.real_cls(str(value))
++            except InvalidOperation as err:
++                raise ValueError from err
+ 
+     def decode_non_decimal(self, value: str) -> int:
+         """Returns a Python ``int`` as decoded from *value*
+@@ -294,13 +305,17 @@ class ODLDecoder(PVLDecoder):
+     default to an ODLGrammar() object.
+     """
+ 
+-    def __init__(self, grammar=None, quantity_cls=None):
++    def __init__(self, grammar=None, quantity_cls=None, real_cls=None):
+         self.errors = []
+ 
+         if grammar is None:
+-            super().__init__(grammar=ODLGrammar(), quantity_cls=quantity_cls)
+-        else:
+-            super().__init__(grammar=grammar, quantity_cls=quantity_cls)
++            grammar = ODLGrammar()
++
++        super().__init__(
++            grammar=grammar,
++            quantity_cls=quantity_cls,
++            real_cls=real_cls
++        )
+ 
+     def decode_datetime(self, value: str):
+         """Extends parent function to also deal with datetimes
+diff --git a/pvl/encoder.py b/pvl/encoder.py
+index 5d8118b..8198fe5 100644
+--- a/pvl/encoder.py
++++ b/pvl/encoder.py
+@@ -5,7 +5,7 @@ An encoder deals with converting Python objects into
+ string values that conform to a PVL specification.
+ """
+ 
+-# Copyright 2015, 2019-2020, ``pvl`` library authors.
++# Copyright 2015, 2019-2021, ``pvl`` library authors.
+ #
+ # Reuse is permitted under the terms of the license.
+ # The AUTHORS file and the LICENSE file are at the
+@@ -16,6 +16,7 @@ import re
+ import textwrap
+ 
+ from collections import abc, namedtuple
++from decimal import Decimal
+ from warnings import warn
+ 
+ from .collections import PVLObject, PVLGroup, Quantity
+@@ -126,6 +127,9 @@ class PVLEncoder(object):
+                 f"group_class ({group_class})."
+             )
+ 
++        # Finally, let's keep track of everything we consider "numerical":
++        self.numeric_types = (int, float, self.decoder.real_cls, Decimal)
++
+     def _import_quantities(self):
+         warn_str = (
+             "The {} library is not present, so {} objects will "
+@@ -382,8 +386,8 @@ class PVLEncoder(object):
+                 return self.grammar.true_keyword
+             else:
+                 return self.grammar.false_keyword
+-        elif isinstance(value, (int, float)):
+-            return repr(value)
++        elif isinstance(value, self.numeric_types):
++            return str(value)
+         elif isinstance(value, str):
+             return self.encode_string(value)
+         else:
+@@ -561,8 +565,8 @@ class ODLEncoder(PVLEncoder):
+ 
+         For Python, these correspond to the following:
+ 
+-        * numeric_value: int, float, and Quantity whose value
+-          is int or float
++        * numeric_value: any of self.numeric_types, and Quantity whose value
++          is one of the self.numeric_types.
+         * date_time_string: datetime objects
+         * text_string_value: str
+         * symbol_value: str
+@@ -570,13 +574,19 @@ class ODLEncoder(PVLEncoder):
+         """
+         for quant in self.quantities:
+             if isinstance(value, quant.cls):
+-                if isinstance(getattr(value, quant.value_prop), (int, float)):
++                if isinstance(
++                    getattr(value, quant.value_prop), self.numeric_types
++                ):
+                     return True
+ 
+-        if isinstance(
+-            value,
+-            (int, float, datetime.date, datetime.datetime, datetime.time, str),
+-        ):
++        scalar_types = (
++            *self.numeric_types,
++            datetime.date,
++            datetime.datetime,
++            datetime.time,
++            str
++        )
++        if isinstance(value, scalar_types):
+             return True
+ 
+         return False
+@@ -602,6 +612,15 @@ class ODLEncoder(PVLEncoder):
+                 if fe in value:
+                     return False
+ 
++            if len(value) > self.width / 2:
++                # This means that the string is long and it is very
++                # likely to get wrapped and have carriage returns,
++                # and thus "ODL Format Effectors" inserted later.
++                # Unfortunately, without knowing the width of the
++                # parameter term, and the current indent level, this
++                # still may end up being incorrect threshhold.
++                return False
++
+             if value.isprintable() and len(value) > 0:  # Item 3
+                 return True
+         else:
+@@ -711,7 +730,10 @@ class ODLEncoder(PVLEncoder):
+         """
+         for quant in self.quantities:
+             if isinstance(value, quant.cls):
+-                if isinstance(getattr(value, quant.value_prop), (int, float)):
++                if isinstance(
++                    getattr(value, quant.value_prop),
++                    self.numeric_types
++                ):
+                     return super().encode_value(value)
+                 else:
+                     raise ValueError(

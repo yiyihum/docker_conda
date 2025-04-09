@@ -1,0 +1,187 @@
+diff --git a/parliament/__init__.py b/parliament/__init__.py
+index f9b5d48..91dd4b3 100644
+--- a/parliament/__init__.py
++++ b/parliament/__init__.py
+@@ -1,7 +1,7 @@
+ """
+ This library is a linter for AWS IAM policies.
+ """
+-__version__ = "1.3.1"
++__version__ = "1.4.0"
+ 
+ import fnmatch
+ import functools
+@@ -147,6 +147,52 @@ def is_arn_match(resource_type, arn_format, resource):
+ 
+     return is_glob_match(arn_id, resource_id)
+ 
++def is_arn_strictly_valid(resource_type, arn_format, resource):
++    """
++    Strictly validate the arn_format specified in the docs, with the resource
++    given in the IAM policy. These can each be strings with globbing. For example, we
++    want to match the following two strings:
++    - arn:*:s3:::*/*
++    - arn:aws:s3:::*personalize*
++
++    That should return true because you could have "arn:aws:s3:::personalize/" which matches both.
++
++    However when not using *, must include the resource type in the resource arn and wildcards
++    are not valid for the resource type portion (https://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html#genref-aws-service-namesspaces)
++
++    Input:
++    - resource_type: Example "bucket", this is only used to identify special cases.
++    - arn_format: ARN regex from the docs
++    - resource: ARN regex from IAM policy
++
++    """
++
++    if is_arn_match(resource_type, arn_format, resource):
++        # this would have already raised exception
++        arn_parts = arn_format.split(":")
++        resource_parts = resource.split(":")
++        arn_id = ":".join(arn_parts[5:])
++        resource_id = ":".join(resource_parts[5:])
++
++        # Does the resource contain a resource type component
++        # regex looks for a resource type word like "user" or "cluster-endpoint" followed by a
++        # : or / and then anything else excluding the resource type string starting with a *
++        arn_id_resource_type = re.match(r"(^[^\*][\w-]+)[\/\:].+", arn_id)
++
++        if arn_id_resource_type != None and resource_id != "*":
++            
++            # https://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html#genref-aws-service-namesspaces
++            # The following is not allowed: arn:aws:iam::123456789012:u*
++            if not (resource_id.startswith(arn_id_resource_type[1])):
++                return False
++
++        # replace aws variable and check for other colons
++        resource_id_no_vars = re.sub(r"\$\{aws.\w+\}", "", resource_id)
++        if ":" in resource_id_no_vars and not ":" in arn_id:
++            return False
++
++        return True
++    return False
+ 
+ def is_glob_match(s1, s2):
+     # This comes from https://github.com/duo-labs/parliament/issues/36#issuecomment-574001764
+diff --git a/parliament/cli.py b/parliament/cli.py
+index fee82e7..4905e82 100755
+--- a/parliament/cli.py
++++ b/parliament/cli.py
+@@ -233,7 +233,7 @@ def main():
+                 contents = f.read()
+                 policy_file_json = jsoncfg.loads_config(contents)
+                 policy_string = json.dumps(
+-                    policy_file_json["PolicyVersion"]["Document"]
++                    policy_file_json.PolicyVersion.Document()
+                 )
+                 policy = analyze_policy_string(
+                     policy_string,
+@@ -248,55 +248,55 @@ def main():
+         with open(args.auth_details_file) as f:
+             contents = f.read()
+             auth_details_json = jsoncfg.loads_config(contents)
+-            for policy in auth_details_json["Policies"]:
++            for policy in auth_details_json.Policies:
+                 # Ignore AWS defined policies
+-                if "arn:aws:iam::aws:" in policy["Arn"]:
++                if "arn:aws:iam::aws:" in policy.Arn():
+                     continue
+ 
+                 # Ignore AWS Service-linked roles
+                 if (
+-                    policy["Path"] == "/service-role/"
+-                    or policy["Path"] == "/aws-service-role/"
+-                    or policy["PolicyName"].startswith("AWSServiceRoleFor")
+-                    or policy["PolicyName"].endswith("ServiceRolePolicy")
+-                    or policy["PolicyName"].endswith("ServiceLinkedRolePolicy")
++                    policy.Path() == "/service-role/"
++                    or policy.Path() == "/aws-service-role/"
++                    or policy.PolicyName().startswith("AWSServiceRoleFor")
++                    or policy.PolicyName().endswith("ServiceRolePolicy")
++                    or policy.PolicyName().endswith("ServiceLinkedRolePolicy")
+                 ):
+                     continue
+ 
+-                for version in policy["PolicyVersionList"]:
+-                    if not version["IsDefaultVersion"]:
++                for version in policy.PolicyVersionList:
++                    if not version.IsDefaultVersion():
+                         continue
+                     policy = analyze_policy_string(
+-                        json.dumps(version["Document"]), policy["Arn"],
++                        json.dumps(version.Document()), policy.Arn(),
+                     )
+                     findings.extend(policy.findings)
+ 
+             # Review the inline policies on Users, Roles, and Groups
+-            for user in auth_details_json["UserDetailList"]:
+-                for policy in user.get("UserPolicyList", []):
++            for user in auth_details_json.UserDetailList:
++                for policy in user.UserPolicyList([]):
+                     policy = analyze_policy_string(
+-                        json.dumps(policy["PolicyDocument"]),
+-                        user["Arn"],
++                        json.dumps(policy['PolicyDocument']),
++                        user.Arn(),
+                         private_auditors_custom_path=args.private_auditors,
+                         include_community_auditors=args.include_community_auditors,
+                         config=config,
+                     )
+                     findings.extend(policy.findings)
+-            for role in auth_details_json["RoleDetailList"]:
+-                for policy in role.get("RolePolicyList", []):
++            for role in auth_details_json.RoleDetailList:
++                for policy in role.RolePolicyList([]):
+                     policy = analyze_policy_string(
+-                        json.dumps(policy["PolicyDocument"]),
+-                        role["Arn"],
++                        json.dumps(policy['PolicyDocument']),
++                        role.Arn(),
+                         private_auditors_custom_path=args.private_auditors,
+                         include_community_auditors=args.include_community_auditors,
+                         config=config,
+                     )
+                     findings.extend(policy.findings)
+-            for group in auth_details_json["GroupDetailList"]:
+-                for policy in group.get("GroupPolicyList", []):
++            for group in auth_details_json.GroupDetailList:
++                for policy in group.GroupPolicyList([]):
+                     policy = analyze_policy_string(
+-                        json.dumps(policy["PolicyDocument"]),
+-                        group["Arn"],
++                        json.dumps(policy['PolicyDocument']),
++                        group.Arn(),
+                         private_auditors_custom_path=args.private_auditors,
+                         include_community_auditors=args.include_community_auditors,
+                         config=config,
+diff --git a/parliament/statement.py b/parliament/statement.py
+index 805c27c..fc7db73 100644
+--- a/parliament/statement.py
++++ b/parliament/statement.py
+@@ -4,6 +4,7 @@ import re
+ from . import (
+     iam_definition,
+     is_arn_match,
++    is_arn_strictly_valid,
+     expand_action,
+     UnknownActionException,
+     UnknownPrefixException,
+@@ -434,7 +435,7 @@ class Statement:
+                     for aws_principal in make_list(json_object[1]):
+                         text = aws_principal.value
+                         account_id_regex = re.compile("^\d{12}$")
+-                        arn_regex = re.compile("^arn:[-a-z\*]*:iam::(\d{12}|):.*$")
++                        arn_regex = re.compile("^arn:[-a-z\*]*:iam::(\d{12}|cloudfront|):.*$")
+ 
+                         if text == "*":
+                             pass
+@@ -921,7 +922,7 @@ class Statement:
+                             self.resource_star[action_key] += 1
+                             match_found = True
+                             continue
+-                        if is_arn_match(resource_type, arn_format, resource.value):
++                        if is_arn_strictly_valid(resource_type, arn_format, resource.value):
+                             match_found = True
+                             continue
+ 

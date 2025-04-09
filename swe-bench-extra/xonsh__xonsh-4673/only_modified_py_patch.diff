@@ -1,0 +1,204 @@
+diff --git a/xonsh/prompt/env.py b/xonsh/prompt/env.py
+index fa6a9142..2edfd17c 100644
+--- a/xonsh/prompt/env.py
++++ b/xonsh/prompt/env.py
+@@ -1,42 +1,70 @@
+ """Prompt formatter for virtualenv and others"""
+-
+-import os
++import functools
++import re
++from pathlib import Path
++from typing import Optional
+ 
+ from xonsh.built_ins import XSH
+ 
+ 
+-def find_env_name():
+-    """Finds the current environment name from $VIRTUAL_ENV or
+-    $CONDA_DEFAULT_ENV if that is set.
++def find_env_name() -> Optional[str]:
++    """Find current environment name from available sources.
++
++    If ``$VIRTUAL_ENV`` is set, it is determined from the prompt setting in
++    ``<venv>/pyvenv.cfg`` or from the folder name of the environment.
++
++    Otherwise - if it is set - from ``$CONDA_DEFAULT_ENV``.
++    """
++    virtual_env = XSH.env.get("VIRTUAL_ENV")
++    if virtual_env:
++        name = _determine_env_name(virtual_env)
++        if name:
++            return name
++    conda_default_env = XSH.env.get("CONDA_DEFAULT_ENV")
++    if conda_default_env:
++        return conda_default_env
++
++
++def env_name() -> str:
++    """Build env_name based on different sources. Respect order of precedence.
++
++    Name from VIRTUAL_ENV_PROMPT will be used as-is.
++    Names from other sources are surrounded with ``{env_prefix}`` and
++    ``{env_postfix}`` fields.
+     """
+-    env_path = XSH.env.get("VIRTUAL_ENV", "")
+-    if env_path:
+-        env_name = os.path.basename(env_path)
+-    else:
+-        env_name = XSH.env.get("CONDA_DEFAULT_ENV", "")
+-    return env_name
++    if XSH.env.get("VIRTUAL_ENV_DISABLE_PROMPT"):
++        return ""
++    virtual_env_prompt = XSH.env.get("VIRTUAL_ENV_PROMPT")
++    if virtual_env_prompt:
++        return virtual_env_prompt
++    found_envname = find_env_name()
++    return _surround_env_name(found_envname) if found_envname else ""
++
+ 
++@functools.lru_cache(maxsize=5)
++def _determine_env_name(virtual_env: str) -> str:
++    """Use prompt setting from pyvenv.cfg or basename of virtual_env.
+ 
+-def env_name():
+-    """Returns the current env_name if it non-empty, surrounded by the
+-    ``{env_prefix}`` and ``{env_postfix}`` fields.
++    Tries to be resilient to subtle changes in whitespace and quoting in the
++    configuration file format as it adheres to no clear standard.
+     """
+-    env_name = find_env_name()
+-    if XSH.env.get("VIRTUAL_ENV_DISABLE_PROMPT") or not env_name:
+-        # env name prompt printing disabled, or no environment; just return
+-        return
+-
+-    venv_prompt = XSH.env.get("VIRTUAL_ENV_PROMPT")
+-    if venv_prompt is not None:
+-        return venv_prompt
+-    else:
+-        pf = XSH.shell.prompt_formatter
+-        pre = pf._get_field_value("env_prefix")
+-        post = pf._get_field_value("env_postfix")
+-        return pre + env_name + post
+-
+-
+-def vte_new_tab_cwd():
++    venv_path = Path(virtual_env)
++    pyvenv_cfg = venv_path / "pyvenv.cfg"
++    if pyvenv_cfg.is_file():
++        match = re.search(r"prompt\s*=\s*(.*)", pyvenv_cfg.read_text())
++        if match:
++            return match.group(1).strip().lstrip("'\"").rstrip("'\"")
++    return venv_path.name
++
++
++def _surround_env_name(name: str) -> str:
++    pf = XSH.shell.prompt_formatter
++    pre = pf._get_field_value("env_prefix")
++    post = pf._get_field_value("env_postfix")
++    return f"{pre}{name}{post}"
++
++
++def vte_new_tab_cwd() -> None:
+     """This prints an escape sequence that tells VTE terminals the hostname
+     and pwd. This should not be needed in most cases, but sometimes is for
+     certain Linux terminals that do not read the PWD from the environment
+diff --git a/xontrib/vox.py b/xontrib/vox.py
+index 3d5dac12..2a994f59 100644
+--- a/xontrib/vox.py
++++ b/xontrib/vox.py
+@@ -87,6 +87,7 @@ class VoxHandler(xcli.ArgParserAlias):
+         packages: xcli.Annotated[tp.Sequence[str], xcli.Arg(nargs="*")] = (),
+         requirements: xcli.Annotated[tp.Sequence[str], xcli.Arg(action="append")] = (),
+         link_project_dir=False,
++        prompt: "str|None" = None,
+     ):
+         """Create a virtual environment in $VIRTUALENV_HOME with python3's ``venv``.
+ 
+@@ -114,6 +115,8 @@ class VoxHandler(xcli.ArgParserAlias):
+             The argument value is passed to ``pip -r`` to be installed.
+         link_project_dir: -l, --link, --link-project
+             Associate the current directory with the new environment.
++        prompt: --prompt
++            Provides an alternative prompt prefix for this environment.
+         """
+ 
+         print("Creating environment...")
+@@ -128,6 +131,7 @@ class VoxHandler(xcli.ArgParserAlias):
+             symlinks=symlinks,
+             with_pip=(not without_pip),
+             interpreter=interpreter,
++            prompt=prompt,
+         )
+         if link_project_dir:
+             self.project_set(name)
+diff --git a/xontrib/voxapi.py b/xontrib/voxapi.py
+index b74dd1b7..c844c91e 100644
+--- a/xontrib/voxapi.py
++++ b/xontrib/voxapi.py
+@@ -139,6 +139,7 @@ class Vox(collections.abc.Mapping):
+         system_site_packages=False,
+         symlinks=False,
+         with_pip=True,
++        prompt=None,
+     ):
+         """Create a virtual environment in $VIRTUALENV_HOME with python3's ``venv``.
+ 
+@@ -157,8 +158,9 @@ class Vox(collections.abc.Mapping):
+             environment.
+         with_pip : bool
+             If True, ensure pip is installed in the virtual environment. (Default is True)
++        prompt: str
++            Provides an alternative prompt prefix for this environment.
+         """
+-
+         if interpreter is None:
+             interpreter = _get_vox_default_interpreter()
+             print(f"Using Interpreter: {interpreter}")
+@@ -176,7 +178,14 @@ class Vox(collections.abc.Mapping):
+                 )
+             )
+ 
+-        self._create(env_path, interpreter, system_site_packages, symlinks, with_pip)
++        self._create(
++            env_path,
++            interpreter,
++            system_site_packages,
++            symlinks,
++            with_pip,
++            prompt=prompt,
++        )
+         events.vox_on_create.fire(name=name)
+ 
+     def upgrade(self, name, symlinks=False, with_pip=True, interpreter=None):
+@@ -219,6 +228,9 @@ class Vox(collections.abc.Mapping):
+             "symlinks": symlinks,
+             "with_pip": with_pip,
+         }
++        prompt = cfgops.get("prompt")
++        if prompt:
++            flags["prompt"] = prompt.lstrip("'\"").rstrip("'\"")
+         # END things we shouldn't be doing.
+ 
+         # Ok, do what we came here to do.
+@@ -233,6 +245,7 @@ class Vox(collections.abc.Mapping):
+         symlinks=False,
+         with_pip=True,
+         upgrade=False,
++        prompt=None,
+     ):
+         version_output = sp.check_output(
+             [interpreter, "--version"], stderr=sp.STDOUT, text=True
+@@ -255,8 +268,10 @@ class Vox(collections.abc.Mapping):
+             with_pip,
+             upgrade,
+         ]
+-        cmd = [arg for arg in cmd if arg]  # remove empty args
++        if prompt and module == "venv":
++            cmd.extend(["--prompt", prompt])
+ 
++        cmd = [arg for arg in cmd if arg]  # remove empty args
+         logging.debug(cmd)
+ 
+         return_code = sp.call(cmd)
+

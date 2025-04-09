@@ -1,0 +1,179 @@
+diff --git a/docs/examples/types_iterables.py b/docs/examples/types_iterables.py
+--- a/docs/examples/types_iterables.py
++++ b/docs/examples/types_iterables.py
+@@ -1,4 +1,6 @@
+-from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
++from typing import (
++    Deque, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
++)
+ 
+ from pydantic import BaseModel
+ 
+@@ -24,6 +26,8 @@ class Model(BaseModel):
+ 
+     compound: Dict[Union[str, bytes], List[Set[int]]] = None
+ 
++    deque: Deque[int] = None
++
+ 
+ print(Model(simple_list=['1', '2', '3']).simple_list)
+ print(Model(list_of_ints=['1', '2', '3']).list_of_ints)
+@@ -36,3 +40,5 @@ class Model(BaseModel):
+ 
+ print(Model(sequence_of_ints=[1, 2, 3, 4]).sequence_of_ints)
+ print(Model(sequence_of_ints=(1, 2, 3, 4)).sequence_of_ints)
++
++print(Model(deque=[1, 2, 3]).deque)
+diff --git a/pydantic/errors.py b/pydantic/errors.py
+--- a/pydantic/errors.py
++++ b/pydantic/errors.py
+@@ -282,6 +282,10 @@ class FrozenSetError(PydanticTypeError):
+     msg_template = 'value is not a valid frozenset'
+ 
+ 
++class DequeError(PydanticTypeError):
++    msg_template = 'value is not a valid deque'
++
++
+ class TupleError(PydanticTypeError):
+     msg_template = 'value is not a valid tuple'
+ 
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -1,8 +1,10 @@
+ import warnings
++from collections import deque
+ from collections.abc import Iterable as CollectionsIterable
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    Deque,
+     Dict,
+     FrozenSet,
+     Generator,
+@@ -207,6 +209,7 @@ def Schema(default: Any, **kwargs: Any) -> Any:
+ SHAPE_FROZENSET = 8
+ SHAPE_ITERABLE = 9
+ SHAPE_GENERIC = 10
++SHAPE_DEQUE = 11
+ SHAPE_NAME_LOOKUP = {
+     SHAPE_LIST: 'List[{}]',
+     SHAPE_SET: 'Set[{}]',
+@@ -214,6 +217,7 @@ def Schema(default: Any, **kwargs: Any) -> Any:
+     SHAPE_SEQUENCE: 'Sequence[{}]',
+     SHAPE_FROZENSET: 'FrozenSet[{}]',
+     SHAPE_ITERABLE: 'Iterable[{}]',
++    SHAPE_DEQUE: 'Deque[{}]',
+ }
+ 
+ 
+@@ -477,6 +481,9 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+         elif issubclass(origin, FrozenSet):
+             self.type_ = get_args(self.type_)[0]
+             self.shape = SHAPE_FROZENSET
++        elif issubclass(origin, Deque):
++            self.type_ = get_args(self.type_)[0]
++            self.shape = SHAPE_DEQUE
+         elif issubclass(origin, Sequence):
+             self.type_ = get_args(self.type_)[0]
+             self.shape = SHAPE_SEQUENCE
+@@ -620,7 +627,7 @@ def _validate_sequence_like(  # noqa: C901 (ignore complexity)
+         if errors:
+             return v, errors
+ 
+-        converted: Union[List[Any], Set[Any], FrozenSet[Any], Tuple[Any, ...], Iterator[Any]] = result
++        converted: Union[List[Any], Set[Any], FrozenSet[Any], Tuple[Any, ...], Iterator[Any], Deque[Any]] = result
+ 
+         if self.shape == SHAPE_SET:
+             converted = set(result)
+@@ -628,6 +635,8 @@ def _validate_sequence_like(  # noqa: C901 (ignore complexity)
+             converted = frozenset(result)
+         elif self.shape == SHAPE_TUPLE_ELLIPSIS:
+             converted = tuple(result)
++        elif self.shape == SHAPE_DEQUE:
++            converted = deque(result)
+         elif self.shape == SHAPE_SEQUENCE:
+             if isinstance(v, tuple):
+                 converted = tuple(result)
+@@ -635,6 +644,8 @@ def _validate_sequence_like(  # noqa: C901 (ignore complexity)
+                 converted = set(result)
+             elif isinstance(v, Generator):
+                 converted = iter(result)
++            elif isinstance(v, deque):
++                converted = deque(result)
+         return converted, None
+ 
+     def _validate_iterable(
+diff --git a/pydantic/json.py b/pydantic/json.py
+--- a/pydantic/json.py
++++ b/pydantic/json.py
+@@ -1,4 +1,5 @@
+ import datetime
++from collections import deque
+ from decimal import Decimal
+ from enum import Enum
+ from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
+@@ -27,6 +28,7 @@ def isoformat(o: Union[datetime.date, datetime.time]) -> str:
+     Decimal: float,
+     Enum: lambda o: o.value,
+     frozenset: list,
++    deque: list,
+     GeneratorType: list,
+     IPv4Address: str,
+     IPv4Interface: str,
+diff --git a/pydantic/utils.py b/pydantic/utils.py
+--- a/pydantic/utils.py
++++ b/pydantic/utils.py
+@@ -126,7 +126,7 @@ def truncate(v: Union[str], *, max_len: int = 80) -> str:
+ 
+ 
+ def sequence_like(v: Type[Any]) -> bool:
+-    return isinstance(v, (list, tuple, set, frozenset, GeneratorType))
++    return isinstance(v, (list, tuple, set, frozenset, GeneratorType, deque))
+ 
+ 
+ def validate_field_name(bases: List[Type['BaseModel']], field_name: str) -> None:
+diff --git a/pydantic/validators.py b/pydantic/validators.py
+--- a/pydantic/validators.py
++++ b/pydantic/validators.py
+@@ -1,5 +1,5 @@
+ import re
+-from collections import OrderedDict
++from collections import OrderedDict, deque
+ from collections.abc import Hashable
+ from datetime import date, datetime, time, timedelta
+ from decimal import Decimal, DecimalException
+@@ -10,6 +10,7 @@
+     TYPE_CHECKING,
+     Any,
+     Callable,
++    Deque,
+     Dict,
+     FrozenSet,
+     Generator,
+@@ -245,6 +246,15 @@ def frozenset_validator(v: Any) -> FrozenSet[Any]:
+         raise errors.FrozenSetError()
+ 
+ 
++def deque_validator(v: Any) -> Deque[Any]:
++    if isinstance(v, deque):
++        return v
++    elif sequence_like(v):
++        return deque(v)
++    else:
++        raise errors.DequeError()
++
++
+ def enum_member_validator(v: Any, field: 'ModelField', config: 'BaseConfig') -> Enum:
+     try:
+         enum_v = field.type_(v)
+@@ -548,6 +558,7 @@ def check(self, config: Type['BaseConfig']) -> bool:
+     (tuple, [tuple_validator]),
+     (set, [set_validator]),
+     (frozenset, [frozenset_validator]),
++    (deque, [deque_validator]),
+     (UUID, [uuid_validator]),
+     (Decimal, [decimal_validator]),
+     (IPv4Interface, [ip_v4_interface_validator]),
+

@@ -1,0 +1,92 @@
+diff --git a/detective/config.py b/detective/config.py
+index db49a89..a814384 100644
+--- a/detective/config.py
++++ b/detective/config.py
+@@ -49,25 +49,45 @@ def _secret_yaml(loader, node):
+         raise ValueError("Secret {} not found".format(node.value)) from None
+ 
+ 
+-def _stub_dict(constructor, node):
++def _include_yaml(loader, node):
++    """Load another YAML file and embeds it using the !include tag.
++
++    Example:
++        device_tracker: !include device_tracker.yaml
++    """
++    return load_yaml(os.path.join(os.path.dirname(loader.name), node.value))
++
++
++def _stub_tag(constructor, node):
+     """Stub a constructor with a dictionary."""
+-    print("Unsupported YAML found: {} {}".format(node.tag, node.value))
++    seen = getattr(constructor, '_stub_seen', None)
++
++    if seen is None:
++        seen = constructor._stub_seen = set()
++
++    if node.tag not in seen:
++        print("YAML tag {} is not supported".format(node.tag))
++        seen.add(node.tag)
++
+     return {}
+ 
+ 
+-HassSafeConstructor.add_constructor("!include", _stub_dict)
+-HassSafeConstructor.add_constructor("!env_var", _stub_dict)
++HassSafeConstructor.add_constructor("!include", _include_yaml)
++HassSafeConstructor.add_constructor("!env_var", _stub_tag)
+ HassSafeConstructor.add_constructor("!secret", _secret_yaml)
+-HassSafeConstructor.add_constructor("!include_dir_list", _stub_dict)
+-HassSafeConstructor.add_constructor("!include_dir_merge_list", _stub_dict)
+-HassSafeConstructor.add_constructor("!include_dir_named", _stub_dict)
+-HassSafeConstructor.add_constructor("!include_dir_merge_named", _stub_dict)
++HassSafeConstructor.add_constructor("!include_dir_list", _stub_tag)
++HassSafeConstructor.add_constructor("!include_dir_merge_list", _stub_tag)
++HassSafeConstructor.add_constructor("!include_dir_named", _stub_tag)
++HassSafeConstructor.add_constructor("!include_dir_merge_named", _stub_tag)
+ 
+ 
+ def load_hass_config(path):
+     """Load the HASS config."""
+-    fname = os.path.join(path, "configuration.yaml")
++    return load_yaml(os.path.join(path, "configuration.yaml"))
++
+ 
++def load_yaml(fname):
++    """Load a YAML file."""
+     yaml = YAML(typ="safe")
+     # Compat with HASS
+     yaml.allow_duplicate_keys = True
+diff --git a/detective/core.py b/detective/core.py
+index ac1148b..aa08b46 100644
+--- a/detective/core.py
++++ b/detective/core.py
+@@ -24,6 +24,18 @@ def get_db_type(url):
+     return urlparse(url).scheme.split("+")[0]
+ 
+ 
++def stripped_db_url(url):
++    """Return a version of the DB url with the password stripped out."""
++    parsed = urlparse(url)
++
++    if parsed.password is None:
++        return url
++
++    return parsed._replace(
++        netloc="{}:***@{}".format(parsed.username, parsed.hostname)
++    ).geturl()
++
++
+ class HassDatabase:
+     """
+     Initializing the parser fetches all of the data from the database and
+@@ -44,7 +56,7 @@ class HassDatabase:
+         self._entities = None
+         try:
+             self.engine = create_engine(url)
+-            print("Successfully connected to database")
++            print("Successfully connected to database", stripped_db_url(url))
+             if fetch_entities:
+                 self.fetch_entities()
+         except Exception as exc:
+

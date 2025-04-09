@@ -1,0 +1,249 @@
+diff --git a/CHANGES b/CHANGES
+index 2675334..662cfc3 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -1,14 +1,19 @@
+ 0.22.0
+ ------
+ 
++* Update `requests` dependency to the version of 2.22.0 or higher. See #584.
+ * [BETA] Added possibility to record responses to TOML files via `@_recorder.record(file_path="out.toml")` decorator.
++* [BETA] Added possibility to replay responses (populate registry) from TOML files
++  via `responses._add_from_file(file_path="out.toml")` method.
+ * Fix type for the `mock`'s patcher object. See #556
++* Fix type annotation for `CallList`
+ * Add `passthrough` argument to `BaseResponse` object. See #557
+ * Fix `registries` leak. See #563
+ * Add support for the `loose` version of `json_params_matcher` via named argument `strict_match`. See #551
+ * Add lists support as JSON objects in `json_params_matcher`. See #559
+ * Added project links to pypi listing.
+ * Fix `MaxRetryError` exception. Replace exception by `RetryError` according to `requests` implementation. See #572.
++* Adjust error message when `Retry` is exhausted. See #580.
+ 
+ 0.21.0
+ ------
+diff --git a/README.rst b/README.rst
+index 357bd76..d03dad4 100644
+--- a/README.rst
++++ b/README.rst
+@@ -17,7 +17,7 @@ A utility library for mocking out the ``requests`` Python library.
+ 
+ ..  note::
+ 
+-    Responses requires Python 3.7 or newer, and requests >= 2.0
++    Responses requires Python 3.7 or newer, and requests >= 2.22.0
+ 
+ 
+ Table of Contents
+diff --git a/responses/__init__.py b/responses/__init__.py
+index 3cfafb8..24d664b 100644
+--- a/responses/__init__.py
++++ b/responses/__init__.py
+@@ -2,8 +2,6 @@ import inspect
+ import json as json_module
+ import logging
+ from collections import namedtuple
+-from collections.abc import Sequence
+-from collections.abc import Sized
+ from functools import wraps
+ from http import client
+ from itertools import groupby
+@@ -18,12 +16,15 @@ from typing import Iterator
+ from typing import List
+ from typing import Mapping
+ from typing import Optional
++from typing import Sequence
++from typing import Sized
+ from typing import Tuple
+ from typing import Type
+ from typing import Union
+ from typing import overload
+ from warnings import warn
+ 
++import toml as _toml
+ from requests.adapters import HTTPAdapter
+ from requests.adapters import MaxRetryError
+ from requests.exceptions import ConnectionError
+@@ -64,6 +65,7 @@ from urllib.parse import urlunsplit
+ 
+ if TYPE_CHECKING:  # pragma: no cover
+     # import only for linter run
++    import os
+     from unittest.mock import _patch as _mock_patcher
+ 
+     from requests import PreparedRequest
+@@ -217,7 +219,7 @@ def get_wrapped(
+     return wrapper
+ 
+ 
+-class CallList(Sequence, Sized):  # type: ignore[type-arg]
++class CallList(Sequence[Any], Sized):
+     def __init__(self) -> None:
+         self._calls: List[Call] = []
+ 
+@@ -227,7 +229,7 @@ class CallList(Sequence, Sized):  # type: ignore[type-arg]
+     def __len__(self) -> int:
+         return len(self._calls)
+ 
+-    def __getitem__(self, idx: int) -> Call:  # type: ignore[override]
++    def __getitem__(self, idx: Union[int, slice]) -> Union[Call, List[Call]]:
+         return self._calls[idx]
+ 
+     def add(self, request: "PreparedRequest", response: _Body) -> None:
+@@ -415,6 +417,25 @@ class BaseResponse(object):
+         return bool(urlsplit(self.url).query)
+ 
+     def _url_matches(self, url: _URLPatternType, other: str) -> bool:
++        """Compares two URLs.
++
++        Compares only scheme, netloc and path. If 'url' is a re.Pattern, then checks that
++        'other' matches the pattern.
++
++        Parameters
++        ----------
++        url : Union["Pattern[str]", str]
++            Reference URL or Pattern to compare.
++
++        other : str
++            URl that should be compared.
++
++        Returns
++        -------
++        bool
++            True, if URLs are identical or 'other' matches the pattern.
++
++        """
+         if isinstance(url, str):
+             if _has_unicode(url):
+                 url = _clean_unicode(url)
+@@ -661,9 +682,25 @@ class RequestsMock(object):
+         self._thread_lock = _ThreadingLock()
+ 
+     def get_registry(self) -> FirstMatchRegistry:
++        """Returns current registry instance with responses.
++
++        Returns
++        -------
++        FirstMatchRegistry
++            Current registry instance with responses.
++
++        """
+         return self._registry
+ 
+     def _set_registry(self, new_registry: Type[FirstMatchRegistry]) -> None:
++        """Replaces current registry with `new_registry`.
++
++        Parameters
++        ----------
++        new_registry : Type[FirstMatchRegistry]
++            Class reference of the registry that should be set, eg OrderedRegistry
++
++        """
+         if self.registered():
+             err_msg = (
+                 "Cannot replace Registry, current registry has responses.\n"
+@@ -674,6 +711,7 @@ class RequestsMock(object):
+         self._registry = new_registry()
+ 
+     def reset(self) -> None:
++        """Resets registry (including type), calls, passthru_prefixes to default values."""
+         self._registry = FirstMatchRegistry()
+         self._calls.reset()
+         self.passthru_prefixes = ()
+@@ -733,6 +771,21 @@ class RequestsMock(object):
+         response = Response(method=method, url=url, body=body, **kwargs)
+         return self._registry.add(response)
+ 
++    def _add_from_file(self, file_path: "Union[str, bytes, os.PathLike[Any]]") -> None:
++        with open(file_path) as file:
++            data = _toml.load(file)
++
++        for rsp in data["responses"]:
++            rsp = rsp["response"]
++            self.add(
++                method=rsp["method"],
++                url=rsp["url"],
++                body=rsp["body"],
++                status=rsp["status"],
++                content_type=rsp["content_type"],
++                auto_calculate_content_length=rsp["auto_calculate_content_length"],
++            )
++
+     def delete(self, *args: Any, **kwargs: Any) -> BaseResponse:
+         return self.add(DELETE, *args, **kwargs)
+ 
+@@ -1029,7 +1082,7 @@ class RequestsMock(object):
+                 retries = retries.increment(
+                     method=response.request.method,  # type: ignore[misc]
+                     url=response.url,  # type: ignore[misc]
+-                    response=response,  # type: ignore[misc]
++                    response=response.raw,  # type: ignore[misc]
+                 )
+                 return self._on_request(adapter, request, retries=retries, **kwargs)
+             except MaxRetryError as e:
+@@ -1110,6 +1163,7 @@ __all__ = [
+     # Exposed by the RequestsMock class:
+     "activate",
+     "add",
++    "_add_from_file",
+     "add_callback",
+     "add_passthru",
+     "_deprecated_assert_all_requests_are_fired",
+@@ -1144,6 +1198,7 @@ __all__ = [
+ # expose only methods and/or read-only methods
+ activate = _default_mock.activate
+ add = _default_mock.add
++_add_from_file = _default_mock._add_from_file
+ add_callback = _default_mock.add_callback
+ add_passthru = _default_mock.add_passthru
+ _deprecated_assert_all_requests_are_fired = _default_mock.assert_all_requests_are_fired
+diff --git a/responses/registries.py b/responses/registries.py
+index 049df23..4b7e233 100644
+--- a/responses/registries.py
++++ b/responses/registries.py
+@@ -75,9 +75,32 @@ class FirstMatchRegistry(object):
+ 
+ 
+ class OrderedRegistry(FirstMatchRegistry):
++    """Registry where `Response` objects are dependent on the insertion order and invocation index.
++
++    OrderedRegistry applies the rule of first in - first out. Responses should be invoked in
++    the same order in which they were added to the registry. Otherwise, an error is returned.
++    """
++
+     def find(
+         self, request: "PreparedRequest"
+     ) -> Tuple[Optional["BaseResponse"], List[str]]:
++        """Find the next registered `Response` and check if it matches the request.
++
++        Search is performed by taking the first element of the registered responses list
++        and removing this object (popping from the list).
++
++        Parameters
++        ----------
++        request : PreparedRequest
++            Request that was caught by the custom adapter.
++
++        Returns
++        -------
++        Tuple[Optional["BaseResponse"], List[str]]
++            Matched `Response` object and empty list in case of match.
++            Otherwise, None and a list with reasons for not finding a match.
++
++        """
+ 
+         if not self.registered:
+             return None, ["No more registered responses"]
+diff --git a/setup.py b/setup.py
+index 115d183..03e980c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -17,7 +17,7 @@ from setuptools.command.test import test as TestCommand
+ setup_requires = []
+ 
+ install_requires = [
+-    "requests>=2.0,<3.0",
++    "requests>=2.22.0,<3.0",
+     "urllib3>=1.25.10",
+     "toml",
+     "types-toml",

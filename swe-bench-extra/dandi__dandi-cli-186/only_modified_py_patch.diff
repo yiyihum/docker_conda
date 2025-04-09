@@ -1,0 +1,181 @@
+diff --git a/dandi/download.py b/dandi/download.py
+index b3cd295a..40b7ce1f 100644
+--- a/dandi/download.py
++++ b/dandi/download.py
+@@ -6,7 +6,7 @@ from . import girder, get_logger
+ from .consts import dandiset_metadata_file, known_instances, metadata_digests
+ from .dandiset import Dandiset
+ from .exceptions import FailedToConnectError, NotFoundError, UnknownURLError
+-from .utils import flatten, flattened, Parallel, delayed
++from .utils import flatten, flattened, Parallel, delayed, get_instance
+ 
+ lgr = get_logger()
+ 
+@@ -121,9 +121,7 @@ class _dandi_url_parser:
+                                 settings["map_instance"], ", ".join(known_instances)
+                             )
+                         )
+-                    return (known_instances[settings["map_instance"]].girder,) + tuple(
+-                        _
+-                    )
++                    return (get_instance(settings["map_instance"]).girder,) + tuple(_)
+                 continue  # in this run we ignore an match further
+             else:
+                 break
+diff --git a/dandi/exceptions.py b/dandi/exceptions.py
+index ce64b587..3195d53e 100644
+--- a/dandi/exceptions.py
++++ b/dandi/exceptions.py
+@@ -23,3 +23,34 @@ class FailedToConnectError(RuntimeError):
+     """Failed to connect to online resource"""
+ 
+     pass
++
++
++class CliVersionError(RuntimeError):
++    """ Base class for `CliVersionTooOldError` and `BadCliVersionError` """
++
++    def __init__(self, our_version, minversion, bad_versions):
++        self.our_version = our_version
++        self.minversion = minversion
++        self.bad_versions = bad_versions
++
++    def server_requirements(self):
++        s = f"Server requires at least version {self.minversion}"
++        if self.bad_versions:
++            s += f" (but not {', '.join(map(str, self.bad_versions))})"
++        return s
++
++
++class CliVersionTooOldError(CliVersionError):
++    def __str__(self):
++        return (
++            f"Client version {self.our_version} is too old!  "
++            + self.server_requirements()
++        )
++
++
++class BadCliVersionError(CliVersionError):
++    def __str__(self):
++        return (
++            f"Client version {self.our_version} is rejected by server!  "
++            + self.server_requirements()
++        )
+diff --git a/dandi/register.py b/dandi/register.py
+index 87030489..6b4c3d9b 100644
+--- a/dandi/register.py
++++ b/dandi/register.py
+@@ -3,14 +3,15 @@ import os.path as op
+ 
+ from . import get_logger
+ from . import girder
+-from .consts import dandiset_metadata_file, known_instances, routes
++from .consts import dandiset_metadata_file, routes
+ from .dandiset import Dandiset
++from .utils import get_instance
+ 
+ lgr = get_logger()
+ 
+ 
+ def register(name, description, dandiset_path=None, dandi_instance="dandi"):
+-    dandi_instance = known_instances[dandi_instance]
++    dandi_instance = get_instance(dandi_instance)
+     if not dandiset_path and op.exists(dandiset_metadata_file):
+         dandiset = Dandiset.find(os.getcwd())
+         if dandiset:
+diff --git a/dandi/upload.py b/dandi/upload.py
+index edac0c7c..ce40ec85 100644
+--- a/dandi/upload.py
++++ b/dandi/upload.py
+@@ -8,12 +8,11 @@ import time
+ 
+ from .cli.command import lgr
+ from . import __version__
+-from .utils import ensure_datetime, ensure_strtime
++from .utils import ensure_datetime, ensure_strtime, get_instance
+ from .consts import (
+     collection_drafts,
+     dandiset_identifier_regex,
+     dandiset_metadata_file,
+-    known_instances,
+     metadata_digests,
+ )
+ 
+@@ -91,7 +90,7 @@ def upload(
+ 
+     ignore_benign_pynwb_warnings()  # so validate doesn't whine
+ 
+-    client = girder.get_client(known_instances[dandi_instance].girder)
++    client = girder.get_client(get_instance(dandi_instance).girder)
+ 
+     try:
+         collection_rec = girder.ensure_collection(client, girder_collection)
+diff --git a/dandi/utils.py b/dandi/utils.py
+index 67bb90b5..b6b26e55 100644
+--- a/dandi/utils.py
++++ b/dandi/utils.py
+@@ -11,7 +11,13 @@ import sys
+ 
+ from pathlib import Path
+ 
++import requests
+ import ruamel.yaml
++from semantic_version import Version
++
++from . import __version__
++from .consts import dandi_instance, known_instances, known_instances_rev
++from .exceptions import BadCliVersionError, CliVersionTooOldError
+ 
+ if sys.version_info[:2] < (3, 7):
+     import dateutil.parser
+@@ -504,3 +510,50 @@ def delayed(*args, **kwargs):
+     import joblib
+ 
+     return joblib.delayed(*args, **kwargs)
++
++
++def get_instance(dandi_instance_id):
++    if dandi_instance_id.lower().startswith(("http://", "https://")):
++        redirector_url = dandi_instance_id
++        dandi_id = known_instances_rev.get(redirector_url)
++        if dandi_id is not None:
++            instance = known_instances[dandi_id]
++        else:
++            instance = None
++    else:
++        instance = known_instances[dandi_instance_id]
++        redirector_url = instance.redirector
++        if redirector_url is None:
++            return instance
++    try:
++        r = requests.get(redirector_url.rstrip("/") + "/server-info")
++        r.raise_for_status()
++    except Exception as e:
++        lgr.warning("Request to %s failed (%s)", redirector_url, str(e))
++        if instance is not None:
++            lgr.warning("Using hard-coded URLs")
++            return instance
++        else:
++            raise RuntimeError(
++                f"Could not retrieve server info from {redirector_url},"
++                " and client does not recognize URL"
++            )
++    server_info = r.json()
++    try:
++        minversion = Version(server_info["cli-minimal-version"])
++        bad_versions = [Version(v) for v in server_info["cli-bad-versions"]]
++    except ValueError as e:
++        raise ValueError(
++            f"{redirector_url} returned an incorrectly formatted version;"
++            f" please contact that server's administrators: {e}"
++        )
++    our_version = Version(__version__)
++    if our_version < minversion:
++        raise CliVersionTooOldError(our_version, minversion, bad_versions)
++    if our_version in bad_versions:
++        raise BadCliVersionError(our_version, minversion, bad_versions)
++    return dandi_instance(
++        girder=server_info["services"]["girder"]["url"],
++        gui=server_info["services"]["webui"]["url"],
++        redirector=redirector_url,
++    )

@@ -1,0 +1,200 @@
+diff --git a/docs/handlers.rst b/docs/handlers.rst
+index 5703ccb..4e7dcaa 100644
+--- a/docs/handlers.rst
++++ b/docs/handlers.rst
+@@ -235,24 +235,25 @@ partials (`functools.partial`), or the inner functions in the closures:
+         - item1
+         - item2
+ 
+-Sub-handlers can be implemented either imperatively::
++Sub-handlers can be implemented either imperatively
++(where it requires :doc:`asynchronous handlers <async>` and ``async/await``)::
+ 
+     import functools
+     import kopf
+ 
+     @kopf.on.create('zalando.org', 'v1', 'kopfexamples')
+-    def create_fn(spec, **_):
++    async def create_fn(spec, **_):
+         fns = {}
+ 
+         for item in spec.get('items', []):
+             fns[item] = functools.partial(handle_item, item=item)
+ 
+-       kopf.execute(fns)
++       await kopf.execute(fns=fns)
+ 
+     def handle_item(item, *, spec, **_):
+         pass
+ 
+-Or decoratively::
++Or declaratively with decorators::
+ 
+     import kopf
+ 
+@@ -261,9 +262,8 @@ Or decoratively::
+ 
+         for item in spec.get('items', []):
+ 
+-            @kopf.on.this(id=item)
++            @kopf.subhandler(id=item)
+             def handle_item(item=item, **_):
+-
+                 pass
+ 
+ Both of these ways are equivalent.
+diff --git a/docs/idempotence.rst b/docs/idempotence.rst
+index 22d396d..325e50b 100644
+--- a/docs/idempotence.rst
++++ b/docs/idempotence.rst
+@@ -4,8 +4,8 @@ Idempotence
+ 
+ Kopf provides tools to make the handlers idempotent.
+ 
+-`kopf.register` function and `kopf.on.this` decorator allow to schedule
+-arbitrary sub-handlers for the execution in the current cycle.
++The `kopf.register` function and the `kopf.subhandler` decorator allow
++to schedule arbitrary sub-handlers for the execution in the current cycle.
+ 
+ `kopf.execute` coroutine executes arbitrary sub-handlers
+ directly in the place of invocation, and returns when all they have succeeded.
+diff --git a/examples/07-subhandlers/example.py b/examples/07-subhandlers/example.py
+index 3314372..2d6d7d8 100644
+--- a/examples/07-subhandlers/example.py
++++ b/examples/07-subhandlers/example.py
+@@ -6,6 +6,6 @@ def create_fn(spec, **kwargs):
+ 
+     for item in spec.get('items', []):
+ 
+-        @kopf.on.this(id=item)
++        @kopf.subhandler(id=item)
+         async def create_item_fn(item=item, **kwargs):
+             print(f"=== Handling creation for {item}. ===")
+diff --git a/kopf/__init__.py b/kopf/__init__.py
+index 1e6c1a8..ead0560 100644
+--- a/kopf/__init__.py
++++ b/kopf/__init__.py
+@@ -31,12 +31,11 @@ from kopf.engines.posting import (
+     exception,
+ )
+ from kopf.on import (
++    subhandler,
++    register,
+     daemon,
+     timer,
+ )
+-from kopf.on import (
+-    register,
+-)
+ from kopf.reactor import (
+     lifecycles,  # as a separate name on the public namespace
+ )
+diff --git a/kopf/on.py b/kopf/on.py
+index 8604e12..4472237 100644
+--- a/kopf/on.py
++++ b/kopf/on.py
+@@ -418,9 +418,7 @@ def timer(  # lgtm[py/similar-function]
+     return decorator
+ 
+ 
+-# TODO: find a better name: `@kopf.on.this` is confusing and does not fully
+-# TODO: match with the `@kopf.on.{cause}` pattern, where cause is create/update/delete.
+-def this(  # lgtm[py/similar-function]
++def subhandler(  # lgtm[py/similar-function]
+         *,
+         id: Optional[str] = None,
+         errors: Optional[handlers.ErrorsMode] = None,
+@@ -434,7 +432,7 @@ def this(  # lgtm[py/similar-function]
+         when: Optional[callbacks.WhenFilterFn] = None,
+ ) -> ResourceChangingDecorator:
+     """
+-    ``@kopf.on.this()`` decorator for the dynamically generated sub-handlers.
++    ``@kopf.subhandler()`` decorator for the dynamically generated sub-handlers.
+ 
+     Can be used only inside of the handler function.
+     It is efficiently a syntax sugar to look like all other handlers::
+@@ -444,9 +442,8 @@ def this(  # lgtm[py/similar-function]
+ 
+             for task in spec.get('tasks', []):
+ 
+-                @kopf.on.this(id=f'task_{task}')
++                @kopf.subhandler(id=f'task_{task}')
+                 def create_task(*, spec, task=task, **kwargs):
+-
+                     pass
+ 
+     In this example, having spec.tasks set to ``[abc, def]``, this will create
+@@ -517,11 +514,11 @@ def register(  # lgtm[py/similar-function]
+         def create_it(spec, **kwargs):
+             for task in spec.get('tasks', []):
+ 
+-                @kopf.on.this(id=task)
++                @kopf.subhandler(id=task)
+                 def create_single_task(task=task, **_):
+                     pass
+     """
+-    decorator = this(
++    decorator = subhandler(
+         id=id, registry=registry,
+         errors=errors, timeout=timeout, retries=retries, backoff=backoff, cooldown=cooldown,
+         labels=labels, annotations=annotations, when=when,
+@@ -529,6 +526,10 @@ def register(  # lgtm[py/similar-function]
+     return decorator(fn)
+ 
+ 
++# DEPRECATED: for backward compatibility, the original name of @kopf.on.this() is kept.
++this = subhandler
++
++
+ def _warn_deprecated_signatures(
+         fn: Callable[..., Any],
+ ) -> None:
+diff --git a/kopf/reactor/handling.py b/kopf/reactor/handling.py
+index 2c5fb86..c814c26 100644
+--- a/kopf/reactor/handling.py
++++ b/kopf/reactor/handling.py
+@@ -50,7 +50,7 @@ class HandlerChildrenRetry(TemporaryError):
+ 
+ 
+ # The task-local context; propagated down the stack instead of multiple kwargs.
+-# Used in `@kopf.on.this` and `kopf.execute()` to add/get the sub-handlers.
++# Used in `@kopf.subhandler` and `kopf.execute()` to add/get the sub-handlers.
+ sublifecycle_var: ContextVar[Optional[lifecycles.LifeCycleFn]] = ContextVar('sublifecycle_var')
+ subregistry_var: ContextVar[registries.ResourceChangingRegistry] = ContextVar('subregistry_var')
+ subsettings_var: ContextVar[configuration.OperatorSettings] = ContextVar('subsettings_var')
+@@ -77,7 +77,7 @@ async def execute(
+ 
+     If no explicit functions or handlers or registry are passed,
+     the sub-handlers of the current handler are assumed, as accumulated
+-    in the per-handler registry with ``@kopf.on.this``.
++    in the per-handler registry with ``@kopf.subhandler``.
+ 
+     If the call to this method for the sub-handlers is not done explicitly
+     in the handler, it is done implicitly after the handler is exited.
+@@ -137,7 +137,7 @@ async def execute(
+     elif subexecuted_var.get():
+         return
+ 
+-    # If no explicit args were passed, implicitly use the accumulated handlers from `@kopf.on.this`.
++    # If no explicit args were passed, use the accumulated handlers from `@kopf.subhandler`.
+     else:
+         subexecuted_var.set(True)
+         subregistry = subregistry_var.get()
+@@ -336,7 +336,7 @@ async def invoke_handler(
+ 
+     Ensure the global context for this asyncio task is set to the handler and
+     its cause -- for proper population of the sub-handlers via the decorators
+-    (see `@kopf.on.this`).
++    (see `@kopf.subhandler`).
+     """
+ 
+     # For the field-handlers, the old/new/diff values must match the field, not the whole object.
+@@ -349,7 +349,7 @@ async def invoke_handler(
+         diff = diffs.reduce(cause.diff, handler.field)
+         cause = causation.enrich_cause(cause=cause, old=old, new=new, diff=diff)
+ 
+-    # Store the context of the current resource-object-event-handler, to be used in `@kopf.on.this`,
++    # Store the context of the current handler, to be used in `@kopf.subhandler`,
+     # and maybe other places, and consumed in the recursive `execute()` calls for the children.
+     # This replaces the multiple kwargs passing through the whole call stack (easy to forget).
+     with invocation.context([

@@ -1,0 +1,116 @@
+diff --git a/httpx/__init__.py b/httpx/__init__.py
+index caaa81a..01f4068 100644
+--- a/httpx/__init__.py
++++ b/httpx/__init__.py
+@@ -17,8 +17,8 @@ from .exceptions import (
+     ProtocolError,
+     ProxyError,
+     ReadTimeout,
+-    RedirectBodyUnavailable,
+     RedirectLoop,
++    RequestBodyUnavailable,
+     ResponseClosed,
+     ResponseNotRead,
+     StreamConsumed,
+@@ -63,8 +63,8 @@ __all__ = [
+     "PoolTimeout",
+     "ProtocolError",
+     "ReadTimeout",
+-    "RedirectBodyUnavailable",
+     "RedirectLoop",
++    "RequestBodyUnavailable",
+     "ResponseClosed",
+     "ResponseNotRead",
+     "StreamConsumed",
+diff --git a/httpx/client.py b/httpx/client.py
+index b2c2e5e..75f29ac 100644
+--- a/httpx/client.py
++++ b/httpx/client.py
+@@ -27,8 +27,8 @@ from .dispatch.proxy_http import HTTPProxy
+ from .exceptions import (
+     HTTPError,
+     InvalidURL,
+-    RedirectBodyUnavailable,
+     RedirectLoop,
++    RequestBodyUnavailable,
+     TooManyRedirects,
+ )
+ from .models import (
+@@ -451,7 +451,7 @@ class AsyncClient:
+                 raise RedirectLoop()
+ 
+             response = await self.send_handling_auth(
+-                request, auth=auth, timeout=timeout,
++                request, history, auth=auth, timeout=timeout,
+             )
+             response.history = list(history)
+ 
+@@ -561,12 +561,21 @@ class AsyncClient:
+         """
+         if method != request.method and method == "GET":
+             return None
++
+         if not request.stream.can_replay():
+-            raise RedirectBodyUnavailable()
++            raise RequestBodyUnavailable(
++                "Got a redirect response, but the request body was streaming "
++                "and is no longer available."
++            )
++
+         return request.stream
+ 
+     async def send_handling_auth(
+-        self, request: Request, auth: Auth, timeout: Timeout,
++        self,
++        request: Request,
++        history: typing.List[Response],
++        auth: Auth,
++        timeout: Timeout,
+     ) -> Response:
+         auth_flow = auth(request)
+         request = next(auth_flow)
+@@ -580,8 +589,10 @@ class AsyncClient:
+                 await response.aclose()
+                 raise exc from None
+             else:
++                response.history = list(history)
++                await response.aread()
+                 request = next_request
+-                await response.aclose()
++                history.append(response)
+ 
+     async def send_single_request(
+         self, request: Request, timeout: Timeout,
+diff --git a/httpx/exceptions.py b/httpx/exceptions.py
+index 2d8d27d..e199270 100644
+--- a/httpx/exceptions.py
++++ b/httpx/exceptions.py
+@@ -86,13 +86,6 @@ class TooManyRedirects(RedirectError):
+     """
+ 
+ 
+-class RedirectBodyUnavailable(RedirectError):
+-    """
+-    Got a redirect response, but the request body was streaming, and is
+-    no longer available.
+-    """
+-
+-
+ class RedirectLoop(RedirectError):
+     """
+     Infinite redirect loop.
+@@ -117,6 +110,13 @@ class StreamError(HTTPError):
+     """
+ 
+ 
++class RequestBodyUnavailable(StreamError):
++    """
++    Had to send the request again, but the request body was streaming, and is
++    no longer available.
++    """
++
++
+ class StreamConsumed(StreamError):
+     """
+     Attempted to read or stream response content, but the content has already
+

@@ -1,0 +1,224 @@
+diff --git a/mobly/base_test.py b/mobly/base_test.py
+index a83334d..b5176a4 100644
+--- a/mobly/base_test.py
++++ b/mobly/base_test.py
+@@ -344,6 +344,12 @@ class BaseTestClass(object):
+                     test_method(*args, **kwargs)
+                 else:
+                     test_method()
++            except signals.TestPass as e:
++                raise e
++            except Exception as e:
++                logging.exception('Exception occurred in %s.',
++                                  self.current_test_name)
++                raise e
+             finally:
+                 try:
+                     self._teardown_test(test_name)
+@@ -354,7 +360,6 @@ class BaseTestClass(object):
+                     tr_record.add_error('teardown_test', e)
+                     self._exec_procedure_func(self._on_fail, tr_record)
+         except (signals.TestFailure, AssertionError) as e:
+-            logging.exception(e)
+             tr_record.test_fail(e)
+             self._exec_procedure_func(self._on_fail, tr_record)
+         except signals.TestSkip as e:
+@@ -374,7 +379,6 @@ class BaseTestClass(object):
+             is_generate_trigger = True
+             self.results.requested.remove(test_name)
+         except Exception as e:
+-            logging.exception(e)
+             # Exception happened during test.
+             tr_record.test_error(e)
+             self._exec_procedure_func(self._on_fail, tr_record)
+@@ -547,6 +551,22 @@ class BaseTestClass(object):
+             test_methods.append((test_name, test_method))
+         return test_methods
+ 
++    def _skip_remaining_tests(self, exception):
++        """Marks any requested test that has not been executed in a class as
++        skipped.
++
++        This is useful for handling abort class signal.
++
++        Args:
++            exception: The exception object that was thrown to trigger the
++                       skip.
++        """
++        for test_name in self.results.requested:
++            if not self.results.is_test_executed(test_name):
++                test_record = records.TestResultRecord(test_name, self.TAG)
++                test_record.test_skip(exception)
++                self.results.add_record(test_record)
++
+     def run(self, test_names=None):
+         """Runs tests within a test class.
+ 
+@@ -591,21 +611,33 @@ class BaseTestClass(object):
+         # Setup for the class.
+         try:
+             self._setup_class()
++        except signals.TestAbortClass as e:
++            # The test class is intentionally aborted.
++            # Skip all tests peacefully.
++            e.details = 'Test class aborted due to: %s' % e.details
++            self._skip_remaining_tests(e)
++            return self.results
+         except Exception as e:
++            # Setup class failed for unknown reasons.
++            # Fail the class and skip all tests.
+             logging.exception('Failed to setup %s.', self.TAG)
+             class_record = records.TestResultRecord('setup_class', self.TAG)
+             class_record.test_begin()
+             class_record.test_fail(e)
+             self._exec_procedure_func(self._on_fail, class_record)
+             self.results.fail_class(class_record)
+-            self._safe_exec_func(self.teardown_class)
++            self._skip_remaining_tests(e)
+             return self.results
++        finally:
++            self._safe_exec_func(self.teardown_class)
+         # Run tests in order.
+         try:
+             for test_name, test_method in tests:
+                 self.exec_one_test(test_name, test_method)
+             return self.results
+-        except signals.TestAbortClass:
++        except signals.TestAbortClass as e:
++            e.details = 'Test class aborted due to: %s' % e.details
++            self._skip_remaining_tests(e)
+             return self.results
+         except signals.TestAbortAll as e:
+             # Piggy-back test results on this exception object so we don't lose
+diff --git a/tests/mobly/base_test_test.py b/tests/mobly/base_test_test.py
+index 0ed05f7..c9d517b 100755
+--- a/tests/mobly/base_test_test.py
++++ b/tests/mobly/base_test_test.py
+@@ -168,6 +168,10 @@ class BaseTestTest(unittest.TestCase):
+                 # This should not execute because setup_class failed.
+                 never_call()
+ 
++            def test_something2(self):
++                # This should not execute because setup_class failed.
++                never_call()
++
+             def teardown_class(self):
+                 # This should execute because the setup_class failure should
+                 # have already been recorded.
+@@ -179,12 +183,12 @@ class BaseTestTest(unittest.TestCase):
+ 
+         bt_cls = MockBaseTest(self.mock_test_cls_configs)
+         bt_cls.run()
+-        actual_record = bt_cls.results.failed[0]
++        actual_record = bt_cls.results.error[0]
+         self.assertEqual(actual_record.test_name, "setup_class")
+         self.assertEqual(actual_record.details, MSG_EXPECTED_EXCEPTION)
+         self.assertIsNone(actual_record.extras)
+-        expected_summary = ("Error 0, Executed 1, Failed 1, Passed 0, "
+-                            "Requested 1, Skipped 0")
++        expected_summary = ("Error 1, Executed 0, Failed 0, Passed 0, "
++                            "Requested 2, Skipped 2")
+         self.assertEqual(bt_cls.results.summary_str(), expected_summary)
+         teardown_class_call_check.assert_called_once_with("heehee")
+         on_fail_call_check.assert_called_once_with("haha")
+@@ -526,7 +530,33 @@ class BaseTestTest(unittest.TestCase):
+                             "Requested 1, Skipped 0")
+         self.assertEqual(bt_cls.results.summary_str(), expected_summary)
+ 
+-    def test_abort_class(self):
++    def test_abort_setup_class(self):
++        """A class was intentionally aborted by the test.
++
++        This is not considered an error as the abort class is used as a skip
++        signal for the entire class, which is different from raising other
++        exceptions in `setup_class`.
++        """
++        class MockBaseTest(base_test.BaseTestClass):
++            def setup_class(self):
++                asserts.abort_class(MSG_EXPECTED_EXCEPTION)
++
++            def test_1(self):
++                never_call()
++
++            def test_2(self):
++                never_call()
++
++            def test_3(self):
++                never_call()
++
++        bt_cls = MockBaseTest(self.mock_test_cls_configs)
++        bt_cls.run(test_names=["test_1", "test_2", "test_3"])
++        self.assertEqual(bt_cls.results.summary_str(),
++                         ("Error 0, Executed 0, Failed 0, Passed 0, "
++                          "Requested 3, Skipped 3"))
++
++    def test_abort_class_in_test(self):
+         class MockBaseTest(base_test.BaseTestClass):
+             def test_1(self):
+                 pass
+@@ -545,7 +575,7 @@ class BaseTestTest(unittest.TestCase):
+                          MSG_EXPECTED_EXCEPTION)
+         self.assertEqual(bt_cls.results.summary_str(),
+                          ("Error 0, Executed 2, Failed 1, Passed 1, "
+-                          "Requested 3, Skipped 0"))
++                          "Requested 3, Skipped 1"))
+ 
+     def test_uncaught_exception(self):
+         class MockBaseTest(base_test.BaseTestClass):
+@@ -958,12 +988,12 @@ class BaseTestTest(unittest.TestCase):
+ 
+         bt_cls = MockBaseTest(self.mock_test_cls_configs)
+         bt_cls.run()
+-        actual_record = bt_cls.results.failed[0]
++        actual_record = bt_cls.results.error[0]
+         self.assertEqual(actual_record.test_name, "setup_generated_tests")
+         self.assertEqual(
+             actual_record.details,
+             'Test name "ha" already exists, cannot be duplicated!')
+-        expected_summary = ("Error 0, Executed 1, Failed 1, Passed 0, "
++        expected_summary = ("Error 1, Executed 0, Failed 0, Passed 0, "
+                             "Requested 0, Skipped 0")
+         self.assertEqual(bt_cls.results.summary_str(), expected_summary)
+ 
+diff --git a/tests/mobly/records_test.py b/tests/mobly/records_test.py
+index d74c00b..9500d1d 100755
+--- a/tests/mobly/records_test.py
++++ b/tests/mobly/records_test.py
+@@ -219,8 +219,8 @@ class RecordsTest(unittest.TestCase):
+         record2 = records.TestResultRecord("SomeTest", s)
+         tr.fail_class(record2)
+         self.assertEqual(len(tr.passed), 1)
+-        self.assertEqual(len(tr.failed), 1)
+-        self.assertEqual(len(tr.executed), 2)
++        self.assertEqual(len(tr.error), 1)
++        self.assertEqual(len(tr.executed), 1)
+ 
+     def test_result_fail_class_with_special_error(self):
+         """Call TestResult.fail_class with an error class that requires more
+@@ -241,8 +241,8 @@ class RecordsTest(unittest.TestCase):
+         record2 = records.TestResultRecord("SomeTest", se)
+         tr.fail_class(record2)
+         self.assertEqual(len(tr.passed), 1)
+-        self.assertEqual(len(tr.failed), 1)
+-        self.assertEqual(len(tr.executed), 2)
++        self.assertEqual(len(tr.error), 1)
++        self.assertEqual(len(tr.executed), 1)
+ 
+     def test_is_all_pass(self):
+         s = signals.TestPass(self.details, self.float_extra)
+@@ -284,6 +284,15 @@ class RecordsTest(unittest.TestCase):
+         tr.fail_class(record1)
+         self.assertFalse(tr.is_all_pass)
+ 
++    def test_is_test_executed(self):
++        record1 = records.TestResultRecord(self.tn)
++        record1.test_begin()
++        record1.test_fail(Exception("haha"))
++        tr = records.TestResult()
++        tr.add_record(record1)
++        self.assertTrue(tr.is_test_executed(record1.test_name))
++        self.assertFalse(tr.is_test_executed(self.tn + 'ha'))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

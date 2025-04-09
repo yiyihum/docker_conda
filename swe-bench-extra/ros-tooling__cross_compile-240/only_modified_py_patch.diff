@@ -1,0 +1,106 @@
+diff --git a/ros_cross_compile/data_collector.py b/ros_cross_compile/data_collector.py
+index 1589656..a9f9213 100644
+--- a/ros_cross_compile/data_collector.py
++++ b/ros_cross_compile/data_collector.py
+@@ -15,6 +15,7 @@
+ """Classes for time series data collection and writing said data to a file."""
+ 
+ from contextlib import contextmanager
++from datetime import datetime
+ from enum import Enum
+ import json
+ from pathlib import Path
+@@ -60,13 +61,13 @@ class DataCollector:
+         finally:
+             elapsed = time.monotonic() - start
+             time_metric = Datum('{}-time'.format(name), elapsed,
+-                                Units.Seconds.value, time.monotonic(), complete)
++                                Units.Seconds.value, time.time(), complete)
+             self.add_datum(time_metric)
+ 
+     def add_size(self, name: str, size: int):
+         """Provide an interface to add collected Docker image sizes."""
+         size_metric = Datum('{}-size'.format(name), size,
+-                            Units.Bytes.value, time.monotonic(), True)
++                            Units.Bytes.value, time.time(), True)
+         self.add_datum(size_metric)
+ 
+ 
+@@ -80,7 +81,26 @@ class DataWriter:
+         self._write_path.mkdir(parents=True, exist_ok=True)
+         self.write_file = self._write_path / output_file
+ 
+-    def write(self, data_collector: DataCollector):
++    def print_helper(self, data_to_print: List[Dict]):
++        print('--------------------------------- Collected Data ---------------------------------')
++        print('=================================================================================')
++        for datum in data_to_print:
++            # readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(datum['timestamp']))
++            readable_time = datetime.utcfromtimestamp(datum['timestamp']).isoformat()
++            if datum['unit'] == Units.Seconds.value:
++                print('{:>12} | {:>35}: {:.2f} {}'.format(readable_time, datum['name'],
++                                                          datum['value'], datum['unit']),
++                      end='')
++            else:
++                print('{:>12} | {:>35}: {} {}'.format(readable_time, datum['name'],
++                                                      datum['value'], datum['unit']),
++                      end='')
++            if datum['complete']:
++                print('\n')
++            else:
++                print(' {}'.format('incomplete'))
++
++    def write(self, data_collector: DataCollector, print_data: bool):
+         """
+         Write collected datums to a file.
+ 
+@@ -88,5 +108,7 @@ class DataWriter:
+         so that they are conveniently 'dumpable' into a JSON file.
+         """
+         data_to_dump = data_collector.serialize_data()
++        if print_data:
++            self.print_helper(data_to_dump)
+         with self.write_file.open('w') as f:
+             json.dump(list(data_to_dump), f, sort_keys=True, indent=4)
+diff --git a/ros_cross_compile/ros_cross_compile.py b/ros_cross_compile/ros_cross_compile.py
+index d823cd7..6d3d77f 100644
+--- a/ros_cross_compile/ros_cross_compile.py
++++ b/ros_cross_compile/ros_cross_compile.py
+@@ -148,8 +148,12 @@ def parse_args(args: List[str]) -> argparse.Namespace:
+         default='{}.json'.format(datetime.now().strftime('%s')),
+         type=str,
+         help='Provide a filename to store the collected metrics. If no name is provided, '
+-             'then the filename will be the current time in UNIX Epoch format. '
+-    )
++             'then the filename will be the current time in UNIX Epoch format. ')
++    parser.add_argument(
++        '--print-metrics',
++        action='store_true',
++        required=False,
++        help='All collected metrics will be printed to stdout via the logging framework.')
+ 
+     return parser.parse_args(args)
+ 
+@@ -185,7 +189,7 @@ def cross_compile_pipeline(
+         custom_setup_script)
+ 
+     for stage in stages:
+-        with data_collector.timer('cross_compile_{}'.format(stage.name)):
++        with data_collector.timer('{}'.format(stage.name)):
+             stage(platform, docker_client, ros_workspace_dir, customizations, data_collector)
+ 
+ 
+@@ -197,10 +201,10 @@ def main():
+     data_writer = DataWriter(ros_workspace_dir, args.custom_metric_file)
+ 
+     try:
+-        with data_collector.timer('cross_compile_end_to_end'):
++        with data_collector.timer('end_to_end'):
+             cross_compile_pipeline(args, data_collector)
+     finally:
+-        data_writer.write(data_collector)
++        data_writer.write(data_collector, args.print_metrics)
+ 
+ 
+ if __name__ == '__main__':
+

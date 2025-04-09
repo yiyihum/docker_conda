@@ -1,0 +1,104 @@
+diff --git a/telegram/client.py b/telegram/client.py
+index 6fc1a1f..0794692 100644
+--- a/telegram/client.py
++++ b/telegram/client.py
+@@ -1,4 +1,5 @@
+ import os
++import hashlib
+ import time
+ import queue
+ import signal
+@@ -75,7 +76,13 @@ class Telegram:
+         self._database_encryption_key = database_encryption_key
+ 
+         if not files_directory:
+-            files_directory = f'/tmp/.tdlib_files/{self.phone}/'
++            hasher = hashlib.md5()
++            hasher.update(
++                (self.phone or self.bot_token).encode('utf-8')  # type: ignore
++            )
++            directory_name = hasher.hexdigest()
++            files_directory = f'/tmp/.tdlib_files/{directory_name}/'
++
+         self.files_directory = files_directory
+ 
+         self._authorized = False
+@@ -328,15 +335,22 @@ class Telegram:
+     def _signal_handler(self, signum, frame):
+         self._is_enabled = False
+ 
++    def get_authorization_state(self):
++        logger.debug('Getting authorization state')
++        data = {'@type': 'getAuthorizationState'}
++
++        return self._send_data(data, result_id='getAuthorizationState')
++
+     def login(self):
+         """
+         Login process (blocking)
+ 
+-        Must be called before any other call. It sends initial params to the tdlib, sets database encryption key, etc.
++        Must be called before any other call.
++        It sends initial params to the tdlib, sets database encryption key, etc.
+         """
+         authorization_state = None
+         actions = {
+-            None: self._set_initial_params,
++            None: self.get_authorization_state,
+             'authorizationStateWaitTdlibParameters': self._set_initial_params,
+             'authorizationStateWaitEncryptionKey': self._send_encryption_key,
+             'authorizationStateWaitPhoneNumber': self._send_phone_number_or_bot_token,
+@@ -355,7 +369,11 @@ class Telegram:
+ 
+             if result:
+                 result.wait(raise_exc=True)
+-                authorization_state = result.update['authorization_state']['@type']
++
++                if result.id == 'getAuthorizationState':
++                    authorization_state = result.update['@type']
++                else:
++                    authorization_state = result.update['authorization_state']['@type']
+ 
+     def _set_initial_params(self) -> AsyncResult:
+         logger.info(
+diff --git a/telegram/tdjson.py b/telegram/tdjson.py
+index 2b448c0..122e015 100644
+--- a/telegram/tdjson.py
++++ b/telegram/tdjson.py
+@@ -111,6 +111,4 @@ class TDJson:
+         return result
+ 
+     def stop(self) -> None:
+-        self._tdjson._td_json_client_destroy(
+-            self.td_json_client
+-        )  # pylint: disable=protected-access
++        self._td_json_client_destroy(self.td_json_client)
+diff --git a/telegram/utils.py b/telegram/utils.py
+index f233fcb..634c817 100644
+--- a/telegram/utils.py
++++ b/telegram/utils.py
+@@ -3,7 +3,7 @@ import uuid
+ from typing import TYPE_CHECKING, Any, Dict, Optional
+ 
+ if TYPE_CHECKING:
+-    from telegram.client import Telegram    # noqa  pylint: disable=cyclic-import
++    from telegram.client import Telegram  # noqa  pylint: disable=cyclic-import
+ 
+ 
+ class AsyncResult:
+diff --git a/telegram/worker.py b/telegram/worker.py
+index e836579..a2b6a55 100644
+--- a/telegram/worker.py
++++ b/telegram/worker.py
+@@ -24,7 +24,9 @@ class SimpleWorker(BaseWorker):
+     """Simple one-thread worker"""
+ 
+     def run(self) -> None:
+-        self._thread = threading.Thread(target=self._run_thread)    # pylint: disable=attribute-defined-outside-init
++        self._thread = threading.Thread(  # pylint: disable=attribute-defined-outside-init
++            target=self._run_thread
++        )
+         self._thread.daemon = True
+         self._thread.start()
+ 
+

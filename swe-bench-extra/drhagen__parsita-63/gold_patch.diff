@@ -1,0 +1,206 @@
+diff --git a/docs/alternative_parsers.md b/docs/alternative_parsers.md
+index 120938f..0253fb0 100644
+--- a/docs/alternative_parsers.md
++++ b/docs/alternative_parsers.md
+@@ -2,7 +2,7 @@
+ 
+ ## `parser1 | parser2`: alternative parser
+ 
+-This tries to match `parser1`. If it fails, it then tries to match `parser2`. If both fail, it returns the failure message from whichever one got farther. Either side can be a bare string, not both because `'a' | 'b'` tries to call `__or__` on `str` which fails. To try alternative literals, use `lit` with multiple arguments.
++This tries to match `parser1` and `parser2`. If one succeeds and the other fails, it returns the value of the one that succeeded. If both succeed, it returns the value of the one that consumed more input in order to succeed. If both fail, it returns the failure message from whichever one got farther. Either side can be a bare string, but not both because `'a' | 'b'` tries to call `__or__` on `str` which fails. To try alternative literals, use `lit` with multiple arguments.
+ 
+ ```python
+ from parsita import *
+@@ -15,52 +15,53 @@ class NumberParsers(TextParsers):
+ assert NumberParsers.number.parse('4.0000') == Success(4.0)
+ ```
+ 
+-Currently, `first(a, b, c)` is an alias for `a | b | c`. This reflects the current behavior of the alternative parser, which is to return immediately when there is a success and not try any later parsers. In most parsers, the first and longest alternative parsers have the same behavior, especially if the order of the alternatives is carefully considered. In a future release of Parsita, the `a | b` syntax will construct a `longest` parser, which tries all the parsers and returns the success that consumed the most input. If the current behavior of stopping on the first success is important, construct the parser with the `first` function so that it will continue to operate as expected in future releases.
++`a | b | c` is syntactic sugar for `longest(a, b, c)`. There is similar function `first(a, b, c)` that succeeds with the value of the first option to succeed instead of the one that consumed the most input. In most parsers, the first and longest alternative parsers have the same behavior, especially if the order of the alternatives is carefully considered. In version 1 of Parsita, the `a | b` syntax constructed a `first` parser. This was changed in version 2. If the old behavior of stopping on the first success is important, construct the parser with the `first` function to recover the old behavior.
+ 
+-## `first(*parsers)`: first alternative parser
++## `longest(*parsers)`: longest alternative parser
+ 
+-This tries to match each parser supplied. As soon as one parser succeeds, this returns with that parser's successful value. If later parsers would have succeeded, that is irrelevant because they are not tried. If all supplied parsers fail, this fails with the longest failure.
++This tries to match each parser supplied. After it has tried them all, it returns the result of the one that made the most progress, that is, consumed the most input. If none of the supplied parsers succeeds, then an error is returned corresponding to the parser that got farthest. If two or more parsers are successful and are tied for making the most progress, the result of the first such parser is returned.
+ 
+ ```python
+ from parsita import *
+ 
+ class ExpressionParsers(TextParsers):
+-    keyword = lit('pi', 'nan', 'inf')
+     name = reg(r'[a-zA-Z_]+')
+     function = name & '(' >> expression << ')'
+-    expression = first(keyword, function, name)
++    expression = longest(name, function)
+ 
+ assert ExpressionParsers.expression.parse('f(x)') == Success(['f', 'x'])
+-assert ExpressionParsers.expression.parse('pi(x)') == Failure(ParseError(
+-    "Expected end of source but found '('\n"
+-    "Line 1, character 3\n\n"
+-    "pi(x)\n"
+-    "  ^  "
+-))
+-# Note how the above fails because `keyword` is matched by `first` so that
+-# `function`, which would have matched the input, was not tried.
+ ```
+ 
+-This is the current implementation of the `a | b | c` syntax. In a future version of Parsita, the longest alternative parser will be used instead.
++As of version 2 of Parsita, `longest` is the implementation behind the `a | b | c` syntax. It replaced `first`, which was the implementation in version 1.
+ 
+-## `longest(*parsers)`: longest alternative parser
++## `first(*parsers)`: first alternative parser
+ 
+-This tries to match each parser supplied. Unlike `first`, `longest` keeps trying parsers even if one or more succeed. After it has tried them all, it returns the result of the one that made the most progress, that is, consumed the most input. If none of the supplied parsers succeeds, then an error is returned corresponding to the parser that got farthest. If two or more parsers are successful and are tied for making the most progress, the result of the first such parser is returned.
++This tries to match each parser supplied. As soon as one parser succeeds, this returns with that parser's successful value. If later parsers would have succeeded, that is irrelevant because they are not tried. If all supplied parsers fail, this fails with the longest failure.
+ 
+ ```python
+ from parsita import *
+ 
+ class ExpressionParsers(TextParsers):
++    keyword = lit('pi', 'nan', 'inf')
+     name = reg(r'[a-zA-Z_]+')
+     function = name & '(' >> expression << ')'
+-    expression = longest(name, function)
++    expression = first(keyword, function, name)
+ 
+ assert ExpressionParsers.expression.parse('f(x)') == Success(['f', 'x'])
++assert str(ExpressionParsers.expression.parse('pi(x)').failure()) == (
++    "Expected end of source but found '('\n"
++    "Line 1, character 3\n\n"
++    "pi(x)\n"
++    "  ^  "
++)
++# Note how the above fails because `keyword` is matched by `first` so that
++# `function`, which would have matched the input, was not tried.
+ ```
+ 
+-In a future version of Parsita, this will replace `first` as the implementation behind the `a | b | c` syntax.
++In version 1 of Parsita, this was the implementation behind the `a | b | c` syntax. As of version 2, `longest` is used instead.
+ 
+ ## `opt(parser)`: optional parser
++
+ An optional parser tries to match its argument. If the argument succeeds, it returns a list of length one with the successful value as its only element. If the argument fails, then `opt` succeeds anyway, but returns an empty list and consumes no input.
+ 
+ ```python
+diff --git a/docs/miscellaneous_parsers.md b/docs/miscellaneous_parsers.md
+index 275d512..825a438 100644
+--- a/docs/miscellaneous_parsers.md
++++ b/docs/miscellaneous_parsers.md
+@@ -108,8 +108,9 @@ class HostnameParsers(TextParsers, whitespace=None):
+     host = rep1sep(reg('[A-Za-z0-9]+([-]+[A-Za-z0-9]+)*'), '.')
+     server = host << ':' & port
+ 
+-assert HostnameParsers.server.parse('drhagen.com:443') == \
+-    Failure('Expected no other port than 80 but found end of source')
++assert str(HostnameParsers.server.parse('drhagen.com:443').failure()) == (
++    'Expected no other port than 80 but found end of source'
++)
+ ```
+ 
+ ## `debug(parser, *, verbose=False, callback=None)`: debug a parser
+diff --git a/src/parsita/parsers/__init__.py b/src/parsita/parsers/__init__.py
+index 1be60ca..cce412a 100644
+--- a/src/parsita/parsers/__init__.py
++++ b/src/parsita/parsers/__init__.py
+@@ -1,4 +1,4 @@
+-from ._alternative import AlternativeParser, LongestAlternativeParser, first, longest
++from ._alternative import FirstAlternativeParser, LongestAlternativeParser, first, longest
+ from ._any import AnyParser, any1
+ from ._base import Parser, completely_parse_reader
+ from ._conversion import ConversionParser, TransformationParser
+diff --git a/src/parsita/parsers/_alternative.py b/src/parsita/parsers/_alternative.py
+index d9f915d..dfab5a1 100644
+--- a/src/parsita/parsers/_alternative.py
++++ b/src/parsita/parsers/_alternative.py
+@@ -1,4 +1,4 @@
+-__all__ = ["AlternativeParser", "first", "LongestAlternativeParser", "longest"]
++__all__ = ["FirstAlternativeParser", "first", "LongestAlternativeParser", "longest"]
+ 
+ from typing import Generic, Optional, Sequence, Union
+ 
+@@ -7,7 +7,7 @@ from ._base import Parser
+ from ._literal import lit
+ 
+ 
+-class AlternativeParser(Generic[Input, Output], Parser[Input, Output]):
++class FirstAlternativeParser(Generic[Input, Output], Parser[Input, Output]):
+     def __init__(self, parser: Parser[Input, Output], *parsers: Parser[Input, Output]):
+         super().__init__()
+         self.parsers = (parser, *parsers)
+@@ -25,12 +25,12 @@ class AlternativeParser(Generic[Input, Output], Parser[Input, Output]):
+         for parser in self.parsers:
+             names.append(parser.name_or_repr())
+ 
+-        return self.name_or_nothing() + " | ".join(names)
++        return self.name_or_nothing() + f"first({', '.join(names)})"
+ 
+ 
+ def first(
+     parser: Union[Parser[Input, Output], Sequence[Input]], *parsers: Union[Parser[Input, Output], Sequence[Input]]
+-) -> AlternativeParser[Input, Output]:
++) -> FirstAlternativeParser[Input, Output]:
+     """Match the first of several alternative parsers.
+ 
+     A ``AlternativeParser`` attempts to match each supplied parser. If a parser
+@@ -46,7 +46,7 @@ def first(
+         *parsers: Non-empty list of ``Parser``s or literals to try
+     """
+     cleaned_parsers = [lit(parser_i) if isinstance(parser_i, str) else parser_i for parser_i in [parser, *parsers]]
+-    return AlternativeParser(*cleaned_parsers)
++    return FirstAlternativeParser(*cleaned_parsers)
+ 
+ 
+ class LongestAlternativeParser(Generic[Input, Output], Parser[Input, Output]):
+@@ -69,7 +69,7 @@ class LongestAlternativeParser(Generic[Input, Output], Parser[Input, Output]):
+         for parser in self.parsers:
+             names.append(parser.name_or_repr())
+ 
+-        return self.name_or_nothing() + f"longest({', '.join(names)})"
++        return self.name_or_nothing() + " | ".join(names)
+ 
+ 
+ def longest(
+diff --git a/src/parsita/parsers/_base.py b/src/parsita/parsers/_base.py
+index 4a20f36..740b666 100644
+--- a/src/parsita/parsers/_base.py
++++ b/src/parsita/parsers/_base.py
+@@ -149,19 +149,19 @@ class Parser(Generic[Input, Output]):
+             return options.handle_literal(obj)
+ 
+     def __or__(self, other) -> Parser:
+-        from ._alternative import AlternativeParser
++        from ._alternative import LongestAlternativeParser
+ 
+         other = self.handle_other(other)
+         parsers: List[Parser] = []
+-        if isinstance(self, AlternativeParser) and not self.protected:
++        if isinstance(self, LongestAlternativeParser) and not self.protected:
+             parsers.extend(self.parsers)
+         else:
+             parsers.append(self)
+-        if isinstance(other, AlternativeParser) and not other.protected:
++        if isinstance(other, LongestAlternativeParser) and not other.protected:
+             parsers.extend(other.parsers)
+         else:
+             parsers.append(other)
+-        return AlternativeParser(*parsers)
++        return LongestAlternativeParser(*parsers)
+ 
+     def __ror__(self, other) -> Parser:
+         other = self.handle_other(other)
+diff --git a/src/parsita/parsers/_literal.py b/src/parsita/parsers/_literal.py
+index 0ccc8f2..34920d2 100644
+--- a/src/parsita/parsers/_literal.py
++++ b/src/parsita/parsers/_literal.py
+@@ -77,8 +77,8 @@ def lit(literal: Sequence[Input], *literals: Sequence[Input]) -> Parser[str, str
+         arguments are provided.
+     """
+     if len(literals) > 0:
+-        from ._alternative import AlternativeParser
++        from ._alternative import LongestAlternativeParser
+ 
+-        return AlternativeParser(options.handle_literal(literal), *map(options.handle_literal, literals))
++        return LongestAlternativeParser(options.handle_literal(literal), *map(options.handle_literal, literals))
+     else:
+         return options.handle_literal(literal)

@@ -1,0 +1,113 @@
+diff --git a/pydantic/generics.py b/pydantic/generics.py
+--- a/pydantic/generics.py
++++ b/pydantic/generics.py
+@@ -1,4 +1,19 @@
+-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Tuple, Type, TypeVar, Union, cast, get_type_hints
++import sys
++from types import FrameType, ModuleType
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    Callable,
++    ClassVar,
++    Dict,
++    Optional,
++    Tuple,
++    Type,
++    TypeVar,
++    Union,
++    cast,
++    get_type_hints,
++)
+ 
+ from .class_validators import gather_all_validators
+ from .fields import FieldInfo, ModelField
+@@ -45,17 +60,27 @@ def __class_getitem__(cls: Type[GenericModelT], params: Union[Type[Any], Tuple[T
+         model_name = cls.__concrete_name__(params)
+         validators = gather_all_validators(cls)
+         fields = _build_generic_fields(cls.__fields__, concrete_type_hints, typevars_map)
++        model_module = get_caller_module_name() or cls.__module__
+         created_model = cast(
+             Type[GenericModel],  # casting ensures mypy is aware of the __concrete__ and __parameters__ attributes
+             create_model(
+                 model_name,
+-                __module__=cls.__module__,
++                __module__=model_module,
+                 __base__=cls,
+                 __config__=None,
+                 __validators__=validators,
+                 **fields,
+             ),
+         )
++
++        if is_call_from_module():  # create global reference and therefore allow pickling
++            object_in_module = sys.modules[model_module].__dict__.setdefault(model_name, created_model)
++            if object_in_module is not created_model:
++                # this should not ever happen because of _generic_types_cache, but just in case
++                raise TypeError(f'{model_name!r} already defined above, please consider reusing it') from NameError(
++                    f'Name conflict: {model_name!r} in {model_module!r} is already used by {object_in_module!r}'
++                )
++
+         created_model.Config = cls.Config
+         concrete = all(not _is_typevar(v) for v in concrete_type_hints.values())
+         created_model.__concrete__ = concrete
+@@ -114,3 +139,36 @@ def _parameterize_generic_field(field_type: Type[Any], typevars_map: Dict[TypeVa
+ 
+ def _is_typevar(v: Any) -> bool:
+     return isinstance(v, TypeVar)
++
++
++def get_caller_module_name() -> Optional[str]:
++    """
++    Used inside a function to get its caller module name
++
++    Will only work against non-compiled code, therefore used only in pydantic.generics
++    """
++    import inspect
++
++    try:
++        previous_caller_frame = inspect.stack()[2].frame
++    except IndexError as e:
++        raise RuntimeError('This function must be used inside another function') from e
++
++    getmodule = cast(Callable[[FrameType, str], Optional[ModuleType]], inspect.getmodule)
++    previous_caller_module = getmodule(previous_caller_frame, previous_caller_frame.f_code.co_filename)
++    return previous_caller_module.__name__ if previous_caller_module is not None else None
++
++
++def is_call_from_module() -> bool:
++    """
++    Used inside a function to check whether it was called globally
++
++    Will only work against non-compiled code, therefore used only in pydantic.generics
++    """
++    import inspect
++
++    try:
++        previous_caller_frame = inspect.stack()[2].frame
++    except IndexError as e:
++        raise RuntimeError('This function must be used inside another function') from e
++    return previous_caller_frame.f_locals is previous_caller_frame.f_globals
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -803,7 +803,7 @@ def create_model(
+     *,
+     __config__: Type[BaseConfig] = None,
+     __base__: Type[BaseModel] = None,
+-    __module__: Optional[str] = None,
++    __module__: str = __name__,
+     __validators__: Dict[str, classmethod] = None,
+     **field_definitions: Any,
+ ) -> Type[BaseModel]:
+@@ -812,8 +812,9 @@ def create_model(
+     :param __model_name: name of the created model
+     :param __config__: config class to use for the new model
+     :param __base__: base class for the new model to inherit from
++    :param __module__: module of the created model
+     :param __validators__: a dict of method names and @validator class methods
+-    :param **field_definitions: fields of the model (or extra fields if a base is supplied)
++    :param field_definitions: fields of the model (or extra fields if a base is supplied)
+         in the format `<name>=(<type>, <default default>)` or `<name>=<default value>, e.g.
+         `foobar=(str, ...)` or `foobar=123`, or, for complex use-cases, in the format
+         `<name>=<FieldInfo>`, e.g. `foo=Field(default_factory=datetime.utcnow, alias='bar')`

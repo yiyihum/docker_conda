@@ -1,0 +1,228 @@
+diff --git a/rocrate/cli.py b/rocrate/cli.py
+index 7512383..0f02132 100644
+--- a/rocrate/cli.py
++++ b/rocrate/cli.py
+@@ -39,25 +39,23 @@ class State:
+ @click.pass_context
+ def cli(ctx, crate_dir):
+     ctx.obj = state = State()
+-    state.crate_dir = crate_dir
++    state.crate_dir = os.getcwd() if not crate_dir else os.path.abspath(crate_dir)
+ 
+ 
+ @cli.command()
+ @click.option('--gen-preview', is_flag=True)
+ @click.pass_obj
+ def init(state, gen_preview):
+-    crate_dir = state.crate_dir or os.getcwd()
+-    crate = ROCrate(crate_dir, init=True, gen_preview=gen_preview)
+-    crate.metadata.write(crate_dir)
++    crate = ROCrate(state.crate_dir, init=True, gen_preview=gen_preview)
++    crate.metadata.write(state.crate_dir)
+     if crate.preview:
+-        crate.preview.write(crate_dir)
++        crate.preview.write(state.crate_dir)
+ 
+ 
+ @cli.group()
+ @click.pass_obj
+ def add(state):
+-    crate_dir = state.crate_dir or os.getcwd()
+-    state.crate = ROCrate(crate_dir, init=False, gen_preview=False)
++    state.crate = ROCrate(state.crate_dir, init=False, gen_preview=False)
+ 
+ 
+ @add.command()
+@@ -65,16 +63,15 @@ def add(state):
+ @click.option('-l', '--language', type=click.Choice(LANG_CHOICES), default="cwl")
+ @click.pass_obj
+ def workflow(state, path, language):
+-    crate_dir = state.crate_dir or os.getcwd()
+     source = Path(path).resolve(strict=True)
+     try:
+-        dest_path = source.relative_to(crate_dir)
++        dest_path = source.relative_to(state.crate_dir)
+     except ValueError:
+         # For now, only support marking an existing file as a workflow
+-        raise ValueError(f"{source} is not in the crate dir")
++        raise ValueError(f"{source} is not in the crate dir {state.crate_dir}")
+     # TODO: add command options for main and gen_cwl
+     state.crate.add_workflow(source, dest_path, main=True, lang=language, gen_cwl=False)
+-    state.crate.metadata.write(crate_dir)
++    state.crate.metadata.write(state.crate_dir)
+ 
+ 
+ @add.command(name="test-suite")
+@@ -83,9 +80,8 @@ def workflow(state, path, language):
+ @click.option('-m', '--main-entity')
+ @click.pass_obj
+ def suite(state, identifier, name, main_entity):
+-    crate_dir = state.crate_dir or os.getcwd()
+     suite_ = state.crate.add_test_suite(identifier=identifier, name=name, main_entity=main_entity)
+-    state.crate.metadata.write(crate_dir)
++    state.crate.metadata.write(state.crate_dir)
+     print(suite_.id)
+ 
+ 
+@@ -98,9 +94,8 @@ def suite(state, identifier, name, main_entity):
+ @click.option('-n', '--name')
+ @click.pass_obj
+ def instance(state, suite, url, resource, service, identifier, name):
+-    crate_dir = state.crate_dir or os.getcwd()
+     instance_ = state.crate.add_test_instance(suite, url, resource=resource, service=service, identifier=identifier, name=name)
+-    state.crate.metadata.write(crate_dir)
++    state.crate.metadata.write(state.crate_dir)
+     print(instance_.id)
+ 
+ 
+@@ -111,23 +106,21 @@ def instance(state, suite, url, resource, service, identifier, name):
+ @click.option('-v', '--engine-version')
+ @click.pass_obj
+ def definition(state, suite, path, engine, engine_version):
+-    crate_dir = state.crate_dir or os.getcwd()
+     source = Path(path).resolve(strict=True)
+     try:
+-        dest_path = source.relative_to(crate_dir)
++        dest_path = source.relative_to(state.crate_dir)
+     except ValueError:
+         # For now, only support marking an existing file as a test definition
+-        raise ValueError(f"{source} is not in the crate dir")
++        raise ValueError(f"{source} is not in the crate dir {state.crate_dir}")
+     state.crate.add_test_definition(suite, source=source, dest_path=dest_path, engine=engine, engine_version=engine_version)
+-    state.crate.metadata.write(crate_dir)
++    state.crate.metadata.write(state.crate_dir)
+ 
+ 
+ @cli.command()
+ @click.argument('dst', type=click.Path(writable=True))
+ @click.pass_obj
+ def write_zip(state, dst):
+-    crate_dir = state.crate_dir or os.getcwd()
+-    crate = ROCrate(crate_dir, init=True, gen_preview=False)
++    crate = ROCrate(state.crate_dir, init=True, gen_preview=False)
+     crate.write_zip(dst)
+ 
+ 
+diff --git a/rocrate/model/file.py b/rocrate/model/file.py
+index 4b5cc50..8005fcf 100644
+--- a/rocrate/model/file.py
++++ b/rocrate/model/file.py
+@@ -20,10 +20,9 @@
+ import os
+ from pathlib import Path
+ import shutil
+-import urllib
++import urllib.request
+ 
+ from io import IOBase
+-from shutil import copy
+ from urllib.error import HTTPError
+ 
+ from .data_entity import DataEntity
+@@ -38,20 +37,14 @@ class File(DataEntity):
+             properties = {}
+         self.fetch_remote = fetch_remote
+         self.source = source
+-        is_local = is_remote = False
+-        if isinstance(source, (str, Path)):
+-            is_local = os.path.isfile(str(source))
+-            is_remote = is_url(str(source))
+-            if not is_local and not is_remote:
+-                raise ValueError(f"'{source}' is not a path to a local file or a valid remote URI")
+-        elif dest_path is None:
++        if not isinstance(source, (str, Path)) and dest_path is None:
+             raise ValueError("dest_path must be provided if source is not a path or URI")
+         if dest_path:
+             # the entity is refrencing a path relative to the ro-crate root
+             identifier = Path(dest_path).as_posix()  # relative path?
+         else:
+             # if there is no dest_path there must be a URI/local path as source
+-            if is_local:
++            if not is_url(str(source)):
+                 # local source -> becomes local reference = reference relative
+                 # to ro-crate root
+                 identifier = os.path.basename(source)
+@@ -105,23 +98,16 @@ class File(DataEntity):
+             out_file_path.parent.mkdir(parents=True, exist_ok=True)
+             with open(out_file_path, 'w') as out_file:
+                 out_file.write(self.source.getvalue())
+-        else:
+-            if os.path.isfile(self.source):
+-                out_file_path.parent.mkdir(parents=True, exist_ok=True)
+-                copy(self.source, out_file_path)
+-            else:
+-                if self.fetch_remote:
+-                    # Legacy version
+-                    # urllib.request.urlretrieve(self.source, out_file_path)
+-                    # can check that the encodingFormat and contentSize matches
+-                    # the request data? i.e.:
+-                    # response.getheader('Content-Length') == \
+-                    #   self._jsonld['contentSize']
+-                    # this would help check if the dataset to be retrieved is
+-                    # in fact what was registered in the first place.
+-                    out_file_path.parent.mkdir(parents=True, exist_ok=True)
+-                    with urllib.request.urlopen(self.source) as response, open(out_file_path, 'wb') as out_file:
+-                        shutil.copyfileobj(response, out_file)
++        elif is_url(str(self.source)) and self.fetch_remote:
++            # Should we check that the resource hasn't changed? E.g., compare
++            # response.getheader('Content-Length') to self._jsonld['contentSize'] or
++            # response.getheader('Content-Type') to self._jsonld['encodingFormat']
++            out_file_path.parent.mkdir(parents=True, exist_ok=True)
++            with urllib.request.urlopen(self.source) as response, open(out_file_path, 'wb') as out_file:
++                shutil.copyfileobj(response, out_file)
++        elif os.path.isfile(self.source):
++            out_file_path.parent.mkdir(parents=True, exist_ok=True)
++            shutil.copy(self.source, out_file_path)
+ 
+     def write_zip(self, zip_out):
+         if self.id not in zip_out.namelist():
+diff --git a/rocrate/rocrate.py b/rocrate/rocrate.py
+index a968f10..029b8e3 100644
+--- a/rocrate/rocrate.py
++++ b/rocrate/rocrate.py
+@@ -21,7 +21,6 @@ import importlib
+ import json
+ import os
+ import uuid
+-import requests
+ import zipfile
+ import atexit
+ import shutil
+@@ -206,25 +205,21 @@ class ROCrate():
+             if 'File' in entity_types:
+                 # temporary workaround, should be handled in the general case
+                 cls = TestDefinition if "TestDefinition" in entity_types else File
+-                file_path = os.path.join(source, entity['@id'])
+-                identifier = entity.pop('@id', None)
+-                if os.path.exists(file_path):
+-                    # referencing a file path relative to crate-root
+-                    instance = cls(self, file_path, identifier, properties=entity)
++                identifier = entity['@id']
++                props = {k: v for k, v in entity.items() if k != '@id'}
++                if is_url(identifier):
++                    instance = cls(self, source=identifier, properties=props)
+                 else:
+-                    # check if it is a valid absolute URI
+-                    try:
+-                        requests.get(identifier)
+-                        instance = cls(self, identifier, properties=entity)
+-                    except requests.ConnectionError:
+-                        print("Source is not a valid URI")
++                    instance = cls(
++                        self,
++                        source=os.path.join(source, identifier),
++                        dest_path=identifier,
++                        properties=props
++                    )
+             if 'Dataset' in entity_types:
+                 dir_path = os.path.join(source, entity['@id'])
+-                if os.path.exists(dir_path):
+-                    props = {k: v for k, v in entity.items() if k != '@id'}
+-                    instance = Dataset(self, dir_path, entity['@id'], props)
+-                else:
+-                    raise Exception('Directory not found')
++                props = {k: v for k, v in entity.items() if k != '@id'}
++                instance = Dataset(self, dir_path, entity['@id'], props)
+             self.add(instance)
+             added_entities.append(data_entity_id)
+ 

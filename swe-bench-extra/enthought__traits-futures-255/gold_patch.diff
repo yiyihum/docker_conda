@@ -1,0 +1,196 @@
+diff --git a/traits_futures/message_router.py b/traits_futures/message_router.py
+index 9ca7d3f..b2e4db4 100644
+--- a/traits_futures/message_router.py
++++ b/traits_futures/message_router.py
+@@ -69,13 +69,15 @@ class MessageRouter(HasStrictTraits):
+         """
+         Prepare router for routing.
+         """
+-        pass
++        self._pingee = Pingee(on_ping=self._route_message)
++        self._pingee.connect()
+ 
+     def disconnect(self):
+         """
+         Undo any connections made by the ``connect`` call.
+         """
+-        pass
++        self._pingee.disconnect()
++        self._pingee = None
+ 
+     # Private traits ##########################################################
+ 
+@@ -110,6 +112,3 @@ class MessageRouter(HasStrictTraits):
+ 
+     def __connection_ids_default(self):
+         return itertools.count()
+-
+-    def __pingee_default(self):
+-        return Pingee(on_ping=self._route_message)
+diff --git a/traits_futures/null/pinger.py b/traits_futures/null/pinger.py
+index 59a1e15..8da4aed 100644
+--- a/traits_futures/null/pinger.py
++++ b/traits_futures/null/pinger.py
+@@ -22,26 +22,45 @@ class Pingee:
+     """
+     Receiver for pings.
+ 
++    Whenever a ping is received from a linked Pingee, the receiver
++    calls the given fixed parameterless callable.
++
++    The ping receiver must be connected (using the ``connect``) method
++    before use, and should call ``disconnect`` when it's no longer
++    expected to receive pings.
++
+     Parameters
+     ----------
+     on_ping : callable
+-        Zero-argument callable that's executed on the main thread as a
+-        result of each ping.
++        Zero-argument callable that's called on the main thread
++        every time a ping is received.
+     """
+ 
+     def __init__(self, on_ping):
+-        self._event_loop = asyncio.get_event_loop()
+         self._on_ping = on_ping
+ 
++    def connect(self):
++        """
++        Prepare Pingee to receive pings.
++        """
++        self._event_loop = asyncio.get_event_loop()
++
++    def disconnect(self):
++        """
++        Undo any connections made in the connect method.
++        """
++        del self._event_loop
++
+ 
+ class Pinger:
+     """
+-    Ping emitter, which can emit pings in a thread-safe manner.
++    Ping emitter, which can send pings to a receiver in a thread-safe manner.
+ 
+     Parameters
+     ----------
+     pingee : Pingee
+-        The corresponding ping receiver.
++        The target receiver for the pings. The receiver must already be
++        connected.
+     """
+ 
+     def __init__(self, pingee):
+diff --git a/traits_futures/qt/pinger.py b/traits_futures/qt/pinger.py
+index b510eeb..ef435a3 100644
+--- a/traits_futures/qt/pinger.py
++++ b/traits_futures/qt/pinger.py
+@@ -30,11 +30,18 @@ class Pingee(QObject):
+     """
+     Receiver for pings.
+ 
++    Whenever a ping is received from a linked Pingee, the receiver
++    calls the given fixed parameterless callable.
++
++    The ping receiver must be connected (using the ``connect``) method
++    before use, and should call ``disconnect`` when it's no longer
++    expected to receive pings.
++
+     Parameters
+     ----------
+     on_ping : callable
+-        Zero-argument callable that's executed on the main thread as a
+-        result of each ping.
++        Zero-argument callable that's called on the main thread
++        every time a ping is received.
+     """
+ 
+     def __init__(self, on_ping):
+@@ -45,15 +52,28 @@ class Pingee(QObject):
+     def _execute_ping_callback(self):
+         self._on_ping()
+ 
++    def connect(self):
++        """
++        Prepare Pingee to receive pings.
++        """
++        pass
++
++    def disconnect(self):
++        """
++        Undo any connections made in the connect method.
++        """
++        pass
++
+ 
+ class Pinger:
+     """
+-    Ping emitter, which can emit pings in a thread-safe manner.
++    Ping emitter, which can send pings to a receiver in a thread-safe manner.
+ 
+     Parameters
+     ----------
+     pingee : Pingee
+-        The corresponding ping receiver.
++        The target receiver for the pings. The receiver must already be
++        connected.
+     """
+ 
+     def __init__(self, pingee):
+diff --git a/traits_futures/wx/pinger.py b/traits_futures/wx/pinger.py
+index f1ed51b..df65e74 100644
+--- a/traits_futures/wx/pinger.py
++++ b/traits_futures/wx/pinger.py
+@@ -24,12 +24,13 @@ _PingEvent, _PingEventBinder = wx.lib.newevent.NewEvent()
+ 
+ class Pinger:
+     """
+-    Ping emitter, which can emit pings in a thread-safe manner.
++    Ping emitter, which can send pings to a receiver in a thread-safe manner.
+ 
+     Parameters
+     ----------
+     pingee : Pingee
+-        The corresponding ping receiver.
++        The target receiver for the pings. The receiver must already be
++        connected.
+     """
+ 
+     def __init__(self, pingee):
+@@ -60,6 +61,13 @@ class Pingee(wx.EvtHandler):
+     """
+     Receiver for pings.
+ 
++    Whenever a ping is received from a linked Pingee, the receiver
++    calls the given fixed parameterless callable.
++
++    The ping receiver must be connected (using the ``connect``) method
++    before use, and should call ``disconnect`` when it's no longer
++    expected to receive pings.
++
+     Parameters
+     ----------
+     on_ping : callable
+@@ -69,11 +77,16 @@ class Pingee(wx.EvtHandler):
+ 
+     def __init__(self, on_ping):
+         wx.EvtHandler.__init__(self)
+-        self._on_ping = on_ping
+-        self.Bind(_PingEventBinder, self._on_ping_event)
++        self._on_ping = lambda event: on_ping()
+ 
+-    def _on_ping_event(self, event):
++    def connect(self):
++        """
++        Prepare Pingee to receive pings.
++        """
++        self.Bind(_PingEventBinder, handler=self._on_ping)
++
++    def disconnect(self):
+         """
+-        Handler for events of type _PING_EVENT_TYPE.
++        Undo any connections made in the connect method.
+         """
+-        self._on_ping()
++        self.Unbind(_PingEventBinder, handler=self._on_ping)

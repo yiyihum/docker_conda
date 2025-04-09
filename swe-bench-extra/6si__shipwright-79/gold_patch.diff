@@ -1,0 +1,148 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index f034d37..89cf5f1 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,7 +1,8 @@
+ 0.5.1 (unreleased)
+ ------------------
+ 
+-- Nothing changed yet.
++- Add --pull-cache to pull images from repository before building.
++  (`Issue #49 <https://github.com/6si/shipwright/issues/49>`_).
+ 
+ 
+ 0.5.0 (2016-08-19)
+diff --git a/shipwright/base.py b/shipwright/base.py
+index 213d597..421f1af 100644
+--- a/shipwright/base.py
++++ b/shipwright/base.py
+@@ -4,10 +4,11 @@ from . import build, dependencies, docker, push
+ 
+ 
+ class Shipwright(object):
+-    def __init__(self, source_control, docker_client, tags):
++    def __init__(self, source_control, docker_client, tags, pull_cache=False):
+         self.source_control = source_control
+         self.docker_client = docker_client
+         self.tags = tags
++        self._pull_cache = pull_cache
+ 
+     def targets(self):
+         return self.source_control.targets()
+@@ -18,7 +19,10 @@ class Shipwright(object):
+         return self._build(this_ref_str, targets)
+ 
+     def _build(self, this_ref_str, targets):
+-        for evt in build.do_build(self.docker_client, this_ref_str, targets):
++        client = self.docker_client
++        pull_cache = self._pull_cache
++        ref = this_ref_str
++        for evt in build.do_build(client, ref, targets, pull_cache):
+             yield evt
+ 
+         # now that we're built and tagged all the images.
+diff --git a/shipwright/build.py b/shipwright/build.py
+index 707d4f9..4ee1558 100644
+--- a/shipwright/build.py
++++ b/shipwright/build.py
+@@ -13,7 +13,7 @@ def _merge(d1, d2):
+     return d
+ 
+ 
+-def do_build(client, build_ref, targets):
++def do_build(client, build_ref, targets, pull_cache):
+     """
+     Generic function for building multiple images while
+     notifying a callback function with output produced.
+@@ -39,11 +39,11 @@ def do_build(client, build_ref, targets):
+         parent_ref = None
+         if target.parent:
+             parent_ref = build_index.get(target.parent)
+-        for evt in build(client, parent_ref, target):
++        for evt in build(client, parent_ref, target, pull_cache):
+             yield evt
+ 
+ 
+-def build(client, parent_ref, image):
++def build(client, parent_ref, image, pull_cache):
+     """
+     builds the given image tagged with <build_ref> and ensures that
+     it depends on it's parent if it's part of this build group (shares
+@@ -62,7 +62,25 @@ def build(client, parent_ref, image):
+ 
+     built_tags = docker.last_built_from_docker(client, image.name)
+     if image.ref in built_tags:
+-        return []
++        return
++
++    if pull_cache:
++        pull_evts = client.pull(
++            repository=image.name,
++            tag=image.ref,
++            stream=True,
++        )
++
++        failed = False
++        for evt in pull_evts:
++            event = process_event_(evt)
++            if 'error' in event:
++                failed = True
++            else:
++                yield event
++
++        if not failed:
++            return
+ 
+     build_evts = client.build(
+         fileobj=mkcontext(parent_ref, image.path),
+@@ -73,4 +91,5 @@ def build(client, parent_ref, image):
+         dockerfile=os.path.basename(image.path),
+     )
+ 
+-    return (process_event_(evt) for evt in build_evts)
++    for evt in build_evts:
++        yield process_event_(evt)
+diff --git a/shipwright/cli.py b/shipwright/cli.py
+index 24f6f78..82eaf50 100644
+--- a/shipwright/cli.py
++++ b/shipwright/cli.py
+@@ -109,6 +109,11 @@ def argparser():
+         help='Build working tree, including uncommited and untracked changes',
+         action='store_true',
+     )
++    common.add_argument(
++        '--pull-cache',
++        help='When building try to pull previously built images',
++        action='store_true',
++    )
+     a_arg(
+         common, '-d', '--dependants',
+         help='Build DEPENDANTS and all its dependants',
+@@ -157,7 +162,6 @@ def old_style_arg_dict(namespace):
+         '--exclude': _flatten(ns.exclude),
+         '--help': False,
+         '--no-build': getattr(ns, 'no_build', False),
+-        '--dirty': getattr(ns, 'dirty', False),
+         '--upto': _flatten(ns.upto),
+         '--x-assert-hostname': ns.x_assert_hostname,
+         '-H': ns.docker_host,
+@@ -237,8 +241,10 @@ def run(path, arguments, client_cfg, environ, new_style_args=None):
+ 
+     if new_style_args is None:
+         dirty = False
++        pull_cache = False
+     else:
+         dirty = new_style_args.dirty
++        pull_cache = new_style_args.pull_cache
+ 
+     namespace = config['namespace']
+     name_map = config.get('names', {})
+@@ -249,7 +255,7 @@ def run(path, arguments, client_cfg, environ, new_style_args=None):
+             'to commit these changes, re-run with the --dirty flag.'
+         )
+ 
+-    sw = Shipwright(scm, client, arguments['tags'])
++    sw = Shipwright(scm, client, arguments['tags'], pull_cache)
+     command = getattr(sw, command_name)
+ 
+     show_progress = sys.stdout.isatty()

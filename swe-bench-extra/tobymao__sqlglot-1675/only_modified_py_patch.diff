@@ -1,0 +1,93 @@
+diff --git a/sqlglot/dialects/teradata.py b/sqlglot/dialects/teradata.py
+index 3bed58bb..db0d9d4c 100644
+--- a/sqlglot/dialects/teradata.py
++++ b/sqlglot/dialects/teradata.py
+@@ -141,7 +141,9 @@ class Teradata(Dialect):
+ 
+         PROPERTIES_LOCATION = {
+             **generator.Generator.PROPERTIES_LOCATION,  # type: ignore
++            exp.OnCommitProperty: exp.Properties.Location.POST_INDEX,
+             exp.PartitionedByProperty: exp.Properties.Location.POST_INDEX,
++            exp.StabilityProperty: exp.Properties.Location.POST_CREATE,
+         }
+ 
+         TRANSFORMS = {
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 0fff2dca..5f890ac7 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1896,7 +1896,7 @@ class NoPrimaryIndexProperty(Property):
+ 
+ 
+ class OnCommitProperty(Property):
+-    arg_type = {"this": False}
++    arg_type = {"delete": False}
+ 
+ 
+ class PartitionedByProperty(Property):
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 3b9961bb..bb94a51f 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -76,7 +76,7 @@ class Generator:
+         exp.LogProperty: lambda self, e: f"{'NO ' if e.args.get('no') else ''}LOG",
+         exp.MaterializedProperty: lambda self, e: "MATERIALIZED",
+         exp.NoPrimaryIndexProperty: lambda self, e: "NO PRIMARY INDEX",
+-        exp.OnCommitProperty: lambda self, e: "ON COMMIT PRESERVE ROWS",
++        exp.OnCommitProperty: lambda self, e: f"ON COMMIT {'DELETE' if e.args.get('delete') else 'PRESERVE'} ROWS",
+         exp.ReturnsProperty: lambda self, e: self.naked_property(e),
+         exp.SetProperty: lambda self, e: f"{'MULTI' if e.args.get('multi') else ''}SET",
+         exp.SettingsProperty: lambda self, e: f"SETTINGS{self.seg('')}{(self.expressions(e))}",
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index b4382539..54c152e9 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -1212,28 +1212,21 @@ class Parser(metaclass=_Parser):
+             expression = self._parse_ddl_select()
+ 
+             if create_token.token_type == TokenType.TABLE:
+-                # exp.Properties.Location.POST_EXPRESSION
+-                temp_properties = self._parse_properties()
+-                if properties and temp_properties:
+-                    properties.expressions.extend(temp_properties.expressions)
+-                elif temp_properties:
+-                    properties = temp_properties
+-
+                 indexes = []
+                 while True:
+                     index = self._parse_create_table_index()
+ 
+-                    # exp.Properties.Location.POST_INDEX
+-                    if self._match(TokenType.PARTITION_BY, advance=False):
+-                        temp_properties = self._parse_properties()
+-                        if properties and temp_properties:
+-                            properties.expressions.extend(temp_properties.expressions)
+-                        elif temp_properties:
+-                            properties = temp_properties
++                    # exp.Properties.Location.POST_EXPRESSION or exp.Properties.Location.POST_INDEX
++                    temp_properties = self._parse_properties()
++                    if properties and temp_properties:
++                        properties.expressions.extend(temp_properties.expressions)
++                    elif temp_properties:
++                        properties = temp_properties
+ 
+                     if not index:
+                         break
+                     else:
++                        self._match(TokenType.COMMA)
+                         indexes.append(index)
+             elif create_token.token_type == TokenType.VIEW:
+                 if self._match_text_seq("WITH", "NO", "SCHEMA", "BINDING"):
+@@ -1589,8 +1582,9 @@ class Parser(metaclass=_Parser):
+         return exp.NoPrimaryIndexProperty()
+ 
+     def _parse_oncommit(self) -> exp.Expression:
+-        self._match_text_seq("COMMIT", "PRESERVE", "ROWS")
+-        return exp.OnCommitProperty()
++        if self._match_text_seq("COMMIT", "PRESERVE", "ROWS"):
++            return exp.OnCommitProperty()
++        return exp.OnCommitProperty(delete=self._match_text_seq("COMMIT", "DELETE", "ROWS"))
+ 
+     def _parse_distkey(self) -> exp.Expression:
+         return self.expression(exp.DistKeyProperty, this=self._parse_wrapped(self._parse_id_var))
+

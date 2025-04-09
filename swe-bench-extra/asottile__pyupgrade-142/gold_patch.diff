@@ -1,0 +1,71 @@
+diff --git a/README.md b/README.md
+index 8c379f5..4d842dd 100644
+--- a/README.md
++++ b/README.md
+@@ -85,6 +85,9 @@ u'''foo'''  # '''foo'''
+ # `ur` is not a valid string prefix in python3
+ u'\d'   # u'\\d'
+ 
++# this fixes a syntax error in python3.3+
++'\N'    # r'\N'
++
+ # note: pyupgrade is timid in one case (that's usually a mistake)
+ # in python2.x `'\u2603'` is the same as `'\\u2603'` without `unicode_literals`
+ # but in python3.x, that's our friend ☃
+diff --git a/pyupgrade.py b/pyupgrade.py
+index 2a55816..f1d25ec 100644
+--- a/pyupgrade.py
++++ b/pyupgrade.py
+@@ -456,11 +456,9 @@ ESCAPE_STARTS = frozenset((
+     '\n', '\r', '\\', "'", '"', 'a', 'b', 'f', 'n', 'r', 't', 'v',
+     '0', '1', '2', '3', '4', '5', '6', '7',  # octal escapes
+     'x',  # hex escapes
+-    # only valid in non-bytestrings
+-    'N', 'u', 'U',
+ ))
+-ESCAPE_STARTS_BYTES = ESCAPE_STARTS - frozenset(('N', 'u', 'U'))
+ ESCAPE_RE = re.compile(r'\\.', re.DOTALL)
++NAMED_ESCAPE_NAME = re.compile(r'\{[^}]+\}')
+ 
+ 
+ def _parse_string_literal(s):
+@@ -475,18 +473,31 @@ def _fix_escape_sequences(token):
+     if 'r' in actual_prefix or '\\' not in rest:
+         return token
+ 
+-    if 'b' in actual_prefix:
+-        valid_escapes = ESCAPE_STARTS_BYTES
+-    else:
+-        valid_escapes = ESCAPE_STARTS
++    is_bytestring = 'b' in actual_prefix
++
++    def _is_valid_escape(match):
++        c = match.group()[1]
++        return (
++            c in ESCAPE_STARTS or
++            (not is_bytestring and c in 'uU') or
++            (
++                not is_bytestring and
++                c == 'N' and
++                bool(NAMED_ESCAPE_NAME.match(rest, match.end()))
++            )
++        )
+ 
+-    escape_sequences = {m[1] for m in ESCAPE_RE.findall(rest)}
+-    has_valid_escapes = escape_sequences & valid_escapes
+-    has_invalid_escapes = escape_sequences - valid_escapes
++    has_valid_escapes = False
++    has_invalid_escapes = False
++    for match in ESCAPE_RE.finditer(rest):
++        if _is_valid_escape(match):
++            has_valid_escapes = True
++        else:
++            has_invalid_escapes = True
+ 
+     def cb(match):
+         matched = match.group()
+-        if matched[1] in valid_escapes:
++        if _is_valid_escape(match):
+             return matched
+         else:
+             return r'\{}'.format(matched)

@@ -1,0 +1,192 @@
+diff --git a/aqt/archives.py b/aqt/archives.py
+index 480f5bf..64730c9 100644
+--- a/aqt/archives.py
++++ b/aqt/archives.py
+@@ -98,19 +98,16 @@ class QtArchives:
+         else:
+             for m in modules if modules is not None else []:
+                 self.mod_list.append(
+-                    "qt.qt{0}.{0}{1}{2}.{3}.{4}".format(
++                    "qt.qt{0}.{1}.{2}.{3}".format(
+                         self.version.major,
+-                        self.version.minor,
+-                        self.version.patch,
++                        self._version_str(),
+                         m,
+                         arch,
+                     )
+                 )
+                 self.mod_list.append(
+-                    "qt.{0}{1}{2}.{3}.{4}".format(
+-                        self.version.major,
+-                        self.version.minor,
+-                        self.version.patch,
++                    "qt.{0}.{1}.{2}".format(
++                        self._version_str(),
+                         m,
+                         arch,
+                     )
+@@ -120,6 +117,11 @@ class QtArchives:
+         if not all_archives:
+             self.archives = list(filter(lambda a: a.name in subarchives, self.archives))
+ 
++    def _version_str(self) -> str:
++        return ("{0.major}{0.minor}" if self.version == Version("5.9.0") else "{0.major}{0.minor}{0.patch}").format(
++            self.version
++        )
++
+     def _get_archives(self):
+         # Get packages index
+         if self.arch == "wasm_32":
+@@ -128,29 +130,25 @@ class QtArchives:
+             arch_ext = "{}".format(self.arch[7:])
+         else:
+             arch_ext = ""
+-        archive_path = "{0}{1}{2}/qt{3}_{3}{4}{5}{6}/".format(
++        archive_path = "{0}{1}/{2}/qt{3}_{4}{5}/".format(
+             self.os_name,
+-            "_x86/" if self.os_name == "windows" else "_x64/",
++            "_x86" if self.os_name == "windows" else "_x64",
+             self.target,
+             self.version.major,
+-            self.version.minor,
+-            self.version.patch,
++            self._version_str(),
+             arch_ext,
+         )
+         update_xml_url = "{0}{1}Updates.xml".format(self.base, archive_path)
+         archive_url = "{0}{1}".format(self.base, archive_path)
+         target_packages = []
+         target_packages.append(
+-            "qt.qt{0}.{0}{1}{2}.{3}".format(
++            "qt.qt{0}.{1}.{2}".format(
+                 self.version.major,
+-                self.version.minor,
+-                self.version.patch,
++                self._version_str(),
+                 self.arch,
+             )
+         )
+-        target_packages.append(
+-            "qt.{0}{1}{2}.{3}".format(self.version.major, self.version.minor, self.version.patch, self.arch)
+-        )
++        target_packages.append("qt.{0}.{1}".format(self._version_str(), self.arch))
+         target_packages.extend(self.mod_list)
+         self._download_update_xml(update_xml_url)
+         self._parse_update_xml(archive_url, target_packages)
+diff --git a/aqt/updater.py b/aqt/updater.py
+index e8ee446..ca75402 100644
+--- a/aqt/updater.py
++++ b/aqt/updater.py
+@@ -258,6 +258,7 @@ class Updater:
+         arch = target.arch
+         version = Version(target.version)
+         os_name = target.os_name
++        version_dir = "5.9" if version == Version("5.9.0") else target.version
+         if arch is None:
+             arch_dir = ""
+         elif arch.startswith("win64_mingw"):
+@@ -276,9 +277,9 @@ class Updater:
+         else:
+             arch_dir = arch
+         try:
+-            prefix = pathlib.Path(base_dir) / target.version / arch_dir
++            prefix = pathlib.Path(base_dir) / version_dir / arch_dir
+             updater = Updater(prefix, logger)
+-            updater.set_license(base_dir, target.version, arch_dir)
++            updater.set_license(base_dir, version_dir, arch_dir)
+             if target.arch not in [
+                 "ios",
+                 "android",
+@@ -288,7 +289,7 @@ class Updater:
+                 "android_x86",
+                 "android_armv7",
+             ]:  # desktop version
+-                updater.make_qtconf(base_dir, target.version, arch_dir)
++                updater.make_qtconf(base_dir, version_dir, arch_dir)
+                 updater.patch_qmake()
+                 if target.os_name == "linux":
+                     updater.patch_pkgconfig("/home/qt/work/install", target.os_name)
+@@ -297,14 +298,14 @@ class Updater:
+                     updater.patch_pkgconfig("/Users/qt/work/install", target.os_name)
+                     updater.patch_libtool("/Users/qt/work/install/lib", target.os_name)
+                 elif target.os_name == "windows":
+-                    updater.make_qtenv2(base_dir, target.version, arch_dir)
+-                if Version(target.version) < Version("5.14.0"):
++                    updater.make_qtenv2(base_dir, version_dir, arch_dir)
++                if version < Version("5.14.0"):
+                     updater.patch_qtcore(target)
+-            elif Version(target.version) in SimpleSpec(">=5.0,<6.0"):
++            elif version in SimpleSpec(">=5.0,<6.0"):
+                 updater.patch_qmake()
+             else:  # qt6 non-desktop
+-                updater.patch_qmake_script(base_dir, target.version, target.os_name)
+-                updater.patch_target_qt_conf(base_dir, target.version, arch_dir, target.os_name)
++                updater.patch_qmake_script(base_dir, version_dir, target.os_name)
++                updater.patch_target_qt_conf(base_dir, version_dir, arch_dir, target.os_name)
+         except IOError as e:
+             raise e
+ 
+diff --git a/ci/generate_azure_pipelines_matrices.py b/ci/generate_azure_pipelines_matrices.py
+index fd07338..4651e18 100644
+--- a/ci/generate_azure_pipelines_matrices.py
++++ b/ci/generate_azure_pipelines_matrices.py
+@@ -44,6 +44,14 @@ class BuildJob:
+         self.spec = spec
+         self.output_dir = output_dir
+ 
++    def qt_bindir(self, *, sep='/') -> str:
++        out_dir = f"$(Build.BinariesDirectory){sep}Qt" if not self.output_dir else self.output_dir
++        version_dir = "5.9" if self.qt_version == "5.9.0" else self.qt_version
++        return f"{out_dir}{sep}{version_dir}{sep}{self.archdir}{sep}bin"
++
++    def win_qt_bindir(self) -> str:
++        return self.qt_bindir(sep='\\')
++
+ 
+ class PlatformBuildJobs:
+     def __init__(self, platform, build_jobs):
+@@ -130,6 +138,16 @@ windows_build_jobs.extend(
+             module="qtcharts qtnetworkauth",
+             mirror=random.choice(MIRRORS),
+         ),
++        BuildJob(
++            "install-qt",
++            "5.9.0",
++            "windows",
++            "desktop",
++            "win64_msvc2017_64",
++            "msvc2017_64",
++            module="qtcharts qtnetworkauth",
++            mirror=random.choice(MIRRORS),
++        ),
+     ]
+ )
+ 
+@@ -281,24 +299,8 @@ for platform_build_job in all_platform_build_jobs:
+                 ("HAS_EXTENSIONS", build_job.list_options.get("HAS_EXTENSIONS", "False")),
+                 ("USE_EXTENSION", build_job.list_options.get("USE_EXTENSION", "None")),
+                 ("OUTPUT_DIR", build_job.output_dir if build_job.output_dir else ""),
+-                (
+-                    "QT_BINDIR",
+-                    "{0}/{1.qt_version}/{1.archdir}/bin".format(
+-                        "$(Build.BinariesDirectory)/Qt"
+-                        if not build_job.output_dir
+-                        else build_job.output_dir,
+-                        build_job,
+-                    ),
+-                ),
+-                (
+-                    "WIN_QT_BINDIR",
+-                    "{0}\\{1.qt_version}\\{1.archdir}\\bin".format(
+-                        "$(Build.BinariesDirectory)\\Qt"
+-                        if not build_job.output_dir
+-                        else build_job.output_dir,
+-                        build_job,
+-                    ),
+-                ),
++                ("QT_BINDIR", build_job.qt_bindir()),
++                ("WIN_QT_BINDIR", build_job.win_qt_bindir()),
+             ]
+         )
+ 

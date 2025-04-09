@@ -1,0 +1,110 @@
+diff --git a/tests/playlists.py b/tests/playlists.py
+index 1d763da..ae908c1 100755
+--- a/tests/playlists.py
++++ b/tests/playlists.py
+@@ -1072,4 +1072,22 @@ testvideo-1596635519-4770290994-a0e5087d.ts?hdntl=exp=1596678764~acl=/*~data=hdn
+ #EXTINF:5.0000,
+ '''
+ 
++VARIANT_PLAYLIST_WITH_IFRAME_AVERAGE_BANDWIDTH = '''
++#EXTM3U
++#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=624x352,CODECS="avc1.4d001f, mp4a.40.5"
++video-800k.m3u8
++#EXT-X-STREAM-INF:BANDWIDTH=1200000,CODECS="avc1.4d001f, mp4a.40.5"
++video-1200k.m3u8
++#EXT-X-STREAM-INF:BANDWIDTH=400000,CODECS="avc1.4d001f, mp4a.40.5"
++video-400k.m3u8
++#EXT-X-STREAM-INF:BANDWIDTH=150000,CODECS="avc1.4d001f, mp4a.40.5"
++video-150k.m3u8
++#EXT-X-STREAM-INF:BANDWIDTH=64000,CODECS="mp4a.40.5"
++video-64k.m3u8
++#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=151288,RESOLUTION=624x352,CODECS="avc1.4d001f",URI="video-800k-iframes.m3u8"
++#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=193350,AVERAGE_BANDWIDTH=155000,CODECS="avc1.4d001f",URI="video-1200k-iframes.m3u8"
++#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=83598,AVERAGE_BANDWIDTH=65000,CODECS="avc1.4d001f",URI="video-400k-iframes.m3u8"
++#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=38775,AVERAGE_BANDWIDTH=30000,CODECS="avc1.4d001f",URI="video-150k-iframes.m3u8"
++'''
++
+ del abspath, dirname, join
+diff --git a/tests/test_parser.py b/tests/test_parser.py
+index 8837048..acd6632 100644
+--- a/tests/test_parser.py
++++ b/tests/test_parser.py
+@@ -491,3 +491,27 @@ def test_gap_in_parts():
+     assert data['segments'][0]['parts'][1]['gap'] == 'YES'
+     assert data['segments'][0]['parts'][2]['gap_tag'] == True
+     assert data['segments'][0]['parts'][2].get('gap', None) is None
++
++def test_should_parse_variant_playlist_with_iframe_with_average_bandwidth():
++    data = m3u8.parse(playlists.VARIANT_PLAYLIST_WITH_IFRAME_AVERAGE_BANDWIDTH)
++    iframe_playlists = list(data['iframe_playlists'])
++
++    assert True == data['is_variant']
++
++    assert 4 == len(iframe_playlists)
++
++    assert 151288 == iframe_playlists[0]['iframe_stream_info']['bandwidth']
++    # Check for absence of average_bandwidth if not given in the playlist
++    assert 'average_bandwidth' not in iframe_playlists[0]['iframe_stream_info']
++    assert '624x352' == iframe_playlists[0]['iframe_stream_info']['resolution']
++    assert 'avc1.4d001f' == iframe_playlists[0]['iframe_stream_info']['codecs']
++    assert 'video-800k-iframes.m3u8' == iframe_playlists[0]['uri']
++
++    assert 38775 == iframe_playlists[-1]['iframe_stream_info']['bandwidth']
++    assert 'avc1.4d001f' == (
++        iframe_playlists[-1]['iframe_stream_info']['codecs']
++    )
++    assert 'video-150k-iframes.m3u8' == iframe_playlists[-1]['uri']
++    assert 155000 == iframe_playlists[1]['iframe_stream_info']['average_bandwidth']
++    assert 65000 == iframe_playlists[2]['iframe_stream_info']['average_bandwidth']
++    assert 30000 == iframe_playlists[3]['iframe_stream_info']['average_bandwidth']
+diff --git a/tests/test_variant_m3u8.py b/tests/test_variant_m3u8.py
+index fbb01e5..8bfbe99 100644
+--- a/tests/test_variant_m3u8.py
++++ b/tests/test_variant_m3u8.py
+@@ -163,3 +163,46 @@ http://example.com/hdr.m3u8
+ def test_variant_playlist_with_multiple_media():
+     variant_m3u8 = m3u8.loads(playlists.MULTI_MEDIA_PLAYLIST)
+     assert variant_m3u8.dumps() == playlists.MULTI_MEDIA_PLAYLIST
++
++
++def test_create_a_variant_m3u8_with_iframe_with_average_bandwidth_playlists():
++    variant_m3u8 = m3u8.M3U8()
++
++    subtitles = m3u8.Media('english_sub.m3u8', 'SUBTITLES', 'subs', 'en',
++                           'English', 'YES', 'YES', 'NO', None)
++    variant_m3u8.add_media(subtitles)
++
++    low_playlist = m3u8.Playlist(
++        uri='video-800k.m3u8',
++        stream_info={'bandwidth': 800000,
++                     'average_bandwidth': 555000,
++                     'resolution': '624x352',
++                     'codecs': 'avc1.4d001f, mp4a.40.5',
++                     'subtitles': 'subs'},
++        media=[subtitles],
++        base_uri='http://example.com/'
++    )
++    low_iframe_playlist = m3u8.IFramePlaylist(
++        uri='video-800k-iframes.m3u8',
++        iframe_stream_info={'bandwidth': 151288,
++                            'average_bandwidth': 111000,
++                            'resolution': '624x352',
++                            'codecs': 'avc1.4d001f'},
++        base_uri='http://example.com/'
++    )
++
++    variant_m3u8.add_playlist(low_playlist)
++    variant_m3u8.add_iframe_playlist(low_iframe_playlist)
++
++    expected_content = """\
++#EXTM3U
++#EXT-X-MEDIA:URI="english_sub.m3u8",TYPE=SUBTITLES,GROUP-ID="subs",\
++LANGUAGE="en",NAME="English",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO
++#EXT-X-STREAM-INF:BANDWIDTH=800000,AVERAGE-BANDWIDTH=555000,\
++RESOLUTION=624x352,CODECS="avc1.4d001f, mp4a.40.5",SUBTITLES="subs"
++video-800k.m3u8
++#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=151288,\
++AVERAGE-BANDWIDTH=111000,RESOLUTION=624x352,CODECS="avc1.4d001f",\
++URI="video-800k-iframes.m3u8"
++"""
++    assert expected_content == variant_m3u8.dumps()

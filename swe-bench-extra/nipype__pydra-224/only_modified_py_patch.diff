@@ -1,0 +1,224 @@
+diff --git a/pydra/engine/helpers.py b/pydra/engine/helpers.py
+index 1a441f1..3cd9c65 100644
+--- a/pydra/engine/helpers.py
++++ b/pydra/engine/helpers.py
+@@ -10,7 +10,7 @@ from hashlib import sha256
+ import subprocess as sp
+ 
+ from .specs import Runtime, File, attr_fields
+-from .helpers_file import is_existing_file, hash_file, copyfile, is_existing_file
++from .helpers_file import hash_file, copyfile, is_existing_file
+ 
+ 
+ def ensure_list(obj, tuple2list=False):
+@@ -444,12 +444,14 @@ def hash_function(obj):
+ 
+ def hash_value(value, tp=None, metadata=None):
+     """calculating hash or returning values recursively"""
++    if metadata is None:
++        metadata = {}
+     if isinstance(value, (tuple, list)):
+         return [hash_value(el, tp, metadata) for el in value]
+     elif isinstance(value, dict):
+         dict_hash = {k: hash_value(v, tp, metadata) for (k, v) in value.items()}
+         # returning a sorted object
+-        return sorted(dict_hash.items(), key=lambda x: x[0])
++        return [list(el) for el in sorted(dict_hash.items(), key=lambda x: x[0])]
+     else:  # not a container
+         if (
+             (tp is File or "pydra.engine.specs.File" in str(tp))
+@@ -457,8 +459,6 @@ def hash_value(value, tp=None, metadata=None):
+             and "container_path" not in metadata
+         ):
+             return hash_file(value)
+-        elif isinstance(value, tuple):
+-            return list(value)
+         else:
+             return value
+ 
+diff --git a/pydra/engine/helpers_state.py b/pydra/engine/helpers_state.py
+index 1be966a..6aad048 100644
+--- a/pydra/engine/helpers_state.py
++++ b/pydra/engine/helpers_state.py
+@@ -10,6 +10,16 @@ from .helpers import ensure_list
+ logger = logging.getLogger("pydra")
+ 
+ 
++class PydraStateError(Exception):
++    """Custom error for Pydra State"""
++
++    def __init__(self, value):
++        self.value = value
++
++    def __str__(self):
++        return "{}".format(self.value)
++
++
+ def splitter2rpn(splitter, other_states=None, state_fields=True):
+     """
+     Translate user-provided splitter into *reverse polish notation*.
+@@ -49,7 +59,7 @@ def _ordering(
+         if type(el[0]) is str and el[0].startswith("_"):
+             node_nm = el[0][1:]
+             if node_nm not in other_states and state_fields:
+-                raise Exception(
++                raise PydraStateError(
+                     "can't ask for splitter from {}, other nodes that are connected: {}".format(
+                         node_nm, other_states.keys()
+                     )
+@@ -64,7 +74,7 @@ def _ordering(
+         if type(el[1]) is str and el[1].startswith("_"):
+             node_nm = el[1][1:]
+             if node_nm not in other_states and state_fields:
+-                raise Exception(
++                raise PydraStateError(
+                     "can't ask for splitter from {}, other nodes that are connected: {}".format(
+                         node_nm, other_states.keys()
+                     )
+@@ -87,7 +97,7 @@ def _ordering(
+         if type(el[0]) is str and el[0].startswith("_"):
+             node_nm = el[0][1:]
+             if node_nm not in other_states and state_fields:
+-                raise Exception(
++                raise PydraStateError(
+                     "can't ask for splitter from {}, other nodes that are connected: {}".format(
+                         node_nm, other_states.keys()
+                     )
+@@ -102,7 +112,7 @@ def _ordering(
+         if type(el[1]) is str and el[1].startswith("_"):
+             node_nm = el[1][1:]
+             if node_nm not in other_states and state_fields:
+-                raise Exception(
++                raise PydraStateError(
+                     "can't ask for splitter from {}, other nodes that are connected: {}".format(
+                         node_nm, other_states.keys()
+                     )
+@@ -125,7 +135,7 @@ def _ordering(
+         if el.startswith("_"):
+             node_nm = el[1:]
+             if node_nm not in other_states and state_fields:
+-                raise Exception(
++                raise PydraStateError(
+                     "can't ask for splitter from {}, other nodes that are connected: {}".format(
+                         node_nm, other_states.keys()
+                     )
+@@ -156,7 +166,7 @@ def _ordering(
+                 state_fields=state_fields,
+             )
+     else:
+-        raise Exception("splitter has to be a string, a tuple or a list")
++        raise PydraStateError("splitter has to be a string, a tuple or a list")
+     if i > 0:
+         output_splitter.append(current_sign)
+ 
+@@ -702,7 +712,7 @@ def _single_op_splits_groups(op_single, combiner, inner_inputs, groups):
+             return [], {}, [], combiner
+         else:
+             # TODO: probably not needed, should be already check by st.combiner_validation
+-            raise Exception(
++            raise PydraStateError(
+                 "all fields from the combiner have to be in splitter_rpn: {}, but combiner: {} is set".format(
+                     [op_single], combiner
+                 )
+@@ -733,7 +743,7 @@ def combine_final_groups(combiner, groups, groups_stack, keys):
+             elif gr in grs_removed:
+                 pass
+             else:
+-                raise Exception(
++                raise PydraStateError(
+                     "input {} not ready to combine, you have to combine {} "
+                     "first".format(comb, groups_stack[-1])
+                 )
+diff --git a/pydra/engine/state.py b/pydra/engine/state.py
+index 92df1be..40c8111 100644
+--- a/pydra/engine/state.py
++++ b/pydra/engine/state.py
+@@ -111,7 +111,9 @@ class State:
+     @splitter.setter
+     def splitter(self, splitter):
+         if splitter and not isinstance(splitter, (str, tuple, list)):
+-            raise Exception("splitter has to be a string, a tuple or a list")
++            raise hlpst.PydraStateError(
++                "splitter has to be a string, a tuple or a list"
++            )
+         if splitter:
+             self._splitter = hlpst.add_name_splitter(splitter, self.name)
+         else:
+@@ -209,7 +211,7 @@ class State:
+     def combiner(self, combiner):
+         if combiner:
+             if not isinstance(combiner, (str, list)):
+-                raise Exception("combiner has to be a string or a list")
++                raise hlpst.PydraStateError("combiner has to be a string or a list")
+             self._combiner = hlpst.add_name_combiner(ensure_list(combiner), self.name)
+         else:
+             self._combiner = []
+@@ -251,11 +253,13 @@ class State:
+     def other_states(self, other_states):
+         if other_states:
+             if not isinstance(other_states, dict):
+-                raise Exception("other states has to be a dictionary")
++                raise hlpst.PydraStateError("other states has to be a dictionary")
+             else:
+                 for key, val in other_states.items():
+                     if not val:
+-                        raise Exception(f"connection from node {key} is empty")
++                        raise hlpst.PydraStateError(
++                            f"connection from node {key} is empty"
++                        )
+             self._other_states = other_states
+         else:
+             self._other_states = {}
+@@ -360,7 +364,9 @@ class State:
+         ):
+             return "[Left, Right]"  # Left and Right parts separated in outer scalar
+         else:
+-            raise Exception("Left and Right splitters are mixed - splitter invalid")
++            raise hlpst.PydraStateError(
++                "Left and Right splitters are mixed - splitter invalid"
++            )
+ 
+     def set_input_groups(self, state_fields=True):
+         """Evaluate groups, especially the final groups that address the combiner."""
+@@ -409,7 +415,7 @@ class State:
+             ):
+                 last_gr = last_gr - 1
+             if left_nm[1:] not in self.other_states:
+-                raise Exception(
++                raise hlpst.PydraStateError(
+                     f"can't ask for splitter from {left_nm[1:]}, other nodes that are connected: {self.other_states}"
+                 )
+             st = self.other_states[left_nm[1:]][0]
+@@ -434,7 +440,7 @@ class State:
+                 )
+                 self.keys_final += keys_f_st  # st.keys_final
+                 if not hasattr(st, "group_for_inputs_final"):
+-                    raise Exception("previous state has to run first")
++                    raise hlpst.PydraStateError("previous state has to run first")
+                 group_for_inputs = group_for_inputs_f_st
+                 groups_stack = groups_stack_f_st
+                 self.left_combiner_all += combiner_all_st
+@@ -487,7 +493,7 @@ class State:
+                 or spl.startswith("_")
+                 or spl.split(".")[0] == self.name
+             ):
+-                raise Exception(
++                raise hlpst.PydraStateError(
+                     "can't include {} in the splitter, consider using _{}".format(
+                         spl, spl.split(".")[0]
+                     )
+@@ -497,9 +503,11 @@ class State:
+         """ validating if the combiner is correct (after all states are connected)"""
+         if self.combiner:
+             if not self.splitter:
+-                raise Exception("splitter has to be set before setting combiner")
++                raise hlpst.PydraStateError(
++                    "splitter has to be set before setting combiner"
++                )
+             if set(self._combiner) - set(self.splitter_rpn):
+-                raise Exception("all combiners have to be in the splitter")
++                raise hlpst.PydraStateError("all combiners have to be in the splitter")
+ 
+     def prepare_states(self, inputs, cont_dim=None):
+         """
+

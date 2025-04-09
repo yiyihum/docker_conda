@@ -1,0 +1,163 @@
+diff --git a/jupyterhub_config.py b/jupyterhub_config.py
+index cce2c68..e59a17d 100644
+--- a/jupyterhub_config.py
++++ b/jupyterhub_config.py
+@@ -19,6 +19,7 @@ c.KubeSpawner.singleuser_image_spec = 'yuvipanda/simple-singleuser:v1'
+ # The spawned containers need to be able to talk to the hub through the proxy!
+ c.KubeSpawner.hub_connect_ip = os.environ['HUB_CONNECT_IP']
+ 
++c.KubeSpawner.singleuser_service_account = 'default'
+ # Do not use any authentication at all - any username / password will work.
+ c.JupyterHub.authenticator_class = 'dummyauthenticator.DummyAuthenticator'
+ 
+diff --git a/kubespawner/objects.py b/kubespawner/objects.py
+index 36ea5da..3848f2e 100644
+--- a/kubespawner/objects.py
++++ b/kubespawner/objects.py
+@@ -7,6 +7,8 @@ from kubernetes.client.models.v1_pod_spec import V1PodSpec
+ from kubernetes.client.models.v1_object_meta import V1ObjectMeta
+ from kubernetes.client.models.v1_pod_security_context import V1PodSecurityContext
+ from kubernetes.client.models.v1_local_object_reference import V1LocalObjectReference
++from kubernetes.client.models.v1_volume import V1Volume
++from kubernetes.client.models.v1_volume_mount import V1VolumeMount
+ 
+ from kubernetes.client.models.v1_container import V1Container
+ from kubernetes.client.models.v1_security_context import V1SecurityContext
+@@ -40,6 +42,7 @@ def make_pod(
+     mem_guarantee,
+     lifecycle_hooks,
+     init_containers,
++    service_account,
+ ):
+     """
+     Make a k8s pod specification for running a user notebook.
+@@ -106,6 +109,8 @@ def make_pod(
+         Dictionary of lifecycle hooks
+       - init_containers:
+         List of initialization containers belonging to the pod.
++      - service_account:
++        Service account to mount on the pod. None disables mounting
+     """
+ 
+     pod = V1Pod()
+@@ -150,6 +155,28 @@ def make_pod(
+     notebook_container.lifecycle = lifecycle_hooks
+     notebook_container.resources = V1ResourceRequirements()
+     
++    if service_account is None:
++        # Add a hack to ensure that no service accounts are mounted in spawned pods
++        # This makes sure that we don"t accidentally give access to the whole
++        # kubernetes API to the users in the spawned pods.
++        # Note: We don't simply use `automountServiceAccountToken` here since we wanna be compatible
++        # with older kubernetes versions too for now.
++        hack_volume = V1Volume()
++        hack_volume.name =  "no-api-access-please"
++        hack_volume.empty_dir = {}
++        hack_volumes = [hack_volume]
++
++        hack_volume_mount = V1VolumeMount()
++        hack_volume_mount.name = "no-api-access-please"
++        hack_volume_mount.mount_path = "/var/run/secrets/kubernetes.io/serviceaccount"
++        hack_volume_mount.read_only = True
++        hack_volume_mounts = [hack_volume_mount]
++    else:
++        hack_volumes = []
++        hack_volume_mounts = []
++
++        pod.service_account_name = service_account
++
+     if run_privileged:
+         container_security_context = V1SecurityContext()
+         container_security_context.privileged = True
+@@ -167,11 +194,11 @@ def make_pod(
+         notebook_container.resources.limits['cpu'] = cpu_limit
+     if mem_limit:
+         notebook_container.resources.limits['memory'] = mem_limit
+-    notebook_container.volume_mounts = volume_mounts
++    notebook_container.volume_mounts = volume_mounts + hack_volume_mounts
+     pod.spec.containers.append(notebook_container)
+ 
+     pod.spec.init_containers = init_containers
+-    pod.spec.volumes = volumes
++    pod.spec.volumes = volumes + hack_volumes
+     return pod
+ 
+ 
+diff --git a/kubespawner/spawner.py b/kubespawner/spawner.py
+index 24a50e3..19e6c38 100644
+--- a/kubespawner/spawner.py
++++ b/kubespawner/spawner.py
+@@ -21,8 +21,6 @@ from traitlets.config import SingletonConfigurable
+ from traitlets import Type, Unicode, List, Integer, Union, Dict, Bool, Any
+ from jupyterhub.spawner import Spawner
+ from jupyterhub.traitlets import Command
+-from kubernetes.client.models.v1_volume import V1Volume
+-from kubernetes.client.models.v1_volume_mount import V1VolumeMount
+ from kubernetes.client.rest import ApiException
+ from kubernetes import client
+ import escapism
+@@ -149,6 +147,24 @@ class KubeSpawner(Spawner):
+         """
+     ).tag(config=True)
+ 
++    singleuser_service_account = Unicode(
++        None,
++        allow_none=True,
++        config=True,
++        help="""
++        The service account to be mounted in the spawned user pod.
++
++        When set to None (the default), no service account is mounted, and the default service account
++        is explicitly disabled.
++
++        This serviceaccount must already exist in the namespace the user pod is being spawned in.
++
++        WARNING: Be careful with this configuration! Make sure the service account being mounted
++        has the minimal permissions needed, and nothing more. When misconfigured, this can easily
++        give arbitrary users root over your entire cluster.
++        """
++    )
++
+     pod_name_template = Unicode(
+         'jupyter-{username}',
+         config=True,
+@@ -623,19 +639,6 @@ class KubeSpawner(Spawner):
+         else:
+             real_cmd = None
+ 
+-        # Add a hack to ensure that no service accounts are mounted in spawned pods
+-        # This makes sure that we don"t accidentally give access to the whole
+-        # kubernetes API to the users in the spawned pods.
+-        # See https://github.com/kubernetes/kubernetes/issues/16779#issuecomment-157460294
+-        hack_volume = V1Volume()
+-        hack_volume.name =  "no-api-access-please"
+-        hack_volume.empty_dir = {}
+-
+-        hack_volume_mount = V1VolumeMount()
+-        hack_volume_mount.name = "no-api-access-please"
+-        hack_volume_mount.mount_path = "/var/run/secrets/kubernetes.io/serviceaccount"
+-        hack_volume_mount.read_only = True
+-
+         # Default set of labels, picked up from
+         # https://github.com/kubernetes/helm/blob/master/docs/chart_best_practices/labels.md
+         labels = {
+@@ -659,8 +662,8 @@ class KubeSpawner(Spawner):
+             fs_gid=singleuser_fs_gid,
+             run_privileged=self.singleuser_privileged,
+             env=self.get_env(),
+-            volumes=self._expand_all(self.volumes) + [hack_volume],
+-            volume_mounts=self._expand_all(self.volume_mounts) + [hack_volume_mount],
++            volumes=self._expand_all(self.volumes),
++            volume_mounts=self._expand_all(self.volume_mounts),
+             working_dir=self.singleuser_working_dir,
+             labels=labels,
+             cpu_limit=self.cpu_limit,
+@@ -669,6 +672,7 @@ class KubeSpawner(Spawner):
+             mem_guarantee=self.mem_guarantee,
+             lifecycle_hooks=self.singleuser_lifecycle_hooks,
+             init_containers=self.singleuser_init_containers,
++            service_account=self.singleuser_service_account
+         )
+ 
+     def get_pvc_manifest(self):
+

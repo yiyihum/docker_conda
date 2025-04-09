@@ -1,0 +1,97 @@
+diff --git a/README.md b/README.md
+index f6c520f..e97480f 100644
+--- a/README.md
++++ b/README.md
+@@ -76,6 +76,8 @@ All defined s-expressions are listed here, though this specification will be exp
+   - Min: `(Min <source>)`
+   - Sum: `(Sum <source>)`
+   - Zip: `(Zip <source>)`
++  - OrderBy: `(OrderBy <source> <key_selector>)`
++    - `key_selector` must be a `lambda` with one argument
+ 
+ 
+ ## Example
+diff --git a/qastle/linq_util.py b/qastle/linq_util.py
+index d9efe95..be3e88e 100644
+--- a/qastle/linq_util.py
++++ b/qastle/linq_util.py
+@@ -68,6 +68,13 @@ class Zip(ast.AST):
+         self.source = source
+ 
+ 
++class OrderBy(ast.AST):
++    def __init__(self, source, key_selector):
++        self._fields = ['source', 'key_selector']
++        self.source = source
++        self.key_selector = key_selector
++
++
+ linq_operator_names = ('Where',
+                        'Select',
+                        'SelectMany',
+@@ -77,7 +84,8 @@ linq_operator_names = ('Where',
+                        'Max',
+                        'Min',
+                        'Sum',
+-                       'Zip')
++                       'Zip',
++                       'OrderBy')
+ 
+ 
+ class InsertLINQNodesTransformer(ast.NodeTransformer):
+@@ -161,6 +169,15 @@ class InsertLINQNodesTransformer(ast.NodeTransformer):
+             if len(args) != 0:
+                 raise SyntaxError('Zip() call must have zero arguments')
+             return Zip(source=self.visit(source))
++        elif function_name == 'OrderBy':
++            if len(args) != 1:
++                raise SyntaxError('OrderBy() call must have exactly one argument')
++            if isinstance(args[0], ast.Str):
++                args[0] = unwrap_ast(ast.parse(args[0].s))
++            if not isinstance(args[0], ast.Lambda):
++                raise SyntaxError('OrderBy() call argument must be a lambda')
++            return OrderBy(source=self.visit(source),
++                           key_selector=self.visit(args[0]))
+         else:
+             raise NameError('Unhandled LINQ operator: ' + function_name)
+ 
+diff --git a/qastle/transform.py b/qastle/transform.py
+index 4017851..c0b45b7 100644
+--- a/qastle/transform.py
++++ b/qastle/transform.py
+@@ -1,4 +1,5 @@
+-from .linq_util import Where, Select, SelectMany, First, Aggregate, Count, Max, Min, Sum, Zip
++from .linq_util import (Where, Select, SelectMany, First, Aggregate, Count, Max,
++                        Min, Sum, Zip, OrderBy)
+ from .ast_util import wrap_ast, unwrap_ast
+ 
+ import lark
+@@ -203,6 +204,11 @@ class PythonASTToTextASTTransformer(ast.NodeVisitor):
+     def visit_Zip(self, node):
+         return self.make_composite_node_string('Zip', self.visit(node.source))
+ 
++    def visit_OrderBy(self, node):
++        return self.make_composite_node_string('OrderBy',
++                                               self.visit(node.source),
++                                               self.visit(node.key_selector))
++
+     def generic_visit(self, node):
+         raise SyntaxError('Unsupported node type: ' + str(type(node)))
+ 
+@@ -438,5 +444,16 @@ class TextASTToPythonASTTransformer(lark.Transformer):
+                 raise SyntaxError('Zip node must have one field; found ' + str(len(fields)))
+             return Zip(source=fields[0])
+ 
++        elif node_type == 'OrderBy':
++            if len(fields) != 2:
++                raise SyntaxError('OrderBy node must have two fields; found ' + str(len(fields)))
++            if not isinstance(fields[1], ast.Lambda):
++                raise SyntaxError('OrderBy key selector must be a lambda; found '
++                                  + str(type(fields[1])))
++            if len(fields[1].args.args) != 1:
++                raise SyntaxError('OrderBy key selector must have exactly one argument; found '
++                                  + str(len(fields[1].args.args)))
++            return OrderBy(source=fields[0], key_selector=fields[1])
++
+         else:
+             raise SyntaxError('Unknown composite node type: ' + node_type)

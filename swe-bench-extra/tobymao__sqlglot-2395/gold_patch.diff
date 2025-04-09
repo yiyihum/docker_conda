@@ -1,0 +1,119 @@
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 5627af8d..314995ea 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -4633,14 +4633,18 @@ class JSONArrayAgg(Func):
+ # https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/JSON_TABLE.html
+ # Note: parsing of JSON column definitions is currently incomplete.
+ class JSONColumnDef(Expression):
+-    arg_types = {"this": True, "kind": False, "path": False}
++    arg_types = {"this": False, "kind": False, "path": False, "nested_schema": False}
++
++
++class JSONSchema(Expression):
++    arg_types = {"expressions": True}
+ 
+ 
+ # # https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/JSON_TABLE.html
+ class JSONTable(Func):
+     arg_types = {
+         "this": True,
+-        "expressions": True,
++        "schema": True,
+         "path": False,
+         "error_handling": False,
+         "empty_handling": False,
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 7a2879ce..8257adc8 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -2179,13 +2179,21 @@ class Generator:
+         )
+ 
+     def jsoncolumndef_sql(self, expression: exp.JSONColumnDef) -> str:
++        path = self.sql(expression, "path")
++        path = f" PATH {path}" if path else ""
++        nested_schema = self.sql(expression, "nested_schema")
++
++        if nested_schema:
++            return f"NESTED{path} {nested_schema}"
++
+         this = self.sql(expression, "this")
+         kind = self.sql(expression, "kind")
+         kind = f" {kind}" if kind else ""
+-        path = self.sql(expression, "path")
+-        path = f" PATH {path}" if path else ""
+         return f"{this}{kind}{path}"
+ 
++    def jsonschema_sql(self, expression: exp.JSONSchema) -> str:
++        return self.func("COLUMNS", *expression.expressions)
++
+     def jsontable_sql(self, expression: exp.JSONTable) -> str:
+         this = self.sql(expression, "this")
+         path = self.sql(expression, "path")
+@@ -2194,9 +2202,9 @@ class Generator:
+         error_handling = f" {error_handling}" if error_handling else ""
+         empty_handling = expression.args.get("empty_handling")
+         empty_handling = f" {empty_handling}" if empty_handling else ""
+-        columns = f" COLUMNS ({self.expressions(expression, skip_first=True)})"
++        schema = self.sql(expression, "schema")
+         return self.func(
+-            "JSON_TABLE", this, suffix=f"{path}{error_handling}{empty_handling}{columns})"
++            "JSON_TABLE", this, suffix=f"{path}{error_handling}{empty_handling} {schema})"
+         )
+ 
+     def openjsoncolumndef_sql(self, expression: exp.OpenJSONColumnDef) -> str:
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index b0eb3ff0..cf9820b2 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -4354,22 +4354,43 @@ class Parser(metaclass=_Parser):
+ 
+     # Note: this is currently incomplete; it only implements the "JSON_value_column" part
+     def _parse_json_column_def(self) -> exp.JSONColumnDef:
+-        this = self._parse_id_var()
+-        kind = self._parse_types(allow_identifiers=False)
++        if not self._match_text_seq("NESTED"):
++            this = self._parse_id_var()
++            kind = self._parse_types(allow_identifiers=False)
++            nested = None
++        else:
++            this = None
++            kind = None
++            nested = True
++
+         path = self._match_text_seq("PATH") and self._parse_string()
+-        return self.expression(exp.JSONColumnDef, this=this, kind=kind, path=path)
++        nested_schema = nested and self._parse_json_schema()
++
++        return self.expression(
++            exp.JSONColumnDef,
++            this=this,
++            kind=kind,
++            path=path,
++            nested_schema=nested_schema,
++        )
++
++    def _parse_json_schema(self) -> exp.JSONSchema:
++        self._match_text_seq("COLUMNS")
++        return self.expression(
++            exp.JSONSchema,
++            expressions=self._parse_wrapped_csv(self._parse_json_column_def, optional=True),
++        )
+ 
+     def _parse_json_table(self) -> exp.JSONTable:
+         this = self._parse_format_json(self._parse_bitwise())
+         path = self._match(TokenType.COMMA) and self._parse_string()
+         error_handling = self._parse_on_handling("ERROR", "ERROR", "NULL")
+         empty_handling = self._parse_on_handling("EMPTY", "ERROR", "NULL")
+-        self._match_text_seq("COLUMNS")
+-        expressions = self._parse_wrapped_csv(self._parse_json_column_def, optional=True)
++        schema = self._parse_json_schema()
+ 
+         return exp.JSONTable(
+             this=this,
+-            expressions=expressions,
++            schema=schema,
+             path=path,
+             error_handling=error_handling,
+             empty_handling=empty_handling,

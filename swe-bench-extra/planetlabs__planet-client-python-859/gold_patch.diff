@@ -1,0 +1,188 @@
+diff --git a/design-docs/CLI-Subscriptions.md b/design-docs/CLI-Subscriptions.md
+index 043b858..599a740 100644
+--- a/design-docs/CLI-Subscriptions.md
++++ b/design-docs/CLI-Subscriptions.md
+@@ -184,7 +184,7 @@ planet subscriptions request [OPTIONS]
+ 
+ Generate a subscriptions request.
+ 
+-This command provides support for building the subscription request JSON used to create or 
++This command provides support for building the subscription request JSON used to create or
+ update a subscription. It outputs the subscription request.
+ 
+ Options:
+@@ -207,7 +207,10 @@ Options:
+ ### Usage Examples
+ 
+ ```
+-planet subscription request --source source.json --clip geom.json --delivery delivery.json | planet subscriptions create -
++planet subscription request \
++    --name test \
++    --source source.json \
++    --delivery delivery.json | planet subscriptions create -
+ ```
+ 
+ ## Request-catalog
+@@ -222,13 +225,13 @@ Generate a subscriptions request source JSON for a catalog.
+ Options:
+   --asset-types TEXT              One or more comma-separated asset types. Required.
+   --item-types TEXT               One or more comma-separated item-types. Required.
+-  --geom JSON                 geometry of the area of interest of the subscription that will be used to determine matches. 
++  --geometry JSON                 geometry of the area of interest of the subscription that will be used to determine matches.
+                                   Can be a json string, filename, or '-' for stdin.
+   --start-time DATETIME           Start date and time to begin subscription.
+   --end-time DATETIME             Date and time to end the subscription.
+-  --rrule TEXT                    iCalendar recurrance rule to specify recurrances. 
+-  --filter JSON                   A search filter can be specified a json string, 
+-                                  filename, or '-' for stdin. 
++  --rrule TEXT                    iCalendar recurrance rule to specify recurrances.
++  --filter JSON                   A search filter can be specified a json string,
++                                  filename, or '-' for stdin.
+   --pretty                        Format JSON output.
+   --help                          Show this message and exit.
+ ```
+@@ -236,13 +239,12 @@ Options:
+ ### Usage Examples
+ 
+ ```
+-planet subscriptions request \
+-    --source $(planet subscriptions request-catalog
+-        --item-type PSScene
+-        --asset-types ortho_analytic_8b_sr,ortho_udm2
+-        --geom aoi.json
+-        --start-time 05/01/2022)
+-    --delivery delivery.json | planet subscriptions create -
++planet subscriptions request-catalog \
++        --item-types PSScene \
++        --asset-types ortho_analytic_8b_sr,ortho_udm2 \
++        --geometry aoi.geojson \
++        --start-time 2022-01-01) \
++    --delivery delivery.json > source.json
+ ```
+ 
+ ## Request-other
+@@ -257,7 +259,7 @@ Generate a subscriptions request source JSON for another product.
+ Options:
+   --type                        Type.
+   --id                          Id.
+-  --geom JSON                      geometry of the area of interest of the subscription that will be used to determine matches. 
++  --geometry JSON                      geometry of the area of interest of the subscription that will be used to determine matches.
+                                   Can be a json string, filename, or '-' for stdin.
+   --start-time DATETIME           Start date and time to begin subscription.
+   --end-time DATETIME             Date and time to end the subscription.
+@@ -266,18 +268,6 @@ Options:
+   --help                          Show this message and exit.
+ ```
+ 
+-### Usage Examples
+-
+-```
+-planet subscriptions request \
+-    --source $(planet subscriptions request-other
+-        --type othertype
+-        --id otherid
+-        --geom aoi.json
+-        --start-time 05/01/2022)
+-    --delivery delivery.json | planet subscriptions create -
+-```
+-
+ 
+ ## Update
+ 
+diff --git a/planet/cli/subscriptions.py b/planet/cli/subscriptions.py
+index 8cc508a..7e0b21d 100644
+--- a/planet/cli/subscriptions.py
++++ b/planet/cli/subscriptions.py
+@@ -9,6 +9,7 @@ from .io import echo_json
+ from .options import limit, pretty
+ from .session import CliSession
+ from planet.clients.subscriptions import SubscriptionsClient
++from .. import subscription_request
+ 
+ 
+ @asynccontextmanager
+@@ -157,3 +158,84 @@ async def list_subscription_results_cmd(ctx,
+                                                status=status,
+                                                limit=limit):
+             echo_json(result, pretty)
++
++
++@subscriptions.command()
++@click.option('--name',
++              required=True,
++              type=str,
++              help='Subscription name. Does not need to be unique.')
++@click.option('--source',
++              required=True,
++              type=types.JSON(),
++              help='Source JSON. Can be a string, filename, or - for stdin.')
++@click.option('--delivery',
++              required=True,
++              type=types.JSON(),
++              help='Delivery JSON. Can be a string, filename, or - for stdin.')
++@click.option(
++    '--notifications',
++    type=types.JSON(),
++    help='Notifications JSON. Can be a string, filename, or - for stdin.')
++@click.option('--tools',
++              type=types.JSON(),
++              help='Toolchain JSON. Can be a string, filename, or - for stdin.'
++              )
++@pretty
++def request(name, source, delivery, notifications, tools, pretty):
++    """Generate a subscriptions request."""
++    res = subscription_request.build_request(name,
++                                             source,
++                                             delivery,
++                                             notifications=notifications,
++                                             tools=tools)
++    echo_json(res, pretty)
++
++
++@subscriptions.command()
++@click.option('--item-types',
++              required=True,
++              type=types.CommaSeparatedString(),
++              help='One or more comma-separated item types.')
++@click.option('--asset-types',
++              required=True,
++              type=types.CommaSeparatedString(),
++              help='One or more comma-separated asset types.')
++@click.option(
++    '--geometry',
++    required=True,
++    type=types.JSON(),
++    help="""Geometry of the area of interest of the subscription that will be
++    used to determine matches. Can be a string, filename, or - for stdin.""")
++@click.option('--start-time',
++              required=True,
++              type=types.DateTime(),
++              help='Date and time to begin subscription.')
++@click.option('--end-time',
++              type=types.DateTime(),
++              help='Date and time to end subscription.')
++@click.option('--rrule',
++              type=str,
++              help='iCalendar recurrance rule to specify recurrances.')
++@click.option('--filter',
++              type=types.JSON(),
++              help='Search filter.  Can be a string, filename, or - for stdin.'
++              )
++@pretty
++def request_catalog(item_types,
++                    asset_types,
++                    geometry,
++                    start_time,
++                    end_time,
++                    rrule,
++                    filter,
++                    pretty):
++    """Generate a subscriptions request catalog source description."""
++    res = subscription_request.catalog_source(item_types,
++                                              asset_types,
++                                              geometry,
++                                              start_time,
++                                              end_time=end_time,
++                                              rrule=rrule,
++                                              filter=filter)
++    echo_json(res, pretty)

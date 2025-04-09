@@ -1,0 +1,243 @@
+diff --git a/examples/spline_weights.py b/examples/spline_weights.py
+index 73de4fd..171fa83 100644
+--- a/examples/spline_weights.py
++++ b/examples/spline_weights.py
+@@ -62,11 +62,8 @@ grid_full = chain.grid(
+     dims=["latitude", "longitude"],
+     data_names=["velocity"],
+ )
+-grid = vd.distance_mask(
+-    (data.longitude, data.latitude),
+-    maxdist=5 * spacing * 111e3,
+-    grid=grid_full,
+-    projection=projection,
++grid = vd.convexhull_mask(
++    (data.longitude, data.latitude), grid=grid_full, projection=projection
+ )
+ 
+ fig, axes = plt.subplots(
+diff --git a/examples/vector_uncoupled.py b/examples/vector_uncoupled.py
+index acc6db1..6f64194 100644
+--- a/examples/vector_uncoupled.py
++++ b/examples/vector_uncoupled.py
+@@ -61,13 +61,11 @@ score = chain.score(*test)
+ print("Cross-validation R^2 score: {:.2f}".format(score))
+ 
+ # Interpolate the wind speed onto a regular geographic grid and mask the data that are
+-# far from the observation points
++# outside of the convex hull of the data points.
+ grid_full = chain.grid(
+     region, spacing=spacing, projection=projection, dims=["latitude", "longitude"]
+ )
+-grid = vd.distance_mask(
+-    coordinates, maxdist=3 * spacing * 111e3, grid=grid_full, projection=projection
+-)
++grid = vd.convexhull_mask(coordinates, grid=grid_full, projection=projection)
+ 
+ # Make maps of the original and gridded wind speed
+ plt.figure(figsize=(6, 6))
+diff --git a/tutorials/weights.py b/tutorials/weights.py
+index 099f1f2..74f5c5c 100644
+--- a/tutorials/weights.py
++++ b/tutorials/weights.py
+@@ -246,6 +246,8 @@ grid = spline.grid(
+     dims=["latitude", "longitude"],
+     data_names=["velocity"],
+ )
++# Avoid showing interpolation outside of the convex hull of the data points.
++grid = vd.convexhull_mask(coordinates, grid=grid, projection=projection)
+ 
+ ########################################################################################
+ # Calculate an unweighted spline as well for comparison.
+@@ -262,6 +264,9 @@ grid_unweighted = spline_unweighted.grid(
+     dims=["latitude", "longitude"],
+     data_names=["velocity"],
+ )
++grid_unweighted = vd.convexhull_mask(
++    coordinates, grid=grid_unweighted, projection=projection
++)
+ 
+ ########################################################################################
+ # Finally, plot the weighted and unweighted grids side by side.
+diff --git a/verde/__init__.py b/verde/__init__.py
+index b7df9b7..a77e65c 100644
+--- a/verde/__init__.py
++++ b/verde/__init__.py
+@@ -15,7 +15,7 @@ from .coordinates import (
+     project_region,
+     longitude_continuity,
+ )
+-from .mask import distance_mask
++from .mask import distance_mask, convexhull_mask
+ from .utils import variance_to_weights, maxabs, grid_to_table
+ from .io import load_surfer
+ from .distances import median_distance
+diff --git a/verde/mask.py b/verde/mask.py
+index 9c06ca2..6d92cb4 100644
+--- a/verde/mask.py
++++ b/verde/mask.py
+@@ -3,7 +3,10 @@ Mask grid points based on different criteria.
+ """
+ import numpy as np
+ 
+-from .base import n_1d_arrays
++# pylint doesn't pick up on this import for some reason
++from scipy.spatial import Delaunay  # pylint: disable=no-name-in-module
++
++from .base.utils import n_1d_arrays, check_coordinates
+ from .utils import kdtree
+ 
+ 
+@@ -43,9 +46,10 @@ def distance_mask(
+         northing will be used, all subsequent coordinates will be ignored.
+     grid : None or :class:`xarray.Dataset`
+         2D grid with values to be masked. Will use the first two dimensions of
+-        the grid as northing and easting coordinates, respectively. The mask
+-        will be applied to *grid* using the :meth:`xarray.Dataset.where`
+-        method.
++        the grid as northing and easting coordinates, respectively. For this to
++        work, the grid dimensions **must be ordered as northing then easting**.
++        The mask will be applied to *grid* using the
++        :meth:`xarray.Dataset.where` method.
+     projection : callable or None
+         If not None, then should be a callable object ``projection(easting,
+         northing) -> (proj_easting, proj_northing)`` that takes in easting and
+@@ -93,14 +97,7 @@ def distance_mask(
+      [nan nan nan nan nan nan]]
+ 
+     """
+-    if coordinates is None and grid is None:
+-        raise ValueError("Either coordinates or grid must be given.")
+-    if coordinates is None:
+-        dims = [grid[var].dims for var in grid.data_vars][0]
+-        coordinates = np.meshgrid(grid.coords[dims[1]], grid.coords[dims[0]])
+-    if len(set(i.shape for i in coordinates)) != 1:
+-        raise ValueError("Coordinate arrays must have the same shape.")
+-    shape = coordinates[0].shape
++    coordinates, shape = _get_grid_coordinates(coordinates, grid)
+     if projection is not None:
+         data_coordinates = projection(*n_1d_arrays(data_coordinates, 2))
+         coordinates = projection(*n_1d_arrays(coordinates, 2))
+@@ -110,3 +107,121 @@ def distance_mask(
+     if grid is not None:
+         return grid.where(mask)
+     return mask
++
++
++def convexhull_mask(
++    data_coordinates, coordinates=None, grid=None, projection=None,
++):
++    """
++    Mask grid points that are outside the convex hull of the given data points.
++
++    Either *coordinates* or *grid* must be given:
++
++    * If *coordinates* is not None, produces an array that is False when a
++      point is outside the convex hull and True otherwise.
++    * If *grid* is not None, produces a mask and applies it to *grid* (an
++      :class:`xarray.Dataset`).
++
++    Parameters
++    ----------
++    data_coordinates : tuple of arrays
++        Same as *coordinates* but for the data points.
++    coordinates : None or tuple of arrays
++        Arrays with the coordinates of each point that will be masked. Should
++        be in the following order: (easting, northing, ...). Only easting and
++        northing will be used, all subsequent coordinates will be ignored.
++    grid : None or :class:`xarray.Dataset`
++        2D grid with values to be masked. Will use the first two dimensions of
++        the grid as northing and easting coordinates, respectively. For this to
++        work, the grid dimensions **must be ordered as northing then easting**.
++        The mask will be applied to *grid* using the
++        :meth:`xarray.Dataset.where` method.
++    projection : callable or None
++        If not None, then should be a callable object ``projection(easting,
++        northing) -> (proj_easting, proj_northing)`` that takes in easting and
++        northing coordinate arrays and returns projected easting and northing
++        coordinate arrays. This function will be used to project the given
++        coordinates (or the ones extracted from the grid) before calculating
++        distances.
++
++    Returns
++    -------
++    mask : array or :class:`xarray.Dataset`
++        If *coordinates* was given, then a boolean array with the same shape as
++        the elements of *coordinates*. If *grid* was given, then an
++        :class:`xarray.Dataset` with the mask applied to it.
++
++    Examples
++    --------
++
++    >>> from verde import grid_coordinates
++    >>> region = (0, 5, -10, -4)
++    >>> spacing = 1
++    >>> coords = grid_coordinates(region, spacing=spacing)
++    >>> data_coords = ((2, 3, 2, 3), (-9, -9, -6, -6))
++    >>> mask = convexhull_mask(data_coords, coordinates=coords)
++    >>> print(mask)
++    [[False False False False False False]
++     [False False  True  True False False]
++     [False False  True  True False False]
++     [False False  True  True False False]
++     [False False  True  True False False]
++     [False False False False False False]
++     [False False False False False False]]
++    >>> # Mask an xarray.Dataset directly
++    >>> import xarray as xr
++    >>> coords_dict = {"easting": coords[0][0, :], "northing": coords[1][:, 0]}
++    >>> data_vars = {"scalars": (["northing", "easting"], np.ones(mask.shape))}
++    >>> grid = xr.Dataset(data_vars, coords=coords_dict)
++    >>> masked = convexhull_mask(data_coords, grid=grid)
++    >>> print(masked.scalars.values)
++    [[nan nan nan nan nan nan]
++     [nan nan  1.  1. nan nan]
++     [nan nan  1.  1. nan nan]
++     [nan nan  1.  1. nan nan]
++     [nan nan  1.  1. nan nan]
++     [nan nan nan nan nan nan]
++     [nan nan nan nan nan nan]]
++
++    """
++    coordinates, shape = _get_grid_coordinates(coordinates, grid)
++    n_coordinates = 2
++    # Make sure they are arrays so we can normalize
++    data_coordinates = n_1d_arrays(data_coordinates, n_coordinates)
++    coordinates = n_1d_arrays(coordinates, n_coordinates)
++    if projection is not None:
++        data_coordinates = projection(*data_coordinates)
++        coordinates = projection(*coordinates)
++    # Normalize the coordinates to avoid errors from qhull when values are very
++    # large (as occurs when projections are used).
++    means = [coord.mean() for coord in data_coordinates]
++    stds = [coord.std() for coord in data_coordinates]
++    data_coordinates = tuple(
++        (coord - mean) / std for coord, mean, std in zip(data_coordinates, means, stds)
++    )
++    coordinates = tuple(
++        (coord - mean) / std for coord, mean, std in zip(coordinates, means, stds)
++    )
++    triangles = Delaunay(np.transpose(data_coordinates))
++    # Find the triangle that contains each grid point.
++    # -1 indicates that it's not in any triangle.
++    in_triangle = triangles.find_simplex(np.transpose(coordinates))
++    mask = (in_triangle != -1).reshape(shape)
++    if grid is not None:
++        return grid.where(mask)
++    return mask
++
++
++def _get_grid_coordinates(coordinates, grid):
++    """
++    If coordinates is given, return it and their shape. Otherwise, get
++    coordinate arrays from the grid.
++    """
++    if coordinates is None and grid is None:
++        raise ValueError("Either coordinates or grid must be given.")
++    if coordinates is None:
++        dims = [grid[var].dims for var in grid.data_vars][0]
++        coordinates = np.meshgrid(grid.coords[dims[1]], grid.coords[dims[0]])
++    check_coordinates(coordinates)
++    shape = coordinates[0].shape
++    return coordinates, shape
+

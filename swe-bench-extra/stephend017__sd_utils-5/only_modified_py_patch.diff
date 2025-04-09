@@ -1,0 +1,218 @@
+diff --git a/sd_utils/plugins/plugin_base.py b/sd_utils/plugins/plugin_base.py
+index 1aef059..21ff90a 100644
+--- a/sd_utils/plugins/plugin_base.py
++++ b/sd_utils/plugins/plugin_base.py
+@@ -10,10 +10,14 @@ class PluginBase:
+         """
+         pass
+ 
+-    def on_register(self):
++    def on_register(self, data: Any = None):
+         """
+         runs when this plugin is registered with
+         the plugin manager
++
++        Args:
++            data (Any): any parameters passed to this
++                plugin from the plugin manager
+         """
+         raise NotImplementedError
+ 
+@@ -21,11 +25,19 @@ class PluginBase:
+         """
+         runs when the manager begins a query for
+         any plugin.
++
++        Args:
++            data (Any): any parameters passed to this
++                plugin from the plugin manager
+         """
+         raise NotImplementedError
+ 
+-    def on_find(self, data: Any = None):
++    def on_find(self, data: Any = None) -> Any:
+         """
+         runs when the manager specifically queries this plugin
++
++        Args:
++            data (Any): any parameters passed to this
++                plugin from the plugin manager
+         """
+         raise NotImplementedError
+diff --git a/sd_utils/plugins/plugin_collector.py b/sd_utils/plugins/plugin_collector.py
+index f40e3fe..44dc3d1 100644
+--- a/sd_utils/plugins/plugin_collector.py
++++ b/sd_utils/plugins/plugin_collector.py
+@@ -8,7 +8,7 @@ from importlib import import_module
+ def collect_plugins(
+     registering_file: str,
+     registering_file_name: str,
+-    cls: ClassVar[PluginBase],
++    cls: ClassVar[PluginBase] = PluginBase,
+     exclude_files: List[str] = [],
+     assert_one_per_source: bool = True,
+ ) -> List[str]:
+@@ -20,10 +20,13 @@ def collect_plugins(
+         registering_file (str): should be `__file__` of the calling file
+         registering_file_name (str): should be `__name__` of the calling file
+         cls (ClassVar[PluginBase]): the type of plugin to collect
+-        exclude_files (List[str]): any file to exclude from being collected as a plugin
+-        assert_one_per_source (bool): asserts that only 1 plugin may be defined in each source file
++        exclude_files (List[str]): any file to exclude from being collected
++            as a plugin
++        assert_one_per_source (bool): asserts that only 1 plugin may be
++            defined in each source file
+     Returns:
+-        List[str]: a list of all the plugin files collected
++        List[str]: a list of all the plugin files collected. should be
++            stored in the calling files `__all__` variable
+     """
+     exports = []
+ 
+diff --git a/sd_utils/plugins/plugin_manager.py b/sd_utils/plugins/plugin_manager.py
+index 5331be0..deb41ff 100644
+--- a/sd_utils/plugins/plugin_manager.py
++++ b/sd_utils/plugins/plugin_manager.py
+@@ -1,15 +1,21 @@
+ from sd_utils.plugins.plugin_base import PluginBase
+-from typing import ClassVar
++from typing import Any, ClassVar, final
+ 
+ 
+ class PluginManager:
+     def __init__(self):
+         self._plugins = {}
+ 
+-    def register(self, name: str, **kwargs):
++    @final
++    def register(self, name: str, on_register_params: dict = {}, **kwargs):
+         """
+         decorator for registering a plugin to this instance of a
+         plugin manager
++
++        Args:
++            name (str): the name to register this plugin under
++            **kwargs: parameters to be passed to the plugin
++                class when constructed
+         """
+ 
+         def decorator(plugin: ClassVar[PluginBase]):
+@@ -24,15 +30,33 @@ class PluginManager:
+             w = Wrapper(plugin(**kwargs))
+ 
+             self._plugins[name] = w
+-            w.plugin.on_register()
++            w.plugin.on_register(
++                self.get_on_register_params(name, **on_register_params)
++            )
+ 
+             return w
+ 
+         return decorator
+ 
+-    def run(self, name: str):
++    @final
++    def run(
++        self, name: str, on_search_params: dict = {}, on_find_params: dict = {}
++    ) -> Any:
+         """
+-        runs a given plugin
++        runs a given plugin.
++
++        Note: this function
++
++        Args:
++            name (str): the name of the plugin to run
++            on_search_params (dict): parameters to pass to
++                the get_on_search_params function
++            on_find_params (dict): parameters to pass to
++                the get_on_find_params functions
++
++        Returns:
++            Any: The value returned by running the to_find
++                function of the called plugin
+         """
+ 
+         to_run = None
+@@ -40,7 +64,9 @@ class PluginManager:
+             if name == plugin_name:
+                 to_run = wrapper
+             try:
+-                wrapper.plugin.on_search()
++                wrapper.plugin.on_search(
++                    self.get_on_search_params(name, **on_search_params)
++                )
+             except NotImplementedError:
+                 # just skip if its not implemented
+                 pass
+@@ -48,4 +74,55 @@ class PluginManager:
+         if to_run is None:
+             raise ValueError(f"Unable to find plugin with name [{name}]")
+ 
+-        to_run.plugin.on_find()
++        return to_run.plugin.on_find(
++            self.get_on_find_params(name, **on_find_params)
++        )
++
++    def get_on_search_params(self, name: str, **kwargs) -> Any:
++        """
++        function that generates parameters for the on
++        search function of a plugin given its name
++
++        Args:
++            name (str): the name of the command to
++                call on_search for
++            **kwargs: any arguments sent from the run
++                function
++
++        Returns:
++            Any: the arguments to be sent to the on_search function
++        """
++        return kwargs
++
++    def get_on_find_params(self, name: str, **kwargs) -> Any:
++        """
++        function that generates parameters for the on
++        find function of a plugin given its name
++
++        Args:
++            name (str): the name of the command to
++                call on_find for
++            **kwargs: any arguments sent from the run
++                function
++
++        Returns:
++            Any: the arguments to be sent to the on_find function
++        """
++        return kwargs
++
++    def get_on_register_params(self, name: str, **kwargs) -> Any:
++        """
++        function that generates parameters for the on
++        register function of a plugin given its name
++
++        Args:
++            name (str): the name of the command to
++                call on_register for
++            **kwargs: any arguments sent from the
++                register function
++
++        Returns:
++            Any: the arguments to be sent to the
++                on_register function
++        """
++        return kwargs
+diff --git a/setup.py b/setup.py
+index 4f7f17d..340de1c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -7,7 +7,7 @@ with open("README.md", "r") as file:
+ 
+ setup(
+     name="sd_utils",
+-    version="0.1.0",
++    version="0.2.0",
+     description="A python module with basic utils I tend to use in my projects",
+     long_description=readme,
+     long_description_content_type="text/markdown",
+

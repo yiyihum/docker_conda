@@ -1,0 +1,174 @@
+diff --git a/changes/pr4232.yaml b/changes/pr4232.yaml
+new file mode 100644
+index 0000000000..a9b08be9a5
+--- /dev/null
++++ b/changes/pr4232.yaml
+@@ -0,0 +1,2 @@
++enhancement:
++  - "Add `--docker-client-timeout` flag to docker agent, for configuring the timeout for all docker API requests - [#4232](https://github.com/PrefectHQ/prefect/pull/4232)"
+diff --git a/package-lock.json b/package-lock.json
+index ed0115baf8..73659c5821 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -4247,24 +4247,24 @@
+       "dev": true
+     },
+     "elliptic": {
+-      "version": "6.5.3",
+-      "resolved": "https://registry.npmjs.org/elliptic/-/elliptic-6.5.3.tgz",
+-      "integrity": "sha512-IMqzv5wNQf+E6aHeIqATs0tOLeOTwj1QKbRcS3jBbYkl5oLAserA8yJTT7/VyHUYG91PRmPyeQDObKLPpeS4dw==",
++      "version": "6.5.4",
++      "resolved": "https://registry.npmjs.org/elliptic/-/elliptic-6.5.4.tgz",
++      "integrity": "sha512-iLhC6ULemrljPZb+QutR5TQGB+pdW6KGD5RSegS+8sorOZT+rdQFbsQFJgvN3eRqNALqJer4oQ16YvJHlU8hzQ==",
+       "dev": true,
+       "requires": {
+-        "bn.js": "^4.4.0",
+-        "brorand": "^1.0.1",
++        "bn.js": "^4.11.9",
++        "brorand": "^1.1.0",
+         "hash.js": "^1.0.0",
+-        "hmac-drbg": "^1.0.0",
+-        "inherits": "^2.0.1",
+-        "minimalistic-assert": "^1.0.0",
+-        "minimalistic-crypto-utils": "^1.0.0"
++        "hmac-drbg": "^1.0.1",
++        "inherits": "^2.0.4",
++        "minimalistic-assert": "^1.0.1",
++        "minimalistic-crypto-utils": "^1.0.1"
+       },
+       "dependencies": {
+         "bn.js": {
+-          "version": "4.11.9",
+-          "resolved": "https://registry.npmjs.org/bn.js/-/bn.js-4.11.9.tgz",
+-          "integrity": "sha512-E6QoYqCKZfgatHTdHzs1RRKP7ip4vvm+EyRUeE2RF0NblwVvb0p6jSVeNTOFxPn26QXN2o6SMfNxKp6kU8zQaw==",
++          "version": "4.12.0",
++          "resolved": "https://registry.npmjs.org/bn.js/-/bn.js-4.12.0.tgz",
++          "integrity": "sha512-c98Bf3tPniI+scsdk237ku1Dc3ujXQTSgyiPUDEOe7tRkhrqridvh8klBv0HCEso1OLOYcHuCv/cS6DNxKH+ZA==",
+           "dev": true
+         }
+       }
+diff --git a/src/prefect/agent/docker/agent.py b/src/prefect/agent/docker/agent.py
+index 218fd74449..766bf32337 100644
+--- a/src/prefect/agent/docker/agent.py
++++ b/src/prefect/agent/docker/agent.py
+@@ -18,17 +18,18 @@ if TYPE_CHECKING:
+     import docker
+ 
+ 
+-def _stream_container_logs(base_url: str, container_id: str) -> None:
++def _stream_container_logs(base_url: str, timeout: int, container_id: str) -> None:
+     """
+     Stream container logs back to stdout
+ 
+     Args:
+         - base_url (str): URL for a Docker daemon server
++        - timeout (int): timeout for docker api requests
+         - container_id (str): ID of a container to stream logs
+     """
+     import docker
+ 
+-    client = docker.APIClient(base_url=base_url, version="auto")
++    client = docker.APIClient(base_url=base_url, timeout=timeout, version="auto")
+     for log in client.logs(container=container_id, stream=True, follow=True):
+         print(str(log, "utf-8").rstrip())
+ 
+@@ -82,6 +83,8 @@ class DockerAgent(Agent):
+             some Docker-in-Docker setups that users may be running their agent with.
+         - reg_allow_list (List[str], optional): Limits Docker Agent to only pull images
+             from the listed registries.
++        - docker_client_timeout (int, optional): The timeout to use for docker
++            API calls, defaults to 60 seconds.
+     """
+ 
+     def __init__(
+@@ -101,6 +104,7 @@ class DockerAgent(Agent):
+         networks: List[str] = None,
+         docker_interface: bool = True,
+         reg_allow_list: List[str] = None,
++        docker_client_timeout: int = None,
+     ) -> None:
+         super().__init__(
+             agent_config_id=agent_config_id,
+@@ -150,6 +154,7 @@ class DockerAgent(Agent):
+         self.networks = networks
+         self.logger.debug(f"Docker networks set to {self.networks}")
+ 
++        self.docker_client_timeout = docker_client_timeout or 60
+         self.docker_interface = docker_interface
+         self.logger.debug(
+             "Docker interface toggle set to {}".format(self.docker_interface)
+@@ -183,7 +188,11 @@ class DockerAgent(Agent):
+         # the 'import prefect' time low
+         import docker
+ 
+-        return docker.APIClient(base_url=self.base_url, version="auto")
++        return docker.APIClient(
++            base_url=self.base_url,
++            version="auto",
++            timeout=self.docker_client_timeout,
++        )
+ 
+     def heartbeat(self) -> None:
+         try:
+@@ -483,6 +492,7 @@ class DockerAgent(Agent):
+             target=_stream_container_logs,
+             kwargs={
+                 "base_url": self.base_url,
++                "timeout": self.docker_client_timeout,
+                 "container_id": container_id,
+             },
+         )
+diff --git a/src/prefect/cli/agent.py b/src/prefect/cli/agent.py
+index b90fa8b6aa..f26b4f91c5 100644
+--- a/src/prefect/cli/agent.py
++++ b/src/prefect/cli/agent.py
+@@ -223,6 +223,12 @@ def docker():
+         "setups that users may be running their agent with."
+     ),
+ )
++@click.option(
++    "--docker-client-timeout",
++    default=None,
++    type=int,
++    help="The timeout to use for docker API calls, defaults to 60 seconds.",
++)
+ def start(volumes, no_docker_interface, **kwargs):
+     """Start a docker agent"""
+     from prefect.agent.docker import DockerAgent
+@@ -524,6 +530,12 @@ _agents = {
+     help="Disable presence of a Docker interface.",
+     hidden=True,
+ )
++@click.option(
++    "--docker-client-timeout",
++    default=None,
++    type=int,
++    hidden=True,
++)
+ @click.pass_context
+ def start(
+     ctx,
+@@ -549,6 +561,7 @@ def start(
+     agent_address,
+     hostname_label,
+     storage_labels,
++    docker_client_timeout,
+ ):
+     """
+     Start an agent.
+@@ -611,6 +624,7 @@ def start(
+         --no-docker-interface       Disable the check of a Docker interface on this machine.
+                                     Note: This is mostly relevant for some Docker-in-Docker
+                                     setups that users may be running their agent with.
++        --docker-client-timeout     Timeout for docker api requests
+ 
+     \b
+     Kubernetes Agent:
+@@ -692,6 +706,7 @@ def start(
+                 volumes=list(volume),
+                 networks=tuple(network),
+                 docker_interface=not no_docker_interface,
++                docker_client_timeout=docker_client_timeout,
+             ).start()
+         elif agent_option == "fargate":
+             from_qualified_name(retrieved_agent)(

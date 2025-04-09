@@ -24,7 +24,7 @@ COMMIT="$2"
 # 路径设置
 EXPR_PATH="/opt/tiger/expr"
 TEST_BED_PATH="${EXPR_PATH}/testbed/${TASK_ID}"
-TEST_PATCH_PATH="/mnt/bn/tiktok-mm-5/aiic/users/yiming/data/swe-bench-extra/${TASK_ID}/test_patch.diff"
+TEST_PATCH_PATH="./swe-bench-extra/${TASK_ID}/test_patch.diff"
 
 # 测试目录必须存在
 if [ ! -d "$TEST_BED_PATH" ]; then

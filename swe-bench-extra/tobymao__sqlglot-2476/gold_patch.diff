@@ -1,0 +1,179 @@
+diff --git a/sqlglot/dialects/postgres.py b/sqlglot/dialects/postgres.py
+index 30e8b0a8..14fdcb26 100644
+--- a/sqlglot/dialects/postgres.py
++++ b/sqlglot/dialects/postgres.py
+@@ -134,7 +134,9 @@ def _auto_increment_to_serial(expression: exp.Expression) -> exp.Expression:
+ 
+ 
+ def _serial_to_generated(expression: exp.Expression) -> exp.Expression:
+-    kind = expression.args["kind"]
++    kind = expression.args.get("kind")
++    if not kind:
++        return expression
+ 
+     if kind.this == exp.DataType.Type.SERIAL:
+         data_type = exp.DataType(this=exp.DataType.Type.INT)
+diff --git a/sqlglot/dialects/snowflake.py b/sqlglot/dialects/snowflake.py
+index 07be65b9..2d31051b 100644
+--- a/sqlglot/dialects/snowflake.py
++++ b/sqlglot/dialects/snowflake.py
+@@ -32,7 +32,7 @@ def _check_int(s: str) -> bool:
+ 
+ 
+ # from https://docs.snowflake.com/en/sql-reference/functions/to_timestamp.html
+-def _parse_to_timestamp(args: t.List) -> t.Union[exp.StrToTime, exp.UnixToTime]:
++def _parse_to_timestamp(args: t.List) -> t.Union[exp.StrToTime, exp.UnixToTime, exp.TimeStrToTime]:
+     if len(args) == 2:
+         first_arg, second_arg = args
+         if second_arg.is_string:
+@@ -60,8 +60,8 @@ def _parse_to_timestamp(args: t.List) -> t.Union[exp.StrToTime, exp.UnixToTime]:
+     # reduce it using `simplify_literals` first and then check if it's a Literal.
+     first_arg = seq_get(args, 0)
+     if not isinstance(simplify_literals(first_arg, root=True), Literal):
+-        # case: <variant_expr>
+-        return format_time_lambda(exp.StrToTime, "snowflake", default=True)(args)
++        # case: <variant_expr> or other expressions such as columns
++        return exp.TimeStrToTime.from_arg_list(args)
+ 
+     if first_arg.is_string:
+         if _check_int(first_arg.this):
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index b4275b10..35c9a8eb 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -2145,6 +2145,22 @@ class PartitionedByProperty(Property):
+     arg_types = {"this": True}
+ 
+ 
++# https://www.postgresql.org/docs/current/sql-createtable.html
++class PartitionBoundSpec(Expression):
++    # this -> IN / MODULUS, expression -> REMAINDER, from_expressions -> FROM (...), to_expressions -> TO (...)
++    arg_types = {
++        "this": False,
++        "expression": False,
++        "from_expressions": False,
++        "to_expressions": False,
++    }
++
++
++class PartitionedOfProperty(Property):
++    # this -> parent_table (schema), expression -> FOR VALUES ... / DEFAULT
++    arg_types = {"this": True, "expression": True}
++
++
+ class RemoteWithConnectionModelProperty(Property):
+     arg_types = {"this": True}
+ 
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 6a3ba5eb..e88d2cd5 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -310,6 +310,7 @@ class Generator:
+         exp.Order: exp.Properties.Location.POST_SCHEMA,
+         exp.OutputModelProperty: exp.Properties.Location.POST_SCHEMA,
+         exp.PartitionedByProperty: exp.Properties.Location.POST_WITH,
++        exp.PartitionedOfProperty: exp.Properties.Location.POST_SCHEMA,
+         exp.PrimaryKey: exp.Properties.Location.POST_SCHEMA,
+         exp.Property: exp.Properties.Location.POST_WITH,
+         exp.RemoteWithConnectionModelProperty: exp.Properties.Location.POST_SCHEMA,
+@@ -1262,6 +1263,29 @@ class Generator:
+             for_ = " FOR NONE"
+         return f"WITH{no}{concurrent} ISOLATED LOADING{for_}"
+ 
++    def partitionboundspec_sql(self, expression: exp.PartitionBoundSpec) -> str:
++        if isinstance(expression.this, list):
++            return f"IN ({self.expressions(expression, key='this', flat=True)})"
++        if expression.this:
++            modulus = self.sql(expression, "this")
++            remainder = self.sql(expression, "expression")
++            return f"WITH (MODULUS {modulus}, REMAINDER {remainder})"
++
++        from_expressions = self.expressions(expression, key="from_expressions", flat=True)
++        to_expressions = self.expressions(expression, key="to_expressions", flat=True)
++        return f"FROM ({from_expressions}) TO ({to_expressions})"
++
++    def partitionedofproperty_sql(self, expression: exp.PartitionedOfProperty) -> str:
++        this = self.sql(expression, "this")
++
++        for_values_or_default = expression.expression
++        if isinstance(for_values_or_default, exp.PartitionBoundSpec):
++            for_values_or_default = f" FOR VALUES {self.sql(for_values_or_default)}"
++        else:
++            for_values_or_default = " DEFAULT"
++
++        return f"PARTITION OF {this}{for_values_or_default}"
++
+     def lockingproperty_sql(self, expression: exp.LockingProperty) -> str:
+         kind = expression.args.get("kind")
+         this = f" {self.sql(expression, 'this')}" if expression.this else ""
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index f8256fe8..7ff0aabf 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -674,6 +674,7 @@ class Parser(metaclass=_Parser):
+         "ON": lambda self: self._parse_on_property(),
+         "ORDER BY": lambda self: self._parse_order(skip_order_token=True),
+         "OUTPUT": lambda self: self.expression(exp.OutputModelProperty, this=self._parse_schema()),
++        "PARTITION": lambda self: self._parse_partitioned_of(),
+         "PARTITION BY": lambda self: self._parse_partitioned_by(),
+         "PARTITIONED BY": lambda self: self._parse_partitioned_by(),
+         "PARTITIONED_BY": lambda self: self._parse_partitioned_by(),
+@@ -1743,6 +1744,58 @@ class Parser(metaclass=_Parser):
+             return self._parse_csv(self._parse_conjunction)
+         return []
+ 
++    def _parse_partition_bound_spec(self) -> exp.PartitionBoundSpec:
++        def _parse_partition_bound_expr() -> t.Optional[exp.Expression]:
++            if self._match_text_seq("MINVALUE"):
++                return exp.var("MINVALUE")
++            if self._match_text_seq("MAXVALUE"):
++                return exp.var("MAXVALUE")
++            return self._parse_bitwise()
++
++        this: t.Optional[exp.Expression | t.List[exp.Expression]] = None
++        expression = None
++        from_expressions = None
++        to_expressions = None
++
++        if self._match(TokenType.IN):
++            this = self._parse_wrapped_csv(self._parse_bitwise)
++        elif self._match(TokenType.FROM):
++            from_expressions = self._parse_wrapped_csv(_parse_partition_bound_expr)
++            self._match_text_seq("TO")
++            to_expressions = self._parse_wrapped_csv(_parse_partition_bound_expr)
++        elif self._match_text_seq("WITH", "(", "MODULUS"):
++            this = self._parse_number()
++            self._match_text_seq(",", "REMAINDER")
++            expression = self._parse_number()
++            self._match_r_paren()
++        else:
++            self.raise_error("Failed to parse partition bound spec.")
++
++        return self.expression(
++            exp.PartitionBoundSpec,
++            this=this,
++            expression=expression,
++            from_expressions=from_expressions,
++            to_expressions=to_expressions,
++        )
++
++    # https://www.postgresql.org/docs/current/sql-createtable.html
++    def _parse_partitioned_of(self) -> t.Optional[exp.PartitionedOfProperty]:
++        if not self._match_text_seq("OF"):
++            self._retreat(self._index - 1)
++            return None
++
++        this = self._parse_table(schema=True)
++
++        if self._match(TokenType.DEFAULT):
++            expression: exp.Var | exp.PartitionBoundSpec = exp.var("DEFAULT")
++        elif self._match_text_seq("FOR", "VALUES"):
++            expression = self._parse_partition_bound_spec()
++        else:
++            self.raise_error("Expecting either DEFAULT or FOR VALUES clause.")
++
++        return self.expression(exp.PartitionedOfProperty, this=this, expression=expression)
++
+     def _parse_partitioned_by(self) -> exp.PartitionedByProperty:
+         self._match(TokenType.EQ)
+         return self.expression(

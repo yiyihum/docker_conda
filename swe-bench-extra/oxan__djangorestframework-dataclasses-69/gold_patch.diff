@@ -1,0 +1,222 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index d4d38e9..5c23dee 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -1,3 +1,11 @@
++1.3.0, TBD
++----------
++Features & fixes:
++
++* Create values for fields of non-``list`` or ``dict`` composite types (such as ``frozenset`` or ``OrderedDict``) as
++  that type, instead of ``list`` or ``dict``.
++* Allow overriding the field for specific composite types through the ``serializer_field_mapping`` dictionary.
++
+ 1.2.0, 18 November 2022
+ -----------------------
+ Features & fixes:
+diff --git a/README.rst b/README.rst
+index cef229a..87cdea7 100644
+--- a/README.rst
++++ b/README.rst
+@@ -337,9 +337,29 @@ their name or value. The member name is used as display name.
+ * ``enum_class``: The enumeration class.
+ * ``by_name``: Whether members are represented by their value (``False``) or name (``True``).
+ 
++IterableField
++~~~~~~~~~~~~~
++A subclass of `ListField`_ that can return values that aren't of type ``list``, such as ``set``.
++
++**Signature**: ``IterableField(container=list)``
++
++* ``container``: The type of the returned iterable. Must have a constructor that accepts a single parameter of type
++  ``list``, containing the values for the iterable.
++
++MappingField
++~~~~~~~~~~~~
++A subclass of `DictField`_ that can return values that aren't of type ``dict``, such as ``collections.OrderedDict``.
++
++**Signature**: ``IterableField(container=dict)``
++
++* ``container``: The type of the returned mapping. Must have a constructor that accepts a single parameter of type
++  ``dict``, containing the values for the mapping.
++
+ .. _`enumerations`: https://docs.python.org/3/library/enum.html
+ .. _`ChoiceField`: https://www.django-rest-framework.org/api-guide/fields/#choicefield
+ .. _`DecimalField`: https://www.django-rest-framework.org/api-guide/fields/#decimalfield
++.. _`ListField`: https://www.django-rest-framework.org/api-guide/fields/#listfield
++.. _`DictField`: https://www.django-rest-framework.org/api-guide/fields/#dictfield
+ 
+ Advanced usage
+ --------------
+diff --git a/pyproject.toml b/pyproject.toml
+index 571ac0c..6bfcdae 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -42,10 +42,10 @@ dependencies = [
+ ]
+ 
+ [project.urls]
+-repository = "https://github.com/oxan/djangorestframework-dataclasses"
+-documentation = "https://github.com/oxan/djangorestframework-dataclasses/blob/master/README.rst"
+-changelog = "https://github.com/oxan/djangorestframework-dataclasses/blob/master/CHANGELOG.rst"
+-sponsor = "https://github.com/sponsors/oxan"
++Repository = "https://github.com/oxan/djangorestframework-dataclasses"
++Documentation = "https://github.com/oxan/djangorestframework-dataclasses/blob/master/README.rst"
++Changelog = "https://github.com/oxan/djangorestframework-dataclasses/blob/master/CHANGELOG.rst"
++Sponsor = "https://github.com/sponsors/oxan"
+ 
+ [tool.coverage.run]
+ branch = true
+diff --git a/rest_framework_dataclasses/field_utils.py b/rest_framework_dataclasses/field_utils.py
+index cbd0ce3..1fa0e31 100644
+--- a/rest_framework_dataclasses/field_utils.py
++++ b/rest_framework_dataclasses/field_utils.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ import dataclasses
+ import inspect
+ 
+-from typing import Any, Dict, Generic, Mapping, Type, TypeVar
++from typing import Any, Dict, Generic, Mapping, Optional, Type, TypeVar
+ 
+ from rest_framework.utils.model_meta import RelationInfo
+ 
+@@ -28,6 +28,7 @@ class TypeInfo:
+     is_final: bool
+     is_nullable: bool
+     base_type: type
++    container_type: Optional[type]
+ 
+ 
+ def get_dataclass_definition(dataclass_type: Type[T]) -> DataclassDefinition[T]:
+@@ -62,6 +63,12 @@ def get_type_info(tp: type) -> TypeInfo:
+     is_mapping = typing_utils.is_mapping_type(tp)
+     is_many = typing_utils.is_iterable_type(tp)
+ 
++    cp = None
++    if is_mapping or is_many:
++        container_type = typing_utils.get_container_type(tp)
++        if not inspect.isabstract(container_type):
++            cp = container_type
++
+     if is_mapping:
+         tp = typing_utils.get_mapping_value_type(tp)
+     elif is_many:  # This must be elif (instead of if), as otherwise we'd reduce mappings twice as they're also iterable
+@@ -70,7 +77,7 @@ def get_type_info(tp: type) -> TypeInfo:
+     if typing_utils.is_type_variable(tp):
+         tp = typing_utils.get_variable_type_substitute(tp)
+ 
+-    return TypeInfo(is_many, is_mapping, is_final, is_nullable, tp)
++    return TypeInfo(is_many, is_mapping, is_final, is_nullable, tp, cp)
+ 
+ 
+ def get_relation_info(type_info: TypeInfo) -> RelationInfo:
+diff --git a/rest_framework_dataclasses/fields.py b/rest_framework_dataclasses/fields.py
+index 42e4714..f7506aa 100644
+--- a/rest_framework_dataclasses/fields.py
++++ b/rest_framework_dataclasses/fields.py
+@@ -1,4 +1,4 @@
+-from rest_framework.fields import DecimalField, ChoiceField
++from rest_framework.fields import DecimalField, ChoiceField, DictField, ListField
+ 
+ 
+ class DefaultDecimalField(DecimalField):
+@@ -42,3 +42,21 @@ class EnumField(ChoiceField):
+             return value.name
+         else:
+             return value.value
++
++
++class IterableField(ListField):
++    def __init__(self, **kwargs):
++        self.container = kwargs.pop('container', list)
++        super(IterableField, self).__init__(**kwargs)
++
++    def to_internal_value(self, value):
++        return self.container(super(IterableField, self).to_internal_value(value))
++
++
++class MappingField(DictField):
++    def __init__(self, **kwargs):
++        self.container = kwargs.pop('container', dict)
++        super(MappingField, self).__init__(**kwargs)
++
++    def to_internal_value(self, value):
++        return self.container(super(MappingField, self).to_internal_value(value))
+diff --git a/rest_framework_dataclasses/serializers.py b/rest_framework_dataclasses/serializers.py
+index 07657db..2832907 100644
+--- a/rest_framework_dataclasses/serializers.py
++++ b/rest_framework_dataclasses/serializers.py
+@@ -79,8 +79,8 @@ class DataclassSerializer(rest_framework.serializers.Serializer, Generic[T]):
+         datetime.time:      rest_framework.fields.TimeField,
+         datetime.timedelta: rest_framework.fields.DurationField,
+         uuid.UUID:          rest_framework.fields.UUIDField,
+-        dict:               rest_framework.fields.DictField,
+-        list:               rest_framework.fields.ListField
++        list:               fields.IterableField,
++        dict:               fields.MappingField,
+     }
+     serializer_related_field: Type[SerializerField] = PrimaryKeyRelatedField
+ 
+@@ -417,15 +417,25 @@ class DataclassSerializer(rest_framework.serializers.Serializer, Generic[T]):
+         """
+         Create a composite (mapping or list) field.
+         """
+-        # Lookup the types from the field mapping, so that it can easily be changed without overriding the method.
++        # Default to using the field for a dict or list from the field mapping, so that it can easily be changed without
++        # overriding this method.
+         if type_info.is_mapping:
+             field_class = self.serializer_field_mapping[dict]
+         else:
+             field_class = self.serializer_field_mapping[list]
++        field_kwargs: KWArgs = {}
++
++        # If the type of the container is known, see if there's a field override; and pass it to the field.
++        if type_info.container_type:
++            field_kwargs['container'] = type_info.container_type
++            try:
++                field_class = field_utils.lookup_type_in_mapping(self.serializer_field_mapping, type_info.container_type)
++            except KeyError:
++                pass
+ 
+-        # If the base type is not specified or is any type, we don't have to bother creating the child field.
++        # If the base type is not specified or is any type, no need to bother creating the child field.
+         if type_info.base_type is Any:
+-            return field_class, {}
++            return field_class, field_kwargs
+ 
+         # Recurse to build the child field (i.e. the field of every instance). We pass the extra kwargs that are
+         # specified for the child field through, so these can be used to recursively specify kwargs for child fields.
+@@ -439,7 +449,7 @@ class DataclassSerializer(rest_framework.serializers.Serializer, Generic[T]):
+ 
+         # Create child field and initialize parent field kwargs
+         child_field = child_field_class(**child_field_kwargs)
+-        field_kwargs = {'child': child_field}
++        field_kwargs['child'] = child_field
+         return field_class, field_kwargs
+ 
+     def build_standard_field(self, field_name: str, type_info: TypeInfo) -> SerializerFieldDefinition:
+diff --git a/rest_framework_dataclasses/typing_utils.py b/rest_framework_dataclasses/typing_utils.py
+index 4b8c529..a43faa0 100644
+--- a/rest_framework_dataclasses/typing_utils.py
++++ b/rest_framework_dataclasses/typing_utils.py
+@@ -100,6 +100,20 @@ def is_iterable_type(tp: type) -> bool:
+     )
+ 
+ 
++def get_container_type(tp: type) -> typing.Optional[type]:
++    """
++    Return the unsubscripted container type of the given type.
++
++    Some examples of container types are:
++
++        Iterable[str] -> Iterable
++        List[str] -> list
++        Dict[str, int] -> dict
++
++    """
++    return get_origin(tp)
++
++
+ def get_iterable_element_type(tp: type) -> type:
+     """
+     Get the type of elements in an iterable.

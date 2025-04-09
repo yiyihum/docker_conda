@@ -1,0 +1,140 @@
+diff --git a/.github/workflows/unittests.yml b/.github/workflows/unittests.yml
+index fcb4308..889ece1 100644
+--- a/.github/workflows/unittests.yml
++++ b/.github/workflows/unittests.yml
+@@ -10,9 +10,9 @@ jobs:
+         python-version: ['3.6', '3.7', '3.8', '3.9', '3.10', 'pypy-3.6', 'pypy-3.7']
+ 
+     steps:
+-    - uses: actions/checkout@v2
++    - uses: actions/checkout@v3
+     - name: Set up Python ${{ matrix.python-version }}
+-      uses: actions/setup-python@v2
++      uses: actions/setup-python@v3
+       with:
+         python-version: ${{ matrix.python-version }}
+     - name: Install dependencies
+diff --git a/unittests/test_itertools.py b/unittests/test_itertools.py
+index 1a80065..904378d 100644
+--- a/unittests/test_itertools.py
++++ b/unittests/test_itertools.py
+@@ -1,10 +1,11 @@
+ import itertools
++import sys
+ 
+ import pytest
+ 
+ import asyncstdlib as a
+ 
+-from .utility import sync, asyncify, awaitify
++from .utility import sync, asyncify, awaitify, multi_sync, Schedule, Switch, Lock
+ 
+ 
+ @sync
+@@ -210,6 +211,56 @@ async def test_tee():
+             assert await a.list(iterator) == iterable
+ 
+ 
++@multi_sync
++async def test_tee_concurrent_locked():
++    """Test that properly uses a lock for synchronisation"""
++    items = [1, 2, 3, -5, 12, 78, -1, 111]
++
++    async def iter_values():
++        for item in items:
++            # switch to other tasks a few times to guarantees another runs
++            for _ in range(5):
++                await Switch()
++            yield item
++
++    async def test_peer(peer_tee):
++        assert await a.list(peer_tee) == items
++
++    head_peer, *peers = a.tee(iter_values(), n=len(items) // 2, lock=Lock())
++    await Schedule(*map(test_peer, peers))
++    await Switch()
++    results = [item async for item in head_peer]
++    assert results == items
++
++
++# see https://github.com/python/cpython/issues/74956
++@pytest.mark.skipif(
++    sys.version_info < (3, 8),
++    reason="async generators only protect against concurrent access since 3.8",
++)
++@multi_sync
++async def test_tee_concurrent_unlocked():
++    """Test that does not prevent concurrency without a lock"""
++    items = list(range(12))
++
++    async def iter_values():
++        for item in items:
++            # switch to other tasks a few times to guarantees another runs
++            for _ in range(5):
++                await Switch()
++            yield item
++
++    async def test_peer(peer_tee):
++        assert await a.list(peer_tee) == items
++
++    this, peer = a.tee(iter_values(), n=2)
++    await Schedule(test_peer(peer))
++    await Switch()
++    # underlying generator raises RuntimeError when `__anext__` is interleaved
++    with pytest.raises(RuntimeError):
++        await test_peer(this)
++
++
+ @sync
+ async def test_pairwise():
+     assert await a.list(a.pairwise(range(5))) == [(0, 1), (1, 2), (2, 3), (3, 4)]
+diff --git a/unittests/utility.py b/unittests/utility.py
+index 2710fe1..b475eda 100644
+--- a/unittests/utility.py
++++ b/unittests/utility.py
+@@ -85,12 +85,34 @@ class Switch:
+         yield self
+ 
+ 
++class Lock:
++    def __init__(self):
++        self._owned = False
++        self._waiting = []
++
++    async def __aenter__(self):
++        if self._owned:
++            # wait until it is our turn to take the lock
++            token = object()
++            self._waiting.append(token)
++            while self._owned or self._waiting[0] is not token:
++                await Switch()
++            # take the lock and remove our wait claim
++            self._owned = True
++            self._waiting.pop(0)
++        self._owned = True
++
++    async def __aexit__(self, exc_type, exc_val, exc_tb):
++        self._owned = False
++
++
+ def multi_sync(test_case: Callable[..., Coroutine]):
+     """
+-    Mark an ``async def`` test case to be run synchronously with chicldren
++    Mark an ``async def`` test case to be run synchronously with children
+ 
+     This emulates a primitive "event loop" which only responds
+-    to the :py:class:`PingPong`, :py:class:`Schedule` and :py:class:`Switch`.
++    to the :py:class:`PingPong`, :py:class:`Schedule`, :py:class:`Switch`
++    and :py:class:`Lock`.
+     """
+ 
+     @wraps(test_case)
+@@ -103,7 +125,7 @@ def multi_sync(test_case: Callable[..., Coroutine]):
+                 event = coro.send(event)
+             except StopIteration as e:
+                 result = e.args[0] if e.args else None
+-                assert result is None
++                assert result is None, f"got '{result!r}' expected 'None'"
+             else:
+                 if isinstance(event, PingPong):
+                     run_queue.appendleft((coro, event))

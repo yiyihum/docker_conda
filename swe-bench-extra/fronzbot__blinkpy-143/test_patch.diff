@@ -1,0 +1,208 @@
+diff --git a/tests/test_blinkpy.py b/tests/test_blinkpy.py
+index 6676fbd..001c200 100644
+--- a/tests/test_blinkpy.py
++++ b/tests/test_blinkpy.py
+@@ -138,9 +138,13 @@ class TestBlinkSetup(unittest.TestCase):
+         now = self.blink.refresh_rate + 1
+         mock_time.return_value = now
+         self.assertEqual(self.blink.last_refresh, None)
+-        result = self.blink.check_if_ok_to_update()
++        self.assertEqual(self.blink.check_if_ok_to_update(), True)
++        self.assertEqual(self.blink.last_refresh, None)
++        with mock.patch('blinkpy.sync_module.BlinkSyncModule.refresh',
++                        return_value=True):
++            self.blink.refresh()
++
+         self.assertEqual(self.blink.last_refresh, now)
+-        self.assertEqual(result, True)
+         self.assertEqual(self.blink.check_if_ok_to_update(), False)
+         self.assertEqual(self.blink.last_refresh, now)
+ 
+diff --git a/tests/test_cameras.py b/tests/test_cameras.py
+index a340228..aae0b5d 100644
+--- a/tests/test_cameras.py
++++ b/tests/test_cameras.py
+@@ -11,7 +11,7 @@ from unittest import mock
+ from blinkpy import blinkpy
+ from blinkpy.helpers.util import create_session, BlinkURLHandler
+ from blinkpy.sync_module import BlinkSyncModule
+-from blinkpy.camera import BlinkCamera, MAX_CLIPS
++from blinkpy.camera import BlinkCamera
+ import tests.mock_responses as mresp
+ 
+ USERNAME = 'foobar'
+@@ -55,32 +55,6 @@ class TestBlinkCameraSetup(unittest.TestCase):
+         """Clean up after test."""
+         self.blink = None
+ 
+-    def test_check_for_motion(self, mock_sess):
+-        """Test check for motion function."""
+-        self.assertEqual(self.camera.last_record, [])
+-        self.assertEqual(self.camera.motion_detected, None)
+-        self.camera.sync.record_dates = {'foobar': [1, 3, 2, 4]}
+-        self.camera.check_for_motion()
+-        self.assertEqual(self.camera.last_record, [4])
+-        self.assertEqual(self.camera.motion_detected, False)
+-        self.camera.sync.record_dates = {'foobar': [7, 1, 3, 4]}
+-        self.camera.check_for_motion()
+-        self.assertEqual(self.camera.last_record, [7, 4])
+-        self.assertEqual(self.camera.motion_detected, True)
+-        self.camera.check_for_motion()
+-        self.assertEqual(self.camera.last_record, [7, 4])
+-        self.assertEqual(self.camera.motion_detected, False)
+-
+-    def test_max_motion_clips(self, mock_sess):
+-        """Test that we only maintain certain number of records."""
+-        for i in range(0, MAX_CLIPS):
+-            self.camera.last_record.append(i)
+-        self.camera.sync.record_dates['foobar'] = [MAX_CLIPS+2]
+-        self.assertEqual(len(self.camera.last_record), MAX_CLIPS)
+-        self.camera.check_for_motion()
+-        self.assertEqual(self.camera.motion_detected, True)
+-        self.assertEqual(len(self.camera.last_record), MAX_CLIPS)
+-
+     def test_camera_update(self, mock_sess):
+         """Test that we can properly update camera properties."""
+         config = {
+@@ -96,7 +70,12 @@ class TestBlinkCameraSetup(unittest.TestCase):
+             'thumbnail': '/thumb',
+         }
+         self.camera.last_record = ['1']
+-        self.camera.sync.all_clips = {'new': {'1': '/test.mp4'}}
++        self.camera.sync.last_record = {
++            'new': {
++                'clip': '/test.mp4',
++                'time': '1970-01-01T00:00:00'
++            }
++        }
+         mock_sess.side_effect = [
+             mresp.MockResponse({'temp': 71}, 200),
+             'test',
+@@ -128,8 +107,12 @@ class TestBlinkCameraSetup(unittest.TestCase):
+             'barfoo'
+         ]
+         self.camera.last_record = ['1']
+-        self.camera.sync.record_dates['new'] = ['1']
+-        self.camera.sync.all_clips = {'new': {'1': '/test.mp4'}}
++        self.camera.sync.last_record = {
++            'new': {
++                'clip': '/test.mp4',
++                'time': '1970-01-01T00:00:00'
++            }
++        }
+         config = {
+             'name': 'new',
+             'camera_id': 1234,
+@@ -159,8 +142,6 @@ class TestBlinkCameraSetup(unittest.TestCase):
+         """Tests that thumbnail is 'None' if none found."""
+         mock_sess.return_value = 'foobar'
+         self.camera.last_record = ['1']
+-        self.camera.sync.record_dates['new'] = ['1']
+-        self.camera.sync.all_clips = {'new': {'1': '/test.mp4'}}
+         config = {
+             'name': 'new',
+             'camera_id': 1234,
+@@ -179,6 +160,7 @@ class TestBlinkCameraSetup(unittest.TestCase):
+         with self.assertLogs() as logrecord:
+             self.camera.update(config)
+         self.assertEqual(self.camera.thumbnail, None)
++        self.assertEqual(self.camera.last_record, ['1'])
+         self.assertEqual(
+             logrecord.output,
+             ["ERROR:blinkpy.camera:Could not retrieve calibrated temperature.",
+diff --git a/tests/test_sync_module.py b/tests/test_sync_module.py
+index 7c623d1..f1a5848 100644
+--- a/tests/test_sync_module.py
++++ b/tests/test_sync_module.py
+@@ -42,40 +42,47 @@ class TestBlinkSyncModule(unittest.TestCase):
+         mock_resp.return_value = {'devicestatus': True}
+         self.assertEqual(self.blink.sync['test'].get_camera_info(), True)
+ 
+-    def test_get_videos_one_page(self, mock_resp):
+-        """Test video access."""
+-        mock_resp.return_value = [
+-            {
+-                'camera_name': 'foobar',
+-                'address': '/test/clip_1900_01_01_12_00_00AM.mp4',
+-                'thumbnail': '/test/thumb'
+-            }
+-        ]
+-        expected_videos = {'foobar': [
+-            {'clip': '/test/clip_1900_01_01_12_00_00AM.mp4',
+-             'thumb': '/test/thumb'}]}
+-        expected_recs = {'foobar': ['1900_01_01_12_00_00AM']}
+-        expected_clips = {'foobar': {
+-            '1900_01_01_12_00_00AM': '/test/clip_1900_01_01_12_00_00AM.mp4'}}
+-        self.blink.sync['test'].get_videos(start_page=0, end_page=0)
+-        self.assertEqual(self.blink.sync['test'].videos, expected_videos)
+-        self.assertEqual(self.blink.sync['test'].record_dates, expected_recs)
+-        self.assertEqual(self.blink.sync['test'].all_clips, expected_clips)
++    def test_check_new_videos(self, mock_resp):
++        """Test recent video response."""
++        mock_resp.return_value = {
++            'videos': [{
++                'camera_name': 'foo',
++                'address': '/foo/bar.mp4',
++                'created_at': '1970-01-01T00:00:00+0:00'
++            }]
++        }
++        sync_module = self.blink.sync['test']
++        sync_module.cameras = {'foo': None}
++        self.assertEqual(sync_module.motion, {})
++        self.assertTrue(sync_module.check_new_videos())
++        self.assertEqual(sync_module.last_record['foo'],
++                         {'clip': '/foo/bar.mp4',
++                          'time': '1970-01-01T00:00:00+0:00'})
++        self.assertEqual(sync_module.motion, {'foo': True})
++        mock_resp.return_value = {'videos': []}
++        self.assertTrue(sync_module.check_new_videos())
++        self.assertEqual(sync_module.motion, {'foo': False})
++        self.assertEqual(sync_module.last_record['foo'],
++                         {'clip': '/foo/bar.mp4',
++                          'time': '1970-01-01T00:00:00+0:00'})
+ 
+-    def test_get_videos_multi_page(self, mock_resp):
+-        """Test video access with multiple pages."""
+-        mock_resp.return_value = [
+-            {
+-                'camera_name': 'test',
+-                'address': '/foo/bar_1900_01_01_12_00_00AM.mp4',
+-                'thumbnail': '/foobar'
+-            }
+-        ]
+-        self.blink.sync['test'].get_videos()
+-        self.assertEqual(mock_resp.call_count, 2)
+-        mock_resp.reset_mock()
+-        self.blink.sync['test'].get_videos(start_page=0, end_page=9)
+-        self.assertEqual(mock_resp.call_count, 10)
++    def test_check_new_videos_failed(self, mock_resp):
++        """Test method when response is unexpected."""
++        mock_resp.side_effect = [None, 'just a string', {}]
++        sync_module = self.blink.sync['test']
++        sync_module.cameras = {'foo': None}
++
++        sync_module.motion['foo'] = True
++        self.assertFalse(sync_module.check_new_videos())
++        self.assertFalse(sync_module.motion['foo'])
++
++        sync_module.motion['foo'] = True
++        self.assertFalse(sync_module.check_new_videos())
++        self.assertFalse(sync_module.motion['foo'])
++
++        sync_module.motion['foo'] = True
++        self.assertFalse(sync_module.check_new_videos())
++        self.assertFalse(sync_module.motion['foo'])
+ 
+     def test_sync_start(self, mock_resp):
+         """Test sync start function."""
+@@ -88,9 +95,8 @@ class TestBlinkSyncModule(unittest.TestCase):
+             {'event': True},
+             {},
+             {},
+-            {'devicestatus': {}},
+             None,
+-            None
++            {'devicestatus': {}},
+         ]
+         self.blink.sync['test'].start()
+         self.assertEqual(self.blink.sync['test'].name, 'test')

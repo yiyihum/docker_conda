@@ -1,0 +1,400 @@
+diff --git a/tests/mypy/success.py b/tests/mypy/success.py
+--- a/tests/mypy/success.py
++++ b/tests/mypy/success.py
+@@ -10,6 +10,7 @@
+ 
+ from pydantic import BaseModel, NoneStr
+ from pydantic.dataclasses import dataclass
++from pydantic.fields import Field
+ from pydantic.generics import GenericModel
+ 
+ 
+@@ -103,3 +104,8 @@ class WrapperModel(GenericModel, Generic[T]):
+     model_instance = WrapperModel[Model](payload=m)
+     model_instance.payload.list_of_ints.append(4)
+     assert model_instance.payload.list_of_ints == [1, 2, 3, 4]
++
++
++class WithField(BaseModel):
++    age: int
++    first_name: str = Field('John', const=True)
+diff --git a/tests/test_edge_cases.py b/tests/test_edge_cases.py
+--- a/tests/test_edge_cases.py
++++ b/tests/test_edge_cases.py
+@@ -18,6 +18,7 @@
+     validate_model,
+     validator,
+ )
++from pydantic.fields import Schema
+ 
+ 
+ def test_str_bytes():
+@@ -26,7 +27,7 @@ class Model(BaseModel):
+ 
+     m = Model(v='s')
+     assert m.v == 's'
+-    assert '<Field(v type=typing.Union[str, bytes] required)>' == repr(m.fields['v'])
++    assert '<ModelField(v type=typing.Union[str, bytes] required)>' == repr(m.fields['v'])
+ 
+     m = Model(v=b'b')
+     assert m.v == 'b'
+@@ -323,7 +324,7 @@ class Config:
+             fields = {'a': '_a'}
+ 
+     assert Model(_a='different').a == 'different'
+-    assert repr(Model.__fields__['a']) == "<Field(a type=str default='foobar' alias=_a)>"
++    assert repr(Model.__fields__['a']) == "<ModelField(a type=str default='foobar' alias=_a)>"
+ 
+ 
+ def test_alias_error():
+@@ -661,8 +662,8 @@ class Model(BaseModel):
+ 
+         class Config(BaseConfig):
+             @classmethod
+-            def get_field_schema(cls, name):
+-                field_config = super().get_field_schema(name) or {}
++            def get_field_info(cls, name):
++                field_config = super().get_field_info(name) or {}
+                 if 'alias' not in field_config:
+                     field_config['alias'] = re.sub(r'(?:^|_)([a-z])', lambda m: m.group(1).upper(), name)
+                 return field_config
+@@ -673,12 +674,12 @@ def get_field_schema(cls, name):
+     assert v == {'one_thing': 123, 'another_thing': 321}
+ 
+ 
+-def test_get_field_schema_inherit():
++def test_get_field_info_inherit():
+     class ModelOne(BaseModel):
+         class Config(BaseConfig):
+             @classmethod
+-            def get_field_schema(cls, name):
+-                field_config = super().get_field_schema(name) or {}
++            def get_field_info(cls, name):
++                field_config = super().get_field_info(name) or {}
+                 if 'alias' not in field_config:
+                     field_config['alias'] = re.sub(r'_([a-z])', lambda m: m.group(1).upper(), name)
+                 return field_config
+@@ -1006,3 +1007,11 @@ def check_a(cls, v):
+     assert Model().a is None
+     assert Model(a=None).a is None
+     assert Model(a=12).a == 12
++
++
++def test_scheme_deprecated():
++
++    with pytest.warns(DeprecationWarning, match='`Schema` is deprecated, use `Field` instead'):
++
++        class Model(BaseModel):
++            foo: int = Schema(4)
+diff --git a/tests/test_forward_ref.py b/tests/test_forward_ref.py
+--- a/tests/test_forward_ref.py
++++ b/tests/test_forward_ref.py
+@@ -257,7 +257,7 @@ def test_self_reference_json_schema(create_module):
+     module = create_module(
+         """
+ from typing import List
+-from pydantic import BaseModel, Schema
++from pydantic import BaseModel
+ 
+ class Account(BaseModel):
+   name: str
+@@ -294,7 +294,7 @@ def test_self_reference_json_schema_with_future_annotations(create_module):
+         """
+ from __future__ import annotations
+ from typing import List
+-from pydantic import BaseModel, Schema
++from pydantic import BaseModel
+ 
+ class Account(BaseModel):
+   name: str
+@@ -329,7 +329,7 @@ def test_circular_reference_json_schema(create_module):
+     module = create_module(
+         """
+ from typing import List
+-from pydantic import BaseModel, Schema
++from pydantic import BaseModel
+ 
+ class Owner(BaseModel):
+   account: 'Account'
+@@ -378,7 +378,7 @@ def test_circular_reference_json_schema_with_future_annotations(create_module):
+         """
+ from __future__ import annotations
+ from typing import List
+-from pydantic import BaseModel, Schema
++from pydantic import BaseModel
+ 
+ class Owner(BaseModel):
+   account: Account
+diff --git a/tests/test_main.py b/tests/test_main.py
+--- a/tests/test_main.py
++++ b/tests/test_main.py
+@@ -3,7 +3,7 @@
+ 
+ import pytest
+ 
+-from pydantic import BaseModel, Extra, NoneBytes, NoneStr, Required, Schema, ValidationError, constr
++from pydantic import BaseModel, Extra, Field, NoneBytes, NoneStr, Required, ValidationError, constr
+ 
+ 
+ def test_success():
+@@ -40,7 +40,7 @@ def test_ultra_simple_failed():
+ def test_ultra_simple_repr():
+     m = UltraSimpleModel(a=10.2)
+     assert repr(m) == '<UltraSimpleModel a=10.2 b=10>'
+-    assert repr(m.fields['a']) == '<Field(a type=float required)>'
++    assert repr(m.fields['a']) == '<ModelField(a type=float required)>'
+     assert dict(m) == {'a': 10.2, 'b': 10}
+     assert m.dict() == {'a': 10.2, 'b': 10}
+     assert m.json() == '{"a": 10.2, "b": 10}'
+@@ -366,7 +366,7 @@ class Config:
+ 
+ def test_const_validates():
+     class Model(BaseModel):
+-        a: int = Schema(3, const=True)
++        a: int = Field(3, const=True)
+ 
+     m = Model(a=3)
+     assert m.a == 3
+@@ -374,7 +374,7 @@ class Model(BaseModel):
+ 
+ def test_const_uses_default():
+     class Model(BaseModel):
+-        a: int = Schema(3, const=True)
++        a: int = Field(3, const=True)
+ 
+     m = Model()
+     assert m.a == 3
+@@ -382,7 +382,7 @@ class Model(BaseModel):
+ 
+ def test_const_with_wrong_value():
+     class Model(BaseModel):
+-        a: int = Schema(3, const=True)
++        a: int = Field(3, const=True)
+ 
+     with pytest.raises(ValidationError) as exc_info:
+         Model(a=4)
+@@ -402,8 +402,8 @@ class SubModel(BaseModel):
+         b: int
+ 
+     class Model(BaseModel):
+-        a: List[SubModel] = Schema([SubModel(b=1), SubModel(b=2), SubModel(b=3)], const=True)
+-        b: List[SubModel] = Schema([{'b': 4}, {'b': 5}, {'b': 6}], const=True)
++        a: List[SubModel] = Field([SubModel(b=1), SubModel(b=2), SubModel(b=3)], const=True)
++        b: List[SubModel] = Field([{'b': 4}, {'b': 5}, {'b': 6}], const=True)
+ 
+     m = Model()
+     assert m.a == [SubModel(b=1), SubModel(b=2), SubModel(b=3)]
+@@ -441,8 +441,8 @@ class SubModel(BaseModel):
+         b: int
+ 
+     class Model(BaseModel):
+-        a: List[SubModel] = Schema([SubModel(b=1), SubModel(b=2), SubModel(b=3)], const=True)
+-        b: List[SubModel] = Schema([{'b': 4}, {'b': 5}, {'b': 6}], const=True)
++        a: List[SubModel] = Field([SubModel(b=1), SubModel(b=2), SubModel(b=3)], const=True)
++        b: List[SubModel] = Field([{'b': 4}, {'b': 5}, {'b': 6}], const=True)
+ 
+     with pytest.raises(ValidationError) as exc_info:
+         Model(a=[{'b': 3}, {'b': 1}, {'b': 2}], b=[{'b': 6}, {'b': 5}])
+@@ -492,8 +492,8 @@ class SubForm(BaseModel):
+         field: int
+ 
+     class Form(BaseModel):
+-        field1: SubForm = Schema({'field': 2}, const=True)
+-        field2: List[SubForm] = Schema([{'field': 2}], const=True)
++        field1: SubForm = Field({'field': 2}, const=True)
++        field2: List[SubForm] = Field([{'field': 2}], const=True)
+ 
+     with pytest.raises(ValidationError) as exc_info:
+         # Fails
+@@ -780,8 +780,8 @@ class ModelB(BaseModel):
+ 
+ def test_dict_skip_defaults_populated_by_alias():
+     class MyModel(BaseModel):
+-        a: str = Schema('default', alias='alias_a')
+-        b: str = Schema('default', alias='alias_b')
++        a: str = Field('default', alias='alias_a')
++        b: str = Field('default', alias='alias_b')
+ 
+         class Config:
+             allow_population_by_alias = True
+@@ -794,8 +794,8 @@ class Config:
+ 
+ def test_dict_skip_defaults_populated_by_alias_with_extra():
+     class MyModel(BaseModel):
+-        a: str = Schema('default', alias='alias_a')
+-        b: str = Schema('default', alias='alias_b')
++        a: str = Field('default', alias='alias_a')
++        b: str = Field('default', alias='alias_b')
+ 
+         class Config:
+             extra = 'allow'
+@@ -821,7 +821,7 @@ class MyModel(BaseModel):
+ 
+ def test_dict_with_extra_keys():
+     class MyModel(BaseModel):
+-        a: str = Schema(None, alias='alias_a')
++        a: str = Field(None, alias='alias_a')
+ 
+         class Config:
+             extra = Extra.allow
+diff --git a/tests/test_parse.py b/tests/test_parse.py
+--- a/tests/test_parse.py
++++ b/tests/test_parse.py
+@@ -3,7 +3,7 @@
+ 
+ import pytest
+ 
+-from pydantic import BaseModel, Protocol, Schema, ValidationError
++from pydantic import BaseModel, Field, Protocol, ValidationError
+ 
+ 
+ class Model(BaseModel):
+@@ -120,11 +120,11 @@ def test_file_pickle_no_ext(tmpdir):
+ 
+ def test_const_differentiates_union():
+     class SubModelA(BaseModel):
+-        key: str = Schema('A', const=True)
++        key: str = Field('A', const=True)
+         foo: int
+ 
+     class SubModelB(BaseModel):
+-        key: str = Schema('B', const=True)
++        key: str = Field('B', const=True)
+         foo: int
+ 
+     class Model(BaseModel):
+diff --git a/tests/test_schema.py b/tests/test_schema.py
+--- a/tests/test_schema.py
++++ b/tests/test_schema.py
+@@ -11,7 +11,7 @@
+ 
+ import pytest
+ 
+-from pydantic import BaseModel, Extra, Schema, ValidationError, validator
++from pydantic import BaseModel, Extra, Field, ValidationError, validator
+ from pydantic.color import Color
+ from pydantic.networks import AnyUrl, EmailStr, IPvAnyAddress, IPvAnyInterface, IPvAnyNetwork, NameEmail, stricturl
+ from pydantic.schema import (
+@@ -142,8 +142,8 @@ class Bar(BaseModel):
+ 
+ def test_schema_class():
+     class Model(BaseModel):
+-        foo: int = Schema(4, title='Foo is Great')
+-        bar: str = Schema(..., description='this description of bar')
++        foo: int = Field(4, title='Foo is Great')
++        bar: str = Field(..., description='this description of bar')
+ 
+     with pytest.raises(ValidationError):
+         Model()
+@@ -163,14 +163,14 @@ class Model(BaseModel):
+ 
+ 
+ def test_schema_repr():
+-    s = Schema(4, title='Foo is Great')
+-    assert repr(s) == "Schema(default: 4, title: 'Foo is Great', extra: {})"
+-    assert str(s) == "Schema(default: 4, title: 'Foo is Great', extra: {})"
++    s = Field(4, title='Foo is Great')
++    assert repr(s) == "FieldInfo(default: 4, title: 'Foo is Great', extra: {})"
++    assert str(s) == "FieldInfo(default: 4, title: 'Foo is Great', extra: {})"
+ 
+ 
+ def test_schema_class_by_alias():
+     class Model(BaseModel):
+-        foo: int = Schema(4, alias='foofoo')
++        foo: int = Field(4, alias='foofoo')
+ 
+     assert list(Model.schema()['properties'].keys()) == ['foofoo']
+     assert list(Model.schema(by_alias=False)['properties'].keys()) == ['foo']
+@@ -187,7 +187,7 @@ class SpamEnum(str, Enum):
+     class Model(BaseModel):
+         foo: FooEnum
+         bar: BarEnum
+-        spam: SpamEnum = Schema(None)
++        spam: SpamEnum = Field(None)
+ 
+     assert Model.schema() == {
+         'type': 'object',
+@@ -287,7 +287,7 @@ class Model(BaseModel):
+ 
+ def test_const_str():
+     class Model(BaseModel):
+-        a: str = Schema('some string', const=True)
++        a: str = Field('some string', const=True)
+ 
+     assert Model.schema() == {
+         'title': 'Model',
+@@ -298,7 +298,7 @@ class Model(BaseModel):
+ 
+ def test_const_false():
+     class Model(BaseModel):
+-        a: str = Schema('some string', const=False)
++        a: str = Field('some string', const=False)
+ 
+     assert Model.schema() == {
+         'title': 'Model',
+@@ -1115,7 +1115,7 @@ class UserModel(BaseModel):
+ )
+ def test_constraints_schema(kwargs, type_, expected_extra):
+     class Foo(BaseModel):
+-        a: type_ = Schema('foo', title='A title', description='A description', **kwargs)
++        a: type_ = Field('foo', title='A title', description='A description', **kwargs)
+ 
+     expected_schema = {
+         'title': 'Foo',
+@@ -1142,7 +1142,7 @@ class Foo(BaseModel):
+ )
+ def test_not_constraints_schema(kwargs, type_, expected):
+     class Foo(BaseModel):
+-        a: type_ = Schema('foo', title='A title', description='A description', **kwargs)
++        a: type_ = Field('foo', title='A title', description='A description', **kwargs)
+ 
+     base_schema = {
+         'title': 'Foo',
+@@ -1190,7 +1190,7 @@ class Foo(BaseModel):
+ )
+ def test_constraints_schema_validation(kwargs, type_, value):
+     class Foo(BaseModel):
+-        a: type_ = Schema('foo', title='A title', description='A description', **kwargs)
++        a: type_ = Field('foo', title='A title', description='A description', **kwargs)
+ 
+     assert Foo(a=value)
+ 
+@@ -1217,7 +1217,7 @@ class Foo(BaseModel):
+ )
+ def test_constraints_schema_validation_raises(kwargs, type_, value):
+     class Foo(BaseModel):
+-        a: type_ = Schema('foo', title='A title', description='A description', **kwargs)
++        a: type_ = Field('foo', title='A title', description='A description', **kwargs)
+ 
+     with pytest.raises(ValidationError):
+         Foo(a=value)
+@@ -1225,7 +1225,7 @@ class Foo(BaseModel):
+ 
+ def test_schema_kwargs():
+     class Foo(BaseModel):
+-        a: str = Schema('foo', examples=['bar'])
++        a: str = Field('foo', examples=['bar'])
+ 
+     assert Foo.schema() == {
+         'title': 'Foo',
+diff --git a/tests/test_settings.py b/tests/test_settings.py
+--- a/tests/test_settings.py
++++ b/tests/test_settings.py
+@@ -3,7 +3,7 @@
+ 
+ import pytest
+ 
+-from pydantic import BaseModel, BaseSettings, NoneStr, Schema, ValidationError, dataclasses
++from pydantic import BaseModel, BaseSettings, Field, NoneStr, ValidationError, dataclasses
+ from pydantic.env_settings import SettingsError
+ 
+ 
+@@ -137,7 +137,7 @@ class Config:
+ 
+ def test_case_sensitive(monkeypatch):
+     class Settings(BaseSettings):
+-        foo: str = Schema(..., alias='foo')
++        foo: str = Field(..., alias='foo')
+ 
+         class Config:
+             case_sensitive = True

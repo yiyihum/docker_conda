@@ -1,0 +1,199 @@
+diff --git a/phys2bids/cli/run.py b/phys2bids/cli/run.py
+index a0ffbd3..8b9118c 100644
+--- a/phys2bids/cli/run.py
++++ b/phys2bids/cli/run.py
+@@ -110,8 +110,10 @@ def _get_parser():
+                           dest='thr',
+                           type=float,
+                           help='Threshold to use for trigger detection. '
+-                               'Default is 2.5.',
+-                          default=2.5)
++                               'If "ntp" and "TR" are specified, phys2bids automatically computes '
++                               'a threshold to detect the triggers. Use this parameter to set it '
++                               'manually',
++                               default=None)
+     optional.add_argument('-chnames', '--channel-names',
+                           dest='ch_name',
+                           nargs='*',
+diff --git a/phys2bids/phys2bids.py b/phys2bids/phys2bids.py
+index bed7050..4bf09d1 100644
+--- a/phys2bids/phys2bids.py
++++ b/phys2bids/phys2bids.py
+@@ -176,7 +176,7 @@ def use_heuristic(heur_file, sub, ses, filename, outdir, record_label=''):
+ 
+ def phys2bids(filename, info=False, indir='.', outdir='.', heur_file=None,
+               sub=None, ses=None, chtrig=0, chsel=None, num_timepoints_expected=0,
+-              tr=1, thr=2.5, ch_name=[], chplot='', debug=False, quiet=False):
++              tr=1, thr=None, ch_name=[], chplot='', debug=False, quiet=False):
+     """
+     Main workflow of phys2bids.
+     Runs the parser, does some checks on input, then imports
+@@ -259,13 +259,12 @@ def phys2bids(filename, info=False, indir='.', outdir='.', heur_file=None,
+     if info:
+         return
+ 
+-    # Run analysis on trigger channel to get first timepoint and the time offset.
+-    # #!# Get option of no trigger! (which is wrong practice or Respiract)
+-    phys_in.check_trigger_amount(chtrig, thr, num_timepoints_expected, tr)
+-
+     # Create trigger plot. If possible, to have multiple outputs in the same
+     # place, adds sub and ses label.
+-    if tr != 0 or num_timepoints_expected != 0:
++    if tr != 0 and num_timepoints_expected != 0:
++        # Run analysis on trigger channel to get first timepoint and the time offset.
++        # #!# Get option of no trigger! (which is wrong practice or Respiract)
++        phys_in.check_trigger_amount(chtrig, thr, num_timepoints_expected, tr)
+         LGR.info('Plot trigger')
+         plot_path = os.path.join(outdir,
+                                  os.path.splitext(os.path.basename(filename))[0])
+@@ -274,7 +273,7 @@ def phys2bids(filename, info=False, indir='.', outdir='.', heur_file=None,
+         if ses:
+             plot_path += f'_ses-{ses}'
+         viz.plot_trigger(phys_in.timeseries[0], phys_in.timeseries[chtrig],
+-                         plot_path, tr, thr, num_timepoints_expected, filename)
++                         plot_path, tr, phys_in.thr, num_timepoints_expected, filename)
+     else:
+         LGR.info('Not plotting trigger. If you want the trigger to be'
+                  ' plotted enter -tr or -ntp, preferably both.')
+@@ -348,7 +347,7 @@ def phys2bids(filename, info=False, indir='.', outdir='.', heur_file=None,
+                 outfile = f'{outfile}_{uniq_freq}'
+ 
+         LGR.info(f'Exporting files for freq {uniq_freq}')
+-        savetxt(outfile + '.tsv.gz', phys_out[uniq_freq].timeseries.T,
++        savetxt(outfile + '.tsv.gz', phys_out[uniq_freq].timeseries,
+                 fmt='%.8e', delimiter='\t')
+         print_json(outfile, phys_out[uniq_freq].freq,
+                    phys_out[uniq_freq].start_time,
+diff --git a/phys2bids/physio_obj.py b/phys2bids/physio_obj.py
+index 15fa8df..016872f 100644
+--- a/phys2bids/physio_obj.py
++++ b/phys2bids/physio_obj.py
+@@ -6,6 +6,7 @@ I/O objects for phys2bids.
+ """
+ 
+ import logging
++from itertools import groupby
+ 
+ import numpy as np
+ 
+@@ -101,9 +102,12 @@ class BlueprintInput():
+         in the output files.
+     units : (ch) list of strings
+         List of the units of the channels.
+-    num_timepoints_found: int
++    num_timepoints_found: int or None
+         Amount of timepoints found in the automatic count.
+-        This is computed internally, *if* check_trigger_amount() is run
++        This is initialised as "None" and then computed internally,
++        *if* check_trigger_amount() is run
++    thr: float
++        Threshold used by check_trigger_amount() to detect trigger points.
+ 
+     Methods
+     -------
+@@ -144,6 +148,7 @@ class BlueprintInput():
+                              self.ch_amount, 0.0)
+         self.ch_name = has_size(ch_name, self.ch_amount, 'unknown')
+         self.units = has_size(units, self.ch_amount, '[]')
++        self.num_timepoints_found = None
+ 
+     @property
+     def ch_amount(self):
+@@ -232,7 +237,7 @@ class BlueprintInput():
+         del self.ch_name[idx]
+         del self.units[idx]
+ 
+-    def check_trigger_amount(self, chtrig=1, thr=2.5, num_timepoints_expected=0, tr=0):
++    def check_trigger_amount(self, chtrig=1, thr=None, num_timepoints_expected=0, tr=0):
+         """
+         Counts trigger points and corrects time offset in
+         the list representing time.
+@@ -250,6 +255,8 @@ class BlueprintInput():
+         Notes
+         -----
+         Outcome:
++        self.thr: float
++            Threshold used by the function to detect trigger points.
+         self.num_timepoints_found: int
+             Property of the `BlueprintInput` class.
+             Contains the number of timepoints found
+@@ -259,11 +266,16 @@ class BlueprintInput():
+             the time of first trigger.
+         """
+         LGR.info('Counting trigger points')
+-        # Use first derivative of the trigger channel to find the TRs,
++        # Use the trigger channel to find the TRs,
+         # comparing it to a given threshold.
+-        trigger_deriv = np.diff(self.timeseries[chtrig])
+-        timepoints = trigger_deriv > thr
+-        num_timepoints_found = timepoints.sum()
++        trigger = self.timeseries[chtrig]
++        if thr is None:
++            thr = np.mean(trigger) + 2 * np.std(trigger)
++        timepoints = trigger > thr
++        num_timepoints_found = len([is_true for is_true, _ in groupby(timepoints,
++                                    lambda x: x != 0) if is_true])
++        LGR.info(f'The number of timepoints according to the std_thr method '
++                 f'is {num_timepoints_found}. The computed threshold is {thr}')
+         time_offset = self.timeseries[0][timepoints.argmax()]
+ 
+         if num_timepoints_expected:
+@@ -296,7 +308,7 @@ class BlueprintInput():
+         else:
+             LGR.warning('The necessary options to find the amount of timepoints '
+                         'were not provided.')
+-
++        self.thr = thr
+         self.timeseries[0] -= time_offset
+         self.num_timepoints_found = num_timepoints_found
+ 
+@@ -379,7 +391,7 @@ class BlueprintOutput():
+         int
+             Number of channels
+         """
+-        return len(self.timeseries)
++        return self.timeseries.shape[1]
+ 
+     def return_index(self, idx):
+         """
+@@ -397,7 +409,7 @@ class BlueprintOutput():
+             Tuple containing the proper list entry of all the
+             properties of the object with index `idx`
+         """
+-        return (self.timeseries[idx], self.ch_amount, self.freq,
++        return (self.timeseries[:, idx], self.ch_amount, self.freq,
+                 self.ch_name[idx], self.units[idx], self.start_time)
+ 
+     def delete_at_index(self, idx):
+@@ -423,7 +435,7 @@ class BlueprintOutput():
+             In all the property that are lists, the element correspondent to
+             `idx` gets deleted
+         """
+-        self.timeseries = np.delete(self.timeseries, idx, axis=0)
++        self.timeseries = np.delete(self.timeseries, idx, axis=1)
+         del self.ch_name[idx]
+         del self.units[idx]
+ 
+@@ -445,7 +457,7 @@ class BlueprintOutput():
+         cls: :obj: `BlueprintOutput`
+             Populated `BlueprintOutput` object.
+         """
+-        timeseries = np.asarray(blueprint.timeseries)
++        timeseries = np.asarray(blueprint.timeseries).T
+         freq = blueprint.freq[0]
+         ch_name = blueprint.ch_name
+         units = blueprint.units
+diff --git a/phys2bids/viz.py b/phys2bids/viz.py
+index 8d89411..4fb6970 100644
+--- a/phys2bids/viz.py
++++ b/phys2bids/viz.py
+@@ -66,7 +66,7 @@ def plot_trigger(time, trigger, fileprefix, tr, thr, num_timepoints_expected,
+     subplot.set_ylabel('Volts')
+     subplot.plot(time, trigger, '-', time, thrline, 'r-.', time, block, '-')
+     subplot.fill_between(time, block, where=block >= d, interpolate=True, color='#ffbb6e')
+-    subplot.legend(["trigger", "input threshold", "time block"], loc='upper right')
++    subplot.legend(["trigger", "Trigger detection threshold", "time block"], loc='upper right')
+     # plot the first spike according to the user threshold
+     subplot = fig.add_subplot(223)
+     subplot.set_xlim([-tr * 4, tr * 4])
+

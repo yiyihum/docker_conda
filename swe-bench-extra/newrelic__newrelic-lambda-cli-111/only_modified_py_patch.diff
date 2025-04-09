@@ -1,0 +1,154 @@
+diff --git a/newrelic_lambda_cli/cli/layers.py b/newrelic_lambda_cli/cli/layers.py
+index 9807f0e..7a8ab3f 100644
+--- a/newrelic_lambda_cli/cli/layers.py
++++ b/newrelic_lambda_cli/cli/layers.py
+@@ -63,6 +63,12 @@ def register(group):
+     help="Permit upgrade of function layers to new version.",
+     is_flag=True,
+ )
++@click.option(
++    "--enable-extension",
++    "-x",
++    help="Enable the New Relic Lambda Extension",
++    is_flag=True,
++)
+ @click.pass_context
+ def install(
+     ctx,
+@@ -74,6 +80,7 @@ def install(
+     excludes,
+     layer_arn,
+     upgrade,
++    enable_extension,
+ ):
+     """Install New Relic AWS Lambda Layers"""
+     session = boto3.Session(profile_name=aws_profile, region_name=aws_region)
+@@ -92,6 +99,7 @@ def install(
+                 layer_arn,
+                 nr_account_id,
+                 upgrade,
++                enable_extension,
+                 ctx.obj["VERBOSE"],
+             )
+             for function in functions
+diff --git a/newrelic_lambda_cli/layers.py b/newrelic_lambda_cli/layers.py
+index ce3d47a..55c2d1f 100644
+--- a/newrelic_lambda_cli/layers.py
++++ b/newrelic_lambda_cli/layers.py
+@@ -19,7 +19,9 @@ def index(region, runtime):
+     return layers_response.get("Layers", [])
+ 
+ 
+-def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
++def _add_new_relic(
++    config, region, layer_arn, account_id, allow_upgrade, enable_extension
++):
+     runtime = config["Configuration"]["Runtime"]
+     if runtime not in utils.RUNTIME_CONFIG:
+         failure(
+@@ -30,13 +32,20 @@ def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
+ 
+     handler = config["Configuration"]["Handler"]
+     runtime_handler = utils.RUNTIME_CONFIG.get(runtime, {}).get("Handler")
+-    if not allow_upgrade and handler == runtime_handler:
++
++    existing_newrelic_layer = [
++        layer["Arn"]
++        for layer in config["Configuration"].get("Layers", [])
++        if layer["Arn"].startswith(utils.get_arn_prefix(region))
++    ]
++
++    if not allow_upgrade and existing_newrelic_layer:
+         success(
+             "Already installed on function '%s'. Pass --upgrade (or -u) to allow "
+             "upgrade or reinstall to latest layer version."
+             % config["Configuration"]["FunctionArn"]
+         )
+-        return False
++        return True
+ 
+     existing_layers = [
+         layer["Arn"]
+@@ -45,6 +54,7 @@ def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
+     ]
+ 
+     new_relic_layers = []
++
+     if layer_arn:
+         new_relic_layers = [layer_arn]
+     else:
+@@ -80,7 +90,6 @@ def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
+ 
+     update_kwargs = {
+         "FunctionName": config["Configuration"]["FunctionArn"],
+-        "Handler": runtime_handler,
+         "Environment": {
+             "Variables": config["Configuration"]
+             .get("Environment", {})
+@@ -89,17 +98,34 @@ def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
+         "Layers": new_relic_layers + existing_layers,
+     }
+ 
++    # Only used by Python and Node.js runtimes
++    if runtime_handler:
++        update_kwargs["Handler"] = runtime_handler
++
+     # Update the account id
+     update_kwargs["Environment"]["Variables"]["NEW_RELIC_ACCOUNT_ID"] = str(account_id)
+ 
+     # Update the NEW_RELIC_LAMBDA_HANDLER envvars only when it's a new install.
+-    if handler != runtime_handler:
++    if runtime_handler and handler != runtime_handler:
+         update_kwargs["Environment"]["Variables"]["NEW_RELIC_LAMBDA_HANDLER"] = handler
+ 
++    if enable_extension:
++        update_kwargs["Environment"]["Variables"][
++            "NEW_RELIC_LAMBDA_EXTENSION_ENABLED"
++        ] = "true"
++
+     return update_kwargs
+ 
+ 
+-def install(session, function_arn, layer_arn, account_id, allow_upgrade, verbose):
++def install(
++    session,
++    function_arn,
++    layer_arn,
++    account_id,
++    allow_upgrade,
++    enable_extension,
++    verbose,
++):
+     client = session.client("lambda")
+     config = get_function(session, function_arn)
+     if not config:
+@@ -108,7 +134,9 @@ def install(session, function_arn, layer_arn, account_id, allow_upgrade, verbose
+ 
+     region = session.region_name
+ 
+-    update_kwargs = _add_new_relic(config, region, layer_arn, account_id, allow_upgrade)
++    update_kwargs = _add_new_relic(
++        config, region, layer_arn, account_id, allow_upgrade, enable_extension
++    )
+     if not update_kwargs:
+         return False
+ 
+diff --git a/newrelic_lambda_cli/utils.py b/newrelic_lambda_cli/utils.py
+index 547e915..4b9977c 100644
+--- a/newrelic_lambda_cli/utils.py
++++ b/newrelic_lambda_cli/utils.py
+@@ -8,8 +8,13 @@ from click.exceptions import Exit
+ 
+ NEW_RELIC_ARN_PREFIX_TEMPLATE = "arn:aws:lambda:%s:451483290750"
+ RUNTIME_CONFIG = {
++    "dotnetcore3.1": {},
++    "java11": {},
++    "java8.al2": {},
+     "nodejs10.x": {"Handler": "newrelic-lambda-wrapper.handler"},
+     "nodejs12.x": {"Handler": "newrelic-lambda-wrapper.handler"},
++    "provided": {},
++    "provided.al2": {},
+     "python2.7": {"Handler": "newrelic_lambda_wrapper.handler"},
+     "python3.6": {"Handler": "newrelic_lambda_wrapper.handler"},
+     "python3.7": {"Handler": "newrelic_lambda_wrapper.handler"},
+

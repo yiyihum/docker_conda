@@ -1,0 +1,104 @@
+diff --git a/Lib/gftools/gfgithub.py b/Lib/gftools/gfgithub.py
+index 7fddd37..38d36f2 100644
+--- a/Lib/gftools/gfgithub.py
++++ b/Lib/gftools/gfgithub.py
+@@ -4,7 +4,7 @@ import requests
+ import typing
+ import urllib
+ import time
+-
++from gftools.utils import github_user_repo
+ 
+ GITHUB_GRAPHQL_API = "https://api.github.com/graphql"
+ GITHUB_V3_REST_API = "https://api.github.com"
+@@ -18,6 +18,11 @@ class GitHubClient:
+         self.repo_owner = repo_owner
+         self.repo_name = repo_name
+ 
++    @classmethod
++    def from_url(cls, url):
++        user, repo = github_user_repo(url)
++        return cls(user, repo)
++
+     def _post(self, url, payload: typing.Dict):
+         headers = {"Authorization": f"bearer {self.gh_token}"}
+         response = requests.post(url, json=payload, headers=headers)
+@@ -87,7 +92,12 @@ class GitHubClient:
+             self.rest_url("pulls", state="open", head=pr_head, base=pr_base_branch)
+         )
+ 
+-    def create_pr(self, title: str, body: str, head: str, base: str, draft: bool = False):
++    def get_commit(self, ref: str):
++        return self._get(self.rest_url(f"commits/{ref}"))
++
++    def create_pr(
++        self, title: str, body: str, head: str, base: str, draft: bool = False
++    ):
+         return self._post(
+             self.rest_url("pulls"),
+             {
+@@ -96,7 +106,7 @@ class GitHubClient:
+                 "head": head,
+                 "base": base,
+                 "maintainer_can_modify": True,
+-                "draft": draft
++                "draft": draft,
+             },
+         )
+ 
+diff --git a/Lib/gftools/packager.py b/Lib/gftools/packager.py
+index 7ba1d53..1cae84a 100644
+--- a/Lib/gftools/packager.py
++++ b/Lib/gftools/packager.py
+@@ -173,20 +173,14 @@ def load_metadata(fp: "Path | str"):
+                     item.source_file = src
+                     item.dest_file = dst
+                     metadata.source.files.append(item)
+-
+-    metadata.source.repository_url = re.sub(
+-        r"\.git$", "", metadata.source.repository_url
+-    )
+     return metadata
+ 
+ 
+ def save_metadata(fp: Path, metadata: fonts_pb2.FamilyProto):
+     """Save METADATA.pb file and delete old upstream.yaml file."""
+-    _, _, _, user, repo = metadata.source.repository_url.split("/")
+-    github = GitHubClient(user, repo)
+-    url = github.rest_url(f"commits/{metadata.source.branch}")
+-    resp = github._get(url)
+-    git_commit = resp["sha"]
++    github = GitHubClient.from_url(metadata.source.repository_url)
++    commit = github.get_commit(metadata.source.branch)
++    git_commit = commit["sha"]
+     metadata.source.commit = git_commit
+     language_comments = fonts.LanguageComments(LoadLanguages())
+     fonts.WriteProto(metadata, fp, comments=language_comments)
+@@ -219,8 +213,7 @@ def download_assets(
+     metadata: fonts_pb2.FamilyProto, out: Path, latest_release: bool = False
+ ) -> List[str]:
+     """Download assets listed in the metadata's source field"""
+-    _, _, _, owner, repo = metadata.source.repository_url.split("/")
+-    upstream = GitHubClient(owner, repo)
++    upstream = GitHubClient.from_url(metadata.source.repository_url)
+     res = []
+     # Getting files from an archive always takes precedence over a
+     # repo dir
+diff --git a/Lib/gftools/utils.py b/Lib/gftools/utils.py
+index b57e23b..1cfa0f4 100644
+--- a/Lib/gftools/utils.py
++++ b/Lib/gftools/utils.py
+@@ -643,3 +643,13 @@ def shell_quote(s: Union[str, Path]) -> str:
+         return subprocess.list2cmdline([s])
+     else:
+         return shlex.quote(s)
++
++
++def github_user_repo(github_url):
++    pattern = r'https?://github\.com/(?P<user>[^/]+)/(?P<repo>[^/^.]+)'
++    match = re.search(pattern, github_url)
++    if not match:
++        raise ValueError(
++            f"Cannot extract github user and repo name from url '{github_url}'."
++        )
++    return match.group('user'), match.group('repo')

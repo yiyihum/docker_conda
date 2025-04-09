@@ -1,0 +1,302 @@
+diff --git a/tests/test_sync.py b/tests/test_sync.py
+index 5a4b342..911e719 100644
+--- a/tests/test_sync.py
++++ b/tests/test_sync.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import multiprocessing
+ import threading
+ import time
+ from concurrent.futures import ThreadPoolExecutor
+@@ -279,11 +280,10 @@ def test_thread_sensitive_outside_sync():
+         await inner()
+ 
+     # Inner sync function
++    @sync_to_async
+     def inner():
+         result["thread"] = threading.current_thread()
+ 
+-    inner = sync_to_async(inner, thread_sensitive=True)
+-
+     # Run it
+     middle()
+     assert result["thread"] == threading.current_thread()
+@@ -300,22 +300,20 @@ async def test_thread_sensitive_outside_async():
+     result_2 = {}
+ 
+     # Outer sync function
++    @sync_to_async
+     def outer(result):
+         middle(result)
+ 
+-    outer = sync_to_async(outer, thread_sensitive=True)
+-
+     # Middle async function
+     @async_to_sync
+     async def middle(result):
+         await inner(result)
+ 
+     # Inner sync function
++    @sync_to_async
+     def inner(result):
+         result["thread"] = threading.current_thread()
+ 
+-    inner = sync_to_async(inner, thread_sensitive=True)
+-
+     # Run it (in supposed parallel!)
+     await asyncio.wait([outer(result_1), inner(result_2)])
+ 
+@@ -338,22 +336,20 @@ def test_thread_sensitive_double_nested_sync():
+         await level2()
+ 
+     # Sync level 2
++    @sync_to_async
+     def level2():
+         level3()
+ 
+-    level2 = sync_to_async(level2, thread_sensitive=True)
+-
+     # Async level 3
+     @async_to_sync
+     async def level3():
+         await level4()
+ 
+     # Sync level 2
++    @sync_to_async
+     def level4():
+         result["thread"] = threading.current_thread()
+ 
+-    level4 = sync_to_async(level4, thread_sensitive=True)
+-
+     # Run it
+     level1()
+     assert result["thread"] == threading.current_thread()
+@@ -369,22 +365,20 @@ async def test_thread_sensitive_double_nested_async():
+     result = {}
+ 
+     # Sync level 1
++    @sync_to_async
+     def level1():
+         level2()
+ 
+-    level1 = sync_to_async(level1, thread_sensitive=True)
+-
+     # Async level 2
+     @async_to_sync
+     async def level2():
+         await level3()
+ 
+     # Sync level 3
++    @sync_to_async
+     def level3():
+         level4()
+ 
+-    level3 = sync_to_async(level3, thread_sensitive=True)
+-
+     # Async level 4
+     @async_to_sync
+     async def level4():
+@@ -395,6 +389,29 @@ async def test_thread_sensitive_double_nested_async():
+     assert result["thread"] == threading.current_thread()
+ 
+ 
++def test_thread_sensitive_disabled():
++    """
++    Tests that we can disable thread sensitivity and make things run in
++    separate threads.
++    """
++
++    result = {}
++
++    # Middle async function
++    @async_to_sync
++    async def middle():
++        await inner()
++
++    # Inner sync function
++    @sync_to_async(thread_sensitive=False)
++    def inner():
++        result["thread"] = threading.current_thread()
++
++    # Run it
++    middle()
++    assert result["thread"] != threading.current_thread()
++
++
+ class ASGITest(TestCase):
+     """
+     Tests collection of async cases inside classes
+@@ -415,3 +432,32 @@ def test_sync_to_async_detected_as_coroutinefunction():
+ 
+     assert not asyncio.iscoroutinefunction(sync_to_async)
+     assert asyncio.iscoroutinefunction(sync_to_async(sync_func))
++
++
++@pytest.mark.asyncio
++async def test_multiprocessing():
++    """
++    Tests that a forked process can use async_to_sync without it looking for
++    the event loop from the parent process.
++    """
++
++    test_queue = multiprocessing.Queue()
++
++    async def async_process():
++        test_queue.put(42)
++
++    def sync_process():
++        """Runs async_process synchronously"""
++        async_to_sync(async_process)()
++
++    def fork_first():
++        """Forks process before running sync_process"""
++        fork = multiprocessing.Process(target=sync_process)
++        fork.start()
++        fork.join(3)
++        # Force cleanup in failed test case
++        if fork.is_alive():
++            fork.terminate()
++        return test_queue.get(True, 1)
++
++    assert await sync_to_async(fork_first)() == 42
+diff --git a/tests/test_wsgi.py b/tests/test_wsgi.py
+index 3490573..6dcee1c 100644
+--- a/tests/test_wsgi.py
++++ b/tests/test_wsgi.py
+@@ -1,3 +1,5 @@
++import sys
++
+ import pytest
+ 
+ from asgiref.testing import ApplicationCommunicator
+@@ -126,6 +128,130 @@ async def test_wsgi_empty_body():
+     assert (await instance.receive_output(1)) == {"type": "http.response.body"}
+ 
+ 
++@pytest.mark.asyncio
++async def test_wsgi_clamped_body():
++    """
++    Makes sure WsgiToAsgi clamps a body response longer than Content-Length
++    """
++
++    def wsgi_application(environ, start_response):
++        start_response("200 OK", [("Content-Length", "8")])
++        return [b"0123", b"45", b"6789"]
++
++    application = WsgiToAsgi(wsgi_application)
++    instance = ApplicationCommunicator(
++        application,
++        {
++            "type": "http",
++            "http_version": "1.0",
++            "method": "GET",
++            "path": "/",
++            "query_string": b"",
++            "headers": [],
++        },
++    )
++    await instance.send_input({"type": "http.request"})
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.start",
++        "status": 200,
++        "headers": [(b"content-length", b"8")],
++    }
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.body",
++        "body": b"0123",
++        "more_body": True,
++    }
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.body",
++        "body": b"45",
++        "more_body": True,
++    }
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.body",
++        "body": b"67",
++        "more_body": True,
++    }
++    assert (await instance.receive_output(1)) == {"type": "http.response.body"}
++
++
++@pytest.mark.asyncio
++async def test_wsgi_stops_iterating_after_content_length_bytes():
++    """
++    Makes sure WsgiToAsgi does not iterate after than Content-Length bytes
++    """
++
++    def wsgi_application(environ, start_response):
++        start_response("200 OK", [("Content-Length", "4")])
++        yield b"0123"
++        pytest.fail("WsgiToAsgi should not iterate after Content-Length bytes")
++        yield b"4567"
++
++    application = WsgiToAsgi(wsgi_application)
++    instance = ApplicationCommunicator(
++        application,
++        {
++            "type": "http",
++            "http_version": "1.0",
++            "method": "GET",
++            "path": "/",
++            "query_string": b"",
++            "headers": [],
++        },
++    )
++    await instance.send_input({"type": "http.request"})
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.start",
++        "status": 200,
++        "headers": [(b"content-length", b"4")],
++    }
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.body",
++        "body": b"0123",
++        "more_body": True,
++    }
++    assert (await instance.receive_output(1)) == {"type": "http.response.body"}
++
++
++@pytest.mark.asyncio
++async def test_wsgi_multiple_start_response():
++    """
++    Makes sure WsgiToAsgi only keep Content-Length from the last call to start_response
++    """
++
++    def wsgi_application(environ, start_response):
++        start_response("200 OK", [("Content-Length", "5")])
++        try:
++            raise ValueError("Application Error")
++        except ValueError:
++            start_response("500 Server Error", [], sys.exc_info())
++            return [b"Some long error message"]
++
++    application = WsgiToAsgi(wsgi_application)
++    instance = ApplicationCommunicator(
++        application,
++        {
++            "type": "http",
++            "http_version": "1.0",
++            "method": "GET",
++            "path": "/",
++            "query_string": b"",
++            "headers": [],
++        },
++    )
++    await instance.send_input({"type": "http.request"})
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.start",
++        "status": 500,
++        "headers": [],
++    }
++    assert (await instance.receive_output(1)) == {
++        "type": "http.response.body",
++        "body": b"Some long error message",
++        "more_body": True,
++    }
++    assert (await instance.receive_output(1)) == {"type": "http.response.body"}
++
++
+ @pytest.mark.asyncio
+ async def test_wsgi_multi_body():
+     """

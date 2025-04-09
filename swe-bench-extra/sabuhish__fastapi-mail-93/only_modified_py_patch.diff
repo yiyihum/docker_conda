@@ -1,0 +1,96 @@
+diff --git a/fastapi_mail/msg.py b/fastapi_mail/msg.py
+index cc92b34..183148d 100644
+--- a/fastapi_mail/msg.py
++++ b/fastapi_mail/msg.py
+@@ -41,12 +41,14 @@ class MailMsg:
+         return MIMEText(text, _subtype=subtype, _charset=self.charset)
+ 
+     async def attach_file(self, message, attachment):
+-
+-        print(attachment)
+-
+-        for file in attachment:
+-
+-            part = MIMEBase(_maintype='application', _subtype='octet-stream')
++        """Creates a MIMEBase object"""
++        for file, file_meta in attachment:
++            if file_meta and 'mime_type' in file_meta and 'mime_subtype' in file_meta:
++                part = MIMEBase(
++                    _maintype=file_meta['mime_type'], _subtype=file_meta['mime_subtype']
++                )
++            else:
++                part = MIMEBase(_maintype='application', _subtype='octet-stream')
+ 
+             part.set_payload(await file.read())
+             encode_base64(part)
+@@ -62,7 +64,9 @@ class MailMsg:
+             filename = ('UTF8', '', filename)
+ 
+             part.add_header('Content-Disposition', 'attachment', filename=filename)
+-
++            if file_meta and 'headers' in file_meta:
++                for header in file_meta['headers'].keys():
++                    part.add_header(header, file_meta['headers'][header])
+             self.message.attach(part)
+ 
+     async def _message(self, sender):
+diff --git a/fastapi_mail/schemas.py b/fastapi_mail/schemas.py
+index 18ff8f9..1fcdde2 100644
+--- a/fastapi_mail/schemas.py
++++ b/fastapi_mail/schemas.py
+@@ -1,7 +1,7 @@
+ import os
+ from enum import Enum
+ from mimetypes import MimeTypes
+-from typing import Any, Dict, List, Optional, Union
++from typing import Dict, List, Optional, Union
+ 
+ from pydantic import BaseModel, EmailStr, validator
+ from starlette.datastructures import UploadFile
+@@ -29,7 +29,7 @@ class MultipartSubtypeEnum(Enum):
+ 
+ class MessageSchema(BaseModel):
+     recipients: List[EmailStr]
+-    attachments: List[Any] = []
++    attachments: List[Union[UploadFile, Dict, str]] = []
+     subject: str = ''
+     body: Optional[Union[str, list]] = None
+     template_body: Optional[Union[list, dict]] = None
+@@ -47,17 +47,25 @@ class MessageSchema(BaseModel):
+         mime = MimeTypes()
+ 
+         for file in v:
++            file_meta = None
++            if isinstance(file, dict):
++                keys = file.keys()
++                if 'file' not in keys:
++                    raise WrongFile('missing "file" key')
++                file_meta = dict.copy(file)
++                del file_meta['file']
++                file = file['file']
+             if isinstance(file, str):
+                 if os.path.isfile(file) and os.access(file, os.R_OK) and validate_path(file):
+                     mime_type = mime.guess_type(file)
+                     f = open(file, mode='rb')
+                     _, file_name = os.path.split(f.name)
+                     u = UploadFile(file_name, f, content_type=mime_type[0])
+-                    temp.append(u)
++                    temp.append((u, file_meta))
+                 else:
+                     raise WrongFile('incorrect file path for attachment or not readable')
+             elif isinstance(file, UploadFile):
+-                temp.append(file)
++                temp.append((file, file_meta))
+             else:
+                 raise WrongFile('attachments field type incorrect, must be UploadFile or path')
+         return temp
+@@ -69,6 +77,9 @@ class MessageSchema(BaseModel):
+             return 'html'
+         return value
+ 
++    class Config:
++        arbitrary_types_allowed = True
++
+ 
+ def validate_path(path):
+     cur_dir = os.path.abspath(os.curdir)

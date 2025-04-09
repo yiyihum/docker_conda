@@ -1,0 +1,193 @@
+diff --git a/requirements.txt b/requirements.txt
+index 05c3420..f1c41ee 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -4,4 +4,4 @@ daiquiri
+ pluggy>=0.8.0
+ pygithub
+ python-gitlab==1.8.0
+-repobee-plug==0.8.0
++repobee-plug==0.9.0
+diff --git a/setup.py b/setup.py
+index 7e8c9fd..39587b7 100644
+--- a/setup.py
++++ b/setup.py
+@@ -23,7 +23,7 @@ required = [
+     "daiquiri",
+     "pygithub",
+     "colored",
+-    "repobee-plug==0.8.0",
++    "repobee-plug==0.9.0",
+     "python-gitlab==1.8.0",
+ ]
+ 
+diff --git a/src/_repobee/cli.py b/src/_repobee/cli.py
+index 43d6979..e43b0b5 100644
+--- a/src/_repobee/cli.py
++++ b/src/_repobee/cli.py
+@@ -30,6 +30,7 @@ from _repobee import util
+ from _repobee import exception
+ from _repobee import config
+ from _repobee import constants
++from _repobee import formatters
+ 
+ try:
+     os.makedirs(str(constants.LOG_DIR), exist_ok=True)
+@@ -282,6 +283,7 @@ def dispatch_command(
+         ext_commands: A list of active extension commands.
+     """
+     ext_command_names = [cmd.name for cmd in ext_commands or []]
++    hook_results = {}
+     if ext_command_names and args.subparser in ext_command_names:
+         ext_cmd = ext_commands[ext_command_names.index(args.subparser)]
+         with _sys_exit_on_expected_error():
+@@ -311,7 +313,9 @@ def dispatch_command(
+             command.migrate_repos(args.master_repo_urls, api)
+     elif args.subparser == CLONE_PARSER:
+         with _sys_exit_on_expected_error():
+-            command.clone_repos(args.master_repo_names, args.students, api)
++            hook_results = command.clone_repos(
++                args.master_repo_names, args.students, api
++            )
+     elif args.subparser == VERIFY_PARSER:
+         with _sys_exit_on_expected_error():
+             plug.manager.hook.get_api_class().verify_settings(
+@@ -364,6 +368,25 @@ def dispatch_command(
+             "This is a bug, please open an issue.".format(args.subparser)
+         )
+ 
++    if hook_results:
++        _handle_hook_results(
++            hook_results=hook_results, filepath=args.hook_results_file
++        )
++
++
++def _handle_hook_results(hook_results, filepath):
++    LOGGER.info(formatters.format_hook_results_output(hook_results))
++    if filepath:
++        LOGGER.warning(
++            "Storing hook results to file is a beta feature, the file format "
++            "is not final"
++        )
++        output_file = pathlib.Path(filepath)
++        util.atomic_write(
++            plug.result_mapping_to_json(hook_results), output_file
++        )
++        LOGGER.info("Hook results stored to {}".format(filepath))
++
+ 
+ def _add_peer_review_parsers(base_parsers, subparsers):
+     assign_parser = subparsers.add_parser(
+@@ -762,6 +785,13 @@ def _add_subparsers(parser, show_all_opts, ext_commands):
+         parents=[base_parser, base_student_parser, repo_name_parser],
+         formatter_class=_OrderedFormatter,
+     )
++    clone.add_argument(
++        "--hook-results-file",
++        help="Path to a file to store results from plugin hooks in. The "
++        "results are stored as JSON, regardless of file extension.",
++        type=str,
++        default=None,
++    )
+ 
+     plug.manager.hook.clone_parser_hook(clone_parser=clone)
+ 
+diff --git a/src/_repobee/command.py b/src/_repobee/command.py
+index 7b9e50e..ae5b14c 100644
+--- a/src/_repobee/command.py
++++ b/src/_repobee/command.py
+@@ -18,7 +18,7 @@ import shutil
+ import os
+ import sys
+ import tempfile
+-from typing import Iterable, List, Optional, Tuple, Generator
++from typing import Iterable, List, Optional, Tuple, Generator, Mapping
+ from colored import bg, fg, style
+ 
+ import daiquiri
+@@ -343,7 +343,7 @@ def close_issue(
+ 
+ def clone_repos(
+     master_repo_names: Iterable[str], teams: Iterable[plug.Team], api: plug.API
+-) -> None:
++) -> Mapping[str, List[plug.HookResult]]:
+     """Clone all student repos related to the provided master repos and student
+     teams.
+ 
+@@ -352,6 +352,8 @@ def clone_repos(
+         teams: An iterable of student teams.
+         api: An implementation of :py:class:`repobee_plug.API` used to
+             interface with the platform (e.g. GitHub or GitLab) instance.
++    Returns:
++        A mapping from repo name to a list of hook results.
+     """
+     repo_urls = api.get_repo_urls(master_repo_names, teams=teams)
+     # the reason we first compute the urls and then extract repo names is that
+@@ -374,8 +376,8 @@ def clone_repos(
+     for plugin in plug.manager.get_plugins():
+         if "act_on_cloned_repo" in dir(plugin):
+             repo_names = util.generate_repo_names(teams, master_repo_names)
+-            _execute_post_clone_hooks(repo_names, api)
+-            break
++            return _execute_post_clone_hooks(repo_names, api)
++    return {}
+ 
+ 
+ def _clone_repos_no_check(repo_urls, dst_dirpath, api):
+@@ -400,7 +402,9 @@ def _clone_repos_no_check(repo_urls, dst_dirpath, api):
+     return [repo.name for repo in cloned_repos]
+ 
+ 
+-def _execute_post_clone_hooks(repo_names: List[str], api: plug.API):
++def _execute_post_clone_hooks(
++    repo_names: List[str], api: plug.API
++) -> Mapping[str, List[plug.HookResult]]:
+     LOGGER.info("Executing post clone hooks on repos")
+     local_repos = [name for name in os.listdir() if name in repo_names]
+ 
+@@ -411,9 +415,8 @@ def _execute_post_clone_hooks(repo_names: List[str], api: plug.API):
+             path=os.path.abspath(repo_name), api=api
+         )
+         results[repo_name] = res
+-    LOGGER.info(formatters.format_hook_results_output(results))
+ 
+-    LOGGER.info("Post clone hooks done")
++    return results
+ 
+ 
+ def migrate_repos(master_repo_urls: Iterable[str], api: plug.API) -> None:
+diff --git a/src/_repobee/util.py b/src/_repobee/util.py
+index 9adaa95..e4678f9 100644
+--- a/src/_repobee/util.py
++++ b/src/_repobee/util.py
+@@ -9,6 +9,8 @@
+ import os
+ import sys
+ import pathlib
++import shutil
++import tempfile
+ from typing import Iterable, Generator, Union, Set
+ 
+ from repobee_plug import apimeta
+@@ -135,3 +137,21 @@ def find_files_by_extension(
+         for file in files:
+             if _ends_with_ext(file, extensions):
+                 yield pathlib.Path(cwd) / file
++
++
++def atomic_write(content: str, dst: pathlib.Path) -> None:
++    """Write the given contents to the destination "atomically". Achieved by
++    writin in a temporary directory and then moving the file to the
++    destination.
++
++    Args:
++        content: The content to write to the new file.
++        dst: Path to the file.
++    """
++    with tempfile.TemporaryDirectory() as tmpdir:
++        with tempfile.NamedTemporaryFile(
++            delete=False, dir=tmpdir, mode="w"
++        ) as file:
++            file.write(content)
++
++        shutil.move(file.name, str(dst))

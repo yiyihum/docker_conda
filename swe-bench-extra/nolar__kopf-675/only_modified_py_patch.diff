@@ -1,0 +1,172 @@
+diff --git a/kopf/reactor/daemons.py b/kopf/reactor/daemons.py
+index f083e6a..240330e 100644
+--- a/kopf/reactor/daemons.py
++++ b/kopf/reactor/daemons.py
+@@ -25,6 +25,8 @@ import time
+ import warnings
+ from typing import Collection, List, Mapping, MutableMapping, Sequence
+ 
++import aiojobs
++
+ from kopf.engines import loggers
+ from kopf.reactor import causation, effects, handling, lifecycles
+ from kopf.storage import states
+@@ -209,31 +211,71 @@ async def daemon_killer(
+         *,
+         settings: configuration.OperatorSettings,
+         memories: containers.ResourceMemories,
++        freeze_checker: primitives.ToggleSet,
+ ) -> None:
+     """
+-    An operator's root task to kill the daemons on the operator's shutdown.
+-    """
++    An operator's root task to kill the daemons on the operator's demand.
++
++    The "demand" comes in two cases: when the operator is exiting (gracefully
++    or not), and when the operator is pausing because of peering. In that case,
++    all watch-streams are disconnected, and all daemons/timers should stop.
++
++    When pausing, the daemons/timers are stopped via their regular stopping
++    procedure: with graceful or forced termination, backoffs, timeouts.
++
++    .. warning::
++
++        Each daemon will be respawned on the next K8s watch-event strictly
++        after the previous daemon is fully stopped.
++        There are never 2 instances of the same daemon running in parallel.
+ 
+-    # Sleep forever, or until cancelled, which happens when the operator begins its shutdown.
++        In normal cases (enough time is given to stop), this is usually done
++        by the post-freeze re-listing event. In rare cases when the unfreeze
++        happens faster than the daemon is stopped (highly unlikely to happen),
++        that event can be missed because the daemon is being stopped yet,
++        so the respawn can happen with a significant delay.
++
++        This issue is considered low-priority & auxiliary, so as the peering
++        itself. It can be fixed later. Workaround: make daemons to exit fast.
++    """
++    # Unlimited job pool size —- the same as if we would be managing the tasks directly.
++    # Unlimited timeout in `close()` -- since we have our own per-daemon timeout management.
++    scheduler: aiojobs.Scheduler = await aiojobs.create_scheduler(limit=None, close_timeout=99999)
+     try:
+-        await asyncio.Event().wait()
++        while True:
++
++            # Stay here while the operator is running normally, until it is frozen.
++            await freeze_checker.wait_for(True)
++
++            # The stopping tasks are "fire-and-forget" -- we do not get (or care of) the result.
++            # The daemons remain resumable, since they exit not on their own accord.
++            for memory in memories.iter_all_memories():
++                for daemon in memory.running_daemons.values():
++                    await scheduler.spawn(stop_daemon(
++                        settings=settings,
++                        daemon=daemon,
++                        reason=primitives.DaemonStoppingReason.OPERATOR_PAUSING))
++
++            # Stay here while the operator is frozen, until it is resumed.
++            # The fresh stream of watch-events will spawn new daemons naturally.
++            await freeze_checker.wait_for(False)
+ 
+     # Terminate all running daemons when the operator exits (and this task is cancelled).
+     finally:
+-        tasks = [
+-            aiotasks.create_task(
+-                name=f"stop daemon {daemon.handler.id}",
+-                coro=stop_daemon(daemon=daemon, settings=settings))
+-            for memory in memories.iter_all_memories()
+-            for daemon in memory.running_daemons.values()
+-        ]
+-        await aiotasks.wait(tasks)
++        for memory in memories.iter_all_memories():
++            for daemon in memory.running_daemons.values():
++                await scheduler.spawn(stop_daemon(
++                    settings=settings,
++                    daemon=daemon,
++                    reason=primitives.DaemonStoppingReason.OPERATOR_EXITING))
++        await scheduler.close()
+ 
+ 
+ async def stop_daemon(
+         *,
+         settings: configuration.OperatorSettings,
+         daemon: containers.Daemon,
++        reason: primitives.DaemonStoppingReason,
+ ) -> None:
+     """
+     Stop a single daemon.
+@@ -255,7 +297,7 @@ async def stop_daemon(
+         raise RuntimeError(f"Unsupported daemon handler: {handler!r}")
+ 
+     # Whatever happens with other flags & logs & timings, this flag must be surely set.
+-    daemon.stopper.set(reason=primitives.DaemonStoppingReason.OPERATOR_EXITING)
++    daemon.stopper.set(reason=reason)
+     await _wait_for_instant_exit(settings=settings, daemon=daemon)
+ 
+     if daemon.task.done():
+@@ -336,7 +378,7 @@ async def _runner(
+     finally:
+ 
+         # Prevent future re-spawns for those exited on their own, for no reason.
+-        # Only the filter-mismatching daemons can be re-spawned on future events.
++        # Only the filter-mismatching or peering-frozen daemons can be re-spawned.
+         if stopper.reason == primitives.DaemonStoppingReason.NONE:
+             memory.forever_stopped.add(handler.id)
+ 
+diff --git a/kopf/reactor/orchestration.py b/kopf/reactor/orchestration.py
+index ec0b426..3271581 100644
+--- a/kopf/reactor/orchestration.py
++++ b/kopf/reactor/orchestration.py
+@@ -87,8 +87,8 @@ async def ochestrator(
+         settings: configuration.OperatorSettings,
+         identity: peering.Identity,
+         insights: references.Insights,
++        freeze_checker: primitives.ToggleSet,
+ ) -> None:
+-    freeze_checker = primitives.ToggleSet()
+     freeze_blocker = await freeze_checker.make_toggle(name='peering CRD is absent')
+     ensemble = Ensemble(freeze_blocker=freeze_blocker, freeze_checker=freeze_checker)
+     try:
+diff --git a/kopf/reactor/running.py b/kopf/reactor/running.py
+index e66ea48..3c0b33f 100644
+--- a/kopf/reactor/running.py
++++ b/kopf/reactor/running.py
+@@ -177,6 +177,7 @@ async def spawn_tasks(
+     event_queue: posting.K8sEventQueue = asyncio.Queue()
+     signal_flag: aiotasks.Future = asyncio.Future()
+     started_flag: asyncio.Event = asyncio.Event()
++    freeze_checker = primitives.ToggleSet()
+     tasks: MutableSequence[aiotasks.Task] = []
+ 
+     # Map kwargs into the settings object.
+@@ -223,7 +224,8 @@ async def spawn_tasks(
+         name="daemon killer", flag=started_flag, logger=logger,
+         coro=daemons.daemon_killer(
+             settings=settings,
+-            memories=memories)))
++            memories=memories,
++            freeze_checker=freeze_checker)))
+ 
+     # Keeping the credentials fresh and valid via the authentication handlers on demand.
+     tasks.append(aiotasks.create_guarded_task(
+@@ -281,6 +283,7 @@ async def spawn_tasks(
+                 settings=settings,
+                 insights=insights,
+                 identity=identity,
++                freeze_checker=freeze_checker,
+                 processor=functools.partial(processing.process_resource_event,
+                                             lifecycle=lifecycle,
+                                             registry=registry,
+diff --git a/kopf/structs/primitives.py b/kopf/structs/primitives.py
+index 9980aba..d0d7476 100644
+--- a/kopf/structs/primitives.py
++++ b/kopf/structs/primitives.py
+@@ -230,6 +230,7 @@ class DaemonStoppingReason(enum.Flag):
+     DONE = enum.auto()  # whatever the reason and the status, the asyncio task has exited.
+     FILTERS_MISMATCH = enum.auto()  # the resource does not match the filters anymore.
+     RESOURCE_DELETED = enum.auto()  # the resource was deleted, the asyncio task is still awaited.
++    OPERATOR_PAUSING = enum.auto()  # the operator is pausing, the asyncio task is still awaited.
+     OPERATOR_EXITING = enum.auto()  # the operator is exiting, the asyncio task is still awaited.
+     DAEMON_SIGNALLED = enum.auto()  # the stopper flag was set, the asyncio task is still awaited.
+     DAEMON_CANCELLED = enum.auto()  # the asyncio task was cancelled, the thread can be running.
+

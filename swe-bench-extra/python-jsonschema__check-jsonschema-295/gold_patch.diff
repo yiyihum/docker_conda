@@ -1,0 +1,119 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index a8df1f5..0214083 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -20,6 +20,9 @@ Unreleased
+   non-JSON format supported by `check-jsonschema`. The file type is inferred
+   only from the file extension in these cases and defaults to JSON if there is
+   no recognizable extension.
++- Remote schemafiles (http/s) now support YAML, TOML, and JSON5 formats, if the
++  URL ends with the appropriate extension and the matching parser is available.
++  Extensionless URLs are treated as JSON.
+ 
+ 0.23.3
+ ------
+diff --git a/src/check_jsonschema/checker.py b/src/check_jsonschema/checker.py
+index bf1aea0..28931d5 100644
+--- a/src/check_jsonschema/checker.py
++++ b/src/check_jsonschema/checker.py
+@@ -48,7 +48,7 @@ class SchemaChecker:
+ 
+     def get_validator(
+         self, path: pathlib.Path, doc: dict[str, t.Any]
+-    ) -> jsonschema.Validator:
++    ) -> jsonschema.protocols.Validator:
+         try:
+             return self._schema_loader.get_validator(
+                 path, doc, self._format_opts, self._fill_defaults
+diff --git a/src/check_jsonschema/schema_loader/main.py b/src/check_jsonschema/schema_loader/main.py
+index c8c9045..4fa1c57 100644
+--- a/src/check_jsonschema/schema_loader/main.py
++++ b/src/check_jsonschema/schema_loader/main.py
+@@ -17,7 +17,7 @@ from .resolver import make_reference_registry
+ 
+ 
+ def _extend_with_default(
+-    validator_class: type[jsonschema.Validator],
++    validator_class: type[jsonschema.protocols.Validator],
+ ) -> type[jsonschema.Validator]:
+     validate_properties = validator_class.VALIDATORS["properties"]
+ 
+@@ -51,7 +51,7 @@ class SchemaLoaderBase:
+         instance_doc: dict[str, t.Any],
+         format_opts: FormatOptions,
+         fill_defaults: bool,
+-    ) -> jsonschema.Validator:
++    ) -> jsonschema.protocols.Validator:
+         raise NotImplementedError
+ 
+ 
+@@ -112,7 +112,7 @@ class SchemaLoader(SchemaLoaderBase):
+         instance_doc: dict[str, t.Any],
+         format_opts: FormatOptions,
+         fill_defaults: bool,
+-    ) -> jsonschema.Validator:
++    ) -> jsonschema.protocols.Validator:
+         retrieval_uri = self.get_schema_retrieval_uri()
+         schema = self.get_schema()
+ 
+@@ -141,7 +141,7 @@ class SchemaLoader(SchemaLoaderBase):
+             registry=reference_registry,
+             format_checker=format_checker,
+         )
+-        return t.cast(jsonschema.Validator, validator)
++        return t.cast(jsonschema.protocols.Validator, validator)
+ 
+ 
+ class BuiltinSchemaLoader(SchemaLoader):
+@@ -163,7 +163,7 @@ class MetaSchemaLoader(SchemaLoaderBase):
+         instance_doc: dict[str, t.Any],
+         format_opts: FormatOptions,
+         fill_defaults: bool,
+-    ) -> jsonschema.Validator:
++    ) -> jsonschema.protocols.Validator:
+         schema_validator = jsonschema.validators.validator_for(instance_doc)
+         meta_validator_class = jsonschema.validators.validator_for(
+             schema_validator.META_SCHEMA, default=schema_validator
+diff --git a/src/check_jsonschema/schema_loader/readers.py b/src/check_jsonschema/schema_loader/readers.py
+index c2e4697..4c362dc 100644
+--- a/src/check_jsonschema/schema_loader/readers.py
++++ b/src/check_jsonschema/schema_loader/readers.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-import json
++import io
+ import typing as t
+ 
+ import ruamel.yaml
+@@ -48,19 +48,28 @@ class HttpSchemaReader:
+         disable_cache: bool,
+     ) -> None:
+         self.url = url
++        self.parsers = ParserSet()
+         self.downloader = CacheDownloader(
+             url,
+             cache_filename,
+             disable_cache=disable_cache,
+-            validation_callback=json.loads,
++            validation_callback=self._parse,
+         )
++        self._parsed_schema: t.Any | None = None
++
++    def _parse(self, schema_bytes: bytes) -> t.Any:
++        if self._parsed_schema is None:
++            self._parsed_schema = self.parsers.parse_data_with_path(
++                io.BytesIO(schema_bytes), self.url, default_filetype="json"
++            )
++        return self._parsed_schema
+ 
+     def get_retrieval_uri(self) -> str:
+         return self.url
+ 
+     def _read_impl(self) -> t.Any:
+         with self.downloader.open() as fp:
+-            return json.load(fp)
++            return self._parse(fp.read())
+ 
+     def read_schema(self) -> dict:
+         return _run_load_callback(self.url, self._read_impl)

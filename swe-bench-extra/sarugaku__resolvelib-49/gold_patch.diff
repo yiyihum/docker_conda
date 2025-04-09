@@ -1,0 +1,248 @@
+diff --git a/examples/pypi_wheel_provider.py b/examples/pypi_wheel_provider.py
+index 027eb03..4d3dba6 100644
+--- a/examples/pypi_wheel_provider.py
++++ b/examples/pypi_wheel_provider.py
+@@ -1,9 +1,10 @@
+-import platform
++from email.message import EmailMessage
++from email.parser import BytesParser
+ from io import BytesIO
++from operator import attrgetter
++from platform import python_version
+ from urllib.parse import urlparse
+ from zipfile import ZipFile
+-from email.parser import BytesParser
+-from email.message import EmailMessage
+ 
+ import requests
+ import html5lib
+@@ -14,7 +15,7 @@ from packaging.utils import canonicalize_name
+ 
+ from extras_provider import ExtrasProvider
+ 
+-PYTHON_VERSION = Version(platform.python_version())
++PYTHON_VERSION = Version(python_version())
+ 
+ 
+ class Candidate:
+@@ -123,19 +124,23 @@ class PyPIProvider(ExtrasProvider):
+     def get_preference(self, resolution, candidates, information):
+         return len(candidates)
+ 
+-    def find_matches(self, requirement):
+-        candidates = []
+-        name = requirement.name
+-        extras = requirement.extras
++    def find_matches(self, requirements):
++        assert requirements, "resolver promises at least one requirement"
++        assert not any(
++            r.extras for r in requirements[1:]
++        ), "extras not supported in this example"
++
++        name = canonicalize_name(requirements[0].name)
+ 
+         # Need to pass the extras to the search, so they
+         # are added to the candidate at creation - we
+         # treat candidates as immutable once created.
+-        for c in get_project_from_pypi(name, extras):
++        candidates = []
++        for c in get_project_from_pypi(name, set()):
+             version = c.version
+-            if version in requirement.specifier:
++            if all(version in r.specifier for r in requirements):
+                 candidates.append(c)
+-        return candidates
++        return sorted(candidates, key=attrgetter("version"), reverse=True)
+ 
+     def is_satisfied_by(self, requirement, candidate):
+         if canonicalize_name(requirement.name) != candidate.name:
+diff --git a/examples/reporter_demo.py b/examples/reporter_demo.py
+index 8d10582..cce2e2a 100644
+--- a/examples/reporter_demo.py
++++ b/examples/reporter_demo.py
+@@ -50,14 +50,10 @@ class Provider(resolvelib.AbstractProvider):
+     def get_preference(self, resolution, candidates, information):
+         return len(candidates)
+ 
+-    def find_matches(self, requirement):
+-        deps = [
+-            (n, v)
+-            for (n, v) in sorted(self.candidates, reverse=True)
+-            if n == requirement[0] and v in requirement[1]
+-        ]
+-        deps.sort()
+-        return deps
++    def find_matches(self, requirements):
++        for n, v in sorted(self.candidates, reverse=True):
++            if all(n == r[0] and v in r[1] for r in requirements):
++                yield (n, v)
+ 
+     def is_satisfied_by(self, requirement, candidate):
+         assert candidate[0] == requirement[0]
+diff --git a/setup.cfg b/setup.cfg
+index a60e435..7a21627 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -8,20 +8,20 @@ author_email = uranusjr@gmail.com
+ long_description = file: README.rst
+ license = ISC License
+ keywords =
+-    dependency
+-    resolution
++	dependency
++	resolution
+ classifier =
+-    Development Status :: 3 - Alpha
+-    Intended Audience :: Developers
+-    License :: OSI Approved :: ISC License (ISCL)
+-    Operating System :: OS Independent
+-    Programming Language :: Python :: 2
+-    Programming Language :: Python :: 3
+-    Topic :: Software Development :: Libraries :: Python Modules
++	Development Status :: 3 - Alpha
++	Intended Audience :: Developers
++	License :: OSI Approved :: ISC License (ISCL)
++	Operating System :: OS Independent
++	Programming Language :: Python :: 2
++	Programming Language :: Python :: 3
++	Topic :: Software Development :: Libraries :: Python Modules
+ 
+ [options]
+ package_dir =
+-    = src
++	= src
+ packages = find:
+ include_package_data = true
+ zip_safe = false
+@@ -31,19 +31,19 @@ where = src
+ 
+ [options.extras_require]
+ examples =
+-    html5lib
+-    packaging
+-    requests
++	html5lib
++	packaging
++	requests
+ lint =
+ 	black
+ 	flake8
+ test =
+-    commentjson
+-    packaging
+-    pytest
++	commentjson
++	packaging
++	pytest
+ release =
+ 	setl
+-    towncrier
++	towncrier
+ 
+ [bdist_wheel]
+ universal = 1
+@@ -51,8 +51,8 @@ universal = 1
+ [flake8]
+ max-line-length = 80
+ exclude =
+-    .git,
+-    .venvs,
+-    __pycache__,
+-    build,
+-    dist,
++	.git,
++	.venvs,
++	__pycache__,
++	build,
++	dist,
+diff --git a/src/resolvelib/compat/__init__.py b/src/resolvelib/compat/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/resolvelib/compat/collections_abc.py b/src/resolvelib/compat/collections_abc.py
+new file mode 100644
+index 0000000..366cc5e
+--- /dev/null
++++ b/src/resolvelib/compat/collections_abc.py
+@@ -0,0 +1,6 @@
++__all__ = ["Sequence"]
++
++try:
++    from collections.abc import Sequence
++except ImportError:
++    from collections import Sequence
+diff --git a/src/resolvelib/providers.py b/src/resolvelib/providers.py
+index ba86512..326b1ec 100644
+--- a/src/resolvelib/providers.py
++++ b/src/resolvelib/providers.py
+@@ -48,17 +48,19 @@ class AbstractProvider(object):
+         """
+         raise NotImplementedError
+ 
+-    def find_matches(self, requirement):
+-        """Find all possible candidates that satisfy a requirement.
++    def find_matches(self, requirements):
++        """Find all possible candidates that satisfy the given requirements.
+ 
+-        This should try to get candidates based on the requirement's type.
++        This should try to get candidates based on the requirements' types.
+         For VCS, local, and archive requirements, the one-and-only match is
+         returned, and for a "named" requirement, the index(es) should be
+         consulted to find concrete candidates for this requirement.
+ 
+-        The returned candidates should be sorted by reversed preference, e.g.
+-        the most preferred should be LAST. This is done so list-popping can be
+-        as efficient as possible.
++        :param requirements: A collection of requirements which all of the the
++            returned candidates must match. All requirements are guaranteed to
++            have the same identifier. The collection is never empty.
++        :returns: An iterable that orders candidates by preference, e.g. the
++            most preferred candidate should come first.
+         """
+         raise NotImplementedError
+ 
+diff --git a/src/resolvelib/resolvers.py b/src/resolvelib/resolvers.py
+index e45f5a1..4497f97 100644
+--- a/src/resolvelib/resolvers.py
++++ b/src/resolvelib/resolvers.py
+@@ -1,5 +1,6 @@
+ import collections
+ 
++from .compat import collections_abc
+ from .providers import AbstractResolver
+ from .structs import DirectedGraph
+ 
+@@ -77,7 +78,9 @@ class Criterion(object):
+     def from_requirement(cls, provider, requirement, parent):
+         """Build an instance from a requirement.
+         """
+-        candidates = provider.find_matches(requirement)
++        candidates = provider.find_matches([requirement])
++        if not isinstance(candidates, collections_abc.Sequence):
++            candidates = list(candidates)
+         criterion = cls(
+             candidates=candidates,
+             information=[RequirementInformation(requirement, parent)],
+@@ -98,11 +101,9 @@ class Criterion(object):
+         """
+         infos = list(self.information)
+         infos.append(RequirementInformation(requirement, parent))
+-        candidates = [
+-            c
+-            for c in self.candidates
+-            if provider.is_satisfied_by(requirement, c)
+-        ]
++        candidates = provider.find_matches([r for r, _ in infos])
++        if not isinstance(candidates, collections_abc.Sequence):
++            candidates = list(candidates)
+         criterion = type(self)(candidates, infos, list(self.incompatibilities))
+         if not candidates:
+             raise RequirementsConflicted(criterion)
+@@ -218,7 +219,7 @@ class Resolution(object):
+ 
+     def _attempt_to_pin_criterion(self, name, criterion):
+         causes = []
+-        for candidate in reversed(criterion.candidates):
++        for candidate in criterion.candidates:
+             try:
+                 criteria = self._get_criteria_to_update(candidate)
+             except RequirementsConflicted as e:

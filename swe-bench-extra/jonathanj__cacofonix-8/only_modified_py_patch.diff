@@ -1,0 +1,137 @@
+diff --git a/setup.py b/setup.py
+index 28e702f..df669f8 100644
+--- a/setup.py
++++ b/setup.py
+@@ -42,12 +42,17 @@ setup(
+         'Topic :: Software Development :: Build Tools',
+     ],
+     install_requires=[
+-        'towncrier @ git+https://github.com/hawkowl/towncrier.git#egg=towncrier',
++        'towncrier @ git+https://github.com/hawkowl/towncrier.git#egg=towncrier',  # noqa
+         'pyyaml >= 5.3',
+         'aniso8601 >= 8.0.0',
+-        'prompt_toolkit >= 3.0.3',
++        'prompt-toolkit >= 3.0.3',
+         'Pygments >= 2.5.2',
+         'semver >= 2.9.0',
+         'fs >= 2.4.11',
+     ],
++    extras_require={
++        'test': [
++            'pytest >= 5.3.5',
++        ],
++    },
+ )
+diff --git a/src/cacofonix/_app.py b/src/cacofonix/_app.py
+index dd23792..86663f4 100644
+--- a/src/cacofonix/_app.py
++++ b/src/cacofonix/_app.py
+@@ -20,7 +20,7 @@ from ._towncrier import (
+     render_fragment,
+     render_changelog,
+     merge_with_existing_changelog)
+-from ._types import Fragment, FoundFragment
++from ._types import Fragment, FoundFragment, GuessPair
+ from ._effects import SideEffects
+ 
+ 
+@@ -161,7 +161,7 @@ class Application(object):
+         n = 0
+         for n, (version_fs, filename) in enumerate(found_fragments, 1):
+             try:
+-                fragment = self.load_fragment(version_fs.gettext(filename))
++                fragment = self.load_fragment(version_fs.readtext(filename))
+                 fragment_type = fragment.get('type')
+                 showcontent = self.config.fragment_types.get(
+                     fragment_type, {}).get('showcontent', True)
+@@ -219,16 +219,11 @@ class Application(object):
+                 changelog)
+             self.effects.git_stage(changelog_path)
+ 
+-    def guess_version(self, cwd_fs) -> Optional[str]:
++    def guess_version(self, cwd_fs: FS) -> Optional[str]:
+         """
+         Attempt to guess the software version.
+         """
+-        guesses = [package_json]
+-        for guess in guesses:
+-            result = guess(cwd_fs)
+-            if result is not None:
+-                return result
+-        return None
++        return detect_version(cwd_fs)
+ 
+     def known_versions(self) -> List[VersionInfo]:
+         """
+@@ -252,8 +247,24 @@ def package_json(cwd_fs: FS):
+     if cwd_fs.exists('package.json'):
+         log.debug('Guessing version with package.json')
+         try:
+-            return ('package.json',
+-                    json.load(cwd_fs.gettext('package.json')).get('version'))
++            with cwd_fs.open('package.json', 'r') as fd:
++                return json.load(fd).get('version')
+         except json.JSONDecodeError:
+             pass
+     return None
++
++
++_default_guesses = [
++    ('package.json', package_json),
++]
++
++
++def detect_version(cwd_fs: FS, _guesses: List[GuessPair]) -> Optional[str]:
++    """
++    Make several attempts to guess the version of the package.
++    """
++    for kind, guess in _guesses:
++        result = guess(cwd_fs)
++        if result is not None:
++            return kind, result
++    return None
+diff --git a/src/cacofonix/_effects.py b/src/cacofonix/_effects.py
+index 0cdb8c5..fe8ad58 100644
+--- a/src/cacofonix/_effects.py
++++ b/src/cacofonix/_effects.py
+@@ -108,8 +108,8 @@ def _dry_run_method(name: str):
+ 
+ class DryRunSideEffects(SideEffects):
+     """
+-    Dry run side effects that change only temporary files or log actions instead
+-    of performing them.
++    Dry run side effects that change only temporary files or log actions
++    instead of performing them.
+     """
+     git_mv = _dry_run_method('git_mv')
+     git_stage = _dry_run_method('git_stage')
+diff --git a/src/cacofonix/_log.py b/src/cacofonix/_log.py
+index 6d90c95..52feea0 100644
+--- a/src/cacofonix/_log.py
++++ b/src/cacofonix/_log.py
+@@ -13,7 +13,8 @@ def setup_logging(level):
+ def _log_method(name):
+     def __log_method(*a, **kw):
+         global _logger
+-        assert _logger is not None
++        if _logger is None:
++            _logger = logging
+         return getattr(_logger, name)(*a, **kw)
+     return __log_method
+ 
+diff --git a/src/cacofonix/_types.py b/src/cacofonix/_types.py
+index 2c5c2db..097ff87 100644
+--- a/src/cacofonix/_types.py
++++ b/src/cacofonix/_types.py
+@@ -1,4 +1,4 @@
+-from typing import Any, Dict, Tuple
++from typing import Any, Dict, Tuple, Callable, Optional
+ from fs.base import FS
+ 
+ 
+@@ -8,3 +8,4 @@ Fragment = Dict[str, Any]
+ # OutputType = Literal['markdown', 'rest']
+ OutputType = str
+ FoundFragment = Tuple[FS, str]
++GuessPair = Tuple[str, Callable[[FS], Optional[str]]]
+

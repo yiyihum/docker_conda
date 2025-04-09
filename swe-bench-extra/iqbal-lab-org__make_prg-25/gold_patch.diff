@@ -1,0 +1,102 @@
+diff --git a/make_prg/from_msa/cluster_sequences.py b/make_prg/from_msa/cluster_sequences.py
+index bc3cc81..aa67ce6 100644
+--- a/make_prg/from_msa/cluster_sequences.py
++++ b/make_prg/from_msa/cluster_sequences.py
+@@ -121,6 +121,10 @@ def extract_clusters(
+             f"Mismatch between number of sequences/ID lists and number of cluster assignments"
+         )
+     num_clusters = max(cluster_assignment) + 1
++    if set(cluster_assignment) != set(range(num_clusters)):
++        raise ValueError(
++            "Inconsistent cluster numbering (likely reason: more input sequences that clustered data points)"
++        )
+     result = [list() for _ in range(num_clusters)]
+     for cluster_num, clustered_elem in zip(cluster_assignment, value_pool):
+         result[cluster_num].extend(clustered_elem)
+@@ -141,7 +145,9 @@ def merge_clusters(clusters: List[ClusteredIDs], first_id: str) -> ClusteredIDs:
+ 
+ 
+ def kmeans_cluster_seqs_in_interval(
+-    interval: List[int], alignment: MSA, kmer_size: int,
++    interval: List[int],
++    alignment: MSA,
++    kmer_size: int,
+ ) -> ClusteredIDs:
+     """Divide sequences in interval into subgroups of similar sequences."""
+     interval_alignment = alignment[:, interval[0] : interval[1] + 1]
+@@ -181,7 +187,15 @@ def kmeans_cluster_seqs_in_interval(
+                 break
+             start = time.time()
+             kmeans = KMeans(n_clusters=num_clusters, random_state=2).fit(count_matrix)
++            prev_cluster_assignment = cluster_assignment
+             cluster_assignment = list(kmeans.predict(count_matrix))
++            num_fitted_clusters = len(set(cluster_assignment))
++            # Below holds when alignments are different, but kmer counts are identical
++            # (due to repeats), making kmeans unable to fit requested number of clusters
++            if num_fitted_clusters < num_clusters:
++                cluster_assignment = prev_cluster_assignment
++                num_clusters -= 1
++                break
+             seqclustering = extract_clusters(seq_to_gapped_seqs, cluster_assignment)
+ 
+     if num_clusters == 1 or num_clusters == num_sequences:
+diff --git a/make_prg/from_msa/prg_builder.py b/make_prg/from_msa/prg_builder.py
+index 8185a46..f79490e 100644
+--- a/make_prg/from_msa/prg_builder.py
++++ b/make_prg/from_msa/prg_builder.py
+@@ -74,7 +74,7 @@ class PrgBuilder(object):
+ 
+     @classmethod
+     def get_consensus(cls, alignment: MSA):
+-        """ Produces a 'consensus string' from an MSA: at each position of the
++        """Produces a 'consensus string' from an MSA: at each position of the
+         MSA, the string has a base if all aligned sequences agree, and a "*" if not.
+         IUPAC ambiguous bases result in non-consensus and are later expanded in the prg.
+         N results in consensus at that position unless they are all N."""
+@@ -157,10 +157,6 @@ class PrgBuilder(object):
+                         recur = False
+                     elif interval.start not in self.subAlignedSeqs:
+                         self.subAlignedSeqs[interval.start] = []
+-                        logging.debug(
+-                            "subAlignedSeqs now has keys: %s",
+-                            list(self.subAlignedSeqs.keys()),
+-                        )
+                     else:
+                         logging.debug(
+                             "subAlignedSeqs already had key %d in keys: %s. This shouldn't happen.",
+@@ -210,35 +206,14 @@ class PrgBuilder(object):
+     def max_nesting_level_reached(self):
+         max_nesting = []
+         if self.subAlignedSeqs == {}:
+-            logging.debug(
+-                "self.subAlignedSeqs == {} at nesting level %d for interval %s",
+-                self.nesting_level,
+-                self.interval,
+-            )
+             max_nesting.append(self.nesting_level)
+         else:
+-            logging.debug(
+-                "self.subAlignedSeqs.keys(): %s", list(self.subAlignedSeqs.keys())
+-            )
+-            logging.debug(
+-                "self.subAlignedSeqs[self.subAlignedSeqs.keys()[0]]: %s",
+-                self.subAlignedSeqs[list(self.subAlignedSeqs.keys())[0]],
+-            )
+             for interval_start in list(self.subAlignedSeqs.keys()):
+                 logging.debug("interval start: %d", interval_start)
+                 for subaseq in self.subAlignedSeqs[interval_start]:
+-                    logging.debug(
+-                        "type of subAlignedSeqs object in list: %s", type(subaseq)
+-                    )
+                     recur = subaseq.max_nesting_level_reached
+-                    logging.debug(
+-                        "recur max level nesting returned: %d, which has type %s",
+-                        recur,
+-                        type(recur),
+-                    )
+                     max_nesting.append(recur)
+         m = max(max_nesting)
+-        logging.debug("found the max of %s is %d", max_nesting, m)
+         return m
+ 
+     @property

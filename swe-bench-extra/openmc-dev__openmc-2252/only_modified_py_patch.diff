@@ -1,0 +1,218 @@
+diff --git a/openmc/data/decay.py b/openmc/data/decay.py
+index d7ededf33..801ef4410 100644
+--- a/openmc/data/decay.py
++++ b/openmc/data/decay.py
+@@ -1,10 +1,9 @@
+ from collections.abc import Iterable
+ from io import StringIO
+ from math import log
+-from pathlib import Path
+ import re
++from typing import Optional
+ from warnings import warn
+-from xml.etree import ElementTree as ET
+ 
+ import numpy as np
+ from uncertainties import ufloat, UFloat
+@@ -579,7 +578,7 @@ class Decay(EqualityMixin):
+ _DECAY_PHOTON_ENERGY = {}
+ 
+ 
+-def decay_photon_energy(nuclide: str) -> Univariate:
++def decay_photon_energy(nuclide: str) -> Optional[Univariate]:
+     """Get photon energy distribution resulting from the decay of a nuclide
+ 
+     This function relies on data stored in a depletion chain. Before calling it
+@@ -595,9 +594,10 @@ def decay_photon_energy(nuclide: str) -> Univariate:
+ 
+     Returns
+     -------
+-    openmc.stats.Univariate
+-        Distribution of energies in [eV] of photons emitted from decay. Note
+-        that the probabilities represent intensities, given as [decay/sec].
++    openmc.stats.Univariate or None
++        Distribution of energies in [eV] of photons emitted from decay, or None
++        if no photon source exists. Note that the probabilities represent
++        intensities, given as [decay/sec].
+     """
+     if not _DECAY_PHOTON_ENERGY:
+         chain_file = openmc.config.get('chain_file')
+diff --git a/openmc/material.py b/openmc/material.py
+index 16b5a3048..e99eec52c 100644
+--- a/openmc/material.py
++++ b/openmc/material.py
+@@ -92,10 +92,11 @@ class Material(IDManagerMixin):
+     fissionable_mass : float
+         Mass of fissionable nuclides in the material in [g]. Requires that the
+         :attr:`volume` attribute is set.
+-    decay_photon_energy : openmc.stats.Univariate
++    decay_photon_energy : openmc.stats.Univariate or None
+         Energy distribution of photons emitted from decay of unstable nuclides
+-        within the material. The integral of this distribution is the total
+-        intensity of the photon source in [decay/sec].
++        within the material, or None if no photon source exists. The integral of
++        this distribution is the total intensity of the photon source in
++        [decay/sec].
+ 
+         .. versionadded:: 0.14.0
+ 
+@@ -264,7 +265,7 @@ class Material(IDManagerMixin):
+         return density*self.volume
+ 
+     @property
+-    def decay_photon_energy(self) -> Univariate:
++    def decay_photon_energy(self) -> Optional[Univariate]:
+         atoms = self.get_nuclide_atoms()
+         dists = []
+         probs = []
+@@ -273,7 +274,7 @@ class Material(IDManagerMixin):
+             if source_per_atom is not None:
+                 dists.append(source_per_atom)
+                 probs.append(num_atoms)
+-        return openmc.data.combine_distributions(dists, probs)
++        return openmc.data.combine_distributions(dists, probs) if dists else None
+ 
+     @classmethod
+     def from_hdf5(cls, group: h5py.Group):
+diff --git a/openmc/mesh.py b/openmc/mesh.py
+index a4c50a608..d4db5011b 100644
+--- a/openmc/mesh.py
++++ b/openmc/mesh.py
+@@ -514,7 +514,7 @@ class RegularMesh(StructuredMesh):
+     def from_domain(
+         cls,
+         domain,
+-        dimension=[100, 100, 100],
++        dimension=(10, 10, 10),
+         mesh_id=None,
+         name=''
+     ):
+@@ -1137,6 +1137,76 @@ class CylindricalMesh(StructuredMesh):
+ 
+         return mesh
+ 
++    @classmethod
++    def from_domain(
++        cls,
++        domain,
++        dimension=(10, 10, 10),
++        mesh_id=None,
++        phi_grid_bounds=(0.0, 2*pi),
++        name=''
++    ):
++        """Creates a regular CylindricalMesh from an existing openmc domain.
++
++        Parameters
++        ----------
++        domain : openmc.Cell or openmc.Region or openmc.Universe or openmc.Geometry
++            The object passed in will be used as a template for this mesh. The
++            bounding box of the property of the object passed will be used to
++            set the r_grid, z_grid ranges.
++        dimension : Iterable of int
++            The number of equally spaced mesh cells in each direction (r_grid,
++            phi_grid, z_grid)
++        mesh_id : int
++            Unique identifier for the mesh
++        phi_grid_bounds : numpy.ndarray
++            Mesh bounds points along the phi-axis in radians. The default value
++            is (0, 2π), i.e., the full phi range.
++        name : str
++            Name of the mesh
++
++        Returns
++        -------
++        openmc.RegularMesh
++            RegularMesh instance
++
++        """
++        cv.check_type(
++            "domain",
++            domain,
++            (openmc.Cell, openmc.Region, openmc.Universe, openmc.Geometry),
++        )
++
++        mesh = cls(mesh_id, name)
++
++        # loaded once to avoid reading h5m file repeatedly
++        cached_bb = domain.bounding_box
++        max_bounding_box_radius = max(
++            [
++                cached_bb[0][0],
++                cached_bb[0][1],
++                cached_bb[1][0],
++                cached_bb[1][1],
++            ]
++        )
++        mesh.r_grid = np.linspace(
++            0,
++            max_bounding_box_radius,
++            num=dimension[0]+1
++        )
++        mesh.phi_grid = np.linspace(
++            phi_grid_bounds[0],
++            phi_grid_bounds[1],
++            num=dimension[1]+1
++        )
++        mesh.z_grid = np.linspace(
++            cached_bb[0][2],
++            cached_bb[1][2],
++            num=dimension[2]+1
++        )
++
++        return mesh
++
+     def to_xml_element(self):
+         """Return XML representation of the mesh
+ 
+diff --git a/setup.py b/setup.py
+index 477f29dec..a4b77e68b 100755
+--- a/setup.py
++++ b/setup.py
+@@ -5,11 +5,7 @@ import sys
+ import numpy as np
+ 
+ from setuptools import setup, find_packages
+-try:
+-    from Cython.Build import cythonize
+-    have_cython = True
+-except ImportError:
+-    have_cython = False
++from Cython.Build import cythonize
+ 
+ 
+ # Determine shared library suffix
+@@ -57,14 +53,14 @@ kwargs = {
+         'Topic :: Scientific/Engineering'
+         'Programming Language :: C++',
+         'Programming Language :: Python :: 3',
+-        'Programming Language :: Python :: 3.6',
++        'Programming Language :: Python :: 3.7',
+         'Programming Language :: Python :: 3.7',
+         'Programming Language :: Python :: 3.8',
+         'Programming Language :: Python :: 3.9',
+     ],
+ 
+     # Dependencies
+-    'python_requires': '>=3.6',
++    'python_requires': '>=3.7',
+     'install_requires': [
+         'numpy>=1.9', 'h5py', 'scipy', 'ipython', 'matplotlib',
+         'pandas', 'lxml', 'uncertainties'
+@@ -76,13 +72,9 @@ kwargs = {
+         'test': ['pytest', 'pytest-cov', 'colorama'],
+         'vtk': ['vtk'],
+     },
++    # Cython is used to add resonance reconstruction and fast float_endf
++    'ext_modules': cythonize('openmc/data/*.pyx'),
++    'include_dirs': [np.get_include()]
+ }
+ 
+-# If Cython is present, add resonance reconstruction and fast float_endf
+-if have_cython:
+-    kwargs.update({
+-        'ext_modules': cythonize('openmc/data/*.pyx'),
+-        'include_dirs': [np.get_include()]
+-    })
+-
+ setup(**kwargs)
+

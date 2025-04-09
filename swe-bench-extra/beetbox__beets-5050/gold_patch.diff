@@ -1,0 +1,184 @@
+diff --git a/beets/plugins.py b/beets/plugins.py
+index 270da975..e1ac7d61 100644
+--- a/beets/plugins.py
++++ b/beets/plugins.py
+@@ -444,14 +444,29 @@ def import_stages():
+ # New-style (lazy) plugin-provided fields.
+ 
+ 
++def _check_conflicts_and_merge(plugin, plugin_funcs, funcs):
++    """Check the provided template functions for conflicts and merge into funcs.
++
++    Raises a `PluginConflictException` if a plugin defines template functions
++    for fields that another plugin has already defined template functions for.
++    """
++    if plugin_funcs:
++        if not plugin_funcs.keys().isdisjoint(funcs.keys()):
++            conflicted_fields = ", ".join(plugin_funcs.keys() & funcs.keys())
++            raise PluginConflictException(
++                f"Plugin {plugin.name} defines template functions for "
++                f"{conflicted_fields} that conflict with another plugin."
++            )
++        funcs.update(plugin_funcs)
++
++
+ def item_field_getters():
+     """Get a dictionary mapping field names to unary functions that
+     compute the field's value.
+     """
+     funcs = {}
+     for plugin in find_plugins():
+-        if plugin.template_fields:
+-            funcs.update(plugin.template_fields)
++        _check_conflicts_and_merge(plugin, plugin.template_fields, funcs)
+     return funcs
+ 
+ 
+@@ -459,8 +474,7 @@ def album_field_getters():
+     """As above, for album fields."""
+     funcs = {}
+     for plugin in find_plugins():
+-        if plugin.album_template_fields:
+-            funcs.update(plugin.album_template_fields)
++        _check_conflicts_and_merge(plugin, plugin.album_template_fields, funcs)
+     return funcs
+ 
+ 
+diff --git a/beetsplug/smartplaylist.py b/beetsplug/smartplaylist.py
+index 120361d3..12a1c921 100644
+--- a/beetsplug/smartplaylist.py
++++ b/beetsplug/smartplaylist.py
+@@ -45,6 +45,7 @@ class SmartPlaylistPlugin(BeetsPlugin):
+                 "playlist_dir": ".",
+                 "auto": True,
+                 "playlists": [],
++                "uri_format": None,
+                 "forward_slash": False,
+                 "prefix": "",
+                 "urlencode": False,
+@@ -109,6 +110,12 @@ class SmartPlaylistPlugin(BeetsPlugin):
+             action="store_true",
+             help="URL-encode all paths.",
+         )
++        spl_update.parser.add_option(
++            "--uri-format",
++            dest="uri_format",
++            type="string",
++            help="playlist item URI template, e.g. http://beets:8337/item/$id/file.",
++        )
+         spl_update.parser.add_option(
+             "--output",
+             type="string",
+@@ -247,6 +254,8 @@ class SmartPlaylistPlugin(BeetsPlugin):
+ 
+         playlist_dir = self.config["playlist_dir"].as_filename()
+         playlist_dir = bytestring_path(playlist_dir)
++        tpl = self.config["uri_format"].get()
++        prefix = bytestring_path(self.config["prefix"].as_str())
+         relative_to = self.config["relative_to"].get()
+         if relative_to:
+             relative_to = normpath(relative_to)
+@@ -275,18 +284,26 @@ class SmartPlaylistPlugin(BeetsPlugin):
+                 m3u_name = sanitize_path(m3u_name, lib.replacements)
+                 if m3u_name not in m3us:
+                     m3us[m3u_name] = []
+-                item_path = item.path
+-                if relative_to:
+-                    item_path = os.path.relpath(item.path, relative_to)
+-                if item_path not in m3us[m3u_name]:
+-                    m3us[m3u_name].append({"item": item, "path": item_path})
++                item_uri = item.path
++                if tpl:
++                    item_uri = tpl.replace("$id", str(item.id)).encode("utf-8")
++                else:
++                    if relative_to:
++                        item_uri = os.path.relpath(item_uri, relative_to)
++                    if self.config["forward_slash"].get():
++                        item_uri = path_as_posix(item_uri)
++                    if self.config["urlencode"]:
++                        item_uri = bytestring_path(pathname2url(item_uri))
++                    item_uri = prefix + item_uri
++
++                if item_uri not in m3us[m3u_name]:
++                    m3us[m3u_name].append({"item": item, "uri": item_uri})
+                     if pretend and self.config["pretend_paths"]:
+-                        print(displayable_path(item_path))
++                        print(displayable_path(item_uri))
+                     elif pretend:
+                         print(item)
+ 
+         if not pretend:
+-            prefix = bytestring_path(self.config["prefix"].as_str())
+             # Write all of the accumulated track lists to files.
+             for m3u in m3us:
+                 m3u_path = normpath(
+@@ -303,18 +320,13 @@ class SmartPlaylistPlugin(BeetsPlugin):
+                     if m3u8:
+                         f.write(b"#EXTM3U\n")
+                     for entry in m3us[m3u]:
+-                        path = entry["path"]
+                         item = entry["item"]
+-                        if self.config["forward_slash"].get():
+-                            path = path_as_posix(path)
+-                        if self.config["urlencode"]:
+-                            path = bytestring_path(pathname2url(path))
+                         comment = ""
+                         if m3u8:
+                             comment = "#EXTINF:{},{} - {}\n".format(
+                                 int(item.length), item.artist, item.title
+                             )
+-                        f.write(comment.encode("utf-8") + prefix + path + b"\n")
++                        f.write(comment.encode("utf-8") + entry["uri"] + b"\n")
+             # Send an event when playlists were updated.
+             send_event("smartplaylist_update")
+ 
+diff --git a/docs/changelog.rst b/docs/changelog.rst
+index c88a1009..86dc97b0 100644
+--- a/docs/changelog.rst
++++ b/docs/changelog.rst
+@@ -148,8 +148,9 @@ New features:
+   `synced` option to prefer synced lyrics over plain lyrics.
+ * :ref:`import-cmd`: Expose import.quiet_fallback as CLI option.
+ * :ref:`import-cmd`: Expose `import.incremental_skip_later` as CLI option.
+-* :doc:`/plugins/smartplaylist`: Add new config option `smartplaylist.output`.
+ * :doc:`/plugins/smartplaylist`: Expose config options as CLI options.
++* :doc:`/plugins/smartplaylist`: Add new option `smartplaylist.output`.
++* :doc:`/plugins/smartplaylist`: Add new option `smartplaylist.uri_format`.
+ 
+ Bug fixes:
+ 
+@@ -277,6 +278,15 @@ Bug fixes:
+ * Fix bug regarding displaying tracks that have been changed not being
+   displayed unless the detail configuration is enabled.
+ 
++For plugin developers:
++
++* beets now explicitly prevents multiple plugins to define replacement
++  functions for the same field. When previously defining `template_fields`
++  for the same field in two plugins, the last loaded plugin would silently
++  overwrite the function defined by the other plugin.
++  Now, beets will raise an exception when this happens.
++  :bug:`5002`
++
+ For packagers:
+ 
+ * As noted above, the minimum Python version is now 3.7.
+diff --git a/docs/plugins/smartplaylist.rst b/docs/plugins/smartplaylist.rst
+index 365b5af3..a40d1888 100644
+--- a/docs/plugins/smartplaylist.rst
++++ b/docs/plugins/smartplaylist.rst
+@@ -118,9 +118,13 @@ other configuration options are:
+ - **urlencode**: URL-encode all paths. Default: ``no``.
+ - **pretend_paths**: When running with ``--pretend``, show the actual file
+   paths that will be written to the m3u file. Default: ``false``.
++- **uri_format**: Template with an ``$id`` placeholder used generate a
++  playlist item URI, e.g. ``http://beets:8337/item/$id/file``.
++  When this option is specified, the local path-related options ``prefix``,
++  ``relative_to``, ``forward_slash`` and ``urlencode`` are ignored.
+ - **output**: Specify the playlist format: m3u|m3u8. Default ``m3u``.
+ 
+ For many configuration options, there is a corresponding CLI option, e.g.
+ ``--playlist-dir``, ``--relative-to``, ``--prefix``, ``--forward-slash``,
+-``--urlencode``, ``--output``, ``--pretend-paths``.
++``--urlencode``, ``--uri-format``, ``--output``, ``--pretend-paths``.
+ CLI options take precedence over those specified within the configuration file.

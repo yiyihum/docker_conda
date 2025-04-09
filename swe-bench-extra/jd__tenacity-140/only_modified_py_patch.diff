@@ -1,0 +1,324 @@
+diff --git a/tenacity/__init__.py b/tenacity/__init__.py
+index 8330b1a..3360eca 100644
+--- a/tenacity/__init__.py
++++ b/tenacity/__init__.py
+@@ -315,17 +315,17 @@ class BaseRetrying(object):
+ 
+         is_explicit_retry = retry_state.outcome.failed \
+             and isinstance(retry_state.outcome.exception(), TryAgain)
+-        if not (is_explicit_retry or self.retry(retry_state)):
++        if not (is_explicit_retry or self.retry(retry_state=retry_state)):
+             return fut.result()
+ 
+         if self.after is not None:
+-            self.after(retry_state)
++            self.after(retry_state=retry_state)
+ 
+         self.statistics['delay_since_first_attempt'] = \
+             retry_state.seconds_since_start
+-        if self.stop(retry_state):
++        if self.stop(retry_state=retry_state):
+             if self.retry_error_callback:
+-                return self.retry_error_callback(retry_state)
++                return self.retry_error_callback(retry_state=retry_state)
+             retry_exc = self.retry_error_cls(fut)
+             if self.reraise:
+                 raise retry_exc.reraise()
+diff --git a/tenacity/compat.py b/tenacity/compat.py
+index 1af334c..2d3e301 100644
+--- a/tenacity/compat.py
++++ b/tenacity/compat.py
+@@ -16,6 +16,13 @@ def warn_about_non_retry_state_deprecation(cbname, func, stacklevel):
+     warn(msg, DeprecationWarning, stacklevel=stacklevel + 1)
+ 
+ 
++def warn_about_dunder_non_retry_state_deprecation(fn, stacklevel):
++    msg = (
++        '"%s" method must be called with'
++        ' single "retry_state" parameter' % (_utils.get_callback_name(fn)))
++    warn(msg, DeprecationWarning, stacklevel=stacklevel + 1)
++
++
+ def func_takes_retry_state(func):
+     if not six.callable(func):
+         return False
+@@ -29,6 +36,23 @@ def func_takes_retry_state(func):
+ _unset = object()
+ 
+ 
++def _make_unset_exception(func_name, **kwargs):
++    missing = []
++    for k, v in kwargs.iteritems():
++        if v is _unset:
++            missing.append(k)
++    missing_str = ', '.join(repr(s) for s in missing)
++    return TypeError(func_name + ' func missing parameters: ' + missing_str)
++
++
++def _set_delay_since_start(retry_state, delay):
++    # Ensure outcome_timestamp - start_time is *exactly* equal to the delay to
++    # avoid complexity in test code.
++    retry_state.start_time = Fraction(retry_state.start_time)
++    retry_state.outcome_timestamp = (retry_state.start_time + Fraction(delay))
++    assert retry_state.seconds_since_start == delay
++
++
+ def make_retry_state(previous_attempt_number, delay_since_first_attempt,
+                      last_result=None):
+     """Construct RetryCallState for given attempt number & delay.
+@@ -38,13 +62,10 @@ def make_retry_state(previous_attempt_number, delay_since_first_attempt,
+     required_parameter_unset = (previous_attempt_number is _unset or
+                                 delay_since_first_attempt is _unset)
+     if required_parameter_unset:
+-        missing = []
+-        if previous_attempt_number is _unset:
+-            missing.append('previous_attempt_number')
+-        if delay_since_first_attempt is _unset:
+-            missing.append('delay_since_first_attempt')
+-        missing_str = ', '.join(repr(s) for s in missing)
+-        raise TypeError('wait func missing parameters: ' + missing_str)
++        raise _make_unset_exception(
++            'wait/stop',
++            previous_attempt_number=previous_attempt_number,
++            delay_since_first_attempt=delay_since_first_attempt)
+ 
+     from tenacity import RetryCallState
+     retry_state = RetryCallState(None, None, (), {})
+@@ -53,35 +74,10 @@ def make_retry_state(previous_attempt_number, delay_since_first_attempt,
+         retry_state.outcome = last_result
+     else:
+         retry_state.set_result(None)
+-    # Ensure outcome_timestamp - start_time is *exactly* equal to the delay to
+-    # avoid complexity in test code.
+-    retry_state.start_time = Fraction(retry_state.start_time)
+-    retry_state.outcome_timestamp = (
+-        retry_state.start_time + Fraction(delay_since_first_attempt))
+-    assert retry_state.seconds_since_start == delay_since_first_attempt
++    _set_delay_since_start(retry_state, delay_since_first_attempt)
+     return retry_state
+ 
+ 
+-def wait_dunder_call_accept_old_params(fn):
+-    """Wrap wait fn taking "retry_state" to accept old parameter tuple.
+-
+-    This is a backward compatibility shim to ensure tests keep working.
+-    """
+-    @_utils.wraps(fn)
+-    def new_fn(self,
+-               previous_attempt_number=_unset,
+-               delay_since_first_attempt=_unset,
+-               last_result=None,
+-               retry_state=None):
+-        if retry_state is None:
+-            retry_state = make_retry_state(
+-                previous_attempt_number=previous_attempt_number,
+-                delay_since_first_attempt=delay_since_first_attempt,
+-                last_result=last_result)
+-        return fn(self, retry_state=retry_state)
+-    return new_fn
+-
+-
+ def func_takes_last_result(waiter):
+     """Check if function has a "last_result" parameter.
+ 
+@@ -97,6 +93,29 @@ def func_takes_last_result(waiter):
+     return 'last_result' in waiter_spec.args
+ 
+ 
++def stop_dunder_call_accept_old_params(fn):
++    """Decorate cls.__call__ method to accept old "stop" signature."""
++    @_utils.wraps(fn)
++    def new_fn(self,
++               previous_attempt_number=_unset,
++               delay_since_first_attempt=_unset,
++               retry_state=None):
++        if retry_state is None:
++            from tenacity import RetryCallState
++            retry_state_passed_as_non_kwarg = (
++                previous_attempt_number is not _unset and
++                isinstance(previous_attempt_number, RetryCallState))
++            if retry_state_passed_as_non_kwarg:
++                retry_state = previous_attempt_number
++            else:
++                warn_about_dunder_non_retry_state_deprecation(fn, stacklevel=2)
++                retry_state = make_retry_state(
++                    previous_attempt_number=previous_attempt_number,
++                    delay_since_first_attempt=delay_since_first_attempt)
++        return fn(self, retry_state=retry_state)
++    return new_fn
++
++
+ def stop_func_accept_retry_state(stop_func):
+     """Wrap "stop" function to accept "retry_state" parameter."""
+     if not six.callable(stop_func):
+@@ -116,6 +135,31 @@ def stop_func_accept_retry_state(stop_func):
+     return wrapped_stop_func
+ 
+ 
++def wait_dunder_call_accept_old_params(fn):
++    """Decorate cls.__call__ method to accept old "wait" signature."""
++    @_utils.wraps(fn)
++    def new_fn(self,
++               previous_attempt_number=_unset,
++               delay_since_first_attempt=_unset,
++               last_result=None,
++               retry_state=None):
++        if retry_state is None:
++            from tenacity import RetryCallState
++            retry_state_passed_as_non_kwarg = (
++                previous_attempt_number is not _unset and
++                isinstance(previous_attempt_number, RetryCallState))
++            if retry_state_passed_as_non_kwarg:
++                retry_state = previous_attempt_number
++            else:
++                warn_about_dunder_non_retry_state_deprecation(fn, stacklevel=2)
++                retry_state = make_retry_state(
++                    previous_attempt_number=previous_attempt_number,
++                    delay_since_first_attempt=delay_since_first_attempt,
++                    last_result=last_result)
++        return fn(self, retry_state=retry_state)
++    return new_fn
++
++
+ def wait_func_accept_retry_state(wait_func):
+     """Wrap wait function to accept "retry_state" parameter."""
+     if not six.callable(wait_func):
+@@ -146,6 +190,27 @@ def wait_func_accept_retry_state(wait_func):
+     return wrapped_wait_func
+ 
+ 
++def retry_dunder_call_accept_old_params(fn):
++    """Decorate cls.__call__ method to accept old "retry" signature."""
++    @_utils.wraps(fn)
++    def new_fn(self, attempt=_unset, retry_state=None):
++        if retry_state is None:
++            from tenacity import RetryCallState
++            if attempt is _unset:
++                raise _make_unset_exception('retry', attempt=attempt)
++            retry_state_passed_as_non_kwarg = (
++                attempt is not _unset and
++                isinstance(attempt, RetryCallState))
++            if retry_state_passed_as_non_kwarg:
++                retry_state = attempt
++            else:
++                warn_about_dunder_non_retry_state_deprecation(fn, stacklevel=2)
++                retry_state = RetryCallState(None, None, (), {})
++                retry_state.outcome = attempt
++        return fn(self, retry_state=retry_state)
++    return new_fn
++
++
+ def retry_func_accept_retry_state(retry_func):
+     """Wrap "retry" function to accept "retry_state" parameter."""
+     if not six.callable(retry_func):
+diff --git a/tenacity/retry.py b/tenacity/retry.py
+index 4bb5d6b..8e4fab3 100644
+--- a/tenacity/retry.py
++++ b/tenacity/retry.py
+@@ -63,6 +63,7 @@ class retry_if_exception(retry_base):
+     def __init__(self, predicate):
+         self.predicate = predicate
+ 
++    @_compat.retry_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         if retry_state.outcome.failed:
+             return self.predicate(retry_state.outcome.exception())
+@@ -85,6 +86,7 @@ class retry_unless_exception_type(retry_if_exception):
+         super(retry_unless_exception_type, self).__init__(
+             lambda e: not isinstance(e, exception_types))
+ 
++    @_compat.retry_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         # always retry if no exception was raised
+         if not retry_state.outcome.failed:
+@@ -98,6 +100,7 @@ class retry_if_result(retry_base):
+     def __init__(self, predicate):
+         self.predicate = predicate
+ 
++    @_compat.retry_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         if not retry_state.outcome.failed:
+             return self.predicate(retry_state.outcome.result())
+@@ -109,6 +112,7 @@ class retry_if_not_result(retry_base):
+     def __init__(self, predicate):
+         self.predicate = predicate
+ 
++    @_compat.retry_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         if not retry_state.outcome.failed:
+             return not self.predicate(retry_state.outcome.result())
+@@ -152,6 +156,7 @@ class retry_if_not_exception_message(retry_if_exception_message):
+         self.predicate = lambda *args_, **kwargs_: not if_predicate(
+             *args_, **kwargs_)
+ 
++    @_compat.retry_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         if not retry_state.outcome.failed:
+             return True
+@@ -165,6 +170,7 @@ class retry_any(retry_base):
+         self.retries = tuple(_compat.retry_func_accept_retry_state(r)
+                              for r in retries)
+ 
++    @_compat.retry_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return any(r(retry_state) for r in self.retries)
+ 
+@@ -176,5 +182,6 @@ class retry_all(retry_base):
+         self.retries = tuple(_compat.retry_func_accept_retry_state(r)
+                              for r in retries)
+ 
++    @_compat.retry_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return all(r(retry_state) for r in self.retries)
+diff --git a/tenacity/stop.py b/tenacity/stop.py
+index 8fe683f..b587409 100644
+--- a/tenacity/stop.py
++++ b/tenacity/stop.py
+@@ -42,6 +42,7 @@ class stop_any(stop_base):
+         self.stops = tuple(_compat.stop_func_accept_retry_state(stop_func)
+                            for stop_func in stops)
+ 
++    @_compat.stop_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return any(x(retry_state) for x in self.stops)
+ 
+@@ -53,6 +54,7 @@ class stop_all(stop_base):
+         self.stops = tuple(_compat.stop_func_accept_retry_state(stop_func)
+                            for stop_func in stops)
+ 
++    @_compat.stop_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return all(x(retry_state) for x in self.stops)
+ 
+@@ -60,6 +62,7 @@ class stop_all(stop_base):
+ class _stop_never(stop_base):
+     """Never stop."""
+ 
++    @_compat.stop_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return False
+ 
+@@ -73,6 +76,7 @@ class stop_when_event_set(stop_base):
+     def __init__(self, event):
+         self.event = event
+ 
++    @_compat.stop_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return self.event.is_set()
+ 
+@@ -83,6 +87,7 @@ class stop_after_attempt(stop_base):
+     def __init__(self, max_attempt_number):
+         self.max_attempt_number = max_attempt_number
+ 
++    @_compat.stop_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return retry_state.attempt_number >= self.max_attempt_number
+ 
+@@ -93,5 +98,6 @@ class stop_after_delay(stop_base):
+     def __init__(self, max_delay):
+         self.max_delay = max_delay
+ 
++    @_compat.stop_dunder_call_accept_old_params
+     def __call__(self, retry_state):
+         return retry_state.seconds_since_start >= self.max_delay
+

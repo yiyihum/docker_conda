@@ -1,0 +1,413 @@
+diff --git a/beerlog/beerlogdb.py b/beerlog/beerlogdb.py
+index ad83992..3df6f5c 100644
+--- a/beerlog/beerlogdb.py
++++ b/beerlog/beerlogdb.py
+@@ -19,52 +19,22 @@ class BeerModel(peewee.Model):
+     """Sets Metadata for the database."""
+     database = database_proxy
+ 
+-
+-def BeerPerCharacter(character, amount):
+-  """Helper function to generate the SQL expression for the total amount
+-  of beer drunk."""
+-  return peewee.Expression(character.glass, '*', amount)
+-
+-
+-class Character(BeerModel):
+-  """class for one Character in the BeerLog database."""
+-  hexid = peewee.CharField()
+-  glass = peewee.IntegerField(default=constants.DEFAULT_GLASS_SIZE)
+-
+-  @property
+-  def name(self):
+-    """Gets the corresponding name from hexid using the parent db object
+-    method."""
+-    return self._meta.database.GetNameFromHexID(self.hexid)
+-
+-  def GetAmountDrunk(self, at=None):
+-    """Gets the amount of beer drunk."""
+-    return self._meta.database.GetAmountFromHexID(self.hexid, self.glass, at=at)
+-
+-
+-
+ class Entry(BeerModel):
+   """class for one Entry in the BeerLog database."""
+-  character = peewee.ForeignKeyField(Character, backref='entries')
++  character_name = peewee.CharField()
++  amount = peewee.IntegerField(default=constants.DEFAULT_GLASS_SIZE)
+   timestamp = peewee.DateTimeField(default=datetime.now)
+   pic = peewee.CharField(null=True)
+ 
+ class BeerLogDB():
+   """Wrapper for the database."""
+ 
+-  _DEFAULT_GLASS_SIZE = 50
+-
+   def __init__(self, database_path):
+     self.database_path = database_path
+     sqlite_db = peewee.SqliteDatabase(self.database_path)
+     database_proxy.initialize(sqlite_db)
+ 
+-    # This is used for the Character.name property
+-    sqlite_db.GetNameFromHexID = self.GetNameFromHexID
+-    # This is used for the Character.GetAmountDrink() method
+-    sqlite_db.GetAmountFromHexID = self.GetAmountFromHexID
+-
+-    sqlite_db.create_tables([Character, Entry], safe=True)
++    sqlite_db.create_tables([Entry], safe=True)
+ 
+     self.known_tags_list = None
+ 
+@@ -76,7 +46,7 @@ class BeerLogDB():
+     """Closes the database."""
+     database_proxy.close()
+ 
+-  def AddEntry(self, character_hexid, pic, time=None):
++  def AddEntry(self, character_hexid, pic=None, time=None):
+     """Inserts an entry in the database.
+ 
+     Args:
+@@ -87,36 +57,27 @@ class BeerLogDB():
+     Returns:
+       Entry: the Entry that was stored in the database.
+     """
+-    glass = self.GetGlassFromHexID(character_hexid)
+-    character, _ = Character.get_or_create(hexid=character_hexid, glass=glass)
++    amount = self.GetGlassFromHexID(character_hexid)
++    character_name = self.GetNameFromHexID(character_hexid)
+     if time:
+       entry = Entry.create(
+-          character=character,
++          character_name=character_name,
++          amount=amount,
+           timestamp=time,
+           pic=pic
+       )
+     else:
+       entry = Entry.create(
+-          character=character,
++          character_name=character_name,
++          amount=amount,
+           pic=pic
+       )
+     return entry
+ 
+-  def GetAllCharacters(self):
++  def GetAllCharacterNames(self):
+     """Gets all active characters."""
+-    query = Character.select(Character).join(Entry).where(
+-        Character.id == Entry.character_id).distinct()
+-    return query
+-
+-  def GetCharacterFromHexID(self, character_hexid):
+-    """Returns a Character from its hexid.
+-
+-    Args:
+-      character_hexid(str): the character's hexid.
+-    Returns:
+-      Character: a Character object, or None.
+-    """
+-    return Character.get_or_none(Character.hexid == character_hexid)
++    query = Entry.select(Entry.character_name).distinct()
++    return [entry.character_name for entry in query.execute()]
+ 
+   def GetEntryById(self, entry_id):
+     """Returns an Entry by its primary key.
+@@ -149,14 +110,14 @@ class BeerLogDB():
+     """
+     query = Entry.select(
+         Entry,
+-        Character,
++        peewee.fn.SUM(Entry.amount).alias('total'),
+         peewee.fn.MAX(Entry.timestamp).alias('last'),
+-        BeerPerCharacter(Character, peewee.fn.COUNT()).alias('amount')
+-    ).join(Character).group_by(Entry.character).order_by(
+-        BeerPerCharacter(Character, peewee.fn.COUNT()).desc(),
+-        (peewee.fn.MAX(Entry.timestamp)).desc()
++    ).group_by(
++        Entry.character_name
++    ).order_by(
++        peewee.SQL('total').desc(),
++        (peewee.fn.MAX(Entry.timestamp)).asc(),
+     )
+-
+     return query
+ 
+   def GetGlassFromHexID(self, uid):
+@@ -166,12 +127,14 @@ class BeerLogDB():
+       uid(str): the uid in form 0x0580000000050002
+     Returns:
+       int: the glass size for a tag uid, or the default value if not found.
++    Raises:
++      errors.BeerLogError: if the uid can't be found.
+     """
+     tag_object = self.known_tags_list.get(uid)
+     if not tag_object:
+-      return self._DEFAULT_GLASS_SIZE
++      raise errors.BeerLogError('Unknown character for tag {0:s}'.format(uid))
+ 
+-    return tag_object.get('glass', self._DEFAULT_GLASS_SIZE)
++    return tag_object.get('glass', constants.DEFAULT_GLASS_SIZE)
+ 
+   def LoadTagsDB(self, known_tags_path):
+     """Loads the external known tags list.
+@@ -200,12 +163,13 @@ class BeerLogDB():
+     Args:
+       uid(str): the uid in form 0x0580000000050002
+     Returns:
+-      str: the corresponding name for that tag uid, or None if no name is found.
++      str: the corresponding name for that tag uid.
++    Raises:
++      errors.BeerLogError: if the uid can't be found.
+     """
+     tag_object = self.known_tags_list.get(uid)
+     if not tag_object:
+-      return None
+-
++      raise errors.BeerLogError('Unknown character for tag {0:s}'.format(uid))
+     return tag_object.get('realname') or tag_object.get('name')
+ 
+   def GetEarliestTimestamp(self):
+@@ -216,27 +180,38 @@ class BeerLogDB():
+     """Returns the timestamp of the last scan."""
+     return Entry.select(peewee.fn.MAX(Entry.timestamp)).scalar() #pylint: disable=no-value-for-parameter
+ 
+-  def GetAmountFromHexID(self, hexid, glass_size, at=None):
++  def GetAmountFromHexID(self, hexid, at=None):
+     """Returns the amount of beer drunk for a Character.
+ 
+     Args:
+       hexid(str): the hexid of a character.
+-      glass_size(int): the size of the character's glass.
+       at(datetime.datetime): optional maximum date to count scans.
+     Returns:
+       int: the amount of beer.
+     """
+-    character = self.GetCharacterFromHexID(hexid)
++    character_name = self.GetNameFromHexID(hexid)
++    return self.GetAmountFromName(character_name, at=at)
++
++  def GetAmountFromName(self, name, at=None):
++    """Returns the amount of beer drunk for a character.
++
++    Args:
++      name(str): the name of a character.
++      at(datetime.datetime): optional maximum date to count scans.
++    Returns:
++      int: the amount of beer.
++    """
+     amount_cl = 0
+-    if character:
+-      if at:
+-        entries = Entry.select(Entry).where(
+-            Entry.character == character,
+-            Entry.timestamp <= at).count()
+-      else:
+-        entries = Entry.select(Entry).where(
+-            Entry.character == character).count()
+-      amount_cl = entries * glass_size
++    if at:
++      query = Entry.select(peewee.fn.SUM(Entry.amount)).where(
++          Entry.character_name == name,
++          Entry.timestamp <= at)
++    else:
++      query = Entry.select(peewee.fn.SUM(Entry.amount)).where(
++          Entry.character_name == name)
++    amount = query.scalar()
++    if amount:
++      amount_cl = amount
+     return amount_cl
+ 
+ # vim: tabstop=2 shiftwidth=2 expandtab
+diff --git a/beerlog/cli/beerlog_cli.py b/beerlog/cli/beerlog_cli.py
+index 0b8a84d..1cfb5af 100644
+--- a/beerlog/cli/beerlog_cli.py
++++ b/beerlog/cli/beerlog_cli.py
+@@ -15,7 +15,6 @@ import time
+ from beerlog import beerlogdb
+ from beerlog.bnfc import base as nfc_base
+ from beerlog import constants
+-from beerlog import errors
+ from beerlog import events
+ from beerlog.gui import display
+ 
+@@ -185,14 +184,9 @@ class BeerLog():
+     # TODO : have a UI class of events, and let the ui object deal with them
+     self.ResetTimers()
+     if event.type == constants.EVENTTYPES.NFCSCANNED:
+-      name = self.db.GetNameFromHexID(event.uid)
+-      if not name:
+-        raise errors.BeerLogError(
+-            'Could not find the corresponding name for tag id "{0!s}" '
+-            'in "{1:s}"'.format(event.uid, self._known_tags))
+-      character = self.db.GetCharacterFromHexID(event.uid)
+       self.db.AddEntry(event.uid, self._last_taken_picture)
+-      self.ui.machine.scan(who=name, character=character)
++      name = self.db.GetNameFromHexID(event.uid)
++      self.ui.machine.scan(who=name)
+       self.AddDelayedEvent(events.UIEvent(constants.EVENTTYPES.ESCAPE), 2)
+     elif event.type == constants.EVENTTYPES.KEYUP:
+       self.ui.machine.up()
+diff --git a/beerlog/gui/display.py b/beerlog/gui/display.py
+index a535687..08481b5 100644
+--- a/beerlog/gui/display.py
++++ b/beerlog/gui/display.py
+@@ -1,4 +1,5 @@
+-"""TODO"""
++"""Module for managing the display."""
++
+ from __future__ import print_function
+ 
+ from datetime import datetime
+@@ -15,7 +16,13 @@ from beerlog import errors
+ 
+ 
+ def GetShortAmountOfBeer(amount):
+-  """Returns a shortened string for an volume in cL."""
++  """Returns a shortened string for an volume in cL
++
++  Args:
++    amount(float): quantity, in L.
++  Returns:
++    str: the human readable string.
++  """
+   if amount >= 999.5:
+     return 'DED'
+   if amount >= 99.5:
+@@ -24,7 +31,15 @@ def GetShortAmountOfBeer(amount):
+ 
+ 
+ def GetShortLastBeer(last, now=None):
+-  """Returns a shortened string for the last scan."""
++  """Returns a shortened string for the delta between now and last scan.
++
++  Args:
++    last(datetime.datetime): timestamp of the last scan.
++    now(datetime.datetime): an optional time reference.
++      The current datetime if None.
++  Returns:
++    str: the time delta since the last scan and now.
++  """
+   if not now:
+     now = datetime.now()
+   delta = now - last
+@@ -52,6 +67,7 @@ def GetShortLastBeer(last, now=None):
+     result = 'Unk?'
+   return '{0: >4}'.format(result[0:4])
+ 
++
+ class ScoreBoard():
+   """Implements a sliding window with a selector over the score board."""
+ 
+@@ -103,15 +119,14 @@ class ScoreBoard():
+ 
+ 
+ class LumaDisplay():
+-  """TODO"""
++  """Class managing the display."""
+ 
+   STATES = ['SPLASH', 'SCORE', 'STATS', 'SCANNED', 'ERROR']
+ 
+   DEFAULT_SPLASH_PIC = 'assets/pics/splash_small.png'
+   DEFAULT_SCAN_GIF = 'assets/gif/beer_scanned.gif'
+ 
+-  # TODO: remove the default None here
+-  def __init__(self, events_queue=None, database=None):
++  def __init__(self, events_queue, database):
+     self._events_queue = events_queue
+     self._database = database
+     if not self._events_queue:
+@@ -122,8 +137,7 @@ class LumaDisplay():
+     # Internal stuff
+     self.luma_device = None
+     self.machine = None
+-    self._last_scanned = None
+-    self._last_scanned_character = None
++    self._last_scanned_name = None
+     self._last_error = None
+ 
+     # UI related defaults
+@@ -195,8 +209,7 @@ class LumaDisplay():
+     Args:
+       event(transitions.EventData): the event.
+     """
+-    self._last_scanned = event.kwargs.get('who', None)
+-    self._last_scanned_character = event.kwargs.get('character', None)
++    self._last_scanned_name = event.kwargs.get('who', None)
+     self._last_error = event.kwargs.get('error', None)
+     self._scoreboard = ScoreBoard(self._database.GetScoreBoard())
+ 
+@@ -220,11 +233,10 @@ class LumaDisplay():
+         (self.luma_device.width - size[0]) // 2,
+         self.luma_device.height - size[1]
+     )
+-    msg = 'Cheers ' + self._last_scanned + '!'
+-    if self._last_scanned_character:
+-      msg += ' {0:s}L'.format(
+-          GetShortAmountOfBeer(
+-              self._last_scanned_character.GetAmountDrunk() / 100.0))
++    msg = 'Cheers ' + self._last_scanned_name + '!'
++    msg += ' {0:s}L'.format(
++        GetShortAmountOfBeer(
++            self._database.GetAmountFromName(self._last_scanned_name) / 100.0))
+ 
+     for gif_frame in PIL.ImageSequence.Iterator(beer):
+       with regulator:
+@@ -263,8 +275,8 @@ class LumaDisplay():
+         #     '2.Dog        10   5m'
+         text = str(scoreboard_position)+'.'
+         text += ' '.join([
+-            ('{0:<'+str(max_name_width)+'}').format(row.character.name),
+-            GetShortAmountOfBeer(row.amount / 100.0),
++            ('{0:<'+str(max_name_width)+'}').format(row.character_name),
++            GetShortAmountOfBeer(row.total / 100.0),
+             GetShortLastBeer(row.last)])
+         if self._scoreboard.index == scoreboard_position:
+           rectangle_geometry = (
+diff --git a/beerlog/gui/sh1106.py b/beerlog/gui/sh1106.py
+index d1caddd..8f7b5ce 100644
+--- a/beerlog/gui/sh1106.py
++++ b/beerlog/gui/sh1106.py
+@@ -106,7 +106,7 @@ class WaveShareOLEDHat():
+     self._oled_hat = sh1106(self._serial, rotate=0)
+ 
+   def GetDevice(self):
+-    """Returns the """
++    """Returns the luma device"""
+     return self._oled_hat
+ 
+ # vim: tabstop=2 shiftwidth=2 expandtab
+diff --git a/tools/web.py b/tools/web.py
+index 4e20ce8..8ac1203 100644
+--- a/tools/web.py
++++ b/tools/web.py
+@@ -73,10 +73,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
+     db.LoadTagsDB('/home/renzokuken/known_tags.json')
+ 
+     first_scan = db.GetEarliestTimestamp()
+-    first_scan = first_scan.replace(hour=16, minute=0, second=0)
++    first_scan = first_scan.replace(hour=16, minute=0, second=0) # Clean up hack
+     last_scan = db.GetLatestTimestamp()
+     delta = last_scan - first_scan
+-    print(last_scan)
+     total_hours = int((delta.total_seconds() / 3600) + 2)
+     fields = []
+     datasets = {} # {'alcoolique': ['L cummulés']}
+@@ -84,12 +83,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
+       timestamp = (first_scan + datetime.timedelta(seconds=hour * 3600))
+       timestamp = timestamp.replace(tzinfo=datetime.timezone.utc)
+       fields.append(timestamp.astimezone().strftime('%Y%m%d %Hh%M'))
+-      for alcoolique in db.GetAllCharacters():
+-        cl = alcoolique.GetAmountDrunk(at=timestamp)
+-        if alcoolique.name in datasets:
+-          datasets[alcoolique.name].append(cl)
++      for alcoolique in db.GetAllCharacterNames():
++        cl = db.GetAmountFromName(alcoolique, at=timestamp)
++        if alcoolique in datasets:
++          datasets[alcoolique].append(cl)
+         else:
+-          datasets[alcoolique.name] = [cl]
++          datasets[alcoolique] = [cl]
+ 
+     output_datasets = [] # [{'label': 'alcoolique', 'data': ['L cummulés']}]
+     for k, v in datasets.items():

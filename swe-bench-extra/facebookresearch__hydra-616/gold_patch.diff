@@ -1,0 +1,211 @@
+diff --git a/hydra/_internal/config_loader_impl.py b/hydra/_internal/config_loader_impl.py
+index ef18964cef..495f389bcd 100644
+--- a/hydra/_internal/config_loader_impl.py
++++ b/hydra/_internal/config_loader_impl.py
+@@ -61,7 +61,8 @@ class ParsedOverride:
+         return self.pkg1 is not None and self.pkg2 is not None
+ 
+     def is_delete(self) -> bool:
+-        return self.prefix == "~"
++        legacy_delete = self.value == "null"
++        return self.prefix == "~" or legacy_delete
+ 
+     def is_add(self) -> bool:
+         return self.prefix == "+"
+@@ -292,6 +293,19 @@ class ConfigLoaderImpl(ConfigLoader):
+                 )
+         for owl in overrides:
+             override = owl.override
++            if override.value == "null":
++                if override.prefix not in (None, "~"):
++                    ConfigLoaderImpl._raise_parse_override_error(owl.input_line)
++                override.prefix = "~"
++                override.value = None
++
++                msg = (
++                    "\nRemoving from the defaults list by assigning 'null' "
++                    "is deprecated and will be removed in Hydra 1.1."
++                    f"\nUse ~{override.key}"
++                )
++                warnings.warn(category=UserWarning, message=msg)
++
+             if (
+                 not (override.is_delete() or override.is_package_rename())
+                 and override.value is None
+@@ -453,19 +467,6 @@ class ConfigLoaderImpl(ConfigLoader):
+             pkg1 = matches.group("pkg1")
+             pkg2 = matches.group("pkg2")
+             value: Optional[str] = matches.group("value")
+-            if value == "null":
+-                if prefix not in (None, "~"):
+-                    ConfigLoaderImpl._raise_parse_override_error(override)
+-                prefix = "~"
+-                value = None
+-
+-                msg = (
+-                    "\nRemoving from the defaults list by assigning 'null' "
+-                    "is deprecated and will be removed in Hydra 1.1."
+-                    f"\nUse ~{key}"
+-                )
+-                warnings.warn(category=UserWarning, message=msg)
+-
+             ret = ParsedOverride(prefix, key, pkg1, pkg2, value)
+             return ParsedOverrideWithLine(override=ret, input_line=override)
+         else:
+diff --git a/hydra/conf/__init__.py b/hydra/conf/__init__.py
+index c7bc9ccbb8..7be98d6180 100644
+--- a/hydra/conf/__init__.py
++++ b/hydra/conf/__init__.py
+@@ -129,7 +129,8 @@ class HydraConf:
+     # Output directory for produced configuration files and overrides.
+     # E.g., hydra.yaml, overrides.yaml will go here. Useful for debugging
+     # and extra context when looking at past runs.
+-    output_subdir: str = ".hydra"
++    # Setting to None will prevent the creation of the output subdir.
++    output_subdir: Optional[str] = ".hydra"
+ 
+     # Those lists will contain runtime overrides
+     overrides: OverridesConf = OverridesConf()
+diff --git a/hydra/core/utils.py b/hydra/core/utils.py
+index 673b421343..e1da729fa3 100644
+--- a/hydra/core/utils.py
++++ b/hydra/core/utils.py
+@@ -97,16 +97,12 @@ def run_job(
+         # handle output directories here
+         Path(str(working_dir)).mkdir(parents=True, exist_ok=True)
+         os.chdir(working_dir)
+-        hydra_output = Path(config.hydra.output_subdir)
+ 
+         configure_log(config.hydra.job_logging, config.hydra.verbose)
+ 
+         hydra_cfg = OmegaConf.masked_copy(config, "hydra")
+         assert isinstance(hydra_cfg, DictConfig)
+ 
+-        _save_config(task_cfg, "config.yaml", hydra_output)
+-        _save_config(hydra_cfg, "hydra.yaml", hydra_output)
+-        _save_config(config.hydra.overrides.task, "overrides.yaml", hydra_output)
+         with env_override(hydra_cfg.hydra.job.env_set):
+             ret.return_value = task_function(task_cfg)
+         ret.task_name = JobRuntime.instance().get("name")
+@@ -115,6 +111,12 @@ def run_job(
+         # If logging is still required after run_job caller is responsible to re-initialize it.
+         logging.shutdown()
+ 
++        if config.hydra.output_subdir is not None:
++            hydra_output = Path(config.hydra.output_subdir)
++            _save_config(task_cfg, "config.yaml", hydra_output)
++            _save_config(hydra_cfg, "hydra.yaml", hydra_output)
++            _save_config(config.hydra.overrides.task, "overrides.yaml", hydra_output)
++
+         return ret
+     finally:
+         os.chdir(old_cwd)
+diff --git a/news/324.feature b/news/324.feature
+new file mode 100644
+index 0000000000..8f52b743a7
+--- /dev/null
++++ b/news/324.feature
+@@ -0,0 +1,1 @@
++Support for disabling the creation of the `.hydra` subdirectory by overriding "hydra.output_subdir" to "null"
+\ No newline at end of file
+diff --git a/website/docs/terminology.md b/website/docs/terminology.md
+index e1660dc399..9435b92f98 100644
+--- a/website/docs/terminology.md
++++ b/website/docs/terminology.md
+@@ -2,15 +2,16 @@
+ id: terminology
+ title: Terminology
+ ---
++## Overview
+ This page describes some of the common concepts in Hydra.
+ It does not contain a comprehensive description of each item, nor is it a usage guide.  
+ Most concepts here are described in much more details throughout the documentation.
+ 
+-## Config
++### Config
+ A config is an entity containing user configuration, composed of Config Nodes.
+ Configs are always converted to OmegaConf DictConfig or ListConfig objects.
+ 
+-## Primary Config
++### Primary Config
+ The config named in `@hydra.main()` or in `hydra.experimental.compose()`.
+ 
+ ### Config Node
+@@ -30,7 +31,7 @@ A dataclass or an instance of a dataclass that is used to construct a config.
+ The constructed config object is using the underlying type for runtime type validation.  
+ Duck typing (The usage of the underlying type for type annotation) enables static type checking of the config.
+ 
+-## Config Search Path:
++### Config Search Path:
+ Alternative names: Search Path
+    
+ The Config Search Path is a list of virtual paths that is searched in order to find configs.  
+@@ -38,7 +39,7 @@ Conceptually, this is similar to the Python PYTHONPATH or the Java CLASSPATH.
+ When a config searched in the config search path, the first matching config is used.
+ Each config search path element has a schema prefix such as file:// or pkg:// that is corresponding to a ConfigSourcePlugin.
+ 
+-## Config Group
++### Config Group
+ Alternative names: Group
+ 
+ A config group is a logical directory in the Config Search Path. The Config Group options are the union of all the configs in that
+@@ -46,23 +47,23 @@ directory across the Config Search Path.
+ Config Groups can be hierarchical and in that case the path elements are separated by a forward slash ('/') 
+ regardless of the operating system.
+ 
+-## Config Group Option
++### Config Group Option
+ Alternative names: Option
+ 
+ One of the configs in a Config Group.
+ 
+-## Defaults List
++### Defaults List
+ Alternative names: Defaults
+ 
+ A special list in the Primary Config. The Defaults List contains composition instructions Hydra is using when creating the 
+ final config object.
+ The defaults list is removed from the final config object. 
+ 
+-## Package
++### Package
+ A package is the parent lineage of a node. You also think of it as the path of the node in the config object.
+ The package of a Config can be overridden via the command line or via the defaults list.
+ 
+-# Examples
++## Examples
+ 
+ ```yaml title="foo/oompa/loompa.yaml"
+ a:
+diff --git a/website/docs/tutorials/basic/running_your_app/logging.md b/website/docs/tutorials/basic/running_your_app/logging.md
+index 4e9387bd51..ff997ab696 100644
+--- a/website/docs/tutorials/basic/running_your_app/logging.md
++++ b/website/docs/tutorials/basic/running_your_app/logging.md
+@@ -51,5 +51,11 @@ $ python my_app.py hydra.verbose=[__main__,hydra]
+ [2019-09-29 13:06:00,896][__main__][DEBUG] - Debug level message
+ ```
+ 
++You can disable the logging output using by setting `hydra/job_logging` to `disabled'   
++```commandline
++$ python my_app.py hydra/job_logging=disabled
++<NO OUTPUT>
++```
++
+ Logging can be [customized](/configure_hydra/logging.md).
+ 
+diff --git a/website/docs/tutorials/basic/running_your_app/working_directory.md b/website/docs/tutorials/basic/running_your_app/working_directory.md
+index 30337df4f4..7532de2c64 100644
+--- a/website/docs/tutorials/basic/running_your_app/working_directory.md
++++ b/website/docs/tutorials/basic/running_your_app/working_directory.md
+@@ -49,6 +49,11 @@ Inside the configuration output directory we have:
+ And in the main output directory:
+ * `my_app.log`: A log file created for this run
+ 
++### Disabling output subdir 
++You can change the `.hydra` subdirectory name by overriding `hydra.output_subdir`.
++You can disable its creation by overriding `hydra.output_subdir` to `null`. 
++
++
+ ### Original working directory
+ 
+ You can still access the original working directory if you need to:

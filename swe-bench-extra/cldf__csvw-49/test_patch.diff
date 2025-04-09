@@ -1,0 +1,219 @@
+diff --git a/tests/fixtures/datapackage.json b/tests/fixtures/datapackage.json
+new file mode 100644
+index 0000000..57c9221
+--- /dev/null
++++ b/tests/fixtures/datapackage.json
+@@ -0,0 +1,59 @@
++{
++  "profile": "data-package",
++  "resources": [
++    {
++      "path": "frictionless-data.csv",
++      "stats": {
++        "hash": "b36e8c21563ab32645052c11510bddb7", "bytes": 131, "fields": 3, "rows": 9
++      },
++      "control": {"newline": ""},
++      "encoding": "utf-8",
++      "dialect": {"delimiter": "|", "commentChar":  "#", "lineTerminator":  "+\n"},
++      "schema": {
++        "fields": [
++          {"name":  "FK", "type":  "string"},
++          {"name": "Year", "type": "integer", "rdfType":  "http://example.com"},
++          {"name": "Location name", "type": "string"},
++          {"name": "Value", "type": "integer", "groupChar":  "-"},
++          {"name":  "binary", "type":  "string", "format":  "binary"},
++          {"name":  "anyURI", "type":  "string", "format":  "uri"},
++          {"name":  "email", "type":  "string", "format":  "email"},
++          {"name":  "boolean", "type":  "boolean", "trueValues":  ["ja"], "falseValues":  ["nein"]},
++          {"name": "array", "type": "array", "description":  "empty"},
++          {"name": "geojson", "type": "geojson", "title":  "a point"}
++        ],
++        "foreignKeys": [
++          {"fields":  ["FK"], "reference":  {"resource": "tsv", "fields":  ["class"]}}
++        ]
++      },
++      "name": "test",
++      "profile": "tabular-data-resource",
++      "scheme": "file",
++      "format": "csv",
++      "hashing": "md5",
++      "compression": "no",
++      "compressionPath": "",
++      "query": {}
++    },
++    {
++      "path": "tsv.txt",
++      "control": {"newline": ""},
++      "encoding": "utf-8",
++      "dialect": {"delimiter": "\t"},
++      "schema": {
++        "fields": [
++          {"name": "class", "type": "string"},
++          {"name": "a-name", "type": "string"}
++        ]
++      },
++      "name": "tsv",
++      "profile": "tabular-data-resource",
++      "scheme": "file",
++      "format": "csv",
++      "hashing": "md5",
++      "compression": "no",
++      "compressionPath": "",
++      "query": {}
++    }
++  ]
++}
+diff --git a/tests/fixtures/frictionless-data.csv b/tests/fixtures/frictionless-data.csv
+new file mode 100644
+index 0000000..f931adf
+--- /dev/null
++++ b/tests/fixtures/frictionless-data.csv
+@@ -0,0 +1,11 @@
++FK|Year|Location name|Value|binary|anyURI|email|boolean|array|geojson+
++a|2010||10-123|eA==|http://example.com|x@example.com|ja|[]|{}+
++a|2011||20||||nein||+
++c|2012||30||||||+
++#+
++e|2010|Urban|12||||||+
++e|2011|Urban|22||||||+
++e|2012|Urban|32||||||+
++e|2010|Rural|14||||||+
++e|2011|Rural|24||||||+
++x|2012|Rural|34||||||+
+diff --git a/tests/test_frictionless.py b/tests/test_frictionless.py
+new file mode 100644
+index 0000000..150bdf1
+--- /dev/null
++++ b/tests/test_frictionless.py
+@@ -0,0 +1,84 @@
++import json
++import shutil
++import pathlib
++
++import pytest
++
++from csvw.dsv import UnicodeWriter
++from csvw import TableGroup
++from csvw.frictionless import DataPackage
++
++FIXTURES = pathlib.Path(__file__).parent / 'fixtures'
++
++
++@pytest.fixture
++def tmpfixtures(tmpdir):
++    shutil.copytree(str(pathlib.Path(__file__).parent / 'fixtures'), str(tmpdir.join('fixtures')))
++    return pathlib.Path(str(tmpdir)) / 'fixtures'
++
++
++@pytest.fixture
++def datafactory(tmpdir):
++    def make(fields, data):
++        p = pathlib.Path(str(tmpdir)) / 'datapackage.json'
++        with p.open(mode='wt') as f:
++            rsc = dict(
++                profile='tabular-data-resource',
++                scheme='file',
++                format='csv',
++                path='data.csv',
++                schema=dict(fields=fields),
++            )
++            json.dump(dict(resources=[rsc]), f)
++        with UnicodeWriter(p.parent / 'data.csv') as w:
++            w.writerow([f['name'] for f in fields])
++            w.writerows(data)
++        return p
++    return make
++
++
++def test_DataPackage_init():
++    dp = DataPackage(dict(resources=[], name='x'))
++    dp = DataPackage(dp)
++    assert dp.to_tablegroup().common_props['dc:identifier'] == 'x'
++    dp = DataPackage('{"resources": [], "name": "x", "id": "y"}')
++    assert dp.to_tablegroup().common_props['dc:identifier'] == 'y'
++    assert dp.to_tablegroup().common_props['dc:title'] == 'x'
++
++
++def test_DataPackage_constraints(datafactory):
++    dp = datafactory([{'name': 'col', 'constraints': {'maxLength': 3}}], [['abcd']])
++    with pytest.raises(ValueError):
++        _ = list(DataPackage(dp).to_tablegroup().tables[0])
++
++    dp = datafactory([{'name': 'col', 'constraints': {'pattern': '[a-z]{2}'}}], [['abcd']])
++    with pytest.raises(ValueError):
++        _ = list(DataPackage(dp).to_tablegroup().tables[0])
++
++    dp = datafactory(
++        [{'name': 'col', 'type': 'year', 'constraints': {'pattern': '[2].*'}}], [['1990']])
++    with pytest.raises(ValueError):
++        _ = list(DataPackage(dp).to_tablegroup().tables[0])
++
++
++def test_DataPackage(tmpfixtures):
++    dp = DataPackage(tmpfixtures / 'datapackage.json')
++    tg = dp.to_tablegroup()
++    rows = list(tg.tables[0])
++    assert len(rows) == 9
++    assert rows[-1]['Year'] == 2012
++    assert rows[-1]['Location name'] == 'Rural'
++    with pytest.raises(ValueError):
++        tg.check_referential_integrity()
++    schema = tg.tables[0].tableSchema
++    for c in ['binary', 'anyURI']:
++        assert schema.columndict[c].datatype.base == c
++    assert rows[0]['boolean'] is True and rows[1]['boolean'] is False
++    assert rows[0]['Value'] == 10123
++    assert list(rows[0].values())[-1] != '+', "custom line terminator must be stripped"
++
++    tg.to_file(tmpfixtures / 'metadata.json')
++    tg = TableGroup.from_file(tmpfixtures / 'metadata.json')
++    rows = list(tg.tables[0])
++    assert len(rows) == 9
++    assert rows[-1]['Year'] == 2012
+diff --git a/tests/test_metadata.py b/tests/test_metadata.py
+index c840947..7f461fb 100644
+--- a/tests/test_metadata.py
++++ b/tests/test_metadata.py
+@@ -29,12 +29,6 @@ def test_Link():
+     assert li.resolve(pathlib.Path('.')) == pathlib.Path('abc.csv')
+ 
+ 
+-def test_column_init():
+-    with pytest.raises(ValueError):
+-        # column names mustn't start with a -!
+-        csvw.Column(name='-abd')
+-
+-
+ class TestColumnAccess(object):
+ 
+     def test_get_column(self):
+@@ -279,6 +273,10 @@ class TestTableGroup(object):
+         return _make_table_like(
+             csvw.TableGroup, tmpdir, data=data, metadata=metadata, mdname='csv.txt-metadata.json')
+ 
++    def test_from_frictionless(self):
++        tg = csvw.TableGroup.from_frictionless_datapackage(FIXTURES / 'datapackage.json')
++        assert list(tg.tables[0])
++
+     def test_iteritems_column_renaming(self, tmpdir):
+         t = csvw.TableGroup.from_file(FIXTURES / 'test.tsv-metadata.json')
+         items = list(t.tables[0])
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index 20e88b0..0fc3956 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -1,14 +1,6 @@
+-import pytest
+-
+ from csvw import utils
+ 
+ 
+-def test_attr_valid_re(mocker):
+-    validator = utils.attr_valid_re('[0-9]+')
+-    with pytest.raises(ValueError):
+-        validator(None, mocker.Mock(), 'x')
+-
+-
+ def test_lazyproperty():
+     import itertools
+ 

@@ -1,0 +1,176 @@
+diff --git a/catalog_persistence/tests/test_databases.py b/catalog_persistence/tests/test_databases.py
+index 46ef971..33e0bfb 100644
+--- a/catalog_persistence/tests/test_databases.py
++++ b/catalog_persistence/tests/test_databases.py
+@@ -452,23 +452,59 @@ def test_sort_result():
+ 
+ 
+ def test_add_attachment_properties(setup, database_service, xml_test):
+-    expected = {
+-        database_service.db_manager._attachments_properties_key:
+-            {
+-                'href_file':
+-                {
+-                    'content_type': "text/xml",
+-                    'content_size': len(xml_test)
+-                }
+-            }
++    file_properties1 = {
++            'content_type': "text/xml",
++            'content_size': len(xml_test)
+         }
++    key = database_service.db_manager._attachments_properties_key
++    expected = {}
++    expected[key] = {
++        'file1': file_properties1,
++    }
++
++    article_record = get_article_record({'Test': 'Test13'})
++    database_service.register(
++        article_record['document_id'],
++        article_record
++    )
++
++    document_record = database_service.db_manager \
++                            .add_attachment_properties_to_document_record(
++                                article_record['document_id'],
++                                'file1',
++                                file_properties1
++                            )
++    assert expected[key] == document_record[key]
++
++
++def test_get_attachment_properties(setup, database_service, xml_test):
++
++    article_record = get_article_record({'Test': 'Test11'})
++    database_service.register(
++        article_record['document_id'],
++        article_record
++    )
+     file_properties = {
+             'content_type': "text/xml",
+             'content_size': len(xml_test)
+         }
+-    record = {}
+-    assert expected == database_service.db_manager._add_attachment_properties(
+-            record,
+-            'href_file',
+-            file_properties
++
++    database_service.put_attachment(
++        document_id=article_record['document_id'],
++        file_id='href_file',
++        content=xml_test.encode('utf-8'),
++        file_properties=file_properties
++    )
++
++    database_service.put_attachment(
++        document_id=article_record['document_id'],
++        file_id='href_file2',
++        content=xml_test.encode('utf-8'),
++        file_properties=file_properties
++    )
++    expected = file_properties
++    assert expected == \
++        database_service.db_manager.get_attachment_properties(
++            article_record['document_id'],
++            'href_file'
+         )
+diff --git a/catalogmanager/tests/test_article_model.py b/catalogmanager/tests/test_article_model.py
+index 4ab89d1..b055a40 100644
+--- a/catalogmanager/tests/test_article_model.py
++++ b/catalogmanager/tests/test_article_model.py
+@@ -98,6 +98,4 @@ def test_update_href(test_package_A, test_packA_filenames,
+     ]
+ 
+     assert len(items) == 1
+-    assert items[0].href == new_href
+-    assert items[0].name == filename
+-    assert not article.xml_tree.content == content
++    assert not article.xml_tree.compare(content)
+diff --git a/catalogmanager/tests/test_article_services.py b/catalogmanager/tests/test_article_services.py
+index 604354c..510f525 100644
+--- a/catalogmanager/tests/test_article_services.py
++++ b/catalogmanager/tests/test_article_services.py
+@@ -198,7 +198,9 @@ def test_get_asset_file(change_service, test_package_A, test_packA_filenames,
+                                      content=xml_file.content,
+                                      content_size=xml_file.size)
+     for file in test_package_A[1:]:
+-        assert file.content == article_services.get_asset_file('ID', file.name)
++        content_type, content = article_services.get_asset_file(
++            'ID', file.name)
++        assert file.content == content
+ 
+ 
+ def test_get_asset_files(change_service, test_package_A,
+@@ -211,7 +213,12 @@ def test_get_asset_files(change_service, test_package_A,
+                                      content=xml_file.content,
+                                      content_size=xml_file.size)
+     items, msg = article_services.get_asset_files('ID')
++    asset_contents = [
++        asset_data[1]
++        for name, asset_data in items.items()
++        if len(asset_data) == 2
++    ]
+     assert len(items) == len(files)
+     assert len(msg) == 0
+     for asset in files:
+-        assert asset.content in items.values()
++        assert asset.content in asset_contents
+diff --git a/catalogmanager_api/tests/test_article.py b/catalogmanager_api/tests/test_article.py
+index 09654f9..1f5abef 100644
+--- a/catalogmanager_api/tests/test_article.py
++++ b/catalogmanager_api/tests/test_article.py
+@@ -341,3 +341,52 @@ def test_http_article_put_article_with_assets(mocked_put_article,
+         assets_files=expected_assets_properties,
+         **db_settings
+     )
++
++
++@patch.object(catalogmanager, 'get_asset_file')
++def test_http_get_asset_file_calls_get_asset_file(mocked_get_asset_file,
++                                                  db_settings,
++                                                  testapp):
++
++    article_id = 'ID123456'
++    asset_id = 'ID123456'
++    mocked_get_asset_file.return_value = '', b'123456Test'
++    testapp.get('/articles/{}/{}'.format(article_id, asset_id))
++    mocked_get_asset_file.assert_called_once_with(
++        article_id=article_id,
++        asset_id=asset_id,
++        **db_settings
++    )
++
++
++@patch.object(catalogmanager, 'get_asset_file')
++def test_http_get_asset_file_not_found(mocked_get_asset_file,
++                                       testapp):
++    article_id = 'ID123456'
++    asset_id = 'a.jpg'
++    error_msg = 'Asset {} (Article {}) not found'.format(asset_id, article_id)
++    mocked_get_asset_file.side_effect = \
++        catalogmanager.article_services.ArticleServicesException(
++            message=error_msg
++        )
++    expected = {
++        "error": "404",
++        "message": error_msg
++    }
++    result = testapp.get('/articles/{}/{}'.format(article_id, asset_id))
++    assert result.status == '200 OK'
++    assert result.json == expected
++
++
++@patch.object(catalogmanager, 'get_asset_file')
++def test_http_get_asset_file_succeeded(mocked_get_asset_file,
++                                       testapp,
++                                       test_xml_file):
++    article_id = 'ID123456'
++    asset_id = 'a.jpg'
++    expected = 'text/xml', test_xml_file.encode('utf-8')
++    mocked_get_asset_file.return_value = expected
++    result = testapp.get('/articles/{}/{}'.format(article_id, asset_id))
++    assert result.status == '200 OK'
++    assert result.body == expected[1]
++    assert result.content_type == expected[0]

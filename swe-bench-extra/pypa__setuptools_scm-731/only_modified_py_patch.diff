@@ -1,0 +1,128 @@
+diff --git a/src/setuptools_scm/_cli.py b/src/setuptools_scm/_cli.py
+index 88dd6d0..4883c4f 100644
+--- a/src/setuptools_scm/_cli.py
++++ b/src/setuptools_scm/_cli.py
+@@ -10,15 +10,15 @@ from setuptools_scm.discover import walk_potential_roots
+ from setuptools_scm.integration import find_files
+ 
+ 
+-def main() -> None:
+-    opts = _get_cli_opts()
+-    root = opts.root or "."
++def main(args: list[str] | None = None) -> None:
++    opts = _get_cli_opts(args)
++    inferred_root: str = opts.root or "."
+ 
+-    pyproject = opts.config or _find_pyproject(root)
++    pyproject = opts.config or _find_pyproject(inferred_root)
+ 
+     try:
+-        root = opts.root or os.path.relpath(os.path.dirname(pyproject))
+-        config = Configuration.from_file(pyproject, root=root)
++
++        config = Configuration.from_file(pyproject, root=opts.root)
+     except (LookupError, FileNotFoundError) as ex:
+         # no pyproject.toml OR no [tool.setuptools_scm]
+         print(
+@@ -27,10 +27,11 @@ def main() -> None:
+             f" Reason: {ex}.",
+             file=sys.stderr,
+         )
+-        config = Configuration(root=root)
++        config = Configuration(inferred_root)
+ 
+     version = _get_version(config)
+-    assert version is not None
++    if version is None:
++        raise SystemExit("ERROR: no version found for", opts)
+     if opts.strip_dev:
+         version = version.partition(".dev")[0]
+     print(version)
+@@ -40,7 +41,7 @@ def main() -> None:
+             print(fname)
+ 
+ 
+-def _get_cli_opts() -> argparse.Namespace:
++def _get_cli_opts(args: list[str] | None) -> argparse.Namespace:
+     prog = "python -m setuptools_scm"
+     desc = "Print project version according to SCM metadata"
+     parser = argparse.ArgumentParser(prog, description=desc)
+@@ -68,7 +69,7 @@ def _get_cli_opts() -> argparse.Namespace:
+     # We avoid `metavar` to prevent printing repetitive information
+     desc = "List files managed by the SCM"
+     sub.add_parser("ls", help=desc[0].lower() + desc[1:], description=desc)
+-    return parser.parse_args()
++    return parser.parse_args(args)
+ 
+ 
+ def _find_pyproject(parent: str) -> str:
+diff --git a/src/setuptools_scm/config.py b/src/setuptools_scm/config.py
+index f73b905..fee652c 100644
+--- a/src/setuptools_scm/config.py
++++ b/src/setuptools_scm/config.py
+@@ -24,6 +24,7 @@ if TYPE_CHECKING:
+ DEFAULT_TAG_REGEX = r"^(?:[\w-]+-)?(?P<version>[vV]?\d+(?:\.\d+){0,2}[^\+]*)(?:\+.*)?$"
+ DEFAULT_VERSION_SCHEME = "guess-next-dev"
+ DEFAULT_LOCAL_SCHEME = "node-and-date"
++_ROOT = "root"
+ 
+ 
+ def _check_tag_regex(value: str | Pattern[str] | None) -> Pattern[str]:
+@@ -213,6 +214,7 @@ class Configuration:
+ 
+         with open(name, encoding="UTF-8") as strm:
+             data = strm.read()
++
+         defn = _load_toml(data)
+         try:
+             section = defn.get("tool", {})["setuptools_scm"]
+@@ -220,6 +222,21 @@ class Configuration:
+             raise LookupError(
+                 f"{name} does not contain a tool.setuptools_scm section"
+             ) from e
++
++        project = defn.get("project", {})
++        dist_name = cls._cleanup_from_file_args_data(
++            project, dist_name, kwargs, section
++        )
++        return cls(dist_name=dist_name, relative_to=name, **section, **kwargs)
++
++    @staticmethod
++    def _cleanup_from_file_args_data(
++        project: dict[str, Any],
++        dist_name: str | None,
++        kwargs: dict[str, Any],
++        section: dict[str, Any],
++    ) -> str | None:
++        """drops problematic details and figures the distribution name"""
+         if "dist_name" in section:
+             if dist_name is None:
+                 dist_name = section.pop("dist_name")
+@@ -227,13 +244,21 @@ class Configuration:
+                 assert dist_name == section["dist_name"]
+                 del section["dist_name"]
+         if dist_name is None:
+-            if "project" in defn:
+-                # minimal pep 621 support for figuring the pretend keys
+-                dist_name = defn["project"].get("name")
++            # minimal pep 621 support for figuring the pretend keys
++            dist_name = project.get("name")
+         if dist_name is None:
+             dist_name = _read_dist_name_from_setup_cfg()
+-
+-        return cls(dist_name=dist_name, **section, **kwargs)
++        if _ROOT in kwargs:
++            if kwargs[_ROOT] is None:
++                kwargs.pop(_ROOT, None)
++            elif _ROOT in section:
++                if section[_ROOT] != kwargs[_ROOT]:
++                    warnings.warn(
++                        f"root {section[_ROOT]} is overridden"
++                        f" by the cli arg {kwargs[_ROOT]}"
++                    )
++                section.pop("root", None)
++        return dist_name
+ 
+ 
+ def _read_dist_name_from_setup_cfg() -> str | None:
+

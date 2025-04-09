@@ -1,0 +1,126 @@
+diff --git a/b2sdk/b2http.py b/b2sdk/b2http.py
+index 4fe5a172..c2230bb9 100644
+--- a/b2sdk/b2http.py
++++ b/b2sdk/b2http.py
+@@ -307,7 +307,12 @@ class B2Http(object):
+             self._run_post_request_hooks('POST', url, headers, response)
+             return response
+ 
+-        response = _translate_and_retry(do_post, try_count, post_params)
++        try:
++            response = _translate_and_retry(do_post, try_count, post_params)
++        except B2RequestTimeout:
++            # this forces a token refresh, which is necessary if request is still alive
++            # on the server but has terminated for some reason on the client. See #79
++            raise B2RequestTimeoutDuringUpload()
+ 
+         # Decode the JSON that came back.  If we've gotten this far,
+         # we know we have a status of 200 OK.  In this case, the body
+diff --git a/b2sdk/bucket.py b/b2sdk/bucket.py
+index 15d45f21..b95dd265 100644
+--- a/b2sdk/bucket.py
++++ b/b2sdk/bucket.py
+@@ -196,6 +196,36 @@ class Bucket(object):
+         """
+         return self.api.list_parts(file_id, start_part_number, batch_size)
+ 
++    def list_file_versions(self, file_name, fetch_count=None):
++        """
++        Lists all of the versions for a single file.
++
++        :param str file_name: the name of the file to list.
++        :param int,None fetch_count: how many entries to list per API call or ``None`` to use the default. Acceptable values: 1 - 10000
++        :rtype: generator[b2sdk.v1.FileVersionInfo]
++        """
++        if fetch_count is not None and fetch_count <= 0:
++            # fetch_count equal to 0 means "use API default", which we don't want to support here
++            raise ValueError("unsupported fetch_count value")
++        start_file_name = file_name
++        start_file_id = None
++        session = self.api.session
++        while 1:
++            response = session.list_file_versions(
++                self.id_, start_file_name, start_file_id, fetch_count, file_name
++            )
++
++            for entry in response['files']:
++                file_version_info = FileVersionInfoFactory.from_api_response(entry)
++                if file_version_info.file_name != file_name:
++                    # All versions for the requested file name have been listed.
++                    return
++                yield file_version_info
++            start_file_name = response['nextFileName']
++            start_file_id = response['nextFileId']
++            if start_file_name is None:
++                return
++
+     def ls(self, folder_to_list='', show_versions=False, recursive=False, fetch_count=None):
+         """
+         Pretend that folders exist and yields the information about the files in a folder.
+diff --git a/b2sdk/exception.py b/b2sdk/exception.py
+index 61d9fe5f..fdeb2d63 100644
+--- a/b2sdk/exception.py
++++ b/b2sdk/exception.py
+@@ -108,8 +108,9 @@ class BadJson(B2SimpleError):
+     prefix = 'Bad request'
+ 
+ 
+-class BadUploadUrl(TransientErrorMixin, B2SimpleError):
+-    pass
++class BadUploadUrl(B2SimpleError):
++    def should_retry_upload(self):
++        return True
+ 
+ 
+ class BrokenPipe(B2Error):
+@@ -209,6 +210,12 @@ class B2RequestTimeout(TransientErrorMixin, B2SimpleError):
+     pass
+ 
+ 
++class B2RequestTimeoutDuringUpload(B2RequestTimeout):
++    # if a timeout is hit during upload, it is not guaranteed that the the server has released the upload token lock already, so we'll use a new token
++    def should_retry_http(self):
++        return False
++
++
+ class DestFileNewer(B2Error):
+     def __init__(self, dest_file, source_file, dest_prefix, source_prefix):
+         super(DestFileNewer, self).__init__()
+diff --git a/b2sdk/raw_simulator.py b/b2sdk/raw_simulator.py
+index 6b5a091d..50fa5ff4 100644
+--- a/b2sdk/raw_simulator.py
++++ b/b2sdk/raw_simulator.py
+@@ -510,8 +510,10 @@ class BucketSimulator(object):
+         next_file_id = None
+         for key in sorted(six.iterkeys(self.file_name_and_id_to_file)):
+             (file_name, file_id) = key
+-            if (start_file_name <
+-                file_name) or (start_file_name == file_name and start_file_id <= file_id):
++            if (start_file_name < file_name) or (
++                start_file_name == file_name and
++                (start_file_id == '' or int(start_file_id) <= int(file_id))
++            ):
+                 file_sim = self.file_name_and_id_to_file[key]
+                 if prefix is not None and not file_name.startswith(prefix):
+                     break
+diff --git a/b2sdk/v1/exception.py b/b2sdk/v1/exception.py
+index cf149a68..7815a28f 100644
+--- a/b2sdk/v1/exception.py
++++ b/b2sdk/v1/exception.py
+@@ -18,6 +18,7 @@ from b2sdk.exception import B2HttpCallbackException
+ from b2sdk.exception import B2HttpCallbackPostRequestException
+ from b2sdk.exception import B2HttpCallbackPreRequestException
+ from b2sdk.exception import B2RequestTimeout
++from b2sdk.exception import B2RequestTimeoutDuringUpload
+ from b2sdk.exception import B2SimpleError
+ from b2sdk.exception import BadDateFormat
+ from b2sdk.exception import BadFileInfo
+@@ -73,6 +74,7 @@ __all__ = (
+     'B2HttpCallbackPostRequestException',
+     'B2HttpCallbackPreRequestException',
+     'B2RequestTimeout',
++    'B2RequestTimeoutDuringUpload',
+     'B2SimpleError',
+     'BadDateFormat',
+     'BadFileInfo',
+

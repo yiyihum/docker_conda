@@ -1,0 +1,165 @@
+diff --git a/pydantic/errors.py b/pydantic/errors.py
+--- a/pydantic/errors.py
++++ b/pydantic/errors.py
+@@ -48,6 +48,7 @@
+     'TupleLengthError',
+     'ListMinLengthError',
+     'ListMaxLengthError',
++    'ListUniqueItemsError',
+     'SetMinLengthError',
+     'SetMaxLengthError',
+     'FrozenSetMinLengthError',
+@@ -324,6 +325,11 @@ def __init__(self, *, limit_value: int) -> None:
+         super().__init__(limit_value=limit_value)
+ 
+ 
++class ListUniqueItemsError(PydanticValueError):
++    code = 'list.unique_items'
++    msg_template = 'the list has duplicated items'
++
++
+ class SetMinLengthError(PydanticValueError):
+     code = 'set.min_items'
+     msg_template = 'ensure this value has at least {limit_value} items'
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -103,6 +103,7 @@ class FieldInfo(Representation):
+         'multiple_of',
+         'min_items',
+         'max_items',
++        'unique_items',
+         'min_length',
+         'max_length',
+         'allow_mutation',
+@@ -123,6 +124,7 @@ class FieldInfo(Representation):
+         'multiple_of': None,
+         'min_items': None,
+         'max_items': None,
++        'unique_items': None,
+         'allow_mutation': True,
+     }
+ 
+@@ -143,6 +145,7 @@ def __init__(self, default: Any = Undefined, **kwargs: Any) -> None:
+         self.multiple_of = kwargs.pop('multiple_of', None)
+         self.min_items = kwargs.pop('min_items', None)
+         self.max_items = kwargs.pop('max_items', None)
++        self.unique_items = kwargs.pop('unique_items', None)
+         self.min_length = kwargs.pop('min_length', None)
+         self.max_length = kwargs.pop('max_length', None)
+         self.allow_mutation = kwargs.pop('allow_mutation', True)
+@@ -208,6 +211,7 @@ def Field(
+     multiple_of: float = None,
+     min_items: int = None,
+     max_items: int = None,
++    unique_items: bool = None,
+     min_length: int = None,
+     max_length: int = None,
+     allow_mutation: bool = True,
+@@ -241,6 +245,12 @@ def Field(
+       schema will have a ``maximum`` validation keyword
+     :param multiple_of: only applies to numbers, requires the field to be "a multiple of". The
+       schema will have a ``multipleOf`` validation keyword
++    :param min_items: only applies to lists, requires the field to have a minimum number of
++      elements. The schema will have a ``minItems`` validation keyword
++    :param max_items: only applies to lists, requires the field to have a maximum number of
++      elements. The schema will have a ``maxItems`` validation keyword
++    :param max_items: only applies to lists, requires the field not to have duplicated
++      elements. The schema will have a ``uniqueItems`` validation keyword
+     :param min_length: only applies to strings, requires the field to have a minimum length. The
+       schema will have a ``maximum`` validation keyword
+     :param max_length: only applies to strings, requires the field to have a maximum length. The
+@@ -268,6 +278,7 @@ def Field(
+         multiple_of=multiple_of,
+         min_items=min_items,
+         max_items=max_items,
++        unique_items=unique_items,
+         min_length=min_length,
+         max_length=max_length,
+         allow_mutation=allow_mutation,
+diff --git a/pydantic/schema.py b/pydantic/schema.py
+--- a/pydantic/schema.py
++++ b/pydantic/schema.py
+@@ -953,11 +953,9 @@ def get_annotation_from_field_info(
+     :return: the same ``annotation`` if unmodified or a new annotation with validation in place
+     """
+     constraints = field_info.get_constraints()
+-
+     used_constraints: Set[str] = set()
+     if constraints:
+         annotation, used_constraints = get_annotation_with_constraints(annotation, field_info)
+-
+     if validate_assignment:
+         used_constraints.add('allow_mutation')
+ 
+@@ -1001,9 +999,18 @@ def go(type_: Any) -> Type[Any]:
+             if is_union(origin):
+                 return Union[tuple(go(a) for a in args)]  # type: ignore
+ 
+-            if issubclass(origin, List) and (field_info.min_items is not None or field_info.max_items is not None):
+-                used_constraints.update({'min_items', 'max_items'})
+-                return conlist(go(args[0]), min_items=field_info.min_items, max_items=field_info.max_items)
++            if issubclass(origin, List) and (
++                field_info.min_items is not None
++                or field_info.max_items is not None
++                or field_info.unique_items is not None
++            ):
++                used_constraints.update({'min_items', 'max_items', 'unique_items'})
++                return conlist(
++                    go(args[0]),
++                    min_items=field_info.min_items,
++                    max_items=field_info.max_items,
++                    unique_items=field_info.unique_items,
++                )
+ 
+             if issubclass(origin, Set) and (field_info.min_items is not None or field_info.max_items is not None):
+                 used_constraints.update({'min_items', 'max_items'})
+diff --git a/pydantic/types.py b/pydantic/types.py
+--- a/pydantic/types.py
++++ b/pydantic/types.py
+@@ -540,15 +540,18 @@ class ConstrainedList(list):  # type: ignore
+ 
+     min_items: Optional[int] = None
+     max_items: Optional[int] = None
++    unique_items: Optional[bool] = None
+     item_type: Type[T]  # type: ignore
+ 
+     @classmethod
+     def __get_validators__(cls) -> 'CallableGenerator':
+         yield cls.list_length_validator
++        if cls.unique_items:
++            yield cls.unique_items_validator
+ 
+     @classmethod
+     def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+-        update_not_none(field_schema, minItems=cls.min_items, maxItems=cls.max_items)
++        update_not_none(field_schema, minItems=cls.min_items, maxItems=cls.max_items, uniqueItems=cls.unique_items)
+ 
+     @classmethod
+     def list_length_validator(cls, v: 'Optional[List[T]]') -> 'Optional[List[T]]':
+@@ -566,10 +569,22 @@ def list_length_validator(cls, v: 'Optional[List[T]]') -> 'Optional[List[T]]':
+ 
+         return v
+ 
++    @classmethod
++    def unique_items_validator(cls, v: 'List[T]') -> 'List[T]':
++        for i, value in enumerate(v, start=1):
++            if value in v[i:]:
++                raise errors.ListUniqueItemsError()
++
++        return v
+ 
+-def conlist(item_type: Type[T], *, min_items: int = None, max_items: int = None) -> Type[List[T]]:
++
++def conlist(
++    item_type: Type[T], *, min_items: int = None, max_items: int = None, unique_items: bool = None
++) -> Type[List[T]]:
+     # __args__ is needed to conform to typing generics api
+-    namespace = {'min_items': min_items, 'max_items': max_items, 'item_type': item_type, '__args__': (item_type,)}
++    namespace = dict(
++        min_items=min_items, max_items=max_items, unique_items=unique_items, item_type=item_type, __args__=(item_type,)
++    )
+     # We use new_class to be able to deal with Generic types
+     return new_class('ConstrainedListValue', (ConstrainedList,), {}, lambda ns: ns.update(namespace))
+ 
+

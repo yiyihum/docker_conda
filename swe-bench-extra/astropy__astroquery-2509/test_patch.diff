@@ -1,0 +1,134 @@
+diff --git a/astroquery/alma/tests/test_alma_remote.py b/astroquery/alma/tests/test_alma_remote.py
+index 77068624..077b2d64 100644
+--- a/astroquery/alma/tests/test_alma_remote.py
++++ b/astroquery/alma/tests/test_alma_remote.py
+@@ -149,7 +149,18 @@ class TestAlma:
+         with pytest.raises(AttributeError):
+             alma.is_proprietary('uid://NON/EXI/STING')
+ 
+-    @pytest.mark.xfail(reason="Depends on PR 2438 (https://github.com/astropy/astroquery/pull/2438)")
++    def test_retrieve_data(self, temp_path, alma):
++        """
++        Regression test for issue 2490 (the retrieval step will simply fail if
++        given a blank line, so all we're doing is testing that it runs)
++        """
++        alma.cache_location = temp_path
++
++        # small solar TP-only data set (<1 GB)
++        uid = 'uid://A001/X87c/X572'
++
++        alma.retrieve_data_from_uid([uid])
++
+     def test_data_info(self, temp_dir, alma):
+         alma.cache_location = temp_dir
+ 
+diff --git a/astroquery/mast/tests/test_mast_remote.py b/astroquery/mast/tests/test_mast_remote.py
+index 71578c35..7f70ec8d 100644
+--- a/astroquery/mast/tests/test_mast_remote.py
++++ b/astroquery/mast/tests/test_mast_remote.py
+@@ -14,7 +14,8 @@ import astropy.units as u
+ from astroquery import mast
+ 
+ from ..utils import ResolverError
+-from ...exceptions import InvalidQueryError, MaxResultsWarning, NoResultsWarning, RemoteServiceError
++from ...exceptions import (InvalidQueryError, MaxResultsWarning, NoResultsWarning,
++                           DuplicateResultsWarning, RemoteServiceError)
+ 
+ 
+ OBSID = '1647157'
+@@ -274,7 +275,7 @@ class TestMast:
+                 assert os.path.isfile(row['Local Path'])
+ 
+         # just get the curl script
+-        result = mast.Observations.download_products(test_obs[0]["obsid"],
++        result = mast.Observations.download_products(test_obs_id[0]["obsid"],
+                                                      download_dir=str(tmpdir),
+                                                      curl_flag=True,
+                                                      productType=["SCIENCE"],
+@@ -283,12 +284,41 @@ class TestMast:
+         assert os.path.isfile(result['Local Path'][0])
+ 
+         # check for row input
+-        result1 = mast.Observations.get_product_list(test_obs[0]["obsid"])
++        result1 = mast.Observations.get_product_list(test_obs_id[0]["obsid"])
+         result2 = mast.Observations.download_products(result1[0])
+         assert isinstance(result2, Table)
+         assert os.path.isfile(result2['Local Path'][0])
+         assert len(result2) == 1
+ 
++    def test_observations_download_products_no_duplicates(tmpdir):
++
++        # Pull products for a JWST NIRSpec MSA observation with 6 known
++        # duplicates of the MSA configuration file, propID=2736
++        products = mast.Observations.get_product_list("87602009")
++
++        # Filter out everything but the MSA config file
++        mask = np.char.find(products["dataURI"], "_msa.fits") != -1
++        products = products[mask]
++
++        assert len(products) == 6
++
++        # Download the product
++        with pytest.warns(DuplicateResultsWarning):
++            manifest = mast.Observations.download_products(products,
++                                                           download_dir=str(tmpdir))
++
++        # Check that it downloads the MSA config file only once
++        assert len(manifest) == 1
++
++        # enable access to public AWS S3 bucket
++        mast.Observations.enable_cloud_dataset()
++
++        # Check duplicate cloud URIs as well
++        with pytest.warns(DuplicateResultsWarning):
++            uris = mast.Observations.get_cloud_uris(products)
++
++        assert len(uris) == 1
++
+     def test_observations_download_file(self, tmpdir):
+ 
+         # enabling cloud connection
+diff --git a/astroquery/svo_fps/tests/test_svo_fps.py b/astroquery/svo_fps/tests/test_svo_fps.py
+index c2aef041..97a43a48 100644
+--- a/astroquery/svo_fps/tests/test_svo_fps.py
++++ b/astroquery/svo_fps/tests/test_svo_fps.py
+@@ -1,8 +1,9 @@
+ import pytest
+ import os
+ from astropy import units as u
++from requests import ReadTimeout
+ 
+-from astroquery.exceptions import InvalidQueryError
++from astroquery.exceptions import InvalidQueryError, TimeoutError
+ from astroquery.utils.mocks import MockResponse
+ from ..core import SvoFps
+ 
+@@ -46,7 +47,9 @@ def get_mockreturn(method, url, params=None, timeout=10, cache=None, **kwargs):
+     return MockResponse(content, **kwargs)
+ 
+ 
+-def test_get_filter_index(patch_get):
++def test_get_filter_index(patch_get, monkeypatch):
++    with pytest.raises(TypeError, match="missing 2 required positional arguments"):
++        SvoFps.get_filter_index()
+     lambda_min = TEST_LAMBDA*u.angstrom
+     lambda_max = lambda_min + 100*u.angstrom
+     table = SvoFps.get_filter_index(lambda_min, lambda_max)
+@@ -56,6 +59,17 @@ def test_get_filter_index(patch_get):
+     # `get_mockreturn` raises `NotImplementedError`.
+     SvoFps.get_filter_index(lambda_min.to(u.m), lambda_max)
+ 
++    def get_mockreturn_timeout(*args, **kwargs):
++        raise ReadTimeout
++
++    monkeypatch.setattr(SvoFps, '_request', get_mockreturn_timeout)
++    error_msg = (
++        r"^Query did not finish fast enough\. A smaller wavelength range might "
++        r"succeed\. Try increasing the timeout limit if a large range is needed\.$"
++    )
++    with pytest.raises(TimeoutError, match=error_msg):
++        SvoFps.get_filter_index(lambda_min, lambda_max)
++
+ 
+ def test_get_transmission_data(patch_get):
+     table = SvoFps.get_transmission_data(TEST_FILTER_ID)

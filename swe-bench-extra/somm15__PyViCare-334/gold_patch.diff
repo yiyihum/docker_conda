@@ -1,0 +1,93 @@
+diff --git a/PyViCare/PyViCareDeviceConfig.py b/PyViCare/PyViCareDeviceConfig.py
+index 57f546f..0a776a4 100644
+--- a/PyViCare/PyViCareDeviceConfig.py
++++ b/PyViCare/PyViCareDeviceConfig.py
+@@ -12,6 +12,7 @@ from PyViCare.PyViCarePelletsBoiler import PelletsBoiler
+ from PyViCare.PyViCareRadiatorActuator import RadiatorActuator
+ from PyViCare.PyViCareRoomSensor import RoomSensor
+ from PyViCare.PyViCareElectricalEnergySystem import ElectricalEnergySystem
++from PyViCare.PyViCareGateway import Gateway
+ from PyViCare.PyViCareVentilationDevice import VentilationDevice
+ 
+ logger = logging.getLogger('ViCare')
+@@ -54,6 +55,9 @@ class PyViCareDeviceConfig:
+ 
+     def asElectricalEnergySystem(self):
+         return ElectricalEnergySystem(self.service)
++    
++    def asGateway(self):
++        return Gateway(self.service)
+ 
+     def asVentilation(self):
+         return VentilationDevice(self.service)
+@@ -84,7 +88,8 @@ class PyViCareDeviceConfig:
+             (self.asElectricalEnergySystem, r"E3_TCU10_x07", ["type:tcu"]),
+             (self.asElectricalEnergySystem, r"E3_EEBus", ["type:eebus"]),
+             (self.asElectricalEnergySystem, r"E3_VitoCharge_03", ["type:energy_storage"]),
+-            (self.asVentilation, r"E3_ViAir", ["type:ventilation"])
++            (self.asVentilation, r"E3_ViAir", ["type:ventilation"]),
++            (self.asGateway, r"Heatbox1", ["type:gateway;VitoconnectOpto1"])
+         ]
+ 
+         for (creator_method, type_name, roles) in device_types:
+diff --git a/PyViCare/PyViCareGateway.py b/PyViCare/PyViCareGateway.py
+new file mode 100644
+index 0000000..fbdf317
+--- /dev/null
++++ b/PyViCare/PyViCareGateway.py
+@@ -0,0 +1,9 @@
++from PyViCare.PyViCareDevice import Device
++from PyViCare.PyViCareUtils import handleNotSupported
++
++
++class Gateway(Device):
++
++    @handleNotSupported
++    def getWifiSignalStrength(self):
++        return self.service.getProperty("gateway.wifi")["properties"]["strength"]["value"]
+diff --git a/PyViCare/PyViCareService.py b/PyViCare/PyViCareService.py
+index 29e7f64..259deee 100644
+--- a/PyViCare/PyViCareService.py
++++ b/PyViCare/PyViCareService.py
+@@ -27,10 +27,6 @@ def buildSetPropertyUrl(accessor, property_name, action):
+     return f'/features/installations/{accessor.id}/gateways/{accessor.serial}/devices/{accessor.device_id}/features/{property_name}/commands/{action}'
+ 
+ 
+-def buildGetPropertyUrl(accessor, property_name):
+-    return f'/features/installations/{accessor.id}/gateways/{accessor.serial}/devices/{accessor.device_id}/features/{property_name}'
+-
+-
+ class ViCareDeviceAccessor:
+     def __init__(self, id: int, serial: str, device_id: str) -> None:
+         self.id = id
+@@ -45,13 +41,21 @@ class ViCareService:
+         self.roles = roles
+ 
+     def getProperty(self, property_name: str) -> Any:
+-        url = buildGetPropertyUrl(
+-            self.accessor, property_name)
++        url = self.buildGetPropertyUrl(property_name)
+         return self.oauth_manager.get(url)
++        
++    def buildGetPropertyUrl(self, property_name):
++        if self._isGateway():
++            return f'/features/installations/{self.accessor.id}/gateways/{self.accessor.serial}/features/{property_name}'
++        return f'/features/installations/{self.accessor.id}/gateways/{self.accessor.serial}/devices/{self.accessor.device_id}/features/{property_name}'
++
+ 
+     def hasRoles(self, requested_roles) -> bool:
+         return hasRoles(requested_roles, self.roles)
+ 
++    def _isGateway(self) -> bool:
++        return self.hasRoles(["type:gateway;VitoconnectOpto1"])
++
+     def setProperty(self, property_name: str, action: str, data: Any) -> Any:
+         url = buildSetPropertyUrl(
+             self.accessor, property_name, action)
+@@ -61,4 +65,6 @@ class ViCareService:
+ 
+     def fetch_all_features(self) -> Any:
+         url = f'/features/installations/{self.accessor.id}/gateways/{self.accessor.serial}/devices/{self.accessor.device_id}/features/'
++        if self._isGateway():
++            url = f'/features/installations/{self.accessor.id}/gateways/{self.accessor.serial}/features/'
+         return self.oauth_manager.get(url)

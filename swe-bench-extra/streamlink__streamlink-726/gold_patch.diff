@@ -1,0 +1,147 @@
+diff --git a/docs/plugin_matrix.rst b/docs/plugin_matrix.rst
+index 084239b3..4693f248 100644
+--- a/docs/plugin_matrix.rst
++++ b/docs/plugin_matrix.rst
+@@ -92,6 +92,7 @@ foxtr               fox.com.tr           Yes   No
+ funimationnow       - funimation.com     --    Yes
+                     - funimationnow.uk
+ furstream           furstre.am           Yes   No
++garena              garena.live          Yes   --
+ gomexp              gomexp.com           Yes   No
+ goodgame            goodgame.ru          Yes   No    Only HLS streams are available.
+ gulli               replay.gulli.fr      Yes   Yes   Streams may be geo-restricted to France.
+diff --git a/src/streamlink/plugins/garena.py b/src/streamlink/plugins/garena.py
+new file mode 100644
+index 00000000..8349ebc7
+--- /dev/null
++++ b/src/streamlink/plugins/garena.py
+@@ -0,0 +1,69 @@
++import re
++
++from streamlink.plugin import Plugin
++from streamlink.plugin.api import http
++from streamlink.plugin.api import validate
++from streamlink.stream import HLSStream
++
++_url_re = re.compile(r"https?\:\/\/garena\.live\/(?:(?P<channel_id>\d+)|(?P<alias>\w+))")
++
++
++class Garena(Plugin):
++    API_INFO = "https://garena.live/api/channel_info_get"
++    API_STREAM = "https://garena.live/api/channel_stream_get"
++
++    _info_schema = validate.Schema(
++        {
++            "reply": validate.any({
++                "channel_id": int,
++            }, None),
++            "result": validate.text
++        }
++    )
++    _stream_schema = validate.Schema(
++        {
++            "reply": validate.any({
++                "streams": [
++                    {
++                        "url": validate.text,
++                        "resolution": int,
++                        "bitrate": int,
++                        "format": int
++                    }
++                ]
++            }, None),
++            "result": validate.text
++        }
++    )
++
++    @classmethod
++    def can_handle_url(self, url):
++        return _url_re.match(url)
++
++    def _post_api(self, api, payload, schema):
++        res = http.post(api, json=payload)
++        data = http.json(res, schema=schema)
++
++        if data["result"] == "success":
++            post_data = data["reply"]
++            return post_data
++
++    def _get_streams(self):
++        match = _url_re.match(self.url)
++        if match.group("alias"):
++            payload = {"alias": match.group("alias")}
++            info_data = self._post_api(self.API_INFO, payload, self._info_schema)
++            channel_id = info_data["channel_id"]
++        elif match.group("channel_id"):
++            channel_id = int(match.group("channel_id"))
++
++        if channel_id:
++            payload = {"channel_id": channel_id}
++            stream_data = self._post_api(self.API_STREAM, payload, self._stream_schema)
++            for stream in stream_data["streams"]:
++                n = "{0}p".format(stream["resolution"])
++                if stream["format"] == 3:
++                    s = HLSStream(self.session, stream["url"])
++                    yield n, s
++
++__plugin__ = Garena
+diff --git a/src/streamlink/utils/l10n.py b/src/streamlink/utils/l10n.py
+index 1791446b..461fbecc 100644
+--- a/src/streamlink/utils/l10n.py
++++ b/src/streamlink/utils/l10n.py
+@@ -12,7 +12,9 @@ except ImportError:  # pragma: no cover
+ 
+     PYCOUNTRY = True
+ 
+-DEFAULT_LANGUAGE_CODE = "en_US"
++DEFAULT_LANGUAGE = "en"
++DEFAULT_COUNTRY = "US"
++DEFAULT_LANGUAGE_CODE = "{0}_{1}".format(DEFAULT_LANGUAGE, DEFAULT_COUNTRY)
+ 
+ 
+ class Country(object):
+@@ -116,8 +118,15 @@ class Localization(object):
+     def language_code(self):
+         return self._language_code
+ 
++    def _parse_locale_code(self, language_code):
++        parts = language_code.split("_", 1)
++        if len(parts) != 2 or len(parts[0]) != 2 or len(parts[1]) != 2:
++                raise LookupError("Invalid language code: {0}".format(language_code))
++        return self.get_language(parts[0]), self.get_country(parts[1])
++
+     @language_code.setter
+     def language_code(self, language_code):
++        is_system_locale = language_code is None
+         if language_code is None:
+             try:
+                 language_code, _ = locale.getdefaultlocale()
+@@ -125,16 +134,19 @@ class Localization(object):
+                 language_code = None
+             if language_code is None or language_code == "C":
+                 # cannot be determined
+-                language_code = DEFAULT_LANGUAGE_CODE
+-
+-        parts = language_code.split("_", 1)
++                language_code = DEFAULT_LANGUAGE
+ 
+-        if len(parts) != 2 or len(parts[0]) != 2 or len(parts[1]) != 2:
+-            raise LookupError("Invalid language code: {0}".format(language_code))
+-
+-        self._language_code = language_code
+-        self.language = self.get_language(parts[0])
+-        self.country = self.get_country(parts[1])
++        try:
++            self.language, self.country = self._parse_locale_code(language_code)
++            self._language_code = language_code
++        except LookupError:
++            if is_system_locale:
++                # If the system locale returns an invalid code, use the default
++                self.language = self.get_language(DEFAULT_LANGUAGE)
++                self.country = self.get_country(DEFAULT_COUNTRY)
++                self._language_code = DEFAULT_LANGUAGE_CODE
++            else:
++                raise
+ 
+     def equivalent(self, language=None, country=None):
+         equivalent = True

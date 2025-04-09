@@ -1,0 +1,170 @@
+diff --git a/pydantic/config.py b/pydantic/config.py
+--- a/pydantic/config.py
++++ b/pydantic/config.py
+@@ -63,8 +63,10 @@ class BaseConfig:
+     json_encoders: Dict[Type[Any], AnyCallable] = {}
+     underscore_attrs_are_private: bool = False
+ 
+-    # Whether or not inherited models as fields should be reconstructed as base model
++    # whether inherited models as fields should be reconstructed as base model
+     copy_on_model_validation: bool = True
++    # whether `Union` should check all allowed types before even trying to coerce
++    smart_union: bool = False
+ 
+     @classmethod
+     def get_field_info(cls, name: str) -> Dict[str, Any]:
+diff --git a/pydantic/env_settings.py b/pydantic/env_settings.py
+--- a/pydantic/env_settings.py
++++ b/pydantic/env_settings.py
+@@ -6,7 +6,7 @@
+ from .config import BaseConfig, Extra
+ from .fields import ModelField
+ from .main import BaseModel
+-from .typing import StrPath, display_as_type, get_origin, is_union_origin
++from .typing import StrPath, display_as_type, get_origin, is_union
+ from .utils import deep_update, path_type, sequence_like
+ 
+ env_file_sentinel = str(object())
+@@ -175,9 +175,7 @@ def __call__(self, settings: BaseSettings) -> Dict[str, Any]:
+                 except ValueError as e:
+                     raise SettingsError(f'error parsing JSON for "{env_name}"') from e
+             elif (
+-                is_union_origin(get_origin(field.type_))
+-                and field.sub_fields
+-                and any(f.is_complex() for f in field.sub_fields)
++                is_union(get_origin(field.type_)) and field.sub_fields and any(f.is_complex() for f in field.sub_fields)
+             ):
+                 try:
+                     env_val = settings.__config__.json_loads(env_val)
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -42,7 +42,7 @@
+     is_new_type,
+     is_none_type,
+     is_typeddict,
+-    is_union_origin,
++    is_union,
+     new_type_supertype,
+ )
+ from .utils import PyObjectStr, Representation, ValueItems, lenient_issubclass, sequence_like, smart_deepcopy
+@@ -560,7 +560,7 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+             return
+         if origin is Callable:
+             return
+-        if is_union_origin(origin):
++        if is_union(origin):
+             types_ = []
+             for type_ in get_args(self.type_):
+                 if type_ is NoneType:
+@@ -935,6 +935,35 @@ def _validate_singleton(
+     ) -> 'ValidateReturn':
+         if self.sub_fields:
+             errors = []
++
++            if self.model_config.smart_union and is_union(get_origin(self.type_)):
++                # 1st pass: check if the value is an exact instance of one of the Union types
++                # (e.g. to avoid coercing a bool into an int)
++                for field in self.sub_fields:
++                    if v.__class__ is field.outer_type_:
++                        return v, None
++
++                # 2nd pass: check if the value is an instance of any subclass of the Union types
++                for field in self.sub_fields:
++                    # This whole logic will be improved later on to support more complex `isinstance` checks
++                    # It will probably be done once a strict mode is added and be something like:
++                    # ```
++                    #     value, error = field.validate(v, values, strict=True)
++                    #     if error is None:
++                    #         return value, None
++                    # ```
++                    try:
++                        if isinstance(v, field.outer_type_):
++                            return v, None
++                    except TypeError:
++                        # compound type
++                        if isinstance(v, get_origin(field.outer_type_)):
++                            value, error = field.validate(v, values, loc=loc, cls=cls)
++                            if not error:
++                                return value, None
++
++            # 1st pass by default or 3rd pass with `smart_union` enabled:
++            # check if the value can be coerced into one of the Union types
+             for field in self.sub_fields:
+                 value, error = field.validate(v, values, loc=loc, cls=cls)
+                 if error:
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -39,7 +39,7 @@
+     get_origin,
+     is_classvar,
+     is_namedtuple,
+-    is_union_origin,
++    is_union,
+     resolve_annotations,
+     update_model_forward_refs,
+ )
+@@ -191,7 +191,7 @@ def is_untouched(v: Any) -> bool:
+                 elif is_valid_field(ann_name):
+                     validate_field_name(bases, ann_name)
+                     value = namespace.get(ann_name, Undefined)
+-                    allowed_types = get_args(ann_type) if is_union_origin(get_origin(ann_type)) else (ann_type,)
++                    allowed_types = get_args(ann_type) if is_union(get_origin(ann_type)) else (ann_type,)
+                     if (
+                         is_untouched(value)
+                         and ann_type != PyObject
+diff --git a/pydantic/schema.py b/pydantic/schema.py
+--- a/pydantic/schema.py
++++ b/pydantic/schema.py
+@@ -72,7 +72,7 @@
+     is_literal_type,
+     is_namedtuple,
+     is_none_type,
+-    is_union_origin,
++    is_union,
+ )
+ from .utils import ROOT_KEY, get_model, lenient_issubclass, sequence_like
+ 
+@@ -995,7 +995,7 @@ def go(type_: Any) -> Type[Any]:
+ 
+             if origin is Annotated:
+                 return go(args[0])
+-            if is_union_origin(origin):
++            if is_union(origin):
+                 return Union[tuple(go(a) for a in args)]  # type: ignore
+ 
+             if issubclass(origin, List) and (field_info.min_items is not None or field_info.max_items is not None):
+diff --git a/pydantic/typing.py b/pydantic/typing.py
+--- a/pydantic/typing.py
++++ b/pydantic/typing.py
+@@ -193,7 +193,7 @@ def get_args(tp: Type[Any]) -> Tuple[Any, ...]:
+ 
+ if sys.version_info < (3, 10):
+ 
+-    def is_union_origin(tp: Type[Any]) -> bool:
++    def is_union(tp: Type[Any]) -> bool:
+         return tp is Union
+ 
+     WithArgsTypes = (TypingGenericAlias,)
+@@ -202,8 +202,8 @@ def is_union_origin(tp: Type[Any]) -> bool:
+     import types
+     import typing
+ 
+-    def is_union_origin(origin: Type[Any]) -> bool:
+-        return origin is Union or origin is types.UnionType  # noqa: E721
++    def is_union(tp: Type[Any]) -> bool:
++        return tp is Union or tp is types.UnionType  # noqa: E721
+ 
+     WithArgsTypes = (typing._GenericAlias, types.GenericAlias, types.UnionType)
+ 
+@@ -269,7 +269,7 @@ def is_union_origin(origin: Type[Any]) -> bool:
+     'get_origin',
+     'typing_base',
+     'get_all_type_hints',
+-    'is_union_origin',
++    'is_union',
+     'StrPath',
+ )
+ 
+

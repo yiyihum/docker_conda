@@ -1,0 +1,124 @@
+diff --git a/juju/client/jujudata.py b/juju/client/jujudata.py
+index 8b844c2..629ad52 100644
+--- a/juju/client/jujudata.py
++++ b/juju/client/jujudata.py
+@@ -8,6 +8,7 @@ import yaml
+ from juju import tag
+ from juju.client.gocookies import GoCookieJar
+ from juju.errors import JujuError
++from juju.utils import juju_config_dir
+ 
+ 
+ class NoModelException(Exception):
+@@ -121,8 +122,7 @@ class FileJujuData(JujuData):
+     '''Provide access to the Juju client configuration files.
+     Any configuration file is read once and then cached.'''
+     def __init__(self):
+-        self.path = os.environ.get('JUJU_DATA') or '~/.local/share/juju'
+-        self.path = os.path.abspath(os.path.expanduser(self.path))
++        self.path = juju_config_dir()
+         # _loaded keeps track of the loaded YAML from
+         # the Juju data files so we don't need to load the same
+         # file many times.
+diff --git a/juju/machine.py b/juju/machine.py
+index 2067a21..1e46199 100644
+--- a/juju/machine.py
++++ b/juju/machine.py
+@@ -1,7 +1,6 @@
+ import asyncio
+ import ipaddress
+ import logging
+-import os
+ 
+ import pyrfc3339
+ 
+@@ -9,6 +8,7 @@ from . import model, tag
+ from .annotationhelper import _get_annotations, _set_annotations
+ from .client import client
+ from .errors import JujuError
++from juju.utils import juju_ssh_key_paths
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -124,9 +124,10 @@ class Machine(model.ModelEntity):
+         """ Execute an scp command. Requires a fully qualified source and
+         destination.
+         """
++        _, id_path = juju_ssh_key_paths()
+         cmd = [
+             'scp',
+-            '-i', os.path.expanduser('~/.local/share/juju/ssh/juju_id_rsa'),
++            '-i', id_path,
+             '-o', 'StrictHostKeyChecking=no',
+             '-q',
+             '-B'
+@@ -153,9 +154,10 @@ class Machine(model.ModelEntity):
+             raise NotImplementedError('proxy option is not implemented')
+         address = self.dns_name
+         destination = "{}@{}".format(user, address)
++        _, id_path = juju_ssh_key_paths()
+         cmd = [
+             'ssh',
+-            '-i', os.path.expanduser('~/.local/share/juju/ssh/juju_id_rsa'),
++            '-i', id_path,
+             '-o', 'StrictHostKeyChecking=no',
+             '-q',
+             destination
+diff --git a/juju/utils.py b/juju/utils.py
+index 2321ffd..9fca71d 100644
+--- a/juju/utils.py
++++ b/juju/utils.py
+@@ -32,15 +32,50 @@ async def execute_process(*cmd, log=None, loop=None):
+     return p.returncode == 0
+ 
+ 
++def juju_config_dir():
++    """Resolves and returns the path string to the juju configuration
++    folder for the juju CLI tool. Of the following items, returns the
++    first option that works (top to bottom):
++
++    * $JUJU_DATA
++    * $XDG_DATA_HOME/juju
++    * ~/.local/share/juju
++
++    """
++    # Check $JUJU_DATA first
++    config_dir = os.environ.get('JUJU_DATA', None)
++
++    # Second option: $XDG_DATA_HOME for ~/.local/share
++    if not config_dir:
++        config_dir = os.environ.get('XDG_DATA_HOME', None)
++
++    # Third option: just set it to ~/.local/share/juju
++    if not config_dir:
++        config_dir = '~/.local/share/juju'
++
++    return os.path.abspath(os.path.expanduser(config_dir))
++
++
++def juju_ssh_key_paths():
++    """Resolves and returns the path strings for public and private ssh
++    keys for juju CLI.
++
++    """
++    config_dir = juju_config_dir()
++    public_key_path = os.path.join(config_dir, 'ssh', 'juju_id_rsa.pub')
++    private_key_path = os.path.join(config_dir, 'ssh', 'juju_id_rsa')
++
++    return public_key_path, private_key_path
++
++
+ def _read_ssh_key():
+     '''
+     Inner function for read_ssh_key, suitable for passing to our
+     Executor.
+ 
+     '''
+-    default_data_dir = Path(Path.home(), ".local", "share", "juju")
+-    juju_data = os.environ.get("JUJU_DATA", default_data_dir)
+-    ssh_key_path = Path(juju_data, 'ssh', 'juju_id_rsa.pub')
++    public_key_path_str, _ = juju_ssh_key_paths()
++    ssh_key_path = Path(public_key_path_str)
+     with ssh_key_path.open('r') as ssh_key_file:
+         ssh_key = ssh_key_file.readlines()[0].strip()
+     return ssh_key

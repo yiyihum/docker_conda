@@ -1,0 +1,122 @@
+diff --git a/dvc/dvcfile.py b/dvc/dvcfile.py
+--- a/dvc/dvcfile.py
++++ b/dvc/dvcfile.py
+@@ -37,6 +37,11 @@
+ PIPELINE_LOCK = "dvc.lock"
+ 
+ 
++class FileIsGitIgnored(DvcException):
++    def __init__(self, path):
++        super().__init__(f"'{path}' is git-ignored.")
++
++
+ class LockfileCorruptedError(DvcException):
+     pass
+ 
+@@ -103,18 +108,29 @@ def relpath(self):
+     def exists(self):
+         return self.repo.tree.exists(self.path)
+ 
++    def _is_git_ignored(self):
++        from dvc.tree.local import LocalTree
++
++        return isinstance(
++            self.repo.tree, LocalTree
++        ) and self.repo.scm.is_ignored(self.path)
++
+     def _load(self):
+         # it raises the proper exceptions by priority:
+         # 1. when the file doesn't exists
+         # 2. filename is not a DVC-file
+         # 3. path doesn't represent a regular file
++        # 4. when the file is git ignored
+         if not self.exists():
+-            raise StageFileDoesNotExistError(self.path)
++            is_ignored = self.repo.tree.exists(self.path, use_dvcignore=False)
++            raise StageFileDoesNotExistError(self.path, dvc_ignored=is_ignored)
++
+         if self.verify:
+             check_dvc_filename(self.path)
+         if not self.repo.tree.isfile(self.path):
+             raise StageFileIsNotDvcFileError(self.path)
+-
++        if self._is_git_ignored():
++            raise FileIsGitIgnored(self.path)
+         with self.repo.tree.open(self.path) as fd:
+             stage_text = fd.read()
+         d = parse_yaml(stage_text, self.path)
+diff --git a/dvc/repo/stage.py b/dvc/repo/stage.py
+--- a/dvc/repo/stage.py
++++ b/dvc/repo/stage.py
+@@ -3,6 +3,7 @@
+ import os
+ import typing
+ from contextlib import suppress
++from functools import partial
+ from typing import (
+     Callable,
+     Iterable,
+@@ -371,13 +372,33 @@ def collect_repo(self, onerror: Callable[[str, Exception], None] = None):
+                 the collection.
+         """
+         from dvc.dvcfile import is_valid_filename
++        from dvc.tree.local import LocalTree
+ 
+-        stages = []
++        scm = self.repo.scm
++        sep = os.sep
+         outs: Set[str] = set()
++
++        is_local_tree = isinstance(self.tree, LocalTree)
++
++        def is_ignored(path):
++            # apply only for the local tree
++            return is_local_tree and scm.is_ignored(path)
++
++        def is_dvcfile_and_not_ignored(root, file):
++            return is_valid_filename(file) and not is_ignored(
++                f"{root}{sep}{file}"
++            )
++
++        def is_out_or_ignored(root, directory):
++            dir_path = f"{root}{sep}{directory}"
++            return dir_path in outs or is_ignored(dir_path)
++
++        stages = []
+         for root, dirs, files in self.tree.walk(self.repo.root_dir):
+-            for file_name in filter(is_valid_filename, files):
+-                file_path = os.path.join(root, file_name)
++            dvcfile_filter = partial(is_dvcfile_and_not_ignored, root)
+ 
++            for file in filter(dvcfile_filter, files):
++                file_path = os.path.join(root, file)
+                 try:
+                     new_stages = self.load_file(file_path)
+                 except DvcException as exc:
+@@ -393,5 +414,5 @@ def collect_repo(self, onerror: Callable[[str, Exception], None] = None):
+                     for out in stage.outs
+                     if out.scheme == "local"
+                 )
+-            dirs[:] = [d for d in dirs if os.path.join(root, d) not in outs]
++            dirs[:] = [d for d in dirs if not is_out_or_ignored(root, d)]
+         return stages
+diff --git a/dvc/stage/exceptions.py b/dvc/stage/exceptions.py
+--- a/dvc/stage/exceptions.py
++++ b/dvc/stage/exceptions.py
+@@ -14,9 +14,13 @@ class StageFileFormatError(DvcException):
+ 
+ 
+ class StageFileDoesNotExistError(DvcException):
+-    def __init__(self, fname):
++    DVC_IGNORED = "is dvc-ignored"
++    DOES_NOT_EXIST = "does not exist"
++
++    def __init__(self, fname, dvc_ignored=False):
+         self.file = fname
+-        super().__init__(f"'{self.file}' does not exist.")
++        message = self.DVC_IGNORED if dvc_ignored else self.DOES_NOT_EXIST
++        super().__init__(f"'{self.file}' {message}")
+ 
+ 
+ class StageFileAlreadyExistsError(DvcException):
+

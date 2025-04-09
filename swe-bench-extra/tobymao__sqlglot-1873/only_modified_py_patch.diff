@@ -1,0 +1,330 @@
+diff --git a/sqlglot/dialects/bigquery.py b/sqlglot/dialects/bigquery.py
+index a93c98ee..eac04c81 100644
+--- a/sqlglot/dialects/bigquery.py
++++ b/sqlglot/dialects/bigquery.py
+@@ -163,6 +163,12 @@ def _pushdown_cte_column_names(expression: exp.Expression) -> exp.Expression:
+     return expression
+ 
+ 
++def _parse_timestamp(args: t.List) -> exp.StrToTime:
++    this = format_time_lambda(exp.StrToTime, "bigquery")([seq_get(args, 1), seq_get(args, 0)])
++    this.set("zone", seq_get(args, 2))
++    return this
++
++
+ class BigQuery(Dialect):
+     UNNEST_COLUMN_ONLY = True
+ 
+@@ -266,9 +272,7 @@ class BigQuery(Dialect):
+             "PARSE_DATE": lambda args: format_time_lambda(exp.StrToDate, "bigquery")(
+                 [seq_get(args, 1), seq_get(args, 0)]
+             ),
+-            "PARSE_TIMESTAMP": lambda args: format_time_lambda(exp.StrToTime, "bigquery")(
+-                [seq_get(args, 1), seq_get(args, 0)]
+-            ),
++            "PARSE_TIMESTAMP": _parse_timestamp,
+             "REGEXP_CONTAINS": exp.RegexpLike.from_arg_list,
+             "REGEXP_EXTRACT": lambda args: exp.RegexpExtract(
+                 this=seq_get(args, 0),
+@@ -400,7 +404,9 @@ class BigQuery(Dialect):
+                 ]
+             ),
+             exp.StrToDate: lambda self, e: f"PARSE_DATE({self.format_time(e)}, {self.sql(e, 'this')})",
+-            exp.StrToTime: lambda self, e: f"PARSE_TIMESTAMP({self.format_time(e)}, {self.sql(e, 'this')})",
++            exp.StrToTime: lambda self, e: self.func(
++                "PARSE_TIMESTAMP", self.format_time(e), e.this, e.args.get("zone")
++            ),
+             exp.TimeAdd: _date_add_sql("TIME", "ADD"),
+             exp.TimeSub: _date_add_sql("TIME", "SUB"),
+             exp.TimestampAdd: _date_add_sql("TIMESTAMP", "ADD"),
+@@ -551,10 +557,15 @@ class BigQuery(Dialect):
+         }
+ 
+         def attimezone_sql(self, expression: exp.AtTimeZone) -> str:
+-            if not isinstance(expression.parent, exp.Cast):
++            parent = expression.parent
++
++            # BigQuery allows CAST(.. AS {STRING|TIMESTAMP} [FORMAT <fmt> [AT TIME ZONE <tz>]]).
++            # Only the TIMESTAMP one should use the below conversion, when AT TIME ZONE is included.
++            if not isinstance(parent, exp.Cast) or not parent.to.is_type("text"):
+                 return self.func(
+                     "TIMESTAMP", self.func("DATETIME", expression.this, expression.args.get("zone"))
+                 )
++
+             return super().attimezone_sql(expression)
+ 
+         def trycast_sql(self, expression: exp.TryCast) -> str:
+diff --git a/sqlglot/dialects/mysql.py b/sqlglot/dialects/mysql.py
+index 5f743eef..07e744df 100644
+--- a/sqlglot/dialects/mysql.py
++++ b/sqlglot/dialects/mysql.py
+@@ -123,14 +123,15 @@ class MySQL(Dialect):
+         KEYWORDS = {
+             **tokens.Tokenizer.KEYWORDS,
+             "CHARSET": TokenType.CHARACTER_SET,
++            "ENUM": TokenType.ENUM,
+             "FORCE": TokenType.FORCE,
+             "IGNORE": TokenType.IGNORE,
+             "LONGBLOB": TokenType.LONGBLOB,
+             "LONGTEXT": TokenType.LONGTEXT,
+             "MEDIUMBLOB": TokenType.MEDIUMBLOB,
+             "MEDIUMTEXT": TokenType.MEDIUMTEXT,
++            "MEMBER OF": TokenType.MEMBER_OF,
+             "SEPARATOR": TokenType.SEPARATOR,
+-            "ENUM": TokenType.ENUM,
+             "START": TokenType.BEGIN,
+             "SIGNED": TokenType.BIGINT,
+             "SIGNED INTEGER": TokenType.BIGINT,
+@@ -185,11 +186,24 @@ class MySQL(Dialect):
+         COMMANDS = tokens.Tokenizer.COMMANDS - {TokenType.SHOW}
+ 
+     class Parser(parser.Parser):
+-        FUNC_TOKENS = {*parser.Parser.FUNC_TOKENS, TokenType.SCHEMA, TokenType.DATABASE}
++        FUNC_TOKENS = {
++            *parser.Parser.FUNC_TOKENS,
++            TokenType.DATABASE,
++            TokenType.SCHEMA,
++            TokenType.VALUES,
++        }
++
+         TABLE_ALIAS_TOKENS = (
+             parser.Parser.TABLE_ALIAS_TOKENS - parser.Parser.TABLE_INDEX_HINT_TOKENS
+         )
+ 
++        RANGE_PARSERS = {
++            **parser.Parser.RANGE_PARSERS,
++            TokenType.MEMBER_OF: lambda self, this: self.expression(
++                exp.JSONArrayContains, this=this, expression=self._parse_wrapped(self._parse_string)
++            ),
++        }
++
+         FUNCTIONS = {
+             **parser.Parser.FUNCTIONS,
+             "DATE_ADD": parse_date_delta_with_interval(exp.DateAdd),
+@@ -207,6 +221,10 @@ class MySQL(Dialect):
+                 this=self._parse_lambda(),
+                 separator=self._match(TokenType.SEPARATOR) and self._parse_field(),
+             ),
++            # https://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_values
++            "VALUES": lambda self: self.expression(
++                exp.Anonymous, this="VALUES", expressions=[self._parse_id_var()]
++            ),
+         }
+ 
+         STATEMENT_PARSERS = {
+@@ -399,6 +417,7 @@ class MySQL(Dialect):
+         NULL_ORDERING_SUPPORTED = False
+         JOIN_HINTS = False
+         TABLE_HINTS = True
++        DUPLICATE_KEY_UPDATE_WITH_SET = False
+ 
+         TRANSFORMS = {
+             **generator.Generator.TRANSFORMS,
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index de88d72d..2941c9c4 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1525,6 +1525,7 @@ class Insert(Expression):
+         "partition": False,
+         "alternative": False,
+         "where": False,
++        "ignore": False,
+     }
+ 
+     def with_(
+@@ -3623,6 +3624,11 @@ class Is(Binary, Predicate):
+     pass
+ 
+ 
++# https://dev.mysql.com/doc/refman/8.0/en/json-search-functions.html#operator_member-of
++class JSONArrayContains(Binary, Predicate):
++    pass
++
++
+ class Kwarg(Binary):
+     """Kwarg in special functions like func(kwarg => y)."""
+ 
+@@ -4476,7 +4482,7 @@ class StrToDate(Func):
+ 
+ 
+ class StrToTime(Func):
+-    arg_types = {"this": True, "format": True}
++    arg_types = {"this": True, "format": True, "zone": False}
+ 
+ 
+ # Spark allows unix_timestamp()
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index d7794f70..b2c10e02 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -143,6 +143,9 @@ class Generator:
+     # Whether or not comparing against booleans (e.g. x IS TRUE) is supported
+     IS_BOOL_ALLOWED = True
+ 
++    # Whether or not to include the "SET" keyword in the "INSERT ... ON DUPLICATE KEY UPDATE" statement
++    DUPLICATE_KEY_UPDATE_WITH_SET = True
++
+     # https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax
+     SELECT_KINDS: t.Tuple[str, ...] = ("STRUCT", "VALUE")
+ 
+@@ -1105,6 +1108,8 @@ class Generator:
+ 
+         alternative = expression.args.get("alternative")
+         alternative = f" OR {alternative}" if alternative else ""
++        ignore = " IGNORE" if expression.args.get("ignore") else ""
++
+         this = f"{this} {self.sql(expression, 'this')}"
+ 
+         exists = " IF EXISTS" if expression.args.get("exists") else ""
+@@ -1116,7 +1121,7 @@ class Generator:
+         expression_sql = f"{self.sep()}{self.sql(expression, 'expression')}"
+         conflict = self.sql(expression, "conflict")
+         returning = self.sql(expression, "returning")
+-        sql = f"INSERT{alternative}{this}{exists}{partition_sql}{where}{expression_sql}{conflict}{returning}"
++        sql = f"INSERT{alternative}{ignore}{this}{exists}{partition_sql}{where}{expression_sql}{conflict}{returning}"
+         return self.prepend_ctes(expression, sql)
+ 
+     def intersect_sql(self, expression: exp.Intersect) -> str:
+@@ -1143,8 +1148,9 @@ class Generator:
+         do = "" if expression.args.get("duplicate") else " DO "
+         nothing = "NOTHING" if expression.args.get("nothing") else ""
+         expressions = self.expressions(expression, flat=True)
++        set_keyword = "SET " if self.DUPLICATE_KEY_UPDATE_WITH_SET else ""
+         if expressions:
+-            expressions = f"UPDATE SET {expressions}"
++            expressions = f"UPDATE {set_keyword}{expressions}"
+         return f"{self.seg(conflict)} {constraint}{key}{do}{nothing}{expressions}"
+ 
+     def returning_sql(self, expression: exp.Returning) -> str:
+@@ -2434,6 +2440,9 @@ class Generator:
+ 
+         return self.func("ANY_VALUE", this)
+ 
++    def jsonarraycontains_sql(self, expression: exp.JSONArrayContains) -> str:
++        return f"{self.sql(expression, 'this')} MEMBER OF({self.sql(expression, 'expression')})"
++
+ 
+ def cached_generator(
+     cache: t.Optional[t.Dict[int, str]] = None
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index b7704de1..700d9aa1 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -1679,6 +1679,7 @@ class Parser(metaclass=_Parser):
+ 
+     def _parse_insert(self) -> exp.Insert:
+         overwrite = self._match(TokenType.OVERWRITE)
++        ignore = self._match(TokenType.IGNORE)
+         local = self._match_text_seq("LOCAL")
+         alternative = None
+ 
+@@ -1709,6 +1710,7 @@ class Parser(metaclass=_Parser):
+             returning=self._parse_returning(),
+             overwrite=overwrite,
+             alternative=alternative,
++            ignore=ignore,
+         )
+ 
+     def _parse_on_conflict(self) -> t.Optional[exp.OnConflict]:
+@@ -1734,7 +1736,8 @@ class Parser(metaclass=_Parser):
+             nothing = True
+         else:
+             self._match(TokenType.UPDATE)
+-            expressions = self._match(TokenType.SET) and self._parse_csv(self._parse_equality)
++            self._match(TokenType.SET)
++            expressions = self._parse_csv(self._parse_equality)
+ 
+         return self.expression(
+             exp.OnConflict,
+@@ -1917,7 +1920,7 @@ class Parser(metaclass=_Parser):
+                 self.raise_error("Cannot specify both ALL and DISTINCT after SELECT")
+ 
+             limit = self._parse_limit(top=True)
+-            expressions = self._parse_csv(self._parse_expression)
++            expressions = self._parse_expressions()
+ 
+             this = self.expression(
+                 exp.Select,
+@@ -2091,9 +2094,7 @@ class Parser(metaclass=_Parser):
+ 
+         partition = self._parse_partition_by()
+         order = self._parse_order()
+-        measures = (
+-            self._parse_csv(self._parse_expression) if self._match_text_seq("MEASURES") else None
+-        )
++        measures = self._parse_expressions() if self._match_text_seq("MEASURES") else None
+ 
+         if self._match_text_seq("ONE", "ROW", "PER", "MATCH"):
+             rows = exp.var("ONE ROW PER MATCH")
+@@ -3174,7 +3175,7 @@ class Parser(metaclass=_Parser):
+             if query:
+                 expressions = [query]
+             else:
+-                expressions = self._parse_csv(self._parse_expression)
++                expressions = self._parse_expressions()
+ 
+             this = self._parse_query_modifiers(seq_get(expressions, 0))
+ 
+@@ -3709,21 +3710,27 @@ class Parser(metaclass=_Parser):
+             if self._match(TokenType.CHARACTER_SET):
+                 to = self.expression(exp.CharacterSet, this=self._parse_var_or_string())
+         elif self._match(TokenType.FORMAT):
+-            fmt = self._parse_at_time_zone(self._parse_string())
++            fmt_string = self._parse_string()
++            fmt = self._parse_at_time_zone(fmt_string)
+ 
+             if to.this in exp.DataType.TEMPORAL_TYPES:
+-                return self.expression(
++                this = self.expression(
+                     exp.StrToDate if to.this == exp.DataType.Type.DATE else exp.StrToTime,
+                     this=this,
+                     format=exp.Literal.string(
+                         format_time(
+-                            fmt.this if fmt else "",
++                            fmt_string.this if fmt_string else "",
+                             self.FORMAT_MAPPING or self.TIME_MAPPING,
+                             self.FORMAT_TRIE or self.TIME_TRIE,
+                         )
+                     ),
+                 )
+ 
++                if isinstance(fmt, exp.AtTimeZone) and isinstance(this, exp.StrToTime):
++                    this.set("zone", fmt.args["zone"])
++
++                return this
++
+         return self.expression(exp.Cast if strict else exp.TryCast, this=this, to=to, format=fmt)
+ 
+     def _parse_concat(self) -> t.Optional[exp.Expression]:
+@@ -4226,7 +4233,7 @@ class Parser(metaclass=_Parser):
+             return None
+         if self._match(TokenType.L_PAREN, advance=False):
+             return self._parse_wrapped_csv(self._parse_expression)
+-        return self._parse_csv(self._parse_expression)
++        return self._parse_expressions()
+ 
+     def _parse_csv(
+         self, parse_method: t.Callable, sep: TokenType = TokenType.COMMA
+@@ -4276,6 +4283,9 @@ class Parser(metaclass=_Parser):
+             self._match_r_paren()
+         return parse_result
+ 
++    def _parse_expressions(self) -> t.List[t.Optional[exp.Expression]]:
++        return self._parse_csv(self._parse_expression)
++
+     def _parse_select_or_expression(self, alias: bool = False) -> t.Optional[exp.Expression]:
+         return self._parse_select() or self._parse_set_operations(
+             self._parse_expression() if alias else self._parse_conjunction()
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index 79f7a659..8657b73b 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -239,6 +239,7 @@ class TokenType(AutoName):
+     LOCK = auto()
+     MAP = auto()
+     MATCH_RECOGNIZE = auto()
++    MEMBER_OF = auto()
+     MERGE = auto()
+     MOD = auto()
+     NATURAL = auto()
+

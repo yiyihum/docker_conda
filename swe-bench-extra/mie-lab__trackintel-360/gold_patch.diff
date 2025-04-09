@@ -1,0 +1,257 @@
+diff --git a/docs/modules/io.rst b/docs/modules/io.rst
+index 09083d7..0c2d291 100644
+--- a/docs/modules/io.rst
++++ b/docs/modules/io.rst
+@@ -61,6 +61,8 @@ PostGIS Import
+ 
+ .. autofunction:: trackintel.io.postgis.read_trips_postgis
+ 
++.. autofunction:: trackintel.io.postgis.read_tours_postgis
++
+ CSV File Export
+ ===============
+ 
+@@ -89,6 +91,8 @@ PostGIS Export
+ 
+ .. autofunction:: trackintel.io.postgis.write_trips_postgis
+ 
++.. autofunction:: trackintel.io.postgis.write_tours_postgis
++
+ Predefined dataset readers
+ ==========================
+ We also provide functionality to parse well-known datasets directly into the trackintel framework.
+diff --git a/trackintel/io/__init__.py b/trackintel/io/__init__.py
+index bc8260f..540233e 100644
+--- a/trackintel/io/__init__.py
++++ b/trackintel/io/__init__.py
+@@ -30,6 +30,9 @@ from .from_geopandas import read_trips_gpd
+ 
+ from .file import read_tours_csv
+ from .file import write_tours_csv
++from .postgis import read_tours_postgis
++from .postgis import write_tours_postgis
++from .from_geopandas import read_tours_gpd
+ 
+ from .dataset_reader import read_geolife
+ from .dataset_reader import geolife_add_modes_to_triplegs
+diff --git a/trackintel/io/dataset_reader.py b/trackintel/io/dataset_reader.py
+index ebb3f2e..5311452 100644
+--- a/trackintel/io/dataset_reader.py
++++ b/trackintel/io/dataset_reader.py
+@@ -39,6 +39,7 @@ def read_geolife(geolife_path, print_progress=False):
+ 
+     labels: dict
+         Dictionary with the available mode labels.
++        Keys are user ids of users that have a "labels.txt" in their folder.
+ 
+     Notes
+     -----
+@@ -137,10 +138,7 @@ def _get_labels(geolife_path, uids):
+     No further checks are done on user ids, they must be convertable to ints.
+     """
+     labels_rename = {"Start Time": "started_at", "End Time": "finished_at", "Transportation Mode": "mode"}
+-    label_dict = defaultdict(
+-        partial(pd.DataFrame, columns=["started_at", "finished_at", "mode"])
+-    )  # output dict for the labels
+-    # TODO: change geolife_add_modes_to_triplegs so that we can use a dict instead.
++    label_dict = {}  # output dict for the labels
+ 
+     # get paths to all "labels.txt" files.
+     possible_label_paths = ((os.path.join(geolife_path, user_id, "labels.txt"), user_id) for user_id in uids)
+@@ -242,16 +240,13 @@ def geolife_add_modes_to_triplegs(
+     # temp time fields for nn query
+     tpls["started_at_s"] = (tpls["started_at"] - pd.Timestamp("1970-01-01", tz="utc")) // pd.Timedelta("1s")
+     tpls["finished_at_s"] = (tpls["finished_at"] - pd.Timestamp("1970-01-01", tz="utc")) // pd.Timedelta("1s")
+-    all_users = tpls["user_id"].unique()
+     # tpls_id_mode_list is used to collect tripleg-mode matches. It will be filled with dictionaries with the
+     # following keys: [id', 'label_id', 'mode']
+     tpls_id_mode_list = list()
+ 
+-    for user_this in all_users:
++    for user_this in labels.keys():
+         tpls_this = tpls[tpls["user_id"] == user_this]
+         labels_this = labels[user_this]
+-        if labels_this.empty:
+-            continue
+ 
+         labels_this["started_at_s"] = (
+             labels_this["started_at"] - pd.Timestamp("1970-01-01", tz="utc")
+@@ -292,10 +287,7 @@ def geolife_add_modes_to_triplegs(
+         tpls = tpls.join(tpls_id_mode)
+         tpls = tpls.astype({"label_id": "Int64"})
+ 
+-    try:
+-        tpls.drop(["started_at_s", "finished_at_s"], axis=1, inplace=True)
+-    except KeyError:
+-        pass
++    tpls.drop(["started_at_s", "finished_at_s"], axis=1, inplace=True)
+ 
+     try:
+         tpls.drop(["ratio"], axis=1, inplace=True)
+diff --git a/trackintel/io/from_geopandas.py b/trackintel/io/from_geopandas.py
+index 5e101c1..1bb34a1 100644
+--- a/trackintel/io/from_geopandas.py
++++ b/trackintel/io/from_geopandas.py
+@@ -401,7 +401,12 @@ def _trackintel_model(gdf, set_names=None, geom_col=None, crs=None, tz_cols=None
+     if tz_cols is not None:
+         for col in tz_cols:
+             if not pd.api.types.is_datetime64tz_dtype(gdf[col]):
+-                gdf[col] = _localize_timestamp(dt_series=gdf[col], pytz_tzinfo=tz, col_name=col)
++                try:
++                    gdf[col] = _localize_timestamp(dt_series=gdf[col], pytz_tzinfo=tz, col_name=col)
++                except ValueError:
++                    # Taken if column contains datetimes with different timezone informations.
++                    # Cast them to UTC in this case.
++                    gdf[col] = pd.to_datetime(gdf[col], utc=True)
+ 
+     # If is not GeoDataFrame and no geom_col is set end early.
+     # That allows us to handle DataFrames and GeoDataFrames in one function.
+diff --git a/trackintel/io/postgis.py b/trackintel/io/postgis.py
+index 7e2a9de..0746889 100644
+--- a/trackintel/io/postgis.py
++++ b/trackintel/io/postgis.py
+@@ -579,6 +579,118 @@ def write_trips_postgis(
+         )
+ 
+ 
++@_handle_con_string
++def read_tours_postgis(
++    sql,
++    con,
++    geom_col=None,
++    crs=None,
++    index_col=None,
++    coerce_float=True,
++    parse_dates=None,
++    params=None,
++    chunksize=None,
++    **kwargs
++):
++    """Read tours from a PostGIS database.
++
++    Parameters
++    ----------
++    sql : str
++        SQL query e.g. "SELECT * FROM tours"
++
++    con : str, sqlalchemy.engine.Connection or sqlalchemy.engine.Engine
++        Connection string or active connection to PostGIS database.
++
++    geom_col : str, optional
++        The geometry column of the table (if exists).
++
++    crs : optional
++        Coordinate reference system if table has geometry.
++
++    index_col : string or list of strings, optional
++        Column(s) to set as index(MultiIndex)
++
++    coerce_float : boolean, default True
++        Attempt to convert values of non-string, non-numeric objects (like
++        decimal.Decimal) to floating point, useful for SQL result sets
++
++    parse_dates : list or dict, default None
++        - List of column names to parse as dates.
++        - Dict of ``{column_name: format string}`` where format string is
++            strftime compatible in case of parsing string times, or is one of
++            (D, s, ns, ms, us) in case of parsing integer timestamps.
++        - Dict of ``{column_name: arg dict}``, where the arg dict
++            corresponds to the keyword arguments of
++            :func:`pandas.to_datetime`. Especially useful with databases
++            without native Datetime support, such as SQLite.
++
++    params : list, tuple or dict, optional, default None
++        List of parameters to pass to execute method.
++
++    chunksize : int, default None
++        If specified, return an iterator where chunksize is the number
++        of rows to include in each chunk.
++
++    **kwargs
++        Further keyword arguments as available in trackintels trackintel.io.read_tours_gpd().
++        Especially useful to rename column names from the SQL table to trackintel conform column names.
++        See second example how to use it in code.
++
++    Returns
++    -------
++    GeoDataFrame (as trackintel tours)
++        A GeoDataFrame containing the tours.
++
++    Examples
++    --------
++    >>> tours = ti.io.read_tours_postgis("SELECT * FROM tours", con)
++    >>> tours = ti.io.read_tours_postgis("SELECT * FROM tours", con, index_col="id", started_at="start_time",
++    ...                                  finished_at="end_time", user_id="USER")
++    """
++    if geom_col is None:
++        tours = pd.read_sql(
++            sql,
++            con,
++            index_col=index_col,
++            coerce_float=coerce_float,
++            params=params,
++            parse_dates=parse_dates,
++            chunksize=chunksize,
++        )
++    else:
++        tours = gpd.GeoDataFrame.from_postgis(
++            sql,
++            con,
++            geom_col=geom_col,
++            crs=crs,
++            index_col=index_col,
++            coerce_float=coerce_float,
++            parse_dates=parse_dates,
++            params=params,
++            chunksize=chunksize,
++        )
++
++    return ti.io.read_tours_gpd(tours, **kwargs)
++
++
++@_handle_con_string
++def write_tours_postgis(
++    tours, name, con, schema=None, if_exists="fail", index=True, index_label=None, chunksize=None, dtype=None
++):
++    write_trips_postgis(
++        tours,
++        name=name,
++        con=con,
++        schema=schema,
++        if_exists=if_exists,
++        index=index,
++        index_label=index_label,
++        chunksize=chunksize,
++        dtype=dtype,
++    )
++
++
+ # helper docstring to change __doc__ of all write functions conveniently in one place
+ __doc = """Stores {long} to PostGIS. Usually, this is directly called on a {long}
+     DataFrame (see example below).
+@@ -628,3 +740,4 @@ write_triplegs_postgis.__doc__ = __doc.format(long="triplegs", short="tpls")
+ write_staypoints_postgis.__doc__ = __doc.format(long="staypoints", short="sp")
+ write_locations_postgis.__doc__ = __doc.format(long="locations", short="locs")
+ write_trips_postgis.__doc__ = __doc.format(long="trips", short="trips")
++write_tours_postgis.__doc__ = __doc.format(long="tours", short="tours")
+diff --git a/trackintel/model/tours.py b/trackintel/model/tours.py
+index bc11abd..f36eabc 100644
+--- a/trackintel/model/tours.py
++++ b/trackintel/model/tours.py
+@@ -57,6 +57,16 @@ class ToursAccessor(object):
+         """
+         ti.io.file.write_tours_csv(self._obj, filename, *args, **kwargs)
+ 
++    def to_postgis(
++        self, name, con, schema=None, if_exists="fail", index=True, index_label=None, chunksize=None, dtype=None
++    ):
++        """
++        Store this collection of tours to PostGIS.
++
++        See :func:`trackintel.io.postgis.write_tours_postgis`.
++        """
++        ti.io.postgis.write_tours_postgis(self._obj, name, con, schema, if_exists, index, index_label, chunksize, dtype)
++
+     def plot(self, *args, **kwargs):
+         """
+         Plot this collection of tours.

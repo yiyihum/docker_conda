@@ -1,0 +1,120 @@
+diff --git a/CHANGELOG.txt b/CHANGELOG.txt
+index 0f001c1f76..f399c22696 100644
+--- a/CHANGELOG.txt
++++ b/CHANGELOG.txt
+@@ -11,6 +11,7 @@ Changelog
+  * Add oEmbed provider patterns for YouTube Shorts Shorts and YouTube Live URLs (valnuro, Fabien Le Frapper)
+  * Add initial implementation of `PagePermissionPolicy` (Sage Abdullah)
+  * Refactor `UserPagePermissionsProxy` and `PagePermissionTester` to use `PagePermissionPolicy` (Sage Abdullah)
++ * Add a predictable default ordering of the "Object/Other permissions" in the Group Editing view, allow this ordering to be customised (Daniel Kirkham)
+  * Fix: Prevent choosers from failing when initial value is an unrecognised ID, e.g. when moving a page from a location where `parent_page_types` would disallow it (Dan Braghis)
+  * Fix: Move comment notifications toggle to the comments side panel (Sage Abdullah)
+  * Fix: Remove comment button on InlinePanel fields (Sage Abdullah)
+diff --git a/docs/extending/customising_group_views.md b/docs/extending/customising_group_views.md
+index c3abae4070..3e56d16737 100644
+--- a/docs/extending/customising_group_views.md
++++ b/docs/extending/customising_group_views.md
+@@ -106,3 +106,29 @@ INSTALLED_APPS = [
+     ...,
+ ]
+ ```
++
++(customising_group_views_permissions_order)=
++
++## Customising the group editor permissions ordering
++
++The order that object types appear in the group editor's "Object permissions" and "Other permissions" sections can be configured by registering that order in one or more `AppConfig` definitions. The order value is typically an integer between 0 and 999, although this is not enforced.
++
++```python
++from django.apps import AppConfig
++
++
++class MyProjectAdminAppConfig(AppConfig):
++    name = "myproject_admin"
++    verbose_name = "My Project Admin"
++
++    def ready(self):
++        from wagtail.users.permission_order import register
++
++        register("gadgets.SprocketType", order=150)
++        register("gadgets.ChainType", order=151)
++        register("site_settings.Settings", order=160)
++```
++
++A model class can also be passed to `register()`.
++
++Any object types that are not explicitly given an order will be sorted in alphabetical order by `app_label` and `model`, and listed after all of the object types _with_ a configured order.
+diff --git a/docs/releases/5.1.md b/docs/releases/5.1.md
+index a471821509..8f2156a73c 100644
+--- a/docs/releases/5.1.md
++++ b/docs/releases/5.1.md
+@@ -23,6 +23,7 @@ FieldPanels can now be marked as read-only with the `read_only=True` keyword arg
+  * Add oEmbed provider patterns for YouTube Shorts (e.g. [https://www.youtube.com/shorts/nX84KctJtG0](https://www.youtube.com/shorts/nX84KctJtG0)) and YouTube Live URLs (valnuro, Fabien Le Frapper)
+  * Add initial implementation of `PagePermissionPolicy` (Sage Abdullah)
+  * Refactor `UserPagePermissionsProxy` and `PagePermissionTester` to use `PagePermissionPolicy` (Sage Abdullah)
++ * Add a predictable default ordering of the "Object/Other permissions" in the Group Editing view, allow this [ordering to be customised](customising_group_views_permissions_order) (Daniel Kirkham)
+ 
+ ### Bug fixes
+ 
+@@ -120,3 +121,10 @@ If you use the `user_page_permissions` context variable or use the `UserPagePerm
+ The undocumented `get_pages_with_direct_explore_permission` and `get_explorable_root_page` functions in `wagtail.admin.navigation` are deprecated. They can be replaced with `PagePermissionPolicy().instances_with_direct_explore_permission(user)` and `PagePermissionPolicy().explorable_root_instance(user)`, respectively.
+ 
+ The undocumented `users_with_page_permission` function in `wagtail.admin.auth` is also deprecated. It can be replaced with `PagePermissionPolicy().users_with_permission_for_instance(action, page, include_superusers)`.
++
++### The default ordering of Group Editing Permissions models has changed
++
++The ordering for "Object permissions" and "Other permissions" now follows a predictable order equivalent do Django's default `Model` ordering.
++This will be different to the previous ordering which never intentionally implemented.
++
++This default ordering is now `["content_type__app_label", "content_type__model", "codename"]`, which can now be customised [](customising_group_views_permissions_order).
+diff --git a/wagtail/users/permission_order.py b/wagtail/users/permission_order.py
+new file mode 100644
+index 0000000000..2314deff3f
+--- /dev/null
++++ b/wagtail/users/permission_order.py
+@@ -0,0 +1,17 @@
++from django.contrib.contenttypes.models import ContentType
++
++from wagtail.coreutils import resolve_model_string
++
++CONTENT_TYPE_ORDER = {}
++
++
++def register(model, **kwargs):
++    """
++    Registers order against the model content_type, used to
++    control the order the models and its permissions appear
++    in the groups object permission editor
++    """
++    order = kwargs.pop("order", None)
++    if order is not None:
++        content_type = ContentType.objects.get_for_model(resolve_model_string(model))
++        CONTENT_TYPE_ORDER[content_type.id] = order
+diff --git a/wagtail/users/templatetags/wagtailusers_tags.py b/wagtail/users/templatetags/wagtailusers_tags.py
+index 34b3f411a2..c188425ad0 100644
+--- a/wagtail/users/templatetags/wagtailusers_tags.py
++++ b/wagtail/users/templatetags/wagtailusers_tags.py
+@@ -4,6 +4,7 @@ import re
+ from django import template
+ 
+ from wagtail import hooks
++from wagtail.users.permission_order import CONTENT_TYPE_ORDER
+ 
+ register = template.Library()
+ 
+@@ -38,8 +39,13 @@ def format_permissions(permission_bound_field):
+ 
+     """
+     permissions = permission_bound_field.field._queryset
+-    # get a distinct list of the content types that these permissions relate to
+-    content_type_ids = set(permissions.values_list("content_type_id", flat=True))
++    # get a distinct and ordered list of the content types that these permissions relate to.
++    # relies on Permission model default ordering, dict.fromkeys() retaining that order
++    # from the queryset, and the stability of sorted().
++    content_type_ids = sorted(
++        dict.fromkeys(permissions.values_list("content_type_id", flat=True)),
++        key=lambda ct: CONTENT_TYPE_ORDER.get(ct, float("inf")),
++    )
+ 
+     # iterate over permission_bound_field to build a lookup of individual renderable
+     # checkbox objects

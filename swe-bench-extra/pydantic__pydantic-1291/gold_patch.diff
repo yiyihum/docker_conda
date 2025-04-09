@@ -1,0 +1,162 @@
+diff --git a/docs/examples/exporting_models_json.py b/docs/examples/exporting_models_json.py
+--- a/docs/examples/exporting_models_json.py
++++ b/docs/examples/exporting_models_json.py
+@@ -1,6 +1,5 @@
+-from datetime import datetime, timedelta
++from datetime import datetime
+ from pydantic import BaseModel
+-from pydantic.json import timedelta_isoformat
+ 
+ class BarModel(BaseModel):
+     whatever: int
+@@ -11,16 +10,3 @@ class FooBarModel(BaseModel):
+ 
+ m = FooBarModel(foo=datetime(2032, 6, 1, 12, 13, 14), bar={'whatever': 123})
+ print(m.json())
+-# (returns a str)
+-class WithCustomEncoders(BaseModel):
+-    dt: datetime
+-    diff: timedelta
+-
+-    class Config:
+-        json_encoders = {
+-            datetime: lambda v: v.timestamp(),
+-            timedelta: timedelta_isoformat,
+-        }
+-
+-m = WithCustomEncoders(dt=datetime(2032, 6, 1), diff=timedelta(hours=100))
+-print(m.json())
+diff --git a/docs/examples/exporting_models_json_encoders.py b/docs/examples/exporting_models_json_encoders.py
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/exporting_models_json_encoders.py
+@@ -0,0 +1,16 @@
++from datetime import datetime, timedelta
++from pydantic import BaseModel
++from pydantic.json import timedelta_isoformat
++
++class WithCustomEncoders(BaseModel):
++    dt: datetime
++    diff: timedelta
++
++    class Config:
++        json_encoders = {
++            datetime: lambda v: v.timestamp(),
++            timedelta: timedelta_isoformat,
++        }
++
++m = WithCustomEncoders(dt=datetime(2032, 6, 1), diff=timedelta(hours=100))
++print(m.json())
+diff --git a/docs/examples/exporting_models_json_subclass.py b/docs/examples/exporting_models_json_subclass.py
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/exporting_models_json_subclass.py
+@@ -0,0 +1,23 @@
++from datetime import date, timedelta
++from pydantic import BaseModel
++from pydantic.validators import int_validator
++
++class DayThisYear(date):
++    """
++    Contrived example of a special type of date that
++    takes an int and interprets it as a day in the current year
++    """
++    @classmethod
++    def __get_validators__(cls):
++        yield int_validator
++        yield cls.validate
++
++    @classmethod
++    def validate(cls, v: int):
++        return date.today().replace(month=1, day=1) + timedelta(days=v)
++
++class FooModel(BaseModel):
++    date: DayThisYear
++
++m = FooModel(date=300)
++print(m.json())
+diff --git a/pydantic/json.py b/pydantic/json.py
+--- a/pydantic/json.py
++++ b/pydantic/json.py
+@@ -18,25 +18,27 @@ def isoformat(o: Union[datetime.date, datetime.time]) -> str:
+ 
+ 
+ ENCODERS_BY_TYPE: Dict[Type[Any], Callable[[Any], Any]] = {
++    bytes: lambda o: o.decode(),
+     Color: str,
++    datetime.date: isoformat,
++    datetime.datetime: isoformat,
++    datetime.time: isoformat,
++    datetime.timedelta: lambda td: td.total_seconds(),
++    Decimal: float,
++    Enum: lambda o: o.value,
++    frozenset: list,
++    GeneratorType: list,
+     IPv4Address: str,
+-    IPv6Address: str,
+     IPv4Interface: str,
+-    IPv6Interface: str,
+     IPv4Network: str,
++    IPv6Address: str,
++    IPv6Interface: str,
+     IPv6Network: str,
+-    SecretStr: str,
++    Path: str,
+     SecretBytes: str,
+-    UUID: str,
+-    datetime.datetime: isoformat,
+-    datetime.date: isoformat,
+-    datetime.time: isoformat,
+-    datetime.timedelta: lambda td: td.total_seconds(),
++    SecretStr: str,
+     set: list,
+-    frozenset: list,
+-    GeneratorType: list,
+-    bytes: lambda o: o.decode(),
+-    Decimal: float,
++    UUID: str,
+ }
+ 
+ 
+@@ -46,26 +48,29 @@ def pydantic_encoder(obj: Any) -> Any:
+ 
+     if isinstance(obj, BaseModel):
+         return obj.dict()
+-    elif isinstance(obj, Enum):
+-        return obj.value
+-    elif isinstance(obj, Path):
+-        return str(obj)
+     elif is_dataclass(obj):
+         return asdict(obj)
+ 
+-    try:
+-        encoder = ENCODERS_BY_TYPE[obj.__class__]
+-    except KeyError:
+-        raise TypeError(f"Object of type '{obj.__class__.__name__}' is not JSON serializable")
+-    else:
++    # Check the class type and its superclasses for a matching encoder
++    for base in obj.__class__.__mro__[:-1]:
++        try:
++            encoder = ENCODERS_BY_TYPE[base]
++        except KeyError:
++            continue
+         return encoder(obj)
++    else:  # We have exited the for loop without finding a suitable encoder
++        raise TypeError(f"Object of type '{obj.__class__.__name__}' is not JSON serializable")
+ 
+ 
+ def custom_pydantic_encoder(type_encoders: Dict[Any, Callable[[Type[Any]], Any]], obj: Any) -> Any:
+-    encoder = type_encoders.get(obj.__class__)
+-    if encoder:
++    # Check the class type and its superclasses for a matching encoder
++    for base in obj.__class__.__mro__[:-1]:
++        try:
++            encoder = type_encoders[base]
++        except KeyError:
++            continue
+         return encoder(obj)
+-    else:
++    else:  # We have exited the for loop without finding a suitable encoder
+         return pydantic_encoder(obj)
+ 
+ 

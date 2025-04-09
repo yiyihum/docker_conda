@@ -1,0 +1,191 @@
+diff --git a/examples/recursive_array.py b/examples/recursive_array.py
+index 55b56df..46d5e5a 100644
+--- a/examples/recursive_array.py
++++ b/examples/recursive_array.py
+@@ -1,4 +1,5 @@
+-from paco.combinators import (Char, Lazy)
++from paco.combinators import Lazy
++from paco.atomic import Char
+ from paco.miscellaneous import (letters, numbers, optSpace)
+ 
+ lbra = Char('[').then(optSpace)
+@@ -12,7 +13,10 @@ array.p = optSpace >> lbra >> element.sepby(comm) << rbra << optSpace
+ def main():
+     test_str = ' [ [1, 3, 5], [hi, howdy, bye], 42, [[1,2], [4,5]]] '
+     print('Running on: ' + test_str)
+-    print(array(test_str))
++    _, ar = array(test_str)
++    print('(ar[0][2] == {}) ->'.format(ar[0][2]), ar[0][2] == '5')
++    print('(ar[1][1] == {}) ->'.format(ar[1][1]), ar[1][1] == 'howdy')
++    print('(ar[3][1][0] == {}) ->'.format(ar[3][1][0]), ar[3][1][0] == '4')
+ 
+ if __name__ == '__main__':
+     exit(main())
+\ No newline at end of file
+diff --git a/src/paco/__init__.py b/src/paco/__init__.py
+index 0a0fd75..b2db0a3 100644
+--- a/src/paco/__init__.py
++++ b/src/paco/__init__.py
+@@ -1,1 +1,1 @@
+-from . import combinators, miscellaneous, lexer
++from . import combinators, atomic, miscellaneous, lexer
+diff --git a/src/paco/atomic.py b/src/paco/atomic.py
+new file mode 100644
+index 0000000..2468c3d
+--- /dev/null
++++ b/src/paco/atomic.py
+@@ -0,0 +1,67 @@
++
++import re
++from .combinators import Parser, ParseError
++
++class Char(Parser):
++    def __init__(self, char : str) -> None:
++        super().__init__()
++        self.name = 'char(\'{}\')'.format(char)
++        self.char = char
++    
++    def run(self, pos : int, tar : str):
++        if (len(tar) > pos) and (tar[pos] == self.char):
++            return (pos + 1, self.char)
++        
++        got = tar[pos] if len(tar) > pos else "EOF"
++        msg = f"Excpected '{self.char}' but got '{got}'"
++        raise ParseError(pos, pos + 1, msg, self)
++
++class Literal(Parser):
++
++    def __init__(self, literal : str) -> None:
++        super().__init__()
++        self.name = 'lit(\'{}\')'.format(literal)
++        self.literal = literal
++        self.length = len(literal)
++    
++    def run(self, pos : int, tar : str):
++        if tar.startswith(self.literal,pos):
++            return (pos + self.length, self.literal)
++        if len(tar) > (pos + self.length-1):
++            msg = f"Tried to match '{self.literal}' but got '{tar[pos:pos+self.length]}'"
++            raise ParseError(pos, pos + self.length, msg, self)
++        msg = f"Tried to match '{self.literal}' but got EOF"
++        raise ParseError(pos, pos + self.length, msg, self)
++        
++class Regex(Parser):
++
++    def __init__(self, rule : str) -> None:
++        super().__init__()
++        self.name = 'reg(r\'{}\')'.format(rule)
++        self.rule = re.compile(rule)
++    
++    def run(self, pos : int, tar : str):
++        m = self.rule.match(tar, pos)
++        if m is None:
++            msg = f"Couldn't match the rule: {self.rule}"
++            raise ParseError(pos, pos, msg, self)
++        return (m.end(), m.group())
++
++class Tok(Parser):
++
++    def __init__(self, tag : str, data = None):
++        self.tag, self.data = tag, data
++        if data:
++            self.condition = lambda t : (t.type == tag) and (t.data == data)
++        else:
++            self.condition = lambda t : (t.type == tag)
++    
++    def run(self, pos : int, tar : list):
++        if len(tar) > pos:
++            tok = tar[pos]
++            if self.condition(tok):
++                return (pos + 1, tok)
++            msg = 'Expected Token {} but got {}'.format((self.tag,self.data),tok)
++            raise ParseError(tok.start, tok.end, msg, self)
++        else:
++            raise ParseError(pos, pos, 'Got EOF', self)
+diff --git a/src/paco/combinators.py b/src/paco/combinators.py
+index 6ff2b26..7f2f721 100644
+--- a/src/paco/combinators.py
++++ b/src/paco/combinators.py
+@@ -1,4 +1,3 @@
+-import re
+ from typing import Iterable
+ 
+ class Parser(object):
+@@ -65,67 +64,6 @@ class ParseError(Exception):
+     def __str__(self):
+         return self.msg
+ 
+-class Char(Parser):
+-    def __init__(self, char : str) -> None:
+-        super().__init__()
+-        self.name = 'char(\'{}\')'.format(char)
+-        self.char = char
+-    
+-    def run(self, pos : int, tar : str):
+-        if (len(tar) > pos) and (tar[pos] == self.char):
+-            return (pos + 1, self.char)
+-        
+-        got = tar[pos] if len(tar) > pos else "EOF"
+-        msg = f"Excpected '{self.char}' but got '{got}'"
+-        raise ParseError(pos, pos + 1, msg, self)
+-
+-class Literal(Parser):
+-
+-    def __init__(self, literal : str) -> None:
+-        super().__init__()
+-        self.name = 'lit(\'{}\')'.format(literal)
+-        self.literal = literal
+-        self.length = len(literal)
+-    
+-    def run(self, pos : int, tar : str):
+-        if tar.startswith(self.literal,pos):
+-            return (pos + self.length, self.literal)
+-        if len(tar) > (pos + self.length-1):
+-            msg = f"Tried to match '{self.literal}' but got '{tar[pos:pos+self.length]}'"
+-            raise ParseError(pos, pos + self.length, msg, self)
+-        msg = f"Tried to match '{self.literal}' but got EOF"
+-        raise ParseError(pos, pos + self.length, msg, self)
+-        
+-class Regex(Parser):
+-
+-    def __init__(self, rule : str) -> None:
+-        super().__init__()
+-        self.name = 'reg(r\'{}\')'.format(rule)
+-        self.rule = re.compile(rule)
+-    
+-    def run(self, pos : int, tar : str):
+-        m = self.rule.match(tar, pos)
+-        if m is None:
+-            msg = f"Couldn't match the rule: {self.rule}"
+-            raise ParseError(pos, pos, msg, self)
+-        return (m.end(), m.group())
+-
+-class Tok(Parser):
+-
+-    def __init__(self, tag : str, data = None):
+-        self.tag, self.data = tag, data
+-        if data:
+-            self.condition = lambda t : (t.type == tag) and (t.data == data)
+-        else:
+-            self.condition = lambda t : (t.type == tag)
+-    
+-    def run(self, pos : int, tar : list):
+-        tok = tar[pos]
+-        if self.condition(tok):
+-            return (pos + 1, tok)
+-        msg = 'Expected Token was {} but got {}'.format((self.tag,self.data),tok)
+-        raise ParseError(tok.start, tok.end, msg, self)
+-
+ class Sequence(Parser):
+ 
+     def __init__(self, *parsers) -> None:
+diff --git a/src/paco/miscellaneous.py b/src/paco/miscellaneous.py
+index 3938293..c87c881 100644
+--- a/src/paco/miscellaneous.py
++++ b/src/paco/miscellaneous.py
+@@ -1,4 +1,4 @@
+-from .combinators import (Regex)
++from .atomic import (Regex)
+ 
+ letters = Regex("[a-zA-Z]+")
+ letter = Regex("[a-zA-Z]")

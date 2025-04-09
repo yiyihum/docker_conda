@@ -1,0 +1,169 @@
+diff --git a/scrapy/utils/testsite.py b/scrapy/utils/testsite.py
+index ad0375443..e50a989b3 100644
+--- a/scrapy/utils/testsite.py
++++ b/scrapy/utils/testsite.py
+@@ -20,12 +20,20 @@ class SiteTest(object):
+         return urljoin(self.baseurl, path)
+ 
+ 
++class NoMetaRefreshRedirect(util.Redirect):
++    def render(self, request):
++        content = util.Redirect.render(self, request)
++        return content.replace(b'http-equiv=\"refresh\"',
++            b'http-no-equiv=\"do-not-refresh-me\"')
++
++
+ def test_site():
+     r = resource.Resource()
+     r.putChild(b"text", static.Data(b"Works", "text/plain"))
+     r.putChild(b"html", static.Data(b"<body><p class='one'>Works</p><p class='two'>World</p></body>", "text/html"))
+     r.putChild(b"enc-gb18030", static.Data(b"<p>gb18030 encoding</p>", "text/html; charset=gb18030"))
+     r.putChild(b"redirect", util.Redirect(b"/redirected"))
++    r.putChild(b"redirect-no-meta-refresh", NoMetaRefreshRedirect(b"/redirected"))
+     r.putChild(b"redirected", static.Data(b"Redirected here", "text/plain"))
+     return server.Site(r)
+ 
+diff --git a/tests/test_command_fetch.py b/tests/test_command_fetch.py
+index 4843a9a2f..3fa3ed930 100644
+--- a/tests/test_command_fetch.py
++++ b/tests/test_command_fetch.py
+@@ -14,6 +14,18 @@ class FetchTest(ProcessTest, SiteTest, unittest.TestCase):
+         _, out, _ = yield self.execute([self.url('/text')])
+         self.assertEqual(out.strip(), b'Works')
+ 
++    @defer.inlineCallbacks
++    def test_redirect_default(self):
++        _, out, _ = yield self.execute([self.url('/redirect')])
++        self.assertEqual(out.strip(), b'Redirected here')
++
++    @defer.inlineCallbacks
++    def test_redirect_disabled(self):
++        _, out, err = yield self.execute(['--no-redirect', self.url('/redirect-no-meta-refresh')])
++        err = err.strip()
++        self.assertIn(b'downloader/response_status_count/302', err, err)
++        self.assertNotIn(b'downloader/response_status_count/200', err, err)
++
+     @defer.inlineCallbacks
+     def test_headers(self):
+         _, out, _ = yield self.execute([self.url('/text'), '--headers'])
+diff --git a/tests/test_command_shell.py b/tests/test_command_shell.py
+index 7bb7439d6..3e27d6abd 100644
+--- a/tests/test_command_shell.py
++++ b/tests/test_command_shell.py
+@@ -49,6 +49,35 @@ class ShellTest(ProcessTest, SiteTest, unittest.TestCase):
+         _, out, _ = yield self.execute([self.url('/redirect'), '-c', 'response.url'])
+         assert out.strip().endswith(b'/redirected')
+ 
++    @defer.inlineCallbacks
++    def test_redirect_follow_302(self):
++        _, out, _ = yield self.execute([self.url('/redirect-no-meta-refresh'), '-c', 'response.status'])
++        assert out.strip().endswith(b'200')
++
++    @defer.inlineCallbacks
++    def test_redirect_not_follow_302(self):
++        _, out, _ = yield self.execute(['--no-redirect', self.url('/redirect-no-meta-refresh'), '-c', 'response.status'])
++        assert out.strip().endswith(b'302')
++
++    @defer.inlineCallbacks
++    def test_fetch_redirect_follow_302(self):
++        """Test that calling `fetch(url)` follows HTTP redirects by default."""
++        url = self.url('/redirect-no-meta-refresh')
++        code = "fetch('{0}')"
++        errcode, out, errout = yield self.execute(['-c', code.format(url)])
++        self.assertEqual(errcode, 0, out)
++        assert b'Redirecting (302)' in errout
++        assert b'Crawled (200)' in errout
++
++    @defer.inlineCallbacks
++    def test_fetch_redirect_not_follow_302(self):
++        """Test that calling `fetch(url, redirect=False)` disables automatic redirects."""
++        url = self.url('/redirect-no-meta-refresh')
++        code = "fetch('{0}', redirect=False)"
++        errcode, out, errout = yield self.execute(['-c', code.format(url)])
++        self.assertEqual(errcode, 0, out)
++        assert b'Crawled (302)' in errout
++
+     @defer.inlineCallbacks
+     def test_request_replace(self):
+         url = self.url('/text')
+diff --git a/tests/test_utils_datatypes.py b/tests/test_utils_datatypes.py
+index b31d2179c..80f797227 100644
+--- a/tests/test_utils_datatypes.py
++++ b/tests/test_utils_datatypes.py
+@@ -1,7 +1,7 @@
+ import copy
+ import unittest
+ 
+-from scrapy.utils.datatypes import CaselessDict
++from scrapy.utils.datatypes import CaselessDict, SequenceExclude
+ 
+ __doctests__ = ['scrapy.utils.datatypes']
+ 
+@@ -128,6 +128,67 @@ class CaselessDictTest(unittest.TestCase):
+         assert isinstance(h2, CaselessDict)
+ 
+ 
++class SequenceExcludeTest(unittest.TestCase):
++
++    def test_list(self):
++        seq = [1, 2, 3]
++        d = SequenceExclude(seq)
++        self.assertIn(0, d)
++        self.assertIn(4, d)
++        self.assertNotIn(2, d)
++
++    def test_range(self):
++        seq = range(10, 20)
++        d = SequenceExclude(seq)
++        self.assertIn(5, d)
++        self.assertIn(20, d)
++        self.assertNotIn(15, d)
++
++    def test_six_range(self):
++        import six.moves
++        seq = six.moves.range(10**3, 10**6)
++        d = SequenceExclude(seq)
++        self.assertIn(10**2, d)
++        self.assertIn(10**7, d)
++        self.assertNotIn(10**4, d)
++
++    def test_range_step(self):
++        seq = range(10, 20, 3)
++        d = SequenceExclude(seq)
++        are_not_in = [v for v in range(10, 20, 3) if v in d]
++        self.assertEquals([], are_not_in)
++
++        are_not_in = [v for v in range(10, 20) if v in d]
++        self.assertEquals([11, 12, 14, 15, 17, 18], are_not_in)
++
++    def test_string_seq(self):
++        seq = "cde"
++        d = SequenceExclude(seq)
++        chars = "".join(v for v in "abcdefg" if v in d)
++        self.assertEquals("abfg", chars)
++
++    def test_stringset_seq(self):
++        seq = set("cde")
++        d = SequenceExclude(seq)
++        chars = "".join(v for v in "abcdefg" if v in d)
++        self.assertEquals("abfg", chars)
++
++    def test_set(self):
++        """Anything that is not in the supplied sequence will evaluate as 'in' the container."""
++        seq = set([-3, "test", 1.1])
++        d = SequenceExclude(seq)
++        self.assertIn(0, d)
++        self.assertIn("foo", d)
++        self.assertIn(3.14, d)
++        self.assertIn(set("bar"), d)
++
++        # supplied sequence is a set, so checking for list (non)inclusion fails
++        self.assertRaises(TypeError, (0, 1, 2) in d)
++        self.assertRaises(TypeError, d.__contains__, ['a', 'b', 'c'])
++
++        for v in [-3, "test", 1.1]:
++            self.assertNotIn(v, d)
++
+ if __name__ == "__main__":
+     unittest.main()
+ 

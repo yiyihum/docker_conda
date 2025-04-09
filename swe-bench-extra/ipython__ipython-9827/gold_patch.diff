@@ -1,0 +1,253 @@
+diff --git a/.travis.yml b/.travis.yml
+index b7e3d1211..47d42d6fd 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -6,12 +6,29 @@ python:
+     - 3.4
+     - 3.3
+     - 2.7
++    - pypy
+ sudo: false
+ before_install:
+     - git clone --quiet --depth 1 https://github.com/minrk/travis-wheels travis-wheels
+     - 'if [[ $GROUP != js* ]]; then COVERAGE=""; fi'
+ install:
+     - pip install "setuptools>=18.5"
++    # Installs PyPy (+ its Numpy). Based on @frol comment at:
++    # https://github.com/travis-ci/travis-ci/issues/5027
++    - |
++        if [ "$TRAVIS_PYTHON_VERSION" = "pypy" ]; then
++          export PYENV_ROOT="$HOME/.pyenv"
++          if [ -f "$PYENV_ROOT/bin/pyenv" ]; then
++            cd "$PYENV_ROOT" && git pull
++          else
++            rm -rf "$PYENV_ROOT" && git clone --depth 1 https://github.com/yyuu/pyenv.git "$PYENV_ROOT"
++          fi
++          export PYPY_VERSION="5.3.1"
++          "$PYENV_ROOT/bin/pyenv" install "pypy-$PYPY_VERSION"
++          virtualenv --python="$PYENV_ROOT/versions/pypy-$PYPY_VERSION/bin/python" "$HOME/virtualenvs/pypy-$PYPY_VERSION"
++          source "$HOME/virtualenvs/pypy-$PYPY_VERSION/bin/activate"
++          pip install https://bitbucket.org/pypy/numpy/get/master.zip
++        fi
+     - pip install -f travis-wheels/wheelhouse -e file://$PWD#egg=ipython[test]
+     - pip install codecov
+ script:
+@@ -23,4 +40,5 @@ after_success:
+ 
+ matrix:
+     allow_failures:
+-        python: nightly
++        - python: nightly
++        - python: pypy
+diff --git a/IPython/core/completer.py b/IPython/core/completer.py
+index 07bbbaa17..87b13b1c5 100644
+--- a/IPython/core/completer.py
++++ b/IPython/core/completer.py
+@@ -216,7 +216,11 @@ def completions_sorting_key(word):
+ class Bunch(object): pass
+ 
+ 
+-DELIMS = ' \t\n`!@#$^&*()=+[{]}\\|;:\'",<>?'
++if sys.platform == 'win32':
++    DELIMS = ' \t\n`!@#$^&*()=+[{]}|;\'",<>?'
++else:
++    DELIMS = ' \t\n`!@#$^&*()=+[{]}\\|;:\'",<>?'
++
+ GREEDY_DELIMS = ' =\r\n'
+ 
+ 
+@@ -729,7 +733,10 @@ def file_matches(self, text):
+             return [text_prefix + cast_unicode_py2(protect_filename(f)) for f in self.glob("*")]
+ 
+         # Compute the matches from the filesystem
+-        m0 = self.clean_glob(text.replace('\\',''))
++        if sys.platform == 'win32':
++            m0 = self.clean_glob(text)
++        else:
++            m0 = self.clean_glob(text.replace('\\', ''))
+ 
+         if has_protectables:
+             # If we had protectables, we need to revert our changes to the
+diff --git a/IPython/lib/pretty.py b/IPython/lib/pretty.py
+index 49ee2cef3..97529f193 100644
+--- a/IPython/lib/pretty.py
++++ b/IPython/lib/pretty.py
+@@ -85,7 +85,7 @@ def _repr_pretty_(self, p, cycle):
+ import datetime
+ from collections import deque
+ 
+-from IPython.utils.py3compat import PY3, cast_unicode, string_types
++from IPython.utils.py3compat import PY3, PYPY, cast_unicode, string_types
+ from IPython.utils.encoding import get_stream_enc
+ 
+ from io import StringIO
+@@ -605,7 +605,8 @@ def inner(obj, p, cycle):
+ 
+         if cycle:
+             return p.text('{...}')
+-        p.begin_group(1, start)
++        step = len(start)
++        p.begin_group(step, start)
+         keys = obj.keys()
+         # if dict isn't large enough to be truncated, sort keys before displaying
+         if not (p.max_seq_length and len(obj) >= p.max_seq_length):
+@@ -621,7 +622,7 @@ def inner(obj, p, cycle):
+             p.pretty(key)
+             p.text(': ')
+             p.pretty(obj[key])
+-        p.end_group(1, end)
++        p.end_group(step, end)
+     return inner
+ 
+ 
+@@ -631,7 +632,11 @@ def _super_pprint(obj, p, cycle):
+     p.pretty(obj.__thisclass__)
+     p.text(',')
+     p.breakable()
+-    p.pretty(obj.__self__)
++    if PYPY: # In PyPy, super() objects don't have __self__ attributes
++        dself = obj.__repr__.__self__
++        p.pretty(None if dself is obj else dself)
++    else:
++        p.pretty(obj.__self__)
+     p.end_group(8, '>')
+ 
+ 
+@@ -665,8 +670,10 @@ def _type_pprint(obj, p, cycle):
+     # Heap allocated types might not have the module attribute,
+     # and others may set it to None.
+ 
+-    # Checks for a __repr__ override in the metaclass
+-    if type(obj).__repr__ is not type.__repr__:
++    # Checks for a __repr__ override in the metaclass. Can't compare the
++    # type(obj).__repr__ directly because in PyPy the representation function
++    # inherited from type isn't the same type.__repr__
++    if [m for m in _get_mro(type(obj)) if "__repr__" in vars(m)][:1] != [type]:
+         _repr_pprint(obj, p, cycle)
+         return
+ 
+@@ -753,10 +760,15 @@ def _exception_pprint(obj, p, cycle):
+ }
+ 
+ try:
+-    _type_pprinters[types.DictProxyType] = _dict_pprinter_factory('<dictproxy {', '}>')
++    # In PyPy, types.DictProxyType is dict, setting the dictproxy printer
++    # using dict.setdefault avoids overwritting the dict printer
++    _type_pprinters.setdefault(types.DictProxyType,
++                               _dict_pprinter_factory('dict_proxy({', '})'))
+     _type_pprinters[types.ClassType] = _type_pprint
+     _type_pprinters[types.SliceType] = _repr_pprint
+ except AttributeError: # Python 3
++    _type_pprinters[types.MappingProxyType] = \
++        _dict_pprinter_factory('mappingproxy({', '})')
+     _type_pprinters[slice] = _repr_pprint
+     
+ try:
+diff --git a/IPython/terminal/pt_inputhooks/tk.py b/IPython/terminal/pt_inputhooks/tk.py
+index 24313a839..db205b0d2 100644
+--- a/IPython/terminal/pt_inputhooks/tk.py
++++ b/IPython/terminal/pt_inputhooks/tk.py
+@@ -40,10 +40,12 @@
+ """
+ import time
+ 
++from IPython.utils.py3compat import PY3
++
+ import _tkinter
+-try:
++if PY3:
+     import tkinter
+-except ImportError:
++else:
+     import Tkinter as tkinter  # Python 2
+ 
+ def inputhook(inputhook_context):
+diff --git a/IPython/utils/py3compat.py b/IPython/utils/py3compat.py
+index f42f55c95..88602e534 100644
+--- a/IPython/utils/py3compat.py
++++ b/IPython/utils/py3compat.py
+@@ -6,6 +6,7 @@
+ import re
+ import shutil
+ import types
++import platform
+ 
+ from .encoding import DEFAULT_ENCODING
+ 
+@@ -292,6 +293,7 @@ def execfile(fname, glob=None, loc=None, compiler=None):
+ 
+ 
+ PY2 = not PY3
++PYPY = platform.python_implementation() == "PyPy"
+ 
+ 
+ def annotate(**kwargs):
+diff --git a/tox.ini b/tox.ini
+index 3a197386d..1668ce6f3 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,44 +1,28 @@
+-# Tox (http://tox.testrun.org/) is a tool for running tests
+-# in multiple virtualenvs. This configuration file will run the
+-# test suite on all supported python versions. To use it, "pip install tox"
+-# and then run "tox" from this directory.
+-
+-# Building the source distribution requires `invoke` and `lessc` to be on your PATH.
+-# "pip install invoke" will install invoke. Less can be installed by
+-# node.js' (http://nodejs.org/) package manager npm:
+-# "npm install -g less".
+-
+-# Javascript tests need additional dependencies that can be installed
+-# using node.js' package manager npm:
+-# [*] casperjs:  "npm install -g casperjs"
+-# [*] slimerjs:  "npm install -g slimerjs"
+-# [*] phantomjs: "npm install -g phantomjs"
+-
+-# Note: qt4 versions break some tests with tornado versions >=4.0.
++; Tox (http://tox.testrun.org/) is a virtualenv manager for running tests in
++; multiple environments. This configuration file gets the requirements from
++; setup.py like a "pip install ipython[test]". To create the environments, it
++; requires every interpreter available/installed.
++;  -- Commands --
++; pip install tox  # Installs tox
++; tox              # Runs the tests (call from the directory with tox.ini)
++; tox -r           # Ditto, but forcing the virtual environments to be rebuilt
++; tox -e py35,pypy # Runs only in the selected environments
++; tox -- --all -j  # Runs "iptest --all -j" in every environment
+ 
+ [tox]
+-envlist = py27, py33, py34
++envlist = py{36,35,34,33,27,py}
++skip_missing_interpreters = True
++toxworkdir = /tmp/tox_ipython
+ 
+ [testenv]
++; PyPy requires its Numpy fork instead of "pip install numpy"
++; Other IPython/testing dependencies should be in setup.py, not here
+ deps =
+-  pyzmq
+-  nose
+-  tornado<4.0
+-  jinja2
+-  sphinx
+-  pygments
+-  jsonpointer
+-  jsonschema
+-  mistune
++  pypy: https://bitbucket.org/pypy/numpy/get/master.zip
++  py{36,35,34,33,27}: matplotlib
++  .[test]
+ 
+-# To avoid loading IPython module in the current directory, change
+-# current directory to ".tox/py*/tmp" before running test.
++; It's just to avoid loading the IPython package in the current directory
+ changedir = {envtmpdir}
+ 
+-commands =
+-  iptest --all
+-
+-[testenv:py27]
+-deps=
+-  mock
+-  {[testenv]deps}
++commands = iptest {posargs}

@@ -1,0 +1,139 @@
+diff --git a/starttls_policy_cli/tests/configure_test.py b/starttls_policy_cli/tests/configure_test.py
+index 5bd4b2e..706c16a 100644
+--- a/starttls_policy_cli/tests/configure_test.py
++++ b/starttls_policy_cli/tests/configure_test.py
+@@ -104,11 +104,15 @@ test_json_expired = '{\
+     }'
+ 
+ testgen_data = [
+-    param("simple_policy", test_json, "# .testing.example-recipient.com "
++    param("simple_policy", test_json, False, "# .testing.example-recipient.com "
+                                       "undefined due to testing policy\n"
+                                       ".valid.example-recipient.com    "
+                                       "secure match=.valid.example-recipient.com\n"),
+-    param("expired_policy", test_json_expired, "# Policy list is outdated. "
++    param("simple_policy_early", test_json, True, ".testing.example-recipient.com  "
++                                      "secure match=.testing.example-recipient.com\n"
++                                      ".valid.example-recipient.com    "
++                                      "secure match=.valid.example-recipient.com\n"),
++    param("expired_policy", test_json_expired, False, "# Policy list is outdated. "
+                                                "Falling back to opportunistic encryption.\n"),
+ ]
+ 
+@@ -127,10 +131,10 @@ class TestPostfixGenerator(unittest.TestCase):
+         self.assertTrue("postfix reload" in instructions)
+         self.assertTrue(generator.default_filename in instructions)
+ 
+-    def config_test(self, conf, expected):
++    def config_test(self, conf, enforce_testing, expected):
+         """PostfixGenerator test parameterized over various policies"""
+         with TempPolicyDir(conf) as testdir:
+-            generator = configure.PostfixGenerator(testdir)
++            generator = configure.PostfixGenerator(testdir, enforce_testing)
+             generator.generate()
+             pol_filename = os.path.join(testdir, generator.default_filename)
+             with open(pol_filename) as pol_file:
+diff --git a/starttls_policy_cli/tests/main_test.py b/starttls_policy_cli/tests/main_test.py
+index 7c4a593..edca7de 100644
+--- a/starttls_policy_cli/tests/main_test.py
++++ b/starttls_policy_cli/tests/main_test.py
+@@ -24,21 +24,21 @@ class TestArguments(unittest.TestCase):
+ 
+     def test_generate_arg(self):
+         # pylint: disable=protected-access
+-        sys.argv = ["_", "--generate", "lol"]
++        sys.argv = ["_", "--generate", "postfix"]
+         parser = main._argument_parser()
+         arguments = parser.parse_args()
+-        self.assertEqual(arguments.generate, "lol")
++        self.assertEqual(arguments.generate, "postfix")
+ 
+     def test_default_dir(self):
+         # pylint: disable=protected-access
+-        sys.argv = ["_", "--generate", "lol"]
++        sys.argv = ["_", "--generate", "postfix"]
+         parser = main._argument_parser()
+         arguments = parser.parse_args()
+         self.assertEqual(arguments.policy_dir, "/etc/starttls-policy/")
+ 
+     def test_policy_dir(self):
+         # pylint: disable=protected-access
+-        sys.argv = ["_", "--generate", "lol", "--policy-dir", "lmao"]
++        sys.argv = ["_", "--generate", "postfix", "--policy-dir", "lmao"]
+         parser = main._argument_parser()
+         arguments = parser.parse_args()
+         self.assertEqual(arguments.policy_dir, "lmao")
+@@ -50,7 +50,7 @@ class TestPerform(unittest.TestCase):
+         sys.argv = ["_", "--generate", "lmao"]
+         parser = main._argument_parser()
+         parser.error = mock.MagicMock(side_effect=Exception)
+-        self.assertRaises(Exception, main._perform, parser.parse_args(), parser)
++        self.assertRaises(Exception, parser.parse_args)
+ 
+     @mock.patch("starttls_policy_cli.main._ensure_directory")
+     def test_generate(self, ensure_directory):
+@@ -58,7 +58,7 @@ class TestPerform(unittest.TestCase):
+         main.GENERATORS = {"exists": mock.MagicMock()}
+         sys.argv = ["_", "--generate", "exists"]
+         parser = main._argument_parser()
+-        main._perform(parser.parse_args(), parser)
++        main._generate(parser.parse_args())
+         self.assertTrue(main.GENERATORS["exists"].called_with("/etc/starttls-policy"))
+ 
+     @mock.patch("os.path.exists")
+diff --git a/starttls_policy_cli/tests/policy_test.py b/starttls_policy_cli/tests/policy_test.py
+index 81a8fb1..994c7bd 100644
+--- a/starttls_policy_cli/tests/policy_test.py
++++ b/starttls_policy_cli/tests/policy_test.py
+@@ -16,7 +16,6 @@ test_json = '{\
+         "timestamp": "2014-05-26T01:35:33+0000",\
+         "policies": {\
+             ".valid.example-recipient.com": {\
+-                "min-tls-version": "TLSv1.1",\
+                     "mode": "enforce",\
+                     "mxs": [".valid.example-recipient.com"]\
+             }\
+@@ -166,8 +165,8 @@ class TestConfig(unittest.TestCase):
+         with self.assertRaises(util.ConfigError):
+             policy.Config().policies = {'invalid': invalid_policy}
+         conf = policy.Config()
+-        conf.policies = {'valid': {}}
+-        self.assertEqual(conf.get_policy_for('valid').min_tls_version, 'TLSv1.2')
++        conf.policies = {'valid': {'mxs': ['example.com']}}
++        self.assertEqual(conf.get_policy_for('valid').mxs, ['example.com'])
+ 
+     def test_set_aliased_policy(self):
+         conf = policy.Config()
+@@ -175,7 +174,7 @@ class TestConfig(unittest.TestCase):
+         with self.assertRaises(util.ConfigError):
+             conf.policies = {'invalid': {'policy-alias': 'invalid'}}
+         conf.policies = {'valid': {'policy-alias': 'valid'}}
+-        self.assertEqual(conf.get_policy_for('valid').min_tls_version, 'TLSv1.2')
++        self.assertEqual(conf.get_policy_for('valid').mode, 'testing')
+ 
+     def test_iter_policies_aliased(self):
+         conf = policy.Config()
+@@ -226,23 +225,10 @@ class TestPolicy(unittest.TestCase):
+         self.assertFalse('eff.org' in new_conf.mxs)
+         self.assertTrue('example.com' in new_conf.mxs)
+ 
+-    def test_tls_version_default(self):
+-        p = policy.Policy({})
+-        self.assertEqual(p.min_tls_version, 'TLSv1.2')
+-
+     def test_mode_default(self):
+         p = policy.Policy({})
+         self.assertEqual(p.mode, 'testing')
+ 
+-    def test_tls_version_valid(self):
+-        with self.assertRaises(util.ConfigError):
+-            policy.Policy({'min-tls-version': 'SSLv3'})
+-        p = policy.Policy({})
+-        with self.assertRaises(util.ConfigError):
+-            p.min_tls_version = 'SSLv3'
+-        p.min_tls_version = 'TLSv1.1'
+-        self.assertEqual(p.min_tls_version, 'TLSv1.1')
+-
+     def test_mode_valid(self):
+         p = policy.Policy({})
+         with self.assertRaises(util.ConfigError):

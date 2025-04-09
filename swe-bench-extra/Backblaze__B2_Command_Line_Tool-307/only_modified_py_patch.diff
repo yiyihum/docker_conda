@@ -1,0 +1,96 @@
+diff --git a/b2/console_tool.py b/b2/console_tool.py
+index a657532..b218880 100644
+--- a/b2/console_tool.py
++++ b/b2/console_tool.py
+@@ -629,6 +629,23 @@ class MakeUrl(Command):
+         return 0
+ 
+ 
++class ShowAccountInfo(Command):
++    """
++    b2 show-account-info
++
++        Shows the account ID, key, auth token, and URLs.
++    """
++
++    def run(self, args):
++        account_info = self.api.account_info
++        self._print('Account ID:         %s' % (account_info.get_account_id(),))
++        self._print('Application Key:    %s' % (account_info.get_application_key(),))
++        self._print('Account Auth Token: %s' % (account_info.get_account_auth_token(),))
++        self._print('API URL:            %s' % (account_info.get_api_url(),))
++        self._print('Download URL:       %s' % (account_info.get_download_url(),))
++        return 0
++
++
+ class Sync(Command):
+     """
+     b2 sync [--delete] [--keepDays N] [--skipNewer] [--replaceNewer] \\
+diff --git a/b2/sync/sync.py b/b2/sync/sync.py
+index eaba7a6..9dcf371 100644
+--- a/b2/sync/sync.py
++++ b/b2/sync/sync.py
+@@ -13,6 +13,7 @@ from __future__ import division
+ import logging
+ import re
+ import six
++import threading
+ 
+ from ..exception import CommandError
+ from ..utils import trace_call
+@@ -162,6 +163,40 @@ def count_files(local_folder, reporter):
+     reporter.end_local()
+ 
+ 
++class BoundedQueueExecutor(object):
++    """
++    Wraps a futures.Executor and limits the number of requests that
++    can be queued at once.  Requests to submit() tasks block until
++    there is room in the queue.
++
++    The number of available slots in the queue is tracked with a
++    semaphore that is acquired before queueing an action, and
++    released when an action finishes.
++    """
++
++    def __init__(self, executor, queue_limit):
++        self.executor = executor
++        self.semaphore = threading.Semaphore(queue_limit)
++
++    def submit(self, fcn, *args, **kwargs):
++        # Wait until there is room in the queue.
++        self.semaphore.acquire()
++
++        # Wrap the action in a function that will release
++        # the semaphore after it runs.
++        def run_it():
++            try:
++                fcn(*args, **kwargs)
++            finally:
++                self.semaphore.release()
++
++        # Submit the wrapped action.
++        return self.executor.submit(run_it)
++
++    def shutdown(self):
++        self.executor.shutdown()
++
++
+ @trace_call(logger)
+ def sync_folders(
+     source_folder, dest_folder, args, now_millis, stdout, no_progress, max_workers, dry_run=False
+@@ -183,7 +218,12 @@ def sync_folders(
+         # not the same as the executor in the API object, which is used for
+         # uploads.  The tasks in this executor wait for uploads.  Putting them
+         # in the same thread pool could lead to deadlock.
+-        sync_executor = futures.ThreadPoolExecutor(max_workers=max_workers)
++        #
++        # We use an executor with a bounded queue to avoid using up lots of memory
++        # when syncing lots of files.
++        unbounded_executor = futures.ThreadPoolExecutor(max_workers=max_workers)
++        queue_limit = max_workers + 1000
++        sync_executor = BoundedQueueExecutor(unbounded_executor, queue_limit=queue_limit)
+ 
+         # First, start the thread that counts the local files.  That's the operation
+         # that should be fastest, and it provides scale for the progress reporting.
+

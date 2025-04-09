@@ -1,0 +1,145 @@
+diff --git a/gabbi/driver.py b/gabbi/driver.py
+index 33c0a98..49088fa 100644
+--- a/gabbi/driver.py
++++ b/gabbi/driver.py
+@@ -39,7 +39,8 @@ from gabbi import utils
+ 
+ def build_tests(path, loader, host=None, port=8001, intercept=None,
+                 test_loader_name=None, fixture_module=None,
+-                response_handlers=None, prefix='', require_ssl=False):
++                response_handlers=None, prefix='', require_ssl=False,
++                url=None):
+     """Read YAML files from a directory to create tests.
+ 
+     Each YAML file represents an ordered sequence of HTTP requests.
+@@ -54,6 +55,7 @@ def build_tests(path, loader, host=None, port=8001, intercept=None,
+     :param response_handers: ResponseHandler classes.
+     :type response_handlers: List of ResponseHandler classes.
+     :param prefix: A URL prefix for all URLs that are not fully qualified.
++    :param url: A full URL to test against. Replaces host, port and prefix.
+     :param require_ssl: If ``True``, make all tests default to using SSL.
+     :rtype: TestSuite containing multiple TestSuites (one for each YAML file).
+     """
+@@ -63,6 +65,12 @@ def build_tests(path, loader, host=None, port=8001, intercept=None,
+     if not bool(host) ^ bool(intercept):
+         raise AssertionError('must specify exactly one of host or intercept')
+ 
++    # If url is being used, reset host, port and prefix.
++    if url:
++        host, port, prefix, force_ssl = utils.host_info_from_target(url)
++        if force_ssl and not require_ssl:
++            require_ssl = force_ssl
++
+     if test_loader_name is None:
+         test_loader_name = inspect.stack()[1]
+         test_loader_name = os.path.splitext(os.path.basename(
+@@ -97,7 +105,7 @@ def build_tests(path, loader, host=None, port=8001, intercept=None,
+ def py_test_generator(test_dir, host=None, port=8001, intercept=None,
+                       prefix=None, test_loader_name=None,
+                       fixture_module=None, response_handlers=None,
+-                      require_ssl=False):
++                      require_ssl=False, url=None):
+     """Generate tests cases for py.test
+ 
+     This uses build_tests to create TestCases and then yields them in
+@@ -110,7 +118,8 @@ def py_test_generator(test_dir, host=None, port=8001, intercept=None,
+                         test_loader_name=test_loader_name,
+                         fixture_module=fixture_module,
+                         response_handlers=response_handlers,
+-                        prefix=prefix, require_ssl=require_ssl)
++                        prefix=prefix, require_ssl=require_ssl,
++                        url=url)
+ 
+     for test in tests:
+         if hasattr(test, '_tests'):
+diff --git a/gabbi/runner.py b/gabbi/runner.py
+index 3411dbe..d4e79d5 100644
+--- a/gabbi/runner.py
++++ b/gabbi/runner.py
+@@ -17,8 +17,6 @@ from importlib import import_module
+ import sys
+ import unittest
+ 
+-from six.moves.urllib import parse as urlparse
+-
+ from gabbi import case
+ from gabbi import handlers
+ from gabbi.reporter import ConciseTestRunner
+@@ -93,7 +91,7 @@ def run():
+     )
+ 
+     args = parser.parse_args()
+-    host, port, prefix, force_ssl = process_target_args(
++    host, port, prefix, force_ssl = utils.host_info_from_target(
+         args.target, args.prefix)
+ 
+     # Initialize response handlers.
+@@ -113,31 +111,6 @@ def run():
+     sys.exit(not result.wasSuccessful())
+ 
+ 
+-def process_target_args(target, prefix):
+-    """Turn the argparse args into a host, port and prefix."""
+-    force_ssl = False
+-    split_url = urlparse.urlparse(target)
+-
+-    if split_url.scheme:
+-        if split_url.scheme == 'https':
+-            force_ssl = True
+-        return split_url.hostname, split_url.port, split_url.path, force_ssl
+-    else:
+-        target = target
+-        prefix = prefix
+-
+-    if ':' in target and '[' not in target:
+-        host, port = target.rsplit(':', 1)
+-    elif ']:' in target:
+-        host, port = target.rsplit(':', 1)
+-    else:
+-        host = target
+-        port = None
+-    host = host.replace('[', '').replace(']', '')
+-
+-    return host, port, prefix, force_ssl
+-
+-
+ def initialize_handlers(response_handlers):
+     custom_response_handlers = []
+     for import_path in response_handlers or []:
+diff --git a/gabbi/utils.py b/gabbi/utils.py
+index 3de040d..172b4bf 100644
+--- a/gabbi/utils.py
++++ b/gabbi/utils.py
+@@ -126,6 +126,31 @@ def not_binary(content_type):
+             content_type.startswith('application/json'))
+ 
+ 
++def host_info_from_target(target, prefix=None):
++    """Turn url or host:port and target into test destination."""
++    force_ssl = False
++    split_url = urlparse.urlparse(target)
++
++    if split_url.scheme:
++        if split_url.scheme == 'https':
++            force_ssl = True
++        return split_url.hostname, split_url.port, split_url.path, force_ssl
++    else:
++        target = target
++        prefix = prefix
++
++    if ':' in target and '[' not in target:
++        host, port = target.rsplit(':', 1)
++    elif ']:' in target:
++        host, port = target.rsplit(':', 1)
++    else:
++        host = target
++        port = None
++    host = host.replace('[', '').replace(']', '')
++
++    return host, port, prefix, force_ssl
++
++
+ def _colorize(color, message):
+     """Add a color to the message."""
+     try:
+

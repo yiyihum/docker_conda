@@ -1,0 +1,83 @@
+diff --git a/geopandas/tests/test_geodataframe.py b/geopandas/tests/test_geodataframe.py
+index 420274c..0b9e247 100644
+--- a/geopandas/tests/test_geodataframe.py
++++ b/geopandas/tests/test_geodataframe.py
+@@ -1008,6 +1008,24 @@ class TestConstructor:
+         res = GeoDataFrame(data, geometry=geoms)
+         assert_geoseries_equal(res.geometry, GeoSeries(geoms))
+ 
++    def test_repeat_geo_col(self):
++        df = pd.DataFrame(
++            [
++                {"geometry": Point(x, y), "geom": Point(x, y)}
++                for x, y in zip(range(3), range(3))
++            ],
++        )
++        # explicitly prevent construction of gdf with repeat geometry column names
++        # two columns called "geometry", geom col inferred
++        df2 = df.rename(columns={"geom": "geometry"})
++        with pytest.raises(ValueError):
++            GeoDataFrame(df2)
++        # ensure case is caught when custom geom column name is used
++        # two columns called "geom", geom col explicit
++        df3 = df.rename(columns={"geometry": "geom"})
++        with pytest.raises(ValueError):
++            GeoDataFrame(df3, geometry="geom")
++
+ 
+ def test_geodataframe_crs():
+     gdf = GeoDataFrame()
+diff --git a/geopandas/tests/test_merge.py b/geopandas/tests/test_merge.py
+index d003b11..a0495ab 100644
+--- a/geopandas/tests/test_merge.py
++++ b/geopandas/tests/test_merge.py
+@@ -1,4 +1,6 @@
+ import pandas as pd
++import pytest
++from geopandas.testing import assert_geodataframe_equal
+ 
+ from shapely.geometry import Point
+ 
+@@ -48,6 +50,13 @@ class TestMerging:
+         assert isinstance(res, GeoDataFrame)
+         assert isinstance(res.geometry, GeoSeries)
+         self._check_metadata(res)
++        exp = GeoDataFrame(pd.concat([pd.DataFrame(self.gdf), pd.DataFrame(self.gdf)]))
++        assert_geodataframe_equal(exp, res)
++        # check metadata comes from first gdf
++        res4 = pd.concat([self.gdf.set_crs("epsg:4326"), self.gdf], axis=0)
++        # Note: this behaviour potentially does not make sense. If geom cols are
++        # concatenated but have different CRS, then the CRS will be overridden.
++        self._check_metadata(res4, crs="epsg:4326")
+ 
+         # series
+         res = pd.concat([self.gdf.geometry, self.gdf.geometry])
+@@ -63,3 +72,28 @@ class TestMerging:
+         assert isinstance(res, GeoDataFrame)
+         assert isinstance(res.geometry, GeoSeries)
+         self._check_metadata(res)
++
++    def test_concat_axis1_multiple_geodataframes(self):
++        # https://github.com/geopandas/geopandas/issues/1230
++        # Expect that concat should fail gracefully if duplicate column names belonging
++        # to geometry columns are introduced.
++        expected_err = (
++            "GeoDataFrame does not support multiple columns using the geometry"
++            " column name 'geometry'"
++        )
++        with pytest.raises(ValueError, match=expected_err):
++            pd.concat([self.gdf, self.gdf], axis=1)
++
++        # Check case is handled if custom geometry column name is used
++        df2 = self.gdf.rename_geometry("geom")
++        expected_err2 = (
++            "Concat operation has resulted in multiple columns using the geometry "
++            "column name 'geom'."
++        )
++        with pytest.raises(ValueError, match=expected_err2):
++            pd.concat([df2, df2], axis=1)
++
++        # Check that two geometry columns is fine, if they have different names
++        res3 = pd.concat([df2.set_crs("epsg:4326"), self.gdf], axis=1)
++        # check metadata comes from first df
++        self._check_metadata(res3, geometry_column_name="geom", crs="epsg:4326")

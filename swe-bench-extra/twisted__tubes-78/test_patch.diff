@@ -1,0 +1,119 @@
+diff --git a/tubes/test/test_protocol.py b/tubes/test/test_protocol.py
+index 7eb4b3e..5450278 100644
+--- a/tubes/test/test_protocol.py
++++ b/tubes/test/test_protocol.py
+@@ -7,12 +7,16 @@ Tests for L{tubes.protocol}.
+ """
+ 
+ from zope.interface import implementer
++from zope.interface.verify import verifyObject
+ 
+ from twisted.trial.unittest import SynchronousTestCase as TestCase
+ 
+ from twisted.python.failure import Failure
+ from twisted.test.proto_helpers import StringTransport
+-from twisted.internet.interfaces import IStreamServerEndpoint
++from twisted.internet.interfaces import (
++    IStreamServerEndpoint, IHalfCloseableProtocol
++)
++from twisted.internet.error import ConnectionDone
+ 
+ from ..protocol import flowFountFromEndpoint, flowFromEndpoint
+ from ..tube import tube, series
+@@ -404,6 +408,72 @@ class FlowListenerTests(TestCase):
+         self.assertEqual(ports[0].currentlyProducing, True)
+ 
+ 
++    def test_readConnectionLost(self):
++        """
++        The protocol created by L{flowFountFromEndpoint} provides half-close
++        support, and when it receives an EOF (i.e.: C{readConnectionLost}) it
++        will signal the end of the flow to its fount's drain, but not to its
++        drain's fount.
++        """
++        endpoint, ports = fakeEndpointWithPorts()
++        fffep = flowFountFromEndpoint(endpoint)
++        fffep.callback(None)
++        flowFount = self.successResultOf(fffep)
++        protocol = ports[0].factory.buildProtocol(None)
++        verifyObject(IHalfCloseableProtocol, protocol)
++        aTransport = StringTransport()
++        protocol.makeConnection(aTransport)
++        accepted = FakeDrain()
++        flowFount.flowTo(accepted)
++        [flow] = accepted.received
++        receivedData = FakeDrain()
++        dataSender = FakeFount()
++        flow.fount.flowTo(receivedData)
++        dataSender.flowTo(flow.drain)
++        self.assertEqual(len(receivedData.stopped), 0)
++        self.assertEqual(dataSender.flowIsStopped, False)
++        protocol.readConnectionLost()
++        self.assertEqual(len(receivedData.stopped), 1)
++        self.assertIsInstance(receivedData.stopped[0], Failure)
++        receivedData.stopped[0].trap(ConnectionDone)
++        self.assertEqual(dataSender.flowIsStopped, False)
++        protocol.connectionLost(ConnectionDone())
++        self.assertEqual(len(receivedData.stopped), 1)
++        self.assertEqual(dataSender.flowIsStopped, True)
++
++
++    def test_writeConnectionLost(self):
++        """
++        The protocol created by L{flowFountFromEndpoint} provides half-close
++        support, and when it receives an EOF (i.e.: C{writeConnectionLost}) it
++        will signal the end of the flow to its drain's fount, but not to its
++        fount's drain.
++        """
++        endpoint, ports = fakeEndpointWithPorts()
++        fffep = flowFountFromEndpoint(endpoint)
++        fffep.callback(None)
++        flowFount = self.successResultOf(fffep)
++        protocol = ports[0].factory.buildProtocol(None)
++        verifyObject(IHalfCloseableProtocol, protocol)
++        aTransport = StringTransport()
++        protocol.makeConnection(aTransport)
++        accepted = FakeDrain()
++        flowFount.flowTo(accepted)
++        [flow] = accepted.received
++        receivedData = FakeDrain()
++        dataSender = FakeFount()
++        flow.fount.flowTo(receivedData)
++        dataSender.flowTo(flow.drain)
++        self.assertEqual(len(receivedData.stopped), 0)
++        self.assertEqual(dataSender.flowIsStopped, False)
++        protocol.writeConnectionLost()
++        self.assertEqual(len(receivedData.stopped), 0)
++        self.assertEqual(dataSender.flowIsStopped, 1)
++        protocol.connectionLost(ConnectionDone())
++        self.assertEqual(len(receivedData.stopped), 1)
++        self.assertEqual(dataSender.flowIsStopped, 1)
++
++
+     def test_backpressure(self):
+         """
+         When the L{IFount} returned by L{flowFountFromEndpoint} is paused, it
+diff --git a/tubes/test/util.py b/tubes/test/util.py
+index 054a928..9e291d1 100644
+--- a/tubes/test/util.py
++++ b/tubes/test/util.py
+@@ -137,6 +137,7 @@ class FakeFount(object):
+ 
+     flowIsPaused = 0
+     flowIsStopped = False
++
+     def __init__(self, outputType=None):
+         self._pauser = Pauser(self._actuallyPause, self._actuallyResume)
+         self.outputType = outputType
+@@ -170,9 +171,9 @@ class FakeFount(object):
+ 
+     def stopFlow(self):
+         """
+-        Record that the flow was stopped by setting C{flowIsStopped}.
++        Record that the flow was stopped by incrementing C{flowIsStopped}.
+         """
+-        self.flowIsStopped = True
++        self.flowIsStopped += 1
+ 
+ 
+     def _actuallyPause(self):

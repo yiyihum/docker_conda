@@ -1,0 +1,141 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index c490a61..481d94e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1,12 +1,19 @@
+ """
+ This file contains fixtures that are used at multiple points in the tests.
+ """
++import logging
+ import pytest
+ import numpy as np
+ import pandas as pd
+ from mokapot import LinearPsmDataset
+ 
+ 
++@pytest.fixture(autouse=True)
++def set_logging(caplog):
++    """Add logging to everything."""
++    caplog.set_level(level=logging.INFO, logger="mokapot")
++
++
+ @pytest.fixture(scope="session")
+ def psm_df_6():
+     """A DataFrame containing 6 PSMs"""
+@@ -34,6 +41,9 @@ def psm_df_1000(tmp_path):
+         "score": np.concatenate(
+             [rng.normal(3, size=200), rng.normal(size=300)]
+         ),
++        "score2": np.concatenate(
++            [rng.normal(3, size=200), rng.normal(size=300)]
++        ),
+         "filename": "test.mzML",
+         "calcmass": rng.uniform(500, 2000, size=500),
+         "expmass": rng.uniform(500, 2000, size=500),
+@@ -47,6 +57,7 @@ def psm_df_1000(tmp_path):
+         "group": rng.choice(2, size=500),
+         "peptide": [_random_peptide(5, rng) for _ in range(500)],
+         "score": rng.normal(size=500),
++        "score2": rng.normal(size=500),
+         "filename": "test.mzML",
+         "calcmass": rng.uniform(500, 2000, size=500),
+         "expmass": rng.uniform(500, 2000, size=500),
+@@ -75,7 +86,7 @@ def psms(psm_df_1000):
+         target_column="target",
+         spectrum_columns="spectrum",
+         peptide_column="peptide",
+-        feature_columns="score",
++        feature_columns=["score", "score2"],
+         filename_column="filename",
+         scan_column="spectrum",
+         calcmass_column="calcmass",
+diff --git a/tests/unit_tests/test_brew.py b/tests/unit_tests/test_brew.py
+index 319626b..27d0495 100644
+--- a/tests/unit_tests/test_brew.py
++++ b/tests/unit_tests/test_brew.py
+@@ -44,7 +44,7 @@ def test_brew_joint(psms, svm):
+ 
+ def test_brew_folds(psms, svm):
+     """Test that changing the number of folds works"""
+-    results, models = mokapot.brew(psms, svm, test_fdr=0.05, folds=4)
++    results, models = mokapot.brew(psms, svm, test_fdr=0.1, folds=4)
+     assert isinstance(results, mokapot.confidence.LinearConfidence)
+     assert len(models) == 4
+ 
+@@ -92,7 +92,12 @@ def test_brew_test_fdr_error(psms, svm):
+ # @pytest.mark.skip(reason="Not currently working, at least on MacOS.")
+ def test_brew_multiprocess(psms, svm):
+     """Test that multiprocessing doesn't yield an error"""
+-    mokapot.brew(psms, svm, test_fdr=0.05, max_workers=2)
++    _, models = mokapot.brew(psms, svm, test_fdr=0.05, max_workers=2)
++
++    # The models should not be the same:
++    assert_not_close(models[0].estimator.coef_, models[1].estimator.coef_)
++    assert_not_close(models[1].estimator.coef_, models[2].estimator.coef_)
++    assert_not_close(models[2].estimator.coef_, models[0].estimator.coef_)
+ 
+ 
+ def test_brew_trained_models(psms, svm):
+@@ -131,3 +136,8 @@ def test_brew_using_non_trained_models_error(psms, svm):
+         "One or more of the provided models was not previously trained"
+         in str(err)
+     )
++
++
++def assert_not_close(x, y):
++    """Assert that two arrays are not equal"""
++    np.testing.assert_raises(AssertionError, np.testing.assert_allclose, x, y)
+diff --git a/tests/unit_tests/test_confidence.py b/tests/unit_tests/test_confidence.py
+index 34994f0..06f2d01 100644
+--- a/tests/unit_tests/test_confidence.py
++++ b/tests/unit_tests/test_confidence.py
+@@ -28,12 +28,12 @@ def test_one_group(psm_df_1000):
+     )
+ 
+     np.random.seed(42)
+-    grouped = psms.assign_confidence()
++    grouped = psms.assign_confidence(eval_fdr=0.05)
+     scores1 = grouped.group_confidence_estimates[0].psms["mokapot score"]
+ 
+     np.random.seed(42)
+     psms._group_column = None
+-    ungrouped = psms.assign_confidence()
++    ungrouped = psms.assign_confidence(eval_fdr=0.05)
+     scores2 = ungrouped.psms["mokapot score"]
+ 
+     pd.testing.assert_series_equal(scores1, scores2)
+@@ -59,7 +59,7 @@ def test_pickle(psm_df_1000, tmp_path):
+         copy_data=True,
+     )
+ 
+-    results = psms.assign_confidence()
++    results = psms.assign_confidence(eval_fdr=0.05)
+     pkl_file = tmp_path / "results.pkl"
+     with pkl_file.open("wb+") as pkl_dat:
+         pickle.dump(results, pkl_dat)
+diff --git a/tests/unit_tests/test_writer_flashlfq.py b/tests/unit_tests/test_writer_flashlfq.py
+index 9aba9d7..8b468a1 100644
+--- a/tests/unit_tests/test_writer_flashlfq.py
++++ b/tests/unit_tests/test_writer_flashlfq.py
+@@ -8,7 +8,7 @@ import pandas as pd
+ 
+ def test_sanity(psms, tmp_path):
+     """Run simple sanity checks"""
+-    conf = psms.assign_confidence()
++    conf = psms.assign_confidence(eval_fdr=0.05)
+     test1 = conf.to_flashlfq(tmp_path / "test1.txt")
+     mokapot.to_flashlfq(conf, tmp_path / "test2.txt")
+     test3 = mokapot.to_flashlfq([conf, conf], tmp_path / "test3.txt")
+diff --git a/tests/unit_tests/test_writer_txt.py b/tests/unit_tests/test_writer_txt.py
+index fea7f19..326cbae 100644
+--- a/tests/unit_tests/test_writer_txt.py
++++ b/tests/unit_tests/test_writer_txt.py
+@@ -8,7 +8,7 @@ import pandas as pd
+ 
+ def test_sanity(psms, tmp_path):
+     """Run simple sanity checks"""
+-    conf = psms.assign_confidence()
++    conf = psms.assign_confidence(eval_fdr=0.05)
+     test1 = conf.to_txt(dest_dir=tmp_path, file_root="test1")
+     mokapot.to_txt(conf, dest_dir=tmp_path, file_root="test2")
+     test3 = mokapot.to_txt([conf, conf], dest_dir=tmp_path, file_root="test3")

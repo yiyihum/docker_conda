@@ -1,0 +1,153 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 026afba5..6a81e107 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -10,6 +10,8 @@ Bug Fixes
+ - Fixed a bug with moment map orders greater than 1 not being able to handle
+   cubes with non-square spatial dimensions. [#970]
+ 
++- Added a workaround for reading JWST IFUs with incorrect GWCS. [#973]
++
+ Other Changes and Additions
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+diff --git a/specutils/analysis/width.py b/specutils/analysis/width.py
+index 5d6bf897..609081fa 100644
+--- a/specutils/analysis/width.py
++++ b/specutils/analysis/width.py
+@@ -4,9 +4,11 @@ spectral features.
+ """
+ 
+ import numpy as np
++from astropy.nddata import StdDevUncertainty
+ from astropy.stats.funcs import gaussian_sigma_to_fwhm
+ from ..manipulation import extract_region
+ from . import centroid
++from .uncertainty import _convert_uncertainty
+ from .utils import computation_wrapper
+ from scipy.signal import find_peaks, peak_widths
+ 
+@@ -186,8 +188,15 @@ def _compute_gaussian_fwhm(spectrum, regions=None):
+     This is a helper function for the above `gaussian_fwhm()` method.
+     """
+ 
+-    fwhm = _compute_gaussian_sigma_width(spectrum, regions) * gaussian_sigma_to_fwhm
++    sigma = _compute_gaussian_sigma_width(spectrum, regions)
+ 
++    fwhm = sigma * gaussian_sigma_to_fwhm
++    if sigma.uncertainty is not None:
++        fwhm.uncertainty = sigma.uncertainty * gaussian_sigma_to_fwhm
++    else:
++        fwhm.uncertainty = None
++
++    fwhm.uncertainty_type = 'std'
+     return fwhm
+ 
+ 
+@@ -201,9 +210,16 @@ def _compute_gaussian_sigma_width(spectrum, regions=None):
+     else:
+         calc_spectrum = spectrum
+ 
++    if spectrum.uncertainty is not None:
++        flux_uncert = _convert_uncertainty(calc_spectrum.uncertainty, StdDevUncertainty)
++    else:
++        # dummy value for uncertainties to avoid extra if-statements when applying mask
++        flux_uncert = np.zeros_like(calc_spectrum.flux)
++
+     if hasattr(spectrum, 'mask') and spectrum.mask is not None:
+         flux = calc_spectrum.flux[~spectrum.mask]
+         spectral_axis = calc_spectrum.spectral_axis[~spectrum.mask]
++        flux_uncert = flux_uncert[~calc_spectrum.mask]
+     else:
+         flux = calc_spectrum.flux
+         spectral_axis = calc_spectrum.spectral_axis
+@@ -212,11 +228,36 @@ def _compute_gaussian_sigma_width(spectrum, regions=None):
+ 
+     if flux.ndim > 1:
+         spectral_axis = np.broadcast_to(spectral_axis, flux.shape, subok=True)
++        centroid_result_uncert = centroid_result.uncertainty
+         centroid_result = centroid_result[:, np.newaxis]
++        centroid_result.uncertainty = centroid_result_uncert[:, np.newaxis] if centroid_result_uncert is not None else None  # noqa
+ 
+     dx = (spectral_axis - centroid_result)
+-    sigma = np.sqrt(np.sum((dx * dx) * flux, axis=-1) / np.sum(flux, axis=-1))
++    numerator = np.sum((dx * dx) * flux, axis=-1)
++    denom = np.sum(flux, axis=-1)
++    sigma2 = numerator / denom
++    sigma = np.sqrt(sigma2)
++    if centroid_result.uncertainty is not None:
++        # NOTE: until/unless disp_uncert is supported, dx_uncert == centroid_result.uncertainty
++        disp_uncert = 0.0 * spectral_axis.unit
++        dx_uncert = np.sqrt(disp_uncert**2 + centroid_result.uncertainty**2)
++        # dx_uncert = centroid_result.uncertainty
++
++        # uncertainty for each term in the numerator sum
++        num_term_uncerts = dx * dx * flux * np.sqrt(2*(dx_uncert/dx)**2 + (flux_uncert/flux)**2)
++        # uncertainty (squared) for the numerator, added in quadrature
++        num_uncertsq = np.sum(num_term_uncerts**2, axis=-1)
++        # uncertainty (squared) for the denomenator
++        denom_uncertsq = np.sum(flux_uncert**2)
++
++        sigma2_uncert = numerator/denom * np.sqrt(num_uncertsq * numerator**-2 +
++                                                  denom_uncertsq * denom**-2)
++
++        sigma.uncertainty = 0.5 * sigma2_uncert / sigma2 * sigma.unit
++    else:
++        sigma.uncertainty = None
+ 
++    sigma.uncertainty_type = 'std'
+     return sigma
+ 
+ 
+diff --git a/specutils/io/default_loaders/jwst_reader.py b/specutils/io/default_loaders/jwst_reader.py
+index 8f9ee5f5..9bb895f8 100644
+--- a/specutils/io/default_loaders/jwst_reader.py
++++ b/specutils/io/default_loaders/jwst_reader.py
+@@ -7,6 +7,8 @@ from astropy.units import Quantity
+ from astropy.table import Table
+ from astropy.io import fits
+ from astropy.nddata import StdDevUncertainty, VarianceUncertainty, InverseVariance
++from astropy.time import Time
++from astropy.wcs import WCS
+ import asdf
+ from gwcs.wcstools import grid_from_bounding_box
+ 
+@@ -585,6 +587,24 @@ def _jwst_s3d_loader(filename, **kwargs):
+ 
+             wavelength = Quantity(wavelength_array, unit=wavelength_unit)
+ 
++            # The GWCS is currently broken for some IFUs, here we work around that
++            wcs = None
++            if wavelength.shape[0] != flux.shape[-1]:
++                # Need MJD-OBS for this workaround
++                if 'MJD-OBS' not in hdu.header:
++                    for key in ('MJD-BEG', 'DATE-OBS'):  # Possible alternatives
++                        if key in hdu.header:
++                            if key.startswith('MJD'):
++                                hdu.header['MJD-OBS'] = hdu.header[key]
++                                break
++                            else:
++                                t = Time(hdu.header[key])
++                                hdu.header['MJD-OBS'] = t.mjd
++                                break
++                wcs = WCS(hdu.header)
++                # Swap to match the flux transpose
++                wcs = wcs.swapaxes(-1, 0)
++
+             # Merge primary and slit headers and dump into meta
+             slit_header = hdu.header
+             header = primary_header.copy()
+@@ -615,8 +635,11 @@ def _jwst_s3d_loader(filename, **kwargs):
+             mask_name = primary_header.get("MASKEXT", "DQ")
+             mask = hdulist[mask_name].data.T
+ 
+-            spec = Spectrum1D(flux=flux, spectral_axis=wavelength, meta=meta,
+-                              uncertainty=err, mask=mask)
++            if wcs is not None:
++                spec = Spectrum1D(flux=flux, wcs=wcs, meta=meta, uncertainty=err, mask=mask)
++            else:
++                spec = Spectrum1D(flux=flux, spectral_axis=wavelength, meta=meta,
++                                  uncertainty=err, mask=mask)
+             spectra.append(spec)
+ 
+     return SpectrumList(spectra)

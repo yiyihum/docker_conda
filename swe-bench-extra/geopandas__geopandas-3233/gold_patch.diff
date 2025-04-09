@@ -1,0 +1,234 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 124ed9a..79bca30 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -21,6 +21,7 @@ API changes:
+ 
+ New methods:
+ 
++- Added `intersection_all` method from shapely to GeoSeries/GeoDataframe (#3228).
+ - Added `line_merge` method from shapely to GeoSeries/GeoDataframe (#3214).
+ - Added `set_precision` and `get_precision` methods from shapely to GeoSeries/GeoDataframe (#3175).
+ - Added `count_coordinates` method from shapely to GeoSeries/GeoDataframe (#3026).
+@@ -48,6 +49,8 @@ New features and improvements:
+   the specified columns (#3101).
+ - Added support to ``read_file`` for the ``mask`` keyword for the pyogrio engine (#3062).
+ - Added support to ``read_file`` for the ``columns`` keyword for the fiona engine (#3133).
++- Add `sort` keyword to `clip` method for GeoSeries and GeoDataFrame to allow optional
++  preservation of the original order of observations. (#3233)
+ - Added `show_bbox`, `drop_id` and `to_wgs84` arguments to allow further customization of
+   `GeoSeries.to_json` (#3226)
+ 
+@@ -80,7 +83,7 @@ Deprecations and compatibility notes:
+ - The deprecation of `geopandas.datasets` has been enforced and the module has been
+   removed. New sample datasets are now available in the
+   [geodatasets](https://geodatasets.readthedocs.io/en/latest/) package (#3084).
+-- Many longstanding deprecated functions, methods and properties have been removed (#3174), (#3189)
++- Many longstanding deprecated functions, methods and properties have been removed (#3174), (#3190)
+   - Removed deprecated functions
+     `geopandas.io.read_file`, `geopandas.io.to_file` and `geopandas.io.sql.read_postgis`.
+     `geopandas.read_file`, `geopandas.read_postgis` and the GeoDataFrame/GeoSeries `to_file(..)`
+diff --git a/doc/source/docs/reference/geoseries.rst b/doc/source/docs/reference/geoseries.rst
+index ebeec66..74d61f0 100644
+--- a/doc/source/docs/reference/geoseries.rst
++++ b/doc/source/docs/reference/geoseries.rst
+@@ -147,6 +147,7 @@ Aggregating and exploding
+    :toctree: api/
+ 
+    GeoSeries.union_all
++   GeoSeries.intersection_all
+    GeoSeries.explode
+ 
+ Serialization / IO / conversion
+diff --git a/geopandas/array.py b/geopandas/array.py
+index 7d18a9d..d1bcdb2 100644
+--- a/geopandas/array.py
++++ b/geopandas/array.py
+@@ -845,6 +845,9 @@ class GeometryArray(ExtensionArray):
+     def union_all(self):
+         return shapely.union_all(self._data)
+ 
++    def intersection_all(self):
++        return shapely.intersection_all(self._data)
++
+     #
+     # Affinity operations
+     #
+diff --git a/geopandas/base.py b/geopandas/base.py
+index c19b4d2..02eff5f 100644
+--- a/geopandas/base.py
++++ b/geopandas/base.py
+@@ -1732,18 +1732,43 @@ GeometryCollection
+         --------
+ 
+         >>> from shapely.geometry import box
+-        >>> s = geopandas.GeoSeries([box(0,0,1,1), box(0,0,2,2)])
++        >>> s = geopandas.GeoSeries([box(0, 0, 1, 1), box(0, 0, 2, 2)])
+         >>> s
+         0    POLYGON ((1 0, 1 1, 0 1, 0 0, 1 0))
+         1    POLYGON ((2 0, 2 2, 0 2, 0 0, 2 0))
+         dtype: geometry
+ 
+-        >>> union = s.union_all()
+-        >>> print(union)
+-        POLYGON ((0 1, 0 2, 2 2, 2 0, 1 0, 0 0, 0 1))
++        >>> s.union_all()
++        <POLYGON ((0 1, 0 2, 2 2, 2 0, 1 0, 0 0, 0 1))>
+         """
+         return self.geometry.values.union_all()
+ 
++    def intersection_all(self):
++        """Returns a geometry containing the intersection of all geometries in
++        the ``GeoSeries``.
++
++        This method ignores None values when other geometries are present.
++        If all elements of the GeoSeries are None, an empty GeometryCollection is
++        returned.
++
++        Examples
++        --------
++
++        >>> from shapely.geometry import box
++        >>> s = geopandas.GeoSeries(
++        ...     [box(0, 0, 2, 2), box(1, 1, 3, 3), box(0, 0, 1.5, 1.5)]
++        ... )
++        >>> s
++        0              POLYGON ((2 0, 2 2, 0 2, 0 0, 2 0))
++        1              POLYGON ((3 1, 3 3, 1 3, 1 1, 3 1))
++        2    POLYGON ((1.5 0, 1.5 1.5, 0 1.5, 0 0, 1.5 0))
++        dtype: geometry
++
++        >>> s.intersection_all()
++        <POLYGON ((1 1, 1 1.5, 1.5 1.5, 1.5 1, 1 1))>
++        """
++        return self.geometry.values.intersection_all()
++
+     #
+     # Binary operations that return a pandas Series
+     #
+diff --git a/geopandas/geodataframe.py b/geopandas/geodataframe.py
+index d7885fa..f25187b 100644
+--- a/geopandas/geodataframe.py
++++ b/geopandas/geodataframe.py
+@@ -2311,7 +2311,7 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
+             exclusive=exclusive,
+         )
+ 
+-    def clip(self, mask, keep_geom_type=False):
++    def clip(self, mask, keep_geom_type=False, sort=False):
+         """Clip points, lines, or polygon geometries to the mask extent.
+ 
+         Both layers must be in the same Coordinate Reference System (CRS).
+@@ -2334,6 +2334,10 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
+             If True, return only geometries of original type in case of intersection
+             resulting in multiple geometry types or GeometryCollections.
+             If False, return all resulting geometries (potentially mixed types).
++        sort : boolean, default False
++            If True, the order of rows in the clipped GeoDataFrame will be preserved at
++            small performance cost. If False the order of rows in the clipped
++            GeoDataFrame will be random.
+ 
+         Returns
+         -------
+@@ -2364,7 +2368,7 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
+         >>> nws_groceries.shape
+         (7, 8)
+         """
+-        return geopandas.clip(self, mask=mask, keep_geom_type=keep_geom_type)
++        return geopandas.clip(self, mask=mask, keep_geom_type=keep_geom_type, sort=sort)
+ 
+     def overlay(self, right, how="intersection", keep_geom_type=None, make_valid=True):
+         """Perform spatial overlay between GeoDataFrames.
+diff --git a/geopandas/geoseries.py b/geopandas/geoseries.py
+index 51a655a..60de699 100644
+--- a/geopandas/geoseries.py
++++ b/geopandas/geoseries.py
+@@ -1306,7 +1306,7 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
+         """
+         return Series(to_wkt(self.array, **kwargs), index=self.index)
+ 
+-    def clip(self, mask, keep_geom_type: bool = False) -> GeoSeries:
++    def clip(self, mask, keep_geom_type: bool = False, sort=False) -> GeoSeries:
+         """Clip points, lines, or polygon geometries to the mask extent.
+ 
+         Both layers must be in the same Coordinate Reference System (CRS).
+@@ -1329,6 +1329,10 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
+             If True, return only geometries of original type in case of intersection
+             resulting in multiple geometry types or GeometryCollections.
+             If False, return all resulting geometries (potentially mixed-types).
++        sort : boolean, default False
++            If True, the order of rows in the clipped GeoSeries will be preserved
++            at small performance cost.
++            If False the order of rows in the clipped GeoSeries will be random.
+ 
+         Returns
+         -------
+@@ -1359,4 +1363,4 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
+         >>> nws_groceries.shape
+         (7,)
+         """
+-        return geopandas.clip(self, mask=mask, keep_geom_type=keep_geom_type)
++        return geopandas.clip(self, mask=mask, keep_geom_type=keep_geom_type, sort=sort)
+diff --git a/geopandas/tools/clip.py b/geopandas/tools/clip.py
+index 728ff0d..267f5d5 100644
+--- a/geopandas/tools/clip.py
++++ b/geopandas/tools/clip.py
+@@ -22,7 +22,7 @@ def _mask_is_list_like_rectangle(mask):
+     )
+ 
+ 
+-def _clip_gdf_with_mask(gdf, mask):
++def _clip_gdf_with_mask(gdf, mask, sort=False):
+     """Clip geometry to the polygon/rectangle extent.
+ 
+     Clip an input GeoDataFrame to the polygon extent of the polygon
+@@ -36,6 +36,10 @@ def _clip_gdf_with_mask(gdf, mask):
+     mask : (Multi)Polygon, list-like
+         Reference polygon/rectangle for clipping.
+ 
++    sort : boolean, default False
++        If True, the results will be sorted in ascending order using the
++        geometries' indexes as the primary key.
++
+     Returns
+     -------
+     GeoDataFrame
+@@ -48,7 +52,9 @@ def _clip_gdf_with_mask(gdf, mask):
+     else:
+         intersection_polygon = mask
+ 
+-    gdf_sub = gdf.iloc[gdf.sindex.query(intersection_polygon, predicate="intersects")]
++    gdf_sub = gdf.iloc[
++        gdf.sindex.query(intersection_polygon, predicate="intersects", sort=sort)
++    ]
+ 
+     # For performance reasons points don't need to be intersected with poly
+     non_point_mask = gdf_sub.geom_type != "Point"
+@@ -82,7 +88,7 @@ def _clip_gdf_with_mask(gdf, mask):
+     return clipped
+ 
+ 
+-def clip(gdf, mask, keep_geom_type=False):
++def clip(gdf, mask, keep_geom_type=False, sort=False):
+     """Clip points, lines, or polygon geometries to the mask extent.
+ 
+     Both layers must be in the same Coordinate Reference System (CRS).
+@@ -113,6 +119,9 @@ def clip(gdf, mask, keep_geom_type=False):
+         If True, return only geometries of original type in case of intersection
+         resulting in multiple geometry types or GeometryCollections.
+         If False, return all resulting geometries (potentially mixed-types).
++    sort : boolean, default False
++        If True, the results will be sorted in ascending order using the
++        geometries' indexes as the primary key.
+ 
+     Returns
+     -------
+@@ -190,7 +199,7 @@ def clip(gdf, mask, keep_geom_type=False):
+     else:
+         combined_mask = mask
+ 
+-    clipped = _clip_gdf_with_mask(gdf, combined_mask)
++    clipped = _clip_gdf_with_mask(gdf, combined_mask, sort=sort)
+ 
+     if keep_geom_type:
+         geomcoll_concat = (clipped.geom_type == "GeometryCollection").any()

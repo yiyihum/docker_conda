@@ -1,0 +1,110 @@
+diff --git a/next_action/arguments/__init__.py b/next_action/arguments/__init__.py
+index 73eb785..45faa29 100644
+--- a/next_action/arguments/__init__.py
++++ b/next_action/arguments/__init__.py
+@@ -4,7 +4,7 @@ import argparse
+ import os
+ import shutil
+ import sys
+-from typing import Dict, List, Set
++from typing import cast, Dict, List, Set, Tuple
+ 
+ from .arguments import Arguments
+ from .parser import build_parser, parse_remaining_args
+@@ -15,8 +15,8 @@ def parse_arguments() -> Arguments:
+     # Ensure that the help info is printed using all columns available
+     os.environ['COLUMNS'] = str(shutil.get_terminal_size().columns)
+     default_filenames = ["todo.txt"]
+-    arguments = Arguments(default_filenames)
+     parser = build_parser(default_filenames)
++    arguments = Arguments(parser, default_filenames)
+     namespace, remaining = parser.parse_known_args()
+     parse_remaining_args(parser, remaining, namespace)
+     arguments.filenames = namespace.filenames
+diff --git a/next_action/arguments/arguments.py b/next_action/arguments/arguments.py
+index e06f4d5..afbe5ac 100644
+--- a/next_action/arguments/arguments.py
++++ b/next_action/arguments/arguments.py
+@@ -1,12 +1,14 @@
+ """ Argument data class for transfering command line arguments. """
+ 
++import argparse
+ import sys
+ from typing import List, Set
+ 
+ 
+ class Arguments(object):
+     """ Argument data class. """
+-    def __init__(self, default_filenames: List[str]) -> None:
++    def __init__(self, parser: argparse.ArgumentParser, default_filenames: List[str]) -> None:
++        self.parser = parser
+         self.__default_filenames = default_filenames
+         self.__filenames: List[str] = []
+         self.__filters: List[Set[str]] = []
+diff --git a/next_action/arguments/parser.py b/next_action/arguments/parser.py
+index 18afb99..0d3ed9d 100644
+--- a/next_action/arguments/parser.py
++++ b/next_action/arguments/parser.py
+@@ -12,7 +12,7 @@ def build_parser(default_filenames: List[str]) -> argparse.ArgumentParser:
+         description="Show the next action in your todo.txt. The next action is selected from the tasks in the todo.txt \
+                      file based on priority, due date, creation date, and supplied filters.",
+         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+-        usage="%(prog)s [-h] [--version] [-f <todo.txt>] [-n <number> | -a] [<context|project> ...]")
++        usage="%(prog)s [-h] [--version] [-f <filename>] [-n <number> | -a] [<context|project> ...]")
+     add_optional_arguments(parser, default_filenames)
+     add_positional_arguments(parser)
+     return parser
+@@ -23,8 +23,9 @@ def add_optional_arguments(parser: argparse.ArgumentParser, default_filenames: L
+     parser.add_argument(
+         "--version", action="version", version="%(prog)s {0}".format(next_action.__version__))
+     parser.add_argument(
+-        "-f", "--file", action="append", dest="filenames", metavar="<todo.txt>", default=default_filenames, type=str,
+-        help="todo.txt file to read; argument can be repeated to read tasks from multiple todo.txt files")
++        "-f", "--file", action="append", dest="filenames", metavar="<filename>", default=default_filenames, type=str,
++        help="filename of todo.txt file to read; can be - to read from standard input; argument can be repeated to "
++             "read tasks from multiple todo.txt files")
+     number = parser.add_mutually_exclusive_group()
+     number.add_argument(
+         "-n", "--number", metavar="<number>", help="number of next actions to show", type=int, default=1)
+diff --git a/next_action/cli.py b/next_action/cli.py
+index 8e9888a..03cda4c 100644
+--- a/next_action/cli.py
++++ b/next_action/cli.py
+@@ -1,5 +1,7 @@
+ """ Entry point for Next-action's command-line interface. """
+ 
++import fileinput
++
+ from next_action.arguments import parse_arguments
+ from next_action.pick_action import next_actions
+ from next_action.todotxt import read_todotxt_file
+@@ -14,13 +16,10 @@ def next_action() -> None:
+         3) determine the next action(s) and display them.
+     """
+     arguments = parse_arguments()
+-    tasks = []
+-    for filename in arguments.filenames:
+-        try:
+-            todotxt_file = open(filename, "r")
+-        except FileNotFoundError:
+-            print("Can't find {0}".format(filename))
+-            return
+-        tasks.extend(read_todotxt_file(todotxt_file))
++    try:
++        with fileinput.input(arguments.filenames) as todotxt_file:
++            tasks = read_todotxt_file(todotxt_file)
++    except OSError as reason:
++        arguments.parser.error("can't open file: {0}".format(reason))
+     actions = next_actions(tasks, *arguments.filters)
+     print("\n".join(action.text for action in actions[:arguments.number]) if actions else "Nothing to do!")
+diff --git a/next_action/todotxt/__init__.py b/next_action/todotxt/__init__.py
+index 3faed18..1b2b424 100644
+--- a/next_action/todotxt/__init__.py
++++ b/next_action/todotxt/__init__.py
+@@ -8,4 +8,4 @@ from .task import Task
+ def read_todotxt_file(todoxt_file: IO[str]) -> List[Task]:
+     """ Read tasks from a Todo.txt file. """
+     with todoxt_file:
+-        return [Task(line.strip()) for line in todoxt_file.readlines() if line.strip()]
++        return [Task(line.strip()) for line in todoxt_file if line.strip()]
+

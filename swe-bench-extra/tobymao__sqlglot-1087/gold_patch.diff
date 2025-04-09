@@ -1,0 +1,167 @@
+diff --git a/sqlglot/dataframe/sql/functions.py b/sqlglot/dataframe/sql/functions.py
+index a141fe46..01492893 100644
+--- a/sqlglot/dataframe/sql/functions.py
++++ b/sqlglot/dataframe/sql/functions.py
+@@ -1144,10 +1144,16 @@ def aggregate(
+     merge_exp = _get_lambda_from_func(merge)
+     if finish is not None:
+         finish_exp = _get_lambda_from_func(finish)
+-        return Column.invoke_anonymous_function(
+-            col, "AGGREGATE", initialValue, Column(merge_exp), Column(finish_exp)
++        return Column.invoke_expression_over_column(
++            col,
++            glotexp.Reduce,
++            initial=initialValue,
++            merge=Column(merge_exp),
++            finish=Column(finish_exp),
+         )
+-    return Column.invoke_anonymous_function(col, "AGGREGATE", initialValue, Column(merge_exp))
++    return Column.invoke_expression_over_column(
++        col, glotexp.Reduce, initial=initialValue, merge=Column(merge_exp)
++    )
+ 
+ 
+ def transform(
+diff --git a/sqlglot/dialects/postgres.py b/sqlglot/dialects/postgres.py
+index ff654f8c..53798b35 100644
+--- a/sqlglot/dialects/postgres.py
++++ b/sqlglot/dialects/postgres.py
+@@ -148,6 +148,22 @@ def _serial_to_generated(expression):
+     return expression
+ 
+ 
++def _generate_series(args):
++    # The goal is to convert step values like '1 day' or INTERVAL '1 day' into INTERVAL '1' day
++    step = seq_get(args, 2)
++
++    if step is None:
++        # Postgres allows calls with just two arguments -- the "step" argument defaults to 1
++        return exp.GenerateSeries.from_arg_list(args)
++
++    if step.is_string:
++        args[2] = exp.to_interval(step.this)
++    elif isinstance(step, exp.Interval) and not step.args.get("unit"):
++        args[2] = exp.to_interval(step.this.this)
++
++    return exp.GenerateSeries.from_arg_list(args)
++
++
+ def _to_timestamp(args):
+     # TO_TIMESTAMP accepts either a single double argument or (text, text)
+     if len(args) == 1:
+@@ -260,6 +276,7 @@ class Postgres(Dialect):
+             "NOW": exp.CurrentTimestamp.from_arg_list,
+             "TO_TIMESTAMP": _to_timestamp,
+             "TO_CHAR": format_time_lambda(exp.TimeToStr, "postgres"),
++            "GENERATE_SERIES": _generate_series,
+         }
+ 
+         BITWISE = {
+diff --git a/sqlglot/dialects/presto.py b/sqlglot/dialects/presto.py
+index 8bade68c..1038e66a 100644
+--- a/sqlglot/dialects/presto.py
++++ b/sqlglot/dialects/presto.py
+@@ -105,6 +105,29 @@ def _ts_or_ds_add_sql(self, expression):
+     return f"DATE_ADD({unit}, {e}, DATE_PARSE(SUBSTR({this}, 1, 10), {Presto.date_format}))"
+ 
+ 
++def _sequence_sql(self, expression):
++    start = expression.args["start"]
++    end = expression.args["end"]
++    step = expression.args.get("step", 1)  # Postgres defaults to 1 for generate_series
++
++    target_type = None
++
++    if isinstance(start, exp.Cast):
++        target_type = start.to
++    elif isinstance(end, exp.Cast):
++        target_type = end.to
++
++    if target_type and target_type.this == exp.DataType.Type.TIMESTAMP:
++        to = target_type.copy()
++
++        if target_type is start.to:
++            end = exp.Cast(this=end, to=to)
++        else:
++            start = exp.Cast(this=start, to=to)
++
++    return f"SEQUENCE({self.format_args(start, end, step)})"
++
++
+ def _ensure_utf8(charset):
+     if charset.name.lower() != "utf-8":
+         raise UnsupportedError(f"Unsupported charset {charset}")
+@@ -235,7 +258,7 @@ class Presto(Dialect):
+             exp.Decode: _decode_sql,
+             exp.DiToDate: lambda self, e: f"CAST(DATE_PARSE(CAST({self.sql(e, 'this')} AS VARCHAR), {Presto.dateint_format}) AS DATE)",
+             exp.Encode: _encode_sql,
+-            exp.GenerateSeries: rename_func("SEQUENCE"),
++            exp.GenerateSeries: _sequence_sql,
+             exp.Hex: rename_func("TO_HEX"),
+             exp.If: if_sql,
+             exp.ILike: no_ilike_sql,
+diff --git a/sqlglot/dialects/spark.py b/sqlglot/dialects/spark.py
+index f20c4dc1..08ff775d 100644
+--- a/sqlglot/dialects/spark.py
++++ b/sqlglot/dialects/spark.py
+@@ -73,6 +73,7 @@ class Spark(Hive):
+             ),
+             "APPROX_PERCENTILE": exp.ApproxQuantile.from_arg_list,
+             "IIF": exp.If.from_arg_list,
++            "AGGREGATE": exp.Reduce.from_arg_list,
+         }
+ 
+         FUNCTION_PARSERS = {
+diff --git a/sqlglot/executor/env.py b/sqlglot/executor/env.py
+index 04dc9381..ba9cbbdf 100644
+--- a/sqlglot/executor/env.py
++++ b/sqlglot/executor/env.py
+@@ -171,5 +171,6 @@ ENV = {
+     "STRPOSITION": str_position,
+     "SUB": null_if_any(lambda e, this: e - this),
+     "SUBSTRING": substring,
++    "TIMESTRTOTIME": null_if_any(lambda arg: datetime.datetime.fromisoformat(arg)),
+     "UPPER": null_if_any(lambda arg: arg.upper()),
+ }
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 135c49f2..acc99cb3 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -3248,7 +3248,7 @@ class ReadCSV(Func):
+ 
+ 
+ class Reduce(Func):
+-    arg_types = {"this": True, "initial": True, "merge": True, "finish": True}
++    arg_types = {"this": True, "initial": True, "merge": True, "finish": False}
+ 
+ 
+ class RegexpLike(Func):
+@@ -3968,6 +3968,28 @@ def to_identifier(alias, quoted=None) -> t.Optional[Identifier]:
+     return identifier
+ 
+ 
++INTERVAL_STRING_RE = re.compile(r"\s*([0-9]+)\s*([a-zA-Z]+)\s*")
++
++
++def to_interval(interval: str | Literal) -> Interval:
++    """Builds an interval expression from a string like '1 day' or '5 months'."""
++    if isinstance(interval, Literal):
++        if not interval.is_string:
++            raise ValueError("Invalid interval string.")
++
++        interval = interval.this
++
++    interval_parts = INTERVAL_STRING_RE.match(interval)  # type: ignore
++
++    if not interval_parts:
++        raise ValueError("Invalid interval string.")
++
++    return Interval(
++        this=Literal.string(interval_parts.group(1)),
++        unit=Var(this=interval_parts.group(2)),
++    )
++
++
+ @t.overload
+ def to_table(sql_path: str | Table, **kwargs) -> Table:
+     ...

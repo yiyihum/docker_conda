@@ -1,0 +1,333 @@
+diff --git a/fakeredis/_commands.py b/fakeredis/_commands.py
+index f5c8b99..6b231de 100644
+--- a/fakeredis/_commands.py
++++ b/fakeredis/_commands.py
+@@ -1,7 +1,6 @@
+ import functools
+-import re
+-
+ import math
++import re
+ 
+ from . import _msgs as msgs
+ from ._helpers import MAX_STRING_SIZE, null_terminate, SimpleError
+@@ -239,13 +238,15 @@ class AfterAny:
+ class ScoreTest:
+     """Argument converter for sorted set score endpoints."""
+ 
+-    def __init__(self, value, exclusive=False):
++    def __init__(self, value, exclusive=False, bytes_val=None):
+         self.value = value
+         self.exclusive = exclusive
++        self.bytes_val = bytes_val
+ 
+     @classmethod
+     def decode(cls, value):
+         try:
++            original_value = value
+             exclusive = False
+             if value[:1] == b'(':
+                 exclusive = True
+@@ -253,7 +254,7 @@ class ScoreTest:
+             value = Float.decode(
+                 value, allow_leading_whitespace=True, allow_erange=True,
+                 allow_empty=True, crop_null=True)
+-            return cls(value, exclusive)
++            return cls(value, exclusive, original_value)
+         except SimpleError:
+             raise SimpleError(msgs.INVALID_MIN_MAX_FLOAT_MSG)
+ 
+diff --git a/fakeredis/_fakesocket.py b/fakeredis/_fakesocket.py
+index 3b3a3b2..b25ed85 100644
+--- a/fakeredis/_fakesocket.py
++++ b/fakeredis/_fakesocket.py
+@@ -1,13 +1,13 @@
+ import functools
+ import hashlib
+ import itertools
++import math
+ import pickle
+ import queue
+ import random
+ import time
+ import weakref
+ 
+-import math
+ import redis
+ import six
+ 
+@@ -793,7 +793,7 @@ class FakeSocket:
+         c = Float.decode(key.get(b'0')) + Float.decode(amount)
+         if not math.isfinite(c):
+             raise SimpleError(msgs.NONFINITE_MSG)
+-        encoded = self._encodefloat(c, True, )
++        encoded = self._encodefloat(c, True)
+         key.update(encoded)
+         return encoded
+ 
+@@ -1561,23 +1561,30 @@ class FakeSocket:
+     def _zrange(self, key, start, stop, reverse, *args):
+         zset = key.value
+         withscores = False
++        byscore = False
+         for arg in args:
+             if casematch(arg, b'withscores'):
+                 withscores = True
++            elif casematch(arg, b'byscore'):
++                byscore = True
+             else:
+                 raise SimpleError(msgs.SYNTAX_ERROR_MSG)
+-        start, stop = self._fix_range(start, stop, len(zset))
+-        if reverse:
+-            start, stop = len(zset) - stop, len(zset) - start
+-        items = zset.islice_score(start, stop, reverse)
++        if byscore:
++            items = zset.irange_score(start.lower_bound, stop.upper_bound, reverse=reverse)
++        else:
++            start, stop = Int.decode(start.bytes_val), Int.decode(stop.bytes_val)
++            start, stop = self._fix_range(start, stop, len(zset))
++            if reverse:
++                start, stop = len(zset) - stop, len(zset) - start
++            items = zset.islice_score(start, stop, reverse)
+         items = self._apply_withscores(items, withscores)
+         return items
+ 
+-    @command((Key(ZSet), Int, Int), (bytes,))
++    @command((Key(ZSet), ScoreTest, ScoreTest), (bytes,))
+     def zrange(self, key, start, stop, *args):
+         return self._zrange(key, start, stop, False, *args)
+ 
+-    @command((Key(ZSet), Int, Int), (bytes,))
++    @command((Key(ZSet), ScoreTest, ScoreTest), (bytes,))
+     def zrevrange(self, key, start, stop, *args):
+         return self._zrange(key, start, stop, True, *args)
+ 
+diff --git a/poetry.lock b/poetry.lock
+index d78f762..b2f7c5d 100644
+--- a/poetry.lock
++++ b/poetry.lock
+@@ -83,7 +83,7 @@ pycparser = "*"
+ 
+ [[package]]
+ name = "charset-normalizer"
+-version = "2.1.0"
++version = "2.1.1"
+ description = "The Real First Universal Charset Detector. Open, modern and actively maintained alternative to Chardet."
+ category = "dev"
+ optional = false
+@@ -113,7 +113,7 @@ test = ["hypothesis (==3.55.3)", "flake8 (==3.7.8)"]
+ 
+ [[package]]
+ name = "coverage"
+-version = "6.4.2"
++version = "6.4.4"
+ description = "Code coverage measurement for Python"
+ category = "dev"
+ optional = false
+@@ -160,7 +160,7 @@ dev = ["tox", "bump2version (<1)", "sphinx (<2)", "importlib-metadata (<3)", "im
+ 
+ [[package]]
+ name = "distlib"
+-version = "0.3.5"
++version = "0.3.6"
+ description = "Distribution utilities"
+ category = "dev"
+ optional = false
+@@ -187,33 +187,33 @@ test = ["pytest (>=6)"]
+ 
+ [[package]]
+ name = "filelock"
+-version = "3.7.1"
++version = "3.8.0"
+ description = "A platform independent file lock."
+ category = "dev"
+ optional = false
+ python-versions = ">=3.7"
+ 
+ [package.extras]
+-docs = ["furo (>=2021.8.17b43)", "sphinx (>=4.1)", "sphinx-autodoc-typehints (>=1.12)"]
+-testing = ["covdefaults (>=1.2.0)", "coverage (>=4)", "pytest (>=4)", "pytest-cov", "pytest-timeout (>=1.4.2)"]
++docs = ["furo (>=2022.6.21)", "sphinx (>=5.1.1)", "sphinx-autodoc-typehints (>=1.19.1)"]
++testing = ["covdefaults (>=2.2)", "coverage (>=6.4.2)", "pytest (>=7.1.2)", "pytest-cov (>=3)", "pytest-timeout (>=2.1)"]
+ 
+ [[package]]
+ name = "flake8"
+-version = "4.0.1"
++version = "5.0.4"
+ description = "the modular source code checker: pep8 pyflakes and co"
+ category = "dev"
+ optional = false
+-python-versions = ">=3.6"
++python-versions = ">=3.6.1"
+ 
+ [package.dependencies]
+-importlib-metadata = {version = "<4.3", markers = "python_version < \"3.8\""}
+-mccabe = ">=0.6.0,<0.7.0"
+-pycodestyle = ">=2.8.0,<2.9.0"
+-pyflakes = ">=2.4.0,<2.5.0"
++importlib-metadata = {version = ">=1.1.0,<4.3", markers = "python_version < \"3.8\""}
++mccabe = ">=0.7.0,<0.8.0"
++pycodestyle = ">=2.9.0,<2.10.0"
++pyflakes = ">=2.5.0,<2.6.0"
+ 
+ [[package]]
+ name = "hypothesis"
+-version = "6.53.0"
++version = "6.54.4"
+ description = "A library for property-based testing"
+ category = "dev"
+ optional = false
+@@ -225,11 +225,11 @@ exceptiongroup = {version = ">=1.0.0rc8", markers = "python_version < \"3.11\""}
+ sortedcontainers = ">=2.1.0,<3.0.0"
+ 
+ [package.extras]
+-all = ["black (>=19.10b0)", "click (>=7.0)", "django (>=2.2)", "dpcontracts (>=0.4)", "lark-parser (>=0.6.5)", "libcst (>=0.3.16)", "numpy (>=1.9.0)", "pandas (>=1.0)", "pytest (>=4.6)", "python-dateutil (>=1.4)", "pytz (>=2014.1)", "redis (>=3.0.0)", "rich (>=9.0.0)", "importlib-metadata (>=3.6)", "backports.zoneinfo (>=0.2.1)", "tzdata (>=2022.1)"]
++all = ["black (>=19.10b0)", "click (>=7.0)", "django (>=3.2)", "dpcontracts (>=0.4)", "lark-parser (>=0.6.5)", "libcst (>=0.3.16)", "numpy (>=1.9.0)", "pandas (>=1.0)", "pytest (>=4.6)", "python-dateutil (>=1.4)", "pytz (>=2014.1)", "redis (>=3.0.0)", "rich (>=9.0.0)", "importlib-metadata (>=3.6)", "backports.zoneinfo (>=0.2.1)", "tzdata (>=2022.1)"]
+ cli = ["click (>=7.0)", "black (>=19.10b0)", "rich (>=9.0.0)"]
+ codemods = ["libcst (>=0.3.16)"]
+ dateutil = ["python-dateutil (>=1.4)"]
+-django = ["django (>=2.2)"]
++django = ["django (>=3.2)"]
+ dpcontracts = ["dpcontracts (>=0.4)"]
+ ghostwriter = ["black (>=19.10b0)"]
+ lark = ["lark-parser (>=0.6.5)"]
+@@ -294,7 +294,7 @@ test = ["async-timeout", "trio", "testpath", "pytest-asyncio (>=0.17)", "pytest-
+ 
+ [[package]]
+ name = "keyring"
+-version = "23.7.0"
++version = "23.8.2"
+ description = "Store and access your passwords safely."
+ category = "dev"
+ optional = false
+@@ -308,7 +308,7 @@ SecretStorage = {version = ">=3.2", markers = "sys_platform == \"linux\""}
+ 
+ [package.extras]
+ docs = ["sphinx", "jaraco.packaging (>=9)", "rst.linker (>=1.9)", "jaraco.tidelift (>=1.4)"]
+-testing = ["pytest (>=6)", "pytest-checkdocs (>=2.4)", "pytest-flake8", "pytest-cov", "pytest-enabler (>=1.3)", "pytest-black (>=0.3.7)", "pytest-mypy (>=0.9.1)"]
++testing = ["pytest (>=6)", "pytest-checkdocs (>=2.4)", "pytest-flake8", "flake8 (<5)", "pytest-cov", "pytest-enabler (>=1.3)", "pytest-black (>=0.3.7)", "pytest-mypy (>=0.9.1)"]
+ 
+ [[package]]
+ name = "lupa"
+@@ -320,11 +320,11 @@ python-versions = "*"
+ 
+ [[package]]
+ name = "mccabe"
+-version = "0.6.1"
++version = "0.7.0"
+ description = "McCabe checker, plugin for flake8"
+ category = "dev"
+ optional = false
+-python-versions = "*"
++python-versions = ">=3.6"
+ 
+ [[package]]
+ name = "packaging"
+@@ -385,11 +385,11 @@ python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*"
+ 
+ [[package]]
+ name = "pycodestyle"
+-version = "2.8.0"
++version = "2.9.1"
+ description = "Python style guide checker"
+ category = "dev"
+ optional = false
+-python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*"
++python-versions = ">=3.6"
+ 
+ [[package]]
+ name = "pycparser"
+@@ -401,20 +401,23 @@ python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*"
+ 
+ [[package]]
+ name = "pyflakes"
+-version = "2.4.0"
++version = "2.5.0"
+ description = "passive checker of Python programs"
+ category = "dev"
+ optional = false
+-python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*"
++python-versions = ">=3.6"
+ 
+ [[package]]
+ name = "pygments"
+-version = "2.12.0"
++version = "2.13.0"
+ description = "Pygments is a syntax highlighting package written in Python."
+ category = "dev"
+ optional = false
+ python-versions = ">=3.6"
+ 
++[package.extras]
++plugins = ["importlib-metadata"]
++
+ [[package]]
+ name = "pyparsing"
+ version = "3.0.9"
+@@ -502,7 +505,7 @@ python-versions = "*"
+ 
+ [[package]]
+ name = "readme-renderer"
+-version = "35.0"
++version = "37.0"
+ description = "readme_renderer is a library for rendering \"readme\" descriptions for Warehouse"
+ category = "dev"
+ optional = false
+@@ -593,7 +596,7 @@ jupyter = ["ipywidgets (>=7.5.1,<8.0.0)"]
+ 
+ [[package]]
+ name = "secretstorage"
+-version = "3.3.2"
++version = "3.3.3"
+ description = "Python bindings to FreeDesktop.org Secret Service API"
+ category = "dev"
+ optional = false
+@@ -687,7 +690,7 @@ python-versions = ">=3.7"
+ 
+ [[package]]
+ name = "urllib3"
+-version = "1.26.11"
++version = "1.26.12"
+ description = "HTTP library with thread-safe connection pooling, file post, and more."
+ category = "dev"
+ optional = false
+@@ -695,7 +698,7 @@ python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*,
+ 
+ [package.extras]
+ brotli = ["brotlicffi (>=0.8.0)", "brotli (>=1.0.9)", "brotlipy (>=0.6.0)"]
+-secure = ["pyOpenSSL (>=0.14)", "cryptography (>=1.3.4)", "idna (>=2.0.0)", "certifi", "ipaddress"]
++secure = ["pyOpenSSL (>=0.14)", "cryptography (>=1.3.4)", "idna (>=2.0.0)", "certifi", "urllib3-secure-extra", "ipaddress"]
+ socks = ["PySocks (>=1.5.6,!=1.5.7,<2.0)"]
+ 
+ [[package]]
+@@ -751,7 +754,7 @@ lua = ["lupa"]
+ [metadata]
+ lock-version = "1.1"
+ python-versions = "^3.7"
+-content-hash = "7d7877983e79eff5e022268e408a2e7188ad5957e82aa4734e25134e75e9999c"
++content-hash = "397fb04cb476c4abb56ea30d8aa4d641c95afcb3241ff4aadbf6ac34b8a9339e"
+ 
+ [metadata.files]
+ aioredis = []
+diff --git a/pyproject.toml b/pyproject.toml
+index 870594c..8e68b36 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -8,7 +8,7 @@ name = "fakeredis"
+ packages = [
+     { include = "fakeredis" },
+ ]
+-version = "1.9.0"
++version = "1.9.1"
+ description = "Fake implementation of redis API for testing purposes."
+ readme = "README.md"
+ keywords = ["redis", "rq", "django-rq", "rq-scheduler"]
+@@ -59,7 +59,7 @@ pytest = "^7.1.2"
+ pytest-asyncio = "0.19.0"
+ pytest-cov = "^3.0.0"
+ pytest-mock = "^3.7.0"
+-flake8 = "^4.0.1"
++flake8 = "^5.0.4"
+ 
+ [tool.poetry.urls]
+ "Bug Tracker" = "https://github.com/cunla/fakeredis-py/issues"

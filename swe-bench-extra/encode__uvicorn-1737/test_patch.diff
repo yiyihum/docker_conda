@@ -1,0 +1,109 @@
+diff --git a/.github/workflows/test-suite.yml b/.github/workflows/test-suite.yml
+index 04c13b5..ff82ebd 100644
+--- a/.github/workflows/test-suite.yml
++++ b/.github/workflows/test-suite.yml
+@@ -13,7 +13,7 @@ jobs:
+     runs-on: "${{ matrix.os }}"
+     strategy:
+       matrix:
+-        python-version: ["3.7", "3.8", "3.9", "3.10", "3.11-dev"]
++        python-version: ["3.7", "3.8", "3.9", "3.10", "3.11"]
+         os: [windows-latest, ubuntu-latest, macos-latest]
+     steps:
+       - uses: "actions/checkout@v3"
+diff --git a/tests/protocols/test_websocket.py b/tests/protocols/test_websocket.py
+index a5fe93d..d495f51 100644
+--- a/tests/protocols/test_websocket.py
++++ b/tests/protocols/test_websocket.py
+@@ -528,7 +528,6 @@ async def test_client_connection_lost(ws_protocol_cls, http_protocol_cls):
+         while True:
+             message = await receive()
+             if message["type"] == "websocket.connect":
+-                print("accepted")
+                 await send({"type": "websocket.accept"})
+             elif message["type"] == "websocket.disconnect":
+                 break
+@@ -551,6 +550,66 @@ async def test_client_connection_lost(ws_protocol_cls, http_protocol_cls):
+     assert got_disconnect_event_before_shutdown is True
+ 
+ 
++@pytest.mark.anyio
++@pytest.mark.parametrize("ws_protocol_cls", WS_PROTOCOLS)
++@pytest.mark.parametrize("http_protocol_cls", HTTP_PROTOCOLS)
++async def test_not_accept_on_connection_lost(ws_protocol_cls, http_protocol_cls):
++    send_accept_task = asyncio.Event()
++
++    async def app(scope, receive, send):
++        while True:
++            message = await receive()
++            if message["type"] == "websocket.connect":
++                await send_accept_task.wait()
++                await send({"type": "websocket.accept"})
++            elif message["type"] == "websocket.disconnect":
++                break
++
++    async def websocket_session(uri):
++        async with websockets.client.connect(uri):
++            while True:
++                await asyncio.sleep(0.1)
++
++    config = Config(app=app, ws=ws_protocol_cls, http=http_protocol_cls, lifespan="off")
++    async with run_server(config):
++        task = asyncio.create_task(websocket_session("ws://127.0.0.1:8000"))
++        await asyncio.sleep(0.1)
++        task.cancel()
++        send_accept_task.set()
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("ws_protocol_cls", WS_PROTOCOLS)
++@pytest.mark.parametrize("http_protocol_cls", HTTP_PROTOCOLS)
++async def test_send_close_on_server_shutdown(ws_protocol_cls, http_protocol_cls):
++    disconnect_message = {}
++
++    async def app(scope, receive, send):
++        nonlocal disconnect_message
++        while True:
++            message = await receive()
++            if message["type"] == "websocket.connect":
++                await send({"type": "websocket.accept"})
++            elif message["type"] == "websocket.disconnect":
++                disconnect_message = message
++                break
++
++    async def websocket_session(uri):
++        async with websockets.client.connect(uri):
++            while True:
++                await asyncio.sleep(0.1)
++
++    config = Config(app=app, ws=ws_protocol_cls, http=http_protocol_cls, lifespan="off")
++    async with run_server(config):
++        task = asyncio.create_task(websocket_session("ws://127.0.0.1:8000"))
++        await asyncio.sleep(0.1)
++        disconnect_message_before_shutdown = disconnect_message
++
++    assert disconnect_message_before_shutdown == {}
++    assert disconnect_message == {"type": "websocket.disconnect", "code": 1012}
++    task.cancel()
++
++
+ @pytest.mark.anyio
+ @pytest.mark.parametrize("ws_protocol_cls", WS_PROTOCOLS)
+ @pytest.mark.parametrize("http_protocol_cls", HTTP_PROTOCOLS)
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 403112f..d11c632 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -557,3 +557,12 @@ def test_config_use_subprocess(reload, workers, expected):
+     config = Config(app=asgi_app, reload=reload, workers=workers)
+     config.load()
+     assert config.use_subprocess == expected
++
++
++def test_warn_when_using_reload_and_workers(caplog: pytest.LogCaptureFixture) -> None:
++    Config(app=asgi_app, reload=True, workers=2)
++    assert len(caplog.records) == 1
++    assert (
++        '"workers" flag is ignored when reloading is enabled.'
++        in caplog.records[0].message
++    )

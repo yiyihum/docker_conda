@@ -1,0 +1,218 @@
+diff --git a/tests/integration/test_billpayment.py b/tests/integration/test_billpayment.py
+index fab990c..c7ce650 100644
+--- a/tests/integration/test_billpayment.py
++++ b/tests/integration/test_billpayment.py
+@@ -1,5 +1,6 @@
+ from datetime import datetime
+ 
++from quickbooks.objects import AccountBasedExpenseLine, Ref, AccountBasedExpenseLineDetail
+ from quickbooks.objects.account import Account
+ from quickbooks.objects.bill import Bill
+ from quickbooks.objects.billpayment import BillPayment, BillPaymentLine, CheckPayment
+@@ -14,12 +15,30 @@ class BillPaymentTest(QuickbooksTestCase):
+         self.account_number = datetime.now().strftime('%d%H%M')
+         self.name = "Test Account {0}".format(self.account_number)
+ 
+-    def test_create(self):
++    def create_bill(self, amount):
++        bill = Bill()
++        line = AccountBasedExpenseLine()
++        line.Amount = amount
++        line.DetailType = "AccountBasedExpenseLineDetail"
++
++        account_ref = Ref()
++        account_ref.type = "Account"
++        account_ref.value = 1
++        line.AccountBasedExpenseLineDetail = AccountBasedExpenseLineDetail()
++        line.AccountBasedExpenseLineDetail.AccountRef = account_ref
++        bill.Line.append(line)
++
++        vendor = Vendor.all(max_results=1, qb=self.qb_client)[0]
++        bill.VendorRef = vendor.to_ref()
++
++        return bill.save(qb=self.qb_client)
++
++    def create_bill_payment(self, bill, amount, private_note, pay_type):
+         bill_payment = BillPayment()
+ 
+-        bill_payment.PayType = "Check"
+-        bill_payment.TotalAmt = 200
+-        bill_payment.PrivateNote = "Private Note"
++        bill_payment.PayType = pay_type
++        bill_payment.TotalAmt = amount
++        bill_payment.PrivateNote = private_note
+ 
+         vendor = Vendor.all(max_results=1, qb=self.qb_client)[0]
+         bill_payment.VendorRef = vendor.to_ref()
+@@ -31,14 +50,18 @@ class BillPaymentTest(QuickbooksTestCase):
+         ap_account = Account.where("AccountSubType = 'AccountsPayable'", qb=self.qb_client)[0]
+         bill_payment.APAccountRef = ap_account.to_ref()
+ 
+-        bill = Bill.all(max_results=1, qb=self.qb_client)[0]
+-
+         line = BillPaymentLine()
+         line.LinkedTxn.append(bill.to_linked_txn())
+         line.Amount = 200
+ 
+         bill_payment.Line.append(line)
+-        bill_payment.save(qb=self.qb_client)
++        return bill_payment.save(qb=self.qb_client)
++
++    def test_create(self):
++        # create new bill for testing, reusing the same bill will cause Line to be empty
++        # and the new bill payment will be voided automatically
++        bill = self.create_bill(amount=200)
++        bill_payment = self.create_bill_payment(bill, 200, "Private Note", "Check")
+ 
+         query_bill_payment = BillPayment.get(bill_payment.Id, qb=self.qb_client)
+ 
+@@ -48,3 +71,16 @@ class BillPaymentTest(QuickbooksTestCase):
+ 
+         self.assertEqual(len(query_bill_payment.Line), 1)
+         self.assertEqual(query_bill_payment.Line[0].Amount, 200.0)
++
++    def test_void(self):
++        bill = self.create_bill(amount=200)
++        bill_payment = self.create_bill_payment(bill, 200, "Private Note", "Check")
++        query_payment = BillPayment.get(bill_payment.Id, qb=self.qb_client)
++        self.assertEqual(query_payment.TotalAmt, 200.0)
++        self.assertNotIn('Voided', query_payment.PrivateNote)
++
++        bill_payment.void(qb=self.qb_client)
++        query_payment = BillPayment.get(bill_payment.Id, qb=self.qb_client)
++
++        self.assertEqual(query_payment.TotalAmt, 0.0)
++        self.assertIn('Voided', query_payment.PrivateNote)
+\ No newline at end of file
+diff --git a/tests/integration/test_invoice.py b/tests/integration/test_invoice.py
+index 4a686a5..c02e40e 100644
+--- a/tests/integration/test_invoice.py
++++ b/tests/integration/test_invoice.py
+@@ -75,3 +75,14 @@ class InvoiceTest(QuickbooksTestCase):
+ 
+         query_invoice = Invoice.filter(Id=invoice_id, qb=self.qb_client)
+         self.assertEqual([], query_invoice)
++
++    def test_void(self):
++        customer = Customer.all(max_results=1, qb=self.qb_client)[0]
++        invoice = self.create_invoice(customer)
++        invoice_id = invoice.Id
++        invoice.void(qb=self.qb_client)
++
++        query_invoice = Invoice.get(invoice_id, qb=self.qb_client)
++        self.assertEqual(query_invoice.Balance, 0.0)
++        self.assertEqual(query_invoice.TotalAmt, 0.0)
++        self.assertIn('Voided', query_invoice.PrivateNote)
+diff --git a/tests/integration/test_salesreceipt.py b/tests/integration/test_salesreceipt.py
+new file mode 100644
+index 0000000..ce3bd2a
+--- /dev/null
++++ b/tests/integration/test_salesreceipt.py
+@@ -0,0 +1,59 @@
++from datetime import datetime
++
++from quickbooks.objects import SalesReceipt, Customer, \
++    SalesItemLine, SalesItemLineDetail, Item
++from tests.integration.test_base import QuickbooksTestCase
++
++
++class SalesReceiptTest(QuickbooksTestCase):
++    def setUp(self):
++        super(SalesReceiptTest, self).setUp()
++
++        self.account_number = datetime.now().strftime('%d%H%M')
++        self.name = "Test Account {0}".format(self.account_number)
++
++    def create_sales_receipt(self, qty=1, unit_price=100.0):
++        sales_receipt = SalesReceipt()
++        sales_receipt.TotalAmt = qty * unit_price
++        customer = Customer.all(max_results=1, qb=self.qb_client)[0]
++        sales_receipt.CustomerRef = customer.to_ref()
++        item = Item.all(max_results=1, qb=self.qb_client)[0]
++        line = SalesItemLine()
++        sales_item_line_detail = SalesItemLineDetail()
++        sales_item_line_detail.ItemRef = item.to_ref()
++        sales_item_line_detail.Qty = qty
++        sales_item_line_detail.UnitPrice = unit_price
++        today = datetime.now()
++        sales_item_line_detail.ServiceDate = today.strftime(
++            "%Y-%m-%d"
++        )
++        line.SalesItemLineDetail = sales_item_line_detail
++        line.Amount = qty * unit_price
++        sales_receipt.Line = [line]
++
++        return sales_receipt.save(qb=self.qb_client)
++
++    def test_create(self):
++        sales_receipt = self.create_sales_receipt(
++            qty=1,
++            unit_price=100.0
++        )
++        query_sales_receipt = SalesReceipt.get(sales_receipt.Id, qb=self.qb_client)
++
++        self.assertEqual(query_sales_receipt.TotalAmt, 100.0)
++        self.assertEqual(query_sales_receipt.Line[0].Amount, 100.0)
++        self.assertEqual(query_sales_receipt.Line[0].SalesItemLineDetail['Qty'], 1)
++        self.assertEqual(query_sales_receipt.Line[0].SalesItemLineDetail['UnitPrice'], 100.0)
++
++    def test_void(self):
++        sales_receipt = self.create_sales_receipt(
++            qty=1,
++            unit_price=100.0
++        )
++        query_sales_receipt = SalesReceipt.get(sales_receipt.Id, qb=self.qb_client)
++        self.assertEqual(query_sales_receipt.TotalAmt, 100.0)
++        self.assertNotIn('Voided', query_sales_receipt.PrivateNote)
++        sales_receipt.void(qb=self.qb_client)
++        query_sales_receipt = SalesReceipt.get(sales_receipt.Id, qb=self.qb_client)
++        self.assertEqual(query_sales_receipt.TotalAmt, 0.0)
++        self.assertIn('Voided', query_sales_receipt.PrivateNote)
+diff --git a/tests/unit/test_mixins.py b/tests/unit/test_mixins.py
+index c3ff3ed..017df5d 100644
+--- a/tests/unit/test_mixins.py
++++ b/tests/unit/test_mixins.py
+@@ -4,7 +4,7 @@ import os
+ import unittest
+ from urllib.parse import quote
+ 
+-from quickbooks.objects import Bill, Invoice
++from quickbooks.objects import Bill, Invoice, Payment, BillPayment
+ 
+ from tests.integration.test_base import QuickbooksUnitTestCase
+ 
+@@ -381,12 +381,33 @@ class SendMixinTest(QuickbooksUnitTestCase):
+ 
+ class VoidMixinTest(QuickbooksUnitTestCase):
+     @patch('quickbooks.mixins.QuickBooks.post')
+-    def test_void(self, post):
++    def test_void_invoice(self, post):
+         invoice = Invoice()
+         invoice.Id = 2
+         invoice.void(qb=self.qb_client)
+         self.assertTrue(post.called)
+ 
++    @patch('quickbooks.mixins.QuickBooks.post')
++    def test_void_payment(self, post):
++        payment = Payment()
++        payment.Id = 2
++        payment.void(qb=self.qb_client)
++        self.assertTrue(post.called)
++
++    @patch('quickbooks.mixins.QuickBooks.post')
++    def test_void_sales_receipt(self, post):
++        sales_receipt = SalesReceipt()
++        sales_receipt.Id = 2
++        sales_receipt.void(qb=self.qb_client)
++        self.assertTrue(post.called)
++
++    @patch('quickbooks.mixins.QuickBooks.post')
++    def test_void_bill_payment(self, post):
++        bill_payment = BillPayment()
++        bill_payment.Id = 2
++        bill_payment.void(qb=self.qb_client)
++        self.assertTrue(post.called)
++
+     def test_delete_unsaved_exception(self):
+         from quickbooks.exceptions import QuickbooksException
+ 

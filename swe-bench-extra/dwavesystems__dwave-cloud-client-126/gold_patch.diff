@@ -1,0 +1,235 @@
+diff --git a/dwave/cloud/cli.py b/dwave/cloud/cli.py
+index d2a1e95..b4b37d9 100644
+--- a/dwave/cloud/cli.py
++++ b/dwave/cloud/cli.py
+@@ -8,9 +8,10 @@ from dwave.cloud import Client
+ from dwave.cloud.utils import readline_input
+ from dwave.cloud.package_info import __title__, __version__
+ from dwave.cloud.exceptions import (
+-    SolverAuthenticationError, InvalidAPIResponseError, UnsupportedSolverError)
++    SolverAuthenticationError, InvalidAPIResponseError, UnsupportedSolverError,
++    ConfigFileReadError, ConfigFileParseError)
+ from dwave.cloud.config import (
+-    load_config_from_files, get_default_config,
++    load_profile_from_files, load_config_from_files, get_default_config,
+     get_configfile_path, get_default_configfile_path,
+     get_configfile_paths)
+ 
+@@ -64,6 +65,29 @@ def list_local_config():
+         click.echo(path)
+ 
+ 
++def inspect_config(ctx, param, value):
++    if not value or ctx.resilient_parsing:
++        return
++
++    config_file = ctx.params.get('config_file')
++    profile = ctx.params.get('profile')
++
++    try:
++        section = load_profile_from_files(
++            [config_file] if config_file else None, profile)
++
++        click.echo("Config file: {}".format(config_file if config_file else "auto-detected"))
++        click.echo("Profile: {}".format(profile if profile else "auto-detected"))
++        click.echo("---")
++        for key, val in section.items():
++            click.echo("{} = {}".format(key, val))
++
++    except (ValueError, ConfigFileReadError, ConfigFileParseError) as e:
++        click.echo(e)
++
++    ctx.exit()
++
++
+ @click.group()
+ @click.version_option(prog_name=__title__, version=__version__)
+ def cli():
+@@ -71,10 +95,13 @@ def cli():
+ 
+ 
+ @cli.command()
+-@click.option('--config-file', default=None, help='Config file path',
+-              type=click.Path(exists=False, dir_okay=False))
+-@click.option('--profile', default=None,
++@click.option('--config-file', '-c', default=None, is_eager=True,
++              type=click.Path(exists=False, dir_okay=False),
++              help='Config file path')
++@click.option('--profile', '-p', default=None, is_eager=True,
+               help='Connection profile name (config section name)')
++@click.option('--inspect', is_flag=True, expose_value=False, callback=inspect_config,
++              help='Only inspect existing config/profile (no update)')
+ @click.option('--list-config-files', is_flag=True, callback=list_config_files,
+               expose_value=False, is_eager=True,
+               help='List paths of all config files detected on this system')
+@@ -163,9 +190,9 @@ def configure(config_file, profile):
+ 
+ 
+ @cli.command()
+-@click.option('--config-file', default=None, help='Config file path',
++@click.option('--config-file', '-c', default=None, help='Config file path',
+               type=click.Path(exists=True, dir_okay=False))
+-@click.option('--profile', default=None, help='Connection profile name')
++@click.option('--profile', '-p', default=None, help='Connection profile name')
+ def ping(config_file, profile):
+     """Ping the QPU by submitting a single-qubit problem."""
+ 
+diff --git a/dwave/cloud/config.py b/dwave/cloud/config.py
+index e61d1b1..ae2e9c1 100644
+--- a/dwave/cloud/config.py
++++ b/dwave/cloud/config.py
+@@ -18,7 +18,7 @@ def get_configfile_paths(system=True, user=True, local=True, only_existing=True)
+ 
+     Candidates examined depend on the OS, but for Linux possible list is:
+     ``dwave.conf`` in CWD, user-local ``.config/dwave/``, system-wide
+-    ``/etc/dwave/``. For details, see :func:`load_config_from_file`.
++    ``/etc/dwave/``. For details, see :func:`load_config_from_files`.
+ 
+     Args:
+         system (boolean, default=True):
+@@ -160,6 +160,70 @@ def load_config_from_files(filenames=None):
+     return config
+ 
+ 
++def load_profile_from_files(filenames=None, profile=None):
++    """Load config from a list of `filenames`, returning only section
++    defined with `profile`.
++
++    Note:
++        Config files and profile name are **not** read from process environment.
++
++    Args:
++        filenames (list[str], default=None):
++            D-Wave cloud client configuration file locations. Set to ``None`` to
++            auto-detect config files, as described in
++            :func:`load_config_from_files`.
++
++        profile (str, default=None):
++            Name of the profile to return from configuration read from config
++            file(s). Set to ``None`` fallback to ``profile`` key under
++            ``[defaults]`` section, or the first non-defaults section, or the
++            actual ``[defaults]`` section.
++
++    Returns:
++        dict:
++            Mapping of config keys to config values. If no valid config/profile
++            found, returns an empty dict.
++
++    Raises:
++        :exc:`~dwave.cloud.exceptions.ConfigFileReadError`:
++            Config file specified or detected could not be opened or read.
++
++        :exc:`~dwave.cloud.exceptions.ConfigFileParseError`:
++            Config file parse failed.
++
++        :exc:`ValueError`:
++            Profile name not found.
++    """
++
++    # progressively build config from a file, or a list of auto-detected files
++    # raises ConfigFileReadError/ConfigFileParseError on error
++    config = load_config_from_files(filenames)
++
++    # determine profile name fallback:
++    #  (1) profile key under [defaults],
++    #  (2) first non-[defaults] section
++    #  (3) [defaults] section
++    first_section = next(iter(config.sections() + [None]))
++    config_defaults = config.defaults()
++    if not profile:
++        profile = config_defaults.get('profile', first_section)
++
++    if profile:
++        try:
++            section = dict(config[profile])
++        except KeyError:
++            raise ValueError("Config profile {!r} not found".format(profile))
++    else:
++        # as the very last resort (unspecified profile name and
++        # no profiles defined in config), try to use [defaults]
++        if config_defaults:
++            section = config_defaults
++        else:
++            section = {}
++
++    return section
++
++
+ def get_default_config():
+     config = configparser.ConfigParser(default_section="defaults")
+     config.read_string(u"""
+@@ -204,7 +268,7 @@ def load_config(config_file=None, profile=None, client=None,
+     performed (looking first for ``dwave.conf`` in process' current working
+     directory, then in user-local config directories, and finally in system-wide
+     config dirs). For details on format and location detection, see
+-    :func:`load_config_from_file`.
++    :func:`load_config_from_files`.
+ 
+     If location of ``config_file`` is explicitly specified (via arguments or
+     environment variable), but the file does not exits, or is not readable,
+@@ -327,51 +391,22 @@ def load_config(config_file=None, profile=None, client=None,
+             Config file parse failed.
+     """
+ 
+-    def _get_section(filenames, profile):
+-        """Load config from a list of `filenames`, returning only section
+-        defined with `profile`."""
+-
+-        # progressively build config from a file, or a list of auto-detected files
+-        # raises ConfigFileReadError/ConfigFileParseError on error
+-        config = load_config_from_files(filenames)
+-
+-        # determine profile name fallback:
+-        #  (1) profile key under [defaults],
+-        #  (2) first non-[defaults] section
+-        first_section = next(iter(config.sections() + [None]))
+-        config_defaults = config.defaults()
+-        default_profile = config_defaults.get('profile', first_section)
+-
+-        # select profile from the config
+-        if profile is None:
+-            profile = os.getenv("DWAVE_PROFILE", default_profile)
+-        if profile:
+-            try:
+-                section = dict(config[profile])
+-            except KeyError:
+-                raise ValueError("Config profile {!r} not found".format(profile))
+-        else:
+-            # as the very last resort (unspecified profile name and
+-            # no profiles defined in config), try to use [defaults]
+-            if config_defaults:
+-                section = config_defaults
+-            else:
+-                section = {}
+-
+-        return section
++    if profile is None:
++        profile = os.getenv("DWAVE_PROFILE")
+ 
+     if config_file == False:
+         # skip loading from file altogether
+         section = {}
+     elif config_file == True:
+         # force auto-detection, disregarding DWAVE_CONFIG_FILE
+-        section = _get_section(None, profile)
++        section = load_profile_from_files(None, profile)
+     else:
+         # auto-detect if not specified with arg or env
+         if config_file is None:
+             # note: both empty and undefined DWAVE_CONFIG_FILE treated as None
+             config_file = os.getenv("DWAVE_CONFIG_FILE")
+-        section = _get_section([config_file] if config_file else None, profile)
++        section = load_profile_from_files(
++            [config_file] if config_file else None, profile)
+ 
+     # override a selected subset of values via env or kwargs,
+     # pass-through the rest unmodified
+@@ -424,7 +459,7 @@ def legacy_load_config(profile=None, endpoint=None, token=None, solver=None,
+             profile-b|https://two.com,token-two
+ 
+         Assuming the new config file ``dwave.conf`` is not found (in any of the
+-        standard locations, see :meth:`~dwave.cloud.config.load_config_from_file`
++        standard locations, see :meth:`~dwave.cloud.config.load_config_from_files`
+         and :meth:`~dwave.cloud.config.load_config`), then:
+ 
+         >>> client = dwave.cloud.Client.from_config()

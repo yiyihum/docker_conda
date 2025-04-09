@@ -1,0 +1,353 @@
+diff --git a/.travis.yml b/.travis.yml
+index a7630ca91..681d3dd76 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -34,10 +34,10 @@ before_install:
+   hash -r &&
+   conda config --set always_yes yes --set changeps1 no &&
+   conda update -q conda &&
+-  conda install python=${TRAVIS_PYTHON_VERSION} &&
+   conda config --add channels conda-forge &&
+-  conda install -y nipype icu &&
+-  rm -r ${CONDA_HOME}/lib/python${TRAVIS_PYTHON_VERSION}/site-packages/nipype*;
++  conda install python=${TRAVIS_PYTHON_VERSION} &&
++  conda install -y icu &&
++  pip install -r requirements.txt &&
+   pushd $HOME;
+   git clone https://github.com/INCF/pybids.git;
+   cd pybids;
+diff --git a/nipype/interfaces/afni/__init__.py b/nipype/interfaces/afni/__init__.py
+index bebcdab4b..6a1e7df76 100644
+--- a/nipype/interfaces/afni/__init__.py
++++ b/nipype/interfaces/afni/__init__.py
+@@ -22,7 +22,7 @@ from .svm import (SVMTest, SVMTrain)
+ from .utils import (ABoverlap, AFNItoNIFTI, Autobox, Axialize, BrickStat,
+                     Bucket, Calc, Cat, CatMatvec, CenterMass, Copy, Dot,
+                     Edge3, Eval, FWHMx, MaskTool, Merge, Notes, NwarpApply,
+-                    OneDToolPy,
++                    NwarpCat, OneDToolPy,
+                     Refit, Resample, TCat, TCatSubBrick, TStat, To3D, Unifize,
+                     Undump, ZCutUp, GCOR,
+                     Zcat, Zeropad)
+diff --git a/nipype/interfaces/afni/utils.py b/nipype/interfaces/afni/utils.py
+index f7281542a..824557878 100644
+--- a/nipype/interfaces/afni/utils.py
++++ b/nipype/interfaces/afni/utils.py
+@@ -1588,6 +1588,123 @@ class NwarpApply(AFNICommandBase):
+     input_spec = NwarpApplyInputSpec
+     output_spec = AFNICommandOutputSpec
+ 
++
++class NwarpCatInputSpec(AFNICommandInputSpec):
++    in_files = traits.List(
++        traits.Either(
++            traits.File(),
++            traits.Tuple(traits.Enum('IDENT', 'INV', 'SQRT', 'SQRTINV'),
++                         traits.File())),
++        descr="list of tuples of 3D warps and associated functions",
++        mandatory=True,
++        argstr="%s",
++        position=-1)
++    space = traits.String(
++        desc='string to attach to the output dataset as its atlas space '
++             'marker.',
++        argstr='-space %s')
++    inv_warp = traits.Bool(
++        desc='invert the final warp before output',
++        argstr='-iwarp')
++    interp = traits.Enum(
++        'linear', 'quintic', 'wsinc5',
++        desc='specify a different interpolation method than might '
++             'be used for the warp',
++        argstr='-interp %s',
++        default='wsinc5')
++    expad = traits.Int(
++        desc='Pad the nonlinear warps by the given number of voxels voxels in '
++             'all directions. The warp displacements are extended by linear '
++             'extrapolation from the faces of the input grid..',
++        argstr='-expad %d')
++    out_file = File(
++        name_template='%s_NwarpCat',
++        desc='output image file name',
++        argstr='-prefix %s',
++        name_source='in_files')
++    verb = traits.Bool(
++        desc='be verbose',
++        argstr='-verb')
++
++
++class NwarpCat(AFNICommand):
++    """Catenates (composes) 3D warps defined on a grid, OR via a matrix.
++
++    .. note::
++
++      * All transformations are from DICOM xyz (in mm) to DICOM xyz.
++
++      * Matrix warps are in files that end in '.1D' or in '.txt'.  A matrix
++        warp file should have 12 numbers in it, as output (for example), by
++        '3dAllineate -1Dmatrix_save'.
++
++      * Nonlinear warps are in dataset files (AFNI .HEAD/.BRIK or NIfTI .nii)
++        with 3 sub-bricks giving the DICOM order xyz grid displacements in mm.
++
++      * If all the input warps are matrices, then the output is a matrix
++        and will be written to the file 'prefix.aff12.1D'.
++        Unless the prefix already contains the string '.1D', in which case
++        the filename is just the prefix.
++
++      * If 'prefix' is just 'stdout', then the output matrix is written
++        to standard output.
++        In any of these cases, the output format is 12 numbers in one row.
++
++      * If any of the input warps are datasets, they must all be defined on
++        the same 3D grid!
++        And of course, then the output will be a dataset on the same grid.
++        However, you can expand the grid using the '-expad' option.
++
++      * The order of operations in the final (output) warp is, for the
++        case of 3 input warps:
++
++            OUTPUT(x) = warp3( warp2( warp1(x) ) )
++
++       That is, warp1 is applied first, then warp2, et cetera.
++       The 3D x coordinates are taken from each grid location in the
++       first dataset defined on a grid.
++
++    For complete details, see the `3dNwarpCat Documentation.
++    <https://afni.nimh.nih.gov/pub/dist/doc/program_help/3dNwarpCat.html>`_
++
++    Examples
++    ========
++
++    >>> from nipype.interfaces import afni
++    >>> nwarpcat = afni.NwarpCat()
++    >>> nwarpcat.inputs.in_files = ['Q25_warp+tlrc.HEAD', ('IDENT', 'structural.nii')]
++    >>> nwarpcat.inputs.out_file = 'Fred_total_WARP'
++    >>> nwarpcat.cmdline  # doctest: +ALLOW_UNICODE
++    "3dNwarpCat -prefix Fred_total_WARP Q25_warp+tlrc.HEAD 'IDENT(structural.nii)'"
++    >>> res = nwarpcat.run()  # doctest: +SKIP
++
++    """
++    _cmd = '3dNwarpCat'
++    input_spec = NwarpCatInputSpec
++    output_spec = AFNICommandOutputSpec
++
++    def _format_arg(self, name, spec, value):
++        if name == 'in_files':
++            return spec.argstr % (' '.join(["'" + v[0] + "(" + v[1] + ")'"
++                                            if isinstance(v, tuple) else v
++                                            for v in value]))
++        return super(NwarpCat, self)._format_arg(name, spec, value)
++
++    def _gen_filename(self, name):
++        if name == 'out_file':
++            return self._gen_fname(self.inputs.in_files[0][0],
++                                   suffix='_NwarpCat')
++
++    def _list_outputs(self):
++        outputs = self.output_spec().get()
++        if isdefined(self.inputs.out_file):
++            outputs['out_file'] = os.path.abspath(self.inputs.out_file)
++        else:
++            outputs['out_file'] = os.path.abspath(self._gen_fname(
++                self.inputs.in_files[0], suffix='_NwarpCat+tlrc', ext='.HEAD'))
++        return outputs
++
++
+ class OneDToolPyInputSpec(AFNIPythonCommandInputSpec):
+     in_file = File(
+         desc='input file to OneDTool',
+diff --git a/nipype/interfaces/bids_utils.py b/nipype/interfaces/bids_utils.py
+index 0bbc89509..0259a8035 100644
+--- a/nipype/interfaces/bids_utils.py
++++ b/nipype/interfaces/bids_utils.py
+@@ -6,15 +6,15 @@ available interfaces are:
+ 
+ BIDSDataGrabber: Query data from BIDS dataset using pybids grabbids.
+ 
+-Change directory to provide relative paths for doctests
+->>> import os
+->>> import bids
+->>> filepath = os.path.realpath(os.path.dirname(bids.__file__))
+->>> datadir = os.path.realpath(os.path.join(filepath, 'grabbids/tests/data/'))
+->>> os.chdir(datadir)
+ 
++    Change directory to provide relative paths for doctests
++    >>> import os
++    >>> filepath = os.path.dirname( os.path.realpath( __file__ ) )
++    >>> datadir = os.path.realpath(os.path.join(filepath, '../testing/data'))
++    >>> os.chdir(datadir)
+ """
+ from os.path import join, dirname
++import json
+ from .. import logging
+ from .base import (traits,
+                    DynamicTraitedSpec,
+@@ -24,13 +24,11 @@ from .base import (traits,
+                    Str,
+                    Undefined)
+ 
++have_pybids = True
+ try:
+     from bids import grabbids as gb
+-    import json
+ except ImportError:
+     have_pybids = False
+-else:
+-    have_pybids = True
+ 
+ LOGGER = logging.getLogger('workflows')
+ 
+@@ -56,9 +54,6 @@ class BIDSDataGrabber(BaseInterface):
+     Examples
+     --------
+ 
+-    >>> from nipype.interfaces.bids_utils import BIDSDataGrabber
+-    >>> from os.path import basename
+-
+     By default, the BIDSDataGrabber fetches anatomical and functional images
+     from a project, and makes BIDS entities (e.g. subject) available for
+     filtering outputs.
+@@ -66,12 +61,7 @@ class BIDSDataGrabber(BaseInterface):
+     >>> bg = BIDSDataGrabber()
+     >>> bg.inputs.base_dir = 'ds005/'
+     >>> bg.inputs.subject = '01'
+-    >>> results = bg.run()
+-    >>> basename(results.outputs.anat[0]) # doctest: +ALLOW_UNICODE
+-    'sub-01_T1w.nii.gz'
+-
+-    >>> basename(results.outputs.func[0]) # doctest: +ALLOW_UNICODE
+-    'sub-01_task-mixedgamblestask_run-01_bold.nii.gz'
++    >>> results = bg.run() # doctest: +SKIP
+ 
+ 
+     Dynamically created, user-defined output fields can also be defined to
+@@ -83,9 +73,7 @@ class BIDSDataGrabber(BaseInterface):
+     >>> bg.inputs.base_dir = 'ds005/'
+     >>> bg.inputs.subject = '01'
+     >>> bg.inputs.output_query['dwi'] = dict(modality='dwi')
+-    >>> results = bg.run()
+-    >>> basename(results.outputs.dwi[0]) # doctest: +ALLOW_UNICODE
+-    'sub-01_dwi.nii.gz'
++    >>> results = bg.run() # doctest: +SKIP
+ 
+     """
+     input_spec = BIDSDataGrabberInputSpec
+@@ -104,32 +92,32 @@ class BIDSDataGrabber(BaseInterface):
+             If no matching items, returns Undefined.
+         """
+         super(BIDSDataGrabber, self).__init__(**kwargs)
+-        if not have_pybids:
+-            raise ImportError(
+-                "The BIDSEventsGrabber interface requires pybids."
+-                " Please make sure it is installed.")
+ 
+         if not isdefined(self.inputs.output_query):
+             self.inputs.output_query = {"func": {"modality": "func"},
+                                         "anat": {"modality": "anat"}}
+ 
+-        # If infields is None, use all BIDS entities
+-        if infields is None:
++        # If infields is empty, use all BIDS entities
++        if not infields is None and have_pybids:
+             bids_config = join(dirname(gb.__file__), 'config', 'bids.json')
+             bids_config = json.load(open(bids_config, 'r'))
+             infields = [i['name'] for i in bids_config['entities']]
+ 
+-        self._infields = infields
++        self._infields = infields or []
+ 
+         # used for mandatory inputs check
+         undefined_traits = {}
+-        for key in infields:
++        for key in self._infields:
+             self.inputs.add_trait(key, traits.Any)
+             undefined_traits[key] = kwargs[key] if key in kwargs else Undefined
+ 
+         self.inputs.trait_set(trait_change_notify=False, **undefined_traits)
+ 
+     def _run_interface(self, runtime):
++        if not have_pybids:
++            raise ImportError(
++                "The BIDSEventsGrabber interface requires pybids."
++                " Please make sure it is installed.")
+         return runtime
+ 
+     def _list_outputs(self):
+diff --git a/nipype/interfaces/io.py b/nipype/interfaces/io.py
+index f2e3fcd94..4d3220b04 100644
+--- a/nipype/interfaces/io.py
++++ b/nipype/interfaces/io.py
+@@ -1188,15 +1188,18 @@ class SelectFilesInputSpec(DynamicTraitedSpec, BaseInterfaceInputSpec):
+     base_directory = Directory(exists=True,
+                                desc="Root path common to templates.")
+     sort_filelist = traits.Bool(True, usedefault=True,
+-                                desc="When matching mutliple files, return them in sorted order.")
++                                desc="When matching mutliple files, return them"
++                                " in sorted order.")
+     raise_on_empty = traits.Bool(True, usedefault=True,
+-                                 desc="Raise an exception if a template pattern matches no files.")
++                                desc="Raise an exception if a template pattern "
++                                "matches no files.")
+     force_lists = traits.Either(traits.Bool(), traits.List(Str()),
+                                 default=False, usedefault=True,
+-                                desc=("Whether to return outputs as a list even when only one file "
+-                                      "matches the template. Either a boolean that applies to all "
+-                                      "output fields or a list of output field names to coerce to "
+-                                      " a list"))
++                                desc=("Whether to return outputs as a list even"
++                                " when only one file matches the template. "
++                                "Either a boolean that applies to all output "
++                                "fields or a list of output field names to "
++                                "coerce to a list"))
+ 
+ 
+ class SelectFiles(IOBase):
+@@ -1296,6 +1299,8 @@ class SelectFiles(IOBase):
+ 
+         for field, template in list(self._templates.items()):
+ 
++            find_dirs = template[-1] == os.sep
++
+             # Build the full template path
+             if isdefined(self.inputs.base_directory):
+                 template = op.abspath(op.join(
+@@ -1303,6 +1308,10 @@ class SelectFiles(IOBase):
+             else:
+                 template = op.abspath(template)
+ 
++            # re-add separator if searching exclusively for directories
++            if find_dirs:
++                template += os.sep
++
+             # Fill in the template and glob for files
+             filled_template = template.format(**info)
+             filelist = glob.glob(filled_template)
+diff --git a/nipype/testing/data/ds005/filler.txt b/nipype/testing/data/ds005/filler.txt
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/nipype/utils/filemanip.py b/nipype/utils/filemanip.py
+index 72cb1fc15..e8a9ea22b 100644
+--- a/nipype/utils/filemanip.py
++++ b/nipype/utils/filemanip.py
+@@ -646,3 +646,20 @@ def write_rst_dict(info, prefix=''):
+     for key, value in sorted(info.items()):
+         out.append('{}* {} : {}'.format(prefix, key, str(value)))
+     return '\n'.join(out) + '\n\n'
++
++
++def dist_is_editable(dist):
++    """Is distribution an editable install?
++
++    Parameters
++    ----------
++    dist : string
++        Package name
++
++    # Borrowed from `pip`'s' API
++    """
++    for path_item in sys.path:
++        egg_link = os.path.join(path_item, dist + '.egg-link')
++        if os.path.isfile(egg_link):
++            return True
++    return False

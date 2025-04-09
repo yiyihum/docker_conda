@@ -1,0 +1,161 @@
+diff --git a/tests/integrations/android_sdk/ADB/test_command.py b/tests/integrations/android_sdk/ADB/test_command.py
+index 07fdb370..cc5250ed 100644
+--- a/tests/integrations/android_sdk/ADB/test_command.py
++++ b/tests/integrations/android_sdk/ADB/test_command.py
+@@ -1,5 +1,6 @@
+ import os
+ import subprocess
++import sys
+ from pathlib import Path
+ 
+ import pytest
+@@ -18,7 +19,12 @@ def test_simple_command(mock_sdk, tmp_path):
+     # Check that adb was invoked with the expected commands
+     mock_sdk.command.subprocess.check_output.assert_called_once_with(
+         [
+-            os.fsdecode(tmp_path / "sdk" / "platform-tools" / "adb"),
++            os.fsdecode(
++                tmp_path
++                / "sdk"
++                / "platform-tools"
++                / f"adb{'.exe' if sys.platform == 'win32' else ''}"
++            ),
+             "-s",
+             "exampleDevice",
+             "example",
+@@ -63,7 +69,12 @@ def test_error_handling(mock_sdk, tmp_path, name, exception):
+     # Check that adb was invoked as expected
+     mock_sdk.command.subprocess.check_output.assert_called_once_with(
+         [
+-            os.fsdecode(tmp_path / "sdk" / "platform-tools" / "adb"),
++            os.fsdecode(
++                tmp_path
++                / "sdk"
++                / "platform-tools"
++                / f"adb{'.exe' if sys.platform == 'win32' else ''}"
++            ),
+             "-s",
+             "exampleDevice",
+             "example",
+diff --git a/tests/integrations/android_sdk/AndroidSDK/test_verify_emulator.py b/tests/integrations/android_sdk/AndroidSDK/test_verify_emulator.py
+index 610a8647..6315f404 100644
+--- a/tests/integrations/android_sdk/AndroidSDK/test_verify_emulator.py
++++ b/tests/integrations/android_sdk/AndroidSDK/test_verify_emulator.py
+@@ -1,16 +1,29 @@
+ import os
+ import subprocess
++import sys
+ 
+ import pytest
+ 
+ from briefcase.exceptions import BriefcaseCommandError
+ 
++from ....utils import create_file
++
++
++def create_emulator(root_path):
++    # Create `emulator` within `root_path`.
++    if sys.platform == "win32":
++        emulator_bin = "emulator.exe"
++    else:
++        emulator_bin = "emulator"
++
++    create_file(root_path / "emulator" / emulator_bin, "The Emulator", chmod=0o755)
++
+ 
+ def test_succeeds_immediately_if_emulator_installed(mock_sdk):
+     """`verify_emulator()` exits early if the emulator exists in its
+     root_path."""
+     # Create `emulator` within `root_path`.
+-    (mock_sdk.root_path / "emulator").mkdir(parents=True)
++    create_emulator(mock_sdk.root_path)
+ 
+     # Also create the platforms folder
+     (mock_sdk.root_path / "platforms").mkdir(parents=True)
+@@ -28,7 +41,7 @@ def test_succeeds_immediately_if_emulator_installed(mock_sdk):
+ def test_creates_platforms_folder(mock_sdk):
+     """If the platforms folder doesn't exist, it is created."""
+     # Create `emulator` within `root_path`.
+-    (mock_sdk.root_path / "emulator").mkdir(parents=True)
++    create_emulator(mock_sdk.root_path)
+ 
+     # Verify the emulator. This should create the missing platforms folder.
+     mock_sdk.verify_emulator()
+@@ -59,6 +72,28 @@ def test_installs_android_emulator(mock_sdk):
+     )
+ 
+ 
++def test_partial_android_emulator_install(mock_sdk):
++    """If the Android emulator is only partially installed, it's not
++    detected."""
++    # Create the emulator *directory*, but not the actual binary.
++    (mock_sdk.root_path / "emulator").mkdir(parents=True)
++
++    mock_sdk.verify_emulator()
++
++    # Platforms folder now exists
++    assert (mock_sdk.root_path / "platforms").exists()
++
++    mock_sdk.command.subprocess.run.assert_called_once_with(
++        [
++            os.fsdecode(mock_sdk.sdkmanager_path),
++            "platform-tools",
++            "emulator",
++        ],
++        env=mock_sdk.env,
++        check=True,
++    )
++
++
+ def test_install_problems_are_reported(mock_sdk):
+     """If the sdkmanager fails to properly install the Android emulator, an
+     exception is raised."""
+diff --git a/tests/integrations/android_sdk/conftest.py b/tests/integrations/android_sdk/conftest.py
+index 1010a8a6..8845e05e 100644
+--- a/tests/integrations/android_sdk/conftest.py
++++ b/tests/integrations/android_sdk/conftest.py
+@@ -1,3 +1,4 @@
++import platform
+ from pathlib import Path
+ from unittest.mock import MagicMock
+ 
+@@ -17,9 +18,8 @@ def mock_sdk(tmp_path):
+     command.input = DummyConsole()
+     command.logger = Log(verbosity=1)
+ 
+-    # For default test purposes, assume we're on macOS x86_64
+-    command.host_os = "Darwin"
+-    command.host_arch = "x86_64"
++    command.host_arch = platform.machine()
++    command.host_os = platform.system()
+ 
+     # Mock an empty environment
+     command.os.environ = {}
+diff --git a/tests/utils.py b/tests/utils.py
+index 0295996a..165c13e1 100644
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -1,3 +1,4 @@
++import os
+ import zipfile
+ from unittest.mock import MagicMock
+ 
+@@ -31,7 +32,7 @@ class FsPathMock(MagicMock):
+         return MagicMock(**kw)
+ 
+ 
+-def create_file(filepath, content, mode="w"):
++def create_file(filepath, content, mode="w", chmod=None):
+     """A test utility to create a file with known content.
+ 
+     Ensures that the directory for the file exists, and writes a file with
+@@ -48,6 +49,9 @@ def create_file(filepath, content, mode="w"):
+     with filepath.open(mode) as f:
+         f.write(content)
+ 
++    if chmod:
++        os.chmod(filepath, chmod)
++
+     return filepath
+ 
+ 

@@ -1,0 +1,231 @@
+diff --git a/babel/messages/extract.py b/babel/messages/extract.py
+index b6dce6f..4fc3da7 100644
+--- a/babel/messages/extract.py
++++ b/babel/messages/extract.py
+@@ -55,7 +55,8 @@ if TYPE_CHECKING:
+         def seek(self, __offset: int, __whence: int = ...) -> int: ...
+         def tell(self) -> int: ...
+ 
+-    _Keyword: TypeAlias = tuple[int | tuple[int, int] | tuple[int, str], ...] | None
++    _SimpleKeyword: TypeAlias = tuple[int | tuple[int, int] | tuple[int, str], ...] | None
++    _Keyword: TypeAlias = dict[int | None, _SimpleKeyword] | _SimpleKeyword
+ 
+     # 5-tuple of (filename, lineno, messages, comments, context)
+     _FileExtractionResult: TypeAlias = tuple[str, int, str | tuple[str, ...], list[str], str | None]
+@@ -315,6 +316,47 @@ def extract_from_file(
+                             options, strip_comment_tags))
+ 
+ 
++def _match_messages_against_spec(lineno: int, messages: list[str|None], comments: list[str],
++                                 fileobj: _FileObj, spec: tuple[int|tuple[int, str], ...]):
++    translatable = []
++    context = None
++
++    # last_index is 1 based like the keyword spec
++    last_index = len(messages)
++    for index in spec:
++        if isinstance(index, tuple): # (n, 'c')
++            context = messages[index[0] - 1]
++            continue
++        if last_index < index:
++            # Not enough arguments
++            return
++        message = messages[index - 1]
++        if message is None:
++            return
++        translatable.append(message)
++
++    # keyword spec indexes are 1 based, therefore '-1'
++    if isinstance(spec[0], tuple):
++        # context-aware *gettext method
++        first_msg_index = spec[1] - 1
++    else:
++        first_msg_index = spec[0] - 1
++    # An empty string msgid isn't valid, emit a warning
++    if not messages[first_msg_index]:
++        filename = (getattr(fileobj, "name", None) or "(unknown)")
++        sys.stderr.write(
++            f"{filename}:{lineno}: warning: Empty msgid.  It is reserved by GNU gettext: gettext(\"\") "
++            f"returns the header entry with meta information, not the empty string.\n"
++        )
++        return
++
++    translatable = tuple(translatable)
++    if len(translatable) == 1:
++        translatable = translatable[0]
++
++    return lineno, translatable, comments, context
++
++
+ def extract(
+     method: _ExtractionMethod,
+     fileobj: _FileObj,
+@@ -400,56 +442,30 @@ def extract(
+                    options=options or {})
+ 
+     for lineno, funcname, messages, comments in results:
+-        spec = keywords[funcname] or (1,) if funcname else (1,)
+         if not isinstance(messages, (list, tuple)):
+             messages = [messages]
+         if not messages:
+             continue
+ 
+-        # Validate the messages against the keyword's specification
+-        context = None
+-        msgs = []
+-        invalid = False
+-        # last_index is 1 based like the keyword spec
+-        last_index = len(messages)
+-        for index in spec:
+-            if isinstance(index, tuple):
+-                context = messages[index[0] - 1]
+-                continue
+-            if last_index < index:
+-                # Not enough arguments
+-                invalid = True
+-                break
+-            message = messages[index - 1]
+-            if message is None:
+-                invalid = True
+-                break
+-            msgs.append(message)
+-        if invalid:
+-            continue
+-
+-        # keyword spec indexes are 1 based, therefore '-1'
+-        if isinstance(spec[0], tuple):
+-            # context-aware *gettext method
+-            first_msg_index = spec[1] - 1
+-        else:
+-            first_msg_index = spec[0] - 1
+-        if not messages[first_msg_index]:
+-            # An empty string msgid isn't valid, emit a warning
+-            filename = (getattr(fileobj, "name", None) or "(unknown)")
+-            sys.stderr.write(
+-                f"{filename}:{lineno}: warning: Empty msgid.  It is reserved by GNU gettext: gettext(\"\") "
+-                f"returns the header entry with meta information, not the empty string.\n"
+-            )
+-            continue
+-
+-        messages = tuple(msgs)
+-        if len(messages) == 1:
+-            messages = messages[0]
++        specs = keywords[funcname] or None if funcname else None
++        # {None: x} may be collapsed into x for backwards compatibility.
++        if not isinstance(specs, dict):
++            specs = {None: specs}
+ 
+         if strip_comment_tags:
+             _strip_comment_tags(comments, comment_tags)
+-        yield lineno, messages, comments, context
++
++        # None matches all arities.
++        for arity in (None, len(messages)):
++            try:
++                spec = specs[arity]
++            except KeyError:
++                continue
++            if spec is None:
++                spec = (1,)
++            result = _match_messages_against_spec(lineno, messages, comments, fileobj, spec)
++            if result is not None:
++                yield result
+ 
+ 
+ def extract_nothing(
+diff --git a/babel/messages/frontend.py b/babel/messages/frontend.py
+index 6ed1fe5..0008a9b 100644
+--- a/babel/messages/frontend.py
++++ b/babel/messages/frontend.py
+@@ -8,6 +8,8 @@
+     :license: BSD, see LICENSE for more details.
+ """
+ 
++from __future__ import annotations
++
+ import datetime
+ import fnmatch
+ import logging
+@@ -1111,34 +1113,63 @@ def parse_mapping(fileobj, filename=None):
+ 
+     return method_map, options_map
+ 
++def _parse_spec(s: str) -> tuple[int | None, tuple[int|tuple[int, str], ...]]:
++    inds = []
++    number = None
++    for x in s.split(','):
++        if x[-1] == 't':
++            number = int(x[:-1])
++        elif x[-1] == 'c':
++            inds.append((int(x[:-1]), 'c'))
++        else:
++            inds.append(int(x))
++    return number, tuple(inds)
+ 
+ def parse_keywords(strings: Iterable[str] = ()):
+     """Parse keywords specifications from the given list of strings.
+ 
+-    >>> kw = sorted(parse_keywords(['_', 'dgettext:2', 'dngettext:2,3', 'pgettext:1c,2']).items())
+-    >>> for keyword, indices in kw:
+-    ...     print((keyword, indices))
+-    ('_', None)
+-    ('dgettext', (2,))
+-    ('dngettext', (2, 3))
+-    ('pgettext', ((1, 'c'), 2))
++    >>> import pprint
++    >>> keywords = ['_', 'dgettext:2', 'dngettext:2,3', 'pgettext:1c,2',
++    ...             'polymorphic:1', 'polymorphic:2,2t', 'polymorphic:3c,3t']
++    >>> pprint.pprint(parse_keywords(keywords))
++    {'_': None,
++     'dgettext': (2,),
++     'dngettext': (2, 3),
++     'pgettext': ((1, 'c'), 2),
++     'polymorphic': {None: (1,), 2: (2,), 3: ((3, 'c'),)}}
++
++    The input keywords are in GNU Gettext style; see :doc:`cmdline` for details.
++
++    The output is a dictionary mapping keyword names to a dictionary of specifications.
++    Keys in this dictionary are numbers of arguments, where ``None`` means that all numbers
++    of arguments are matched, and a number means only calls with that number of arguments
++    are matched (which happens when using the "t" specifier). However, as a special
++    case for backwards compatibility, if the dictionary of specifications would
++    be ``{None: x}``, i.e., there is only one specification and it matches all argument
++    counts, then it is collapsed into just ``x``.
++
++    A specification is either a tuple or None. If a tuple, each element can be either a number
++    ``n``, meaning that the nth argument should be extracted as a message, or the tuple
++    ``(n, 'c')``, meaning that the nth argument should be extracted as context for the
++    messages. A ``None`` specification is equivalent to ``(1,)``, extracting the first
++    argument.
+     """
+     keywords = {}
+     for string in strings:
+         if ':' in string:
+-            funcname, indices = string.split(':')
++            funcname, spec_str = string.split(':')
++            number, spec = _parse_spec(spec_str)
+         else:
+-            funcname, indices = string, None
+-        if funcname not in keywords:
+-            if indices:
+-                inds = []
+-                for x in indices.split(','):
+-                    if x[-1] == 'c':
+-                        inds.append((int(x[:-1]), 'c'))
+-                    else:
+-                        inds.append(int(x))
+-                indices = tuple(inds)
+-            keywords[funcname] = indices
++            funcname = string
++            number = None
++            spec = None
++        keywords.setdefault(funcname, {})[number] = spec
++
++    # For best backwards compatibility, collapse {None: x} into x.
++    for k, v in keywords.items():
++        if set(v) == {None}:
++            keywords[k] = v[None]
++
+     return keywords
+ 
+ 

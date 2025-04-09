@@ -1,0 +1,115 @@
+diff --git a/pooch/tests/data/registry-custom-url.txt b/pooch/tests/data/registry-custom-url.txt
+index 97be99b..63f432e 100644
+--- a/pooch/tests/data/registry-custom-url.txt
++++ b/pooch/tests/data/registry-custom-url.txt
+@@ -4,3 +4,6 @@ store.zip 0498d2a001e71051bbd2acd2346f38da7cbd345a633cb7bf0f8a20938714b51a
+ tiny-data.txt baee0894dba14b12085eacb204284b97e362f4f3e5a5807693cc90ef415c1b2d https://some-site/tiny-data.txt
+ tiny-data.tar.gz 41503f083814f43a01a8e9a30c28d7a9fe96839a99727a7fdd0acf7cd5bab63b
+ store.tar.gz 088c7f4e0f1859b1c769bb6065de24376f366374817ede8691a6ac2e49f29511
++tiny-data.txt.bz2 753663687a4040c90c8578061867d1df623e6aa8011c870a5dbd88ee3c82e306
++tiny-data.txt.gz 2e2da6161291657617c32192dba95635706af80c6e7335750812907b58fd4b52
++tiny-data.txt.xz 99dcb5c32a6e916344bacb4badcbc2f2b6ee196977d1d8187610c21e7e607765
+diff --git a/pooch/tests/data/registry.txt b/pooch/tests/data/registry.txt
+index 8a7dcef..5795633 100644
+--- a/pooch/tests/data/registry.txt
++++ b/pooch/tests/data/registry.txt
+@@ -4,3 +4,6 @@ tiny-data.zip 0d49e94f07bc1866ec57e7fd1b93a351fba36842ec9b13dd50bf94e8dfa35cbb
+ store.zip 0498d2a001e71051bbd2acd2346f38da7cbd345a633cb7bf0f8a20938714b51a
+ tiny-data.tar.gz 41503f083814f43a01a8e9a30c28d7a9fe96839a99727a7fdd0acf7cd5bab63b
+ store.tar.gz 088c7f4e0f1859b1c769bb6065de24376f366374817ede8691a6ac2e49f29511
++tiny-data.txt.bz2 753663687a4040c90c8578061867d1df623e6aa8011c870a5dbd88ee3c82e306
++tiny-data.txt.gz 2e2da6161291657617c32192dba95635706af80c6e7335750812907b58fd4b52
++tiny-data.txt.xz 99dcb5c32a6e916344bacb4badcbc2f2b6ee196977d1d8187610c21e7e607765
+diff --git a/pooch/tests/test_processors.py b/pooch/tests/test_processors.py
+index c2dae3f..acbcc19 100644
+--- a/pooch/tests/test_processors.py
++++ b/pooch/tests/test_processors.py
+@@ -12,7 +12,7 @@ import warnings
+ import pytest
+ 
+ from .. import Pooch
+-from ..processors import Unzip, Untar, ExtractorProcessor
++from ..processors import Unzip, Untar, ExtractorProcessor, Decompress
+ 
+ from .utils import pooch_test_url, pooch_test_registry, check_tiny_data
+ 
+@@ -21,6 +21,66 @@ REGISTRY = pooch_test_registry()
+ BASEURL = pooch_test_url()
+ 
+ 
++@pytest.mark.parametrize(
++    "method,ext",
++    [("auto", "xz"), ("lzma", "xz"), ("xz", "xz"), ("bzip2", "bz2"), ("gzip", "gz")],
++    ids=["auto", "lzma", "xz", "bz2", "gz"],
++)
++def test_decompress(method, ext):
++    "Check that decompression after download works for all formats"
++    processor = Decompress(method=method)
++    with TemporaryDirectory() as local_store:
++        path = Path(local_store)
++        true_path = str(path / ".".join(["tiny-data.txt", ext, "decomp"]))
++        # Setup a pooch in a temp dir
++        pup = Pooch(path=path, base_url=BASEURL, registry=REGISTRY)
++        # Check the warnings when downloading and from the processor
++        with warnings.catch_warnings(record=True) as warn:
++            fname = pup.fetch("tiny-data.txt." + ext, processor=processor)
++            assert len(warn) == 2
++            assert all(issubclass(w.category, UserWarning) for w in warn)
++            assert str(warn[-2].message).split()[0] == "Downloading"
++            assert str(warn[-1].message).startswith("Decompressing")
++            assert method in str(warn[-1].message)
++        assert fname == true_path
++        check_tiny_data(fname)
++        # Check that processor doesn't execute when not downloading
++        with warnings.catch_warnings(record=True) as warn:
++            fname = pup.fetch("tiny-data.txt." + ext, processor=processor)
++            assert not warn
++        assert fname == true_path
++        check_tiny_data(fname)
++
++
++def test_decompress_fails():
++    "Should fail if method='auto' and no extension is given in the file name"
++    with TemporaryDirectory() as local_store:
++        path = Path(local_store)
++        pup = Pooch(path=path, base_url=BASEURL, registry=REGISTRY)
++        with pytest.raises(ValueError) as exception:
++            with warnings.catch_warnings():
++                pup.fetch("tiny-data.txt", processor=Decompress(method="auto"))
++        assert exception.value.args[0].startswith("Unrecognized extension '.txt'")
++        # Should also fail for a bad method name
++        with pytest.raises(ValueError) as exception:
++            with warnings.catch_warnings():
++                pup.fetch("tiny-data.txt", processor=Decompress(method="bla"))
++        assert exception.value.args[0].startswith("Invalid compression method 'bla'")
++
++
++@pytest.mark.parametrize(
++    "method,ext", [("lzma", "xz"), ("bzip2", "bz2")], ids=["lzma", "bz2"]
++)
++def test_decompress_27_missing_dependencies(method, ext):
++    "Raises an exception when missing extra dependencies for 2.7"
++    decompress = Decompress(method=method)
++    decompress.modules[method] = None
++    with pytest.raises(ValueError) as exception:
++        with warnings.catch_warnings():
++            decompress(fname="meh.txt." + ext, action="download", pooch=None)
++    assert method in exception.value.args[0]
++
++
+ def test_extractprocessor_fails():
+     "The base class should be used and should fail when passed to fecth"
+     with TemporaryDirectory() as local_store:
+diff --git a/pooch/tests/utils.py b/pooch/tests/utils.py
+index 9ea7f33..65e6c3a 100644
+--- a/pooch/tests/utils.py
++++ b/pooch/tests/utils.py
+@@ -57,5 +57,8 @@ def pooch_test_registry():
+         "store.zip": "0498d2a001e71051bbd2acd2346f38da7cbd345a633cb7bf0f8a20938714b51a",
+         "tiny-data.tar.gz": "41503f083814f43a01a8e9a30c28d7a9fe96839a99727a7fdd0acf7cd5bab63b",
+         "store.tar.gz": "088c7f4e0f1859b1c769bb6065de24376f366374817ede8691a6ac2e49f29511",
++        "tiny-data.txt.bz2": "753663687a4040c90c8578061867d1df623e6aa8011c870a5dbd88ee3c82e306",
++        "tiny-data.txt.gz": "2e2da6161291657617c32192dba95635706af80c6e7335750812907b58fd4b52",
++        "tiny-data.txt.xz": "99dcb5c32a6e916344bacb4badcbc2f2b6ee196977d1d8187610c21e7e607765",
+     }
+     return registry

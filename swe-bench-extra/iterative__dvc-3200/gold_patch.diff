@@ -1,0 +1,85 @@
+diff --git a/dvc/config.py b/dvc/config.py
+--- a/dvc/config.py
++++ b/dvc/config.py
+@@ -198,6 +198,7 @@ class Config(object):  # pylint: disable=too-many-instance-attributes
+     SECTION_REMOTE_ASK_PASSWORD = "ask_password"
+     SECTION_REMOTE_GSS_AUTH = "gss_auth"
+     SECTION_REMOTE_NO_TRAVERSE = "no_traverse"
++    SECTION_REMOTE_VERIFY = "verify"
+     SECTION_REMOTE_SCHEMA = {
+         Required(SECTION_REMOTE_URL): str,
+         SECTION_AWS_REGION: str,
+@@ -232,6 +233,7 @@ class Config(object):  # pylint: disable=too-many-instance-attributes
+         SECTION_GDRIVE_USER_CREDENTIALS_FILE: str,
+         PRIVATE_CWD: str,
+         SECTION_REMOTE_NO_TRAVERSE: Bool,
++        SECTION_REMOTE_VERIFY: Bool,
+     }
+ 
+     SECTION_STATE = "state"
+diff --git a/dvc/data_cloud.py b/dvc/data_cloud.py
+--- a/dvc/data_cloud.py
++++ b/dvc/data_cloud.py
+@@ -73,13 +73,25 @@ def pull(self, cache, jobs=None, remote=None, show_checksums=False):
+             show_checksums (bool): show checksums instead of file names in
+                 information messages.
+         """
+-        return self.repo.cache.local.pull(
+-            cache,
+-            jobs=jobs,
+-            remote=self.get_remote(remote, "pull"),
+-            show_checksums=show_checksums,
++        remote = self.get_remote(remote, "pull")
++        downloaded_items_num = self.repo.cache.local.pull(
++            cache, jobs=jobs, remote=remote, show_checksums=show_checksums
+         )
+ 
++        if not remote.verify:
++            self._save_pulled_checksums(cache)
++
++        return downloaded_items_num
++
++    def _save_pulled_checksums(self, cache):
++        for checksum in cache["local"].keys():
++            cache_file = self.repo.cache.local.checksum_to_path_info(checksum)
++            if self.repo.cache.local.exists(cache_file):
++                # We can safely save here, as existing corrupted files will be
++                # removed upon status, while files corrupted during download
++                # will not be moved from tmp_file (see `RemoteBASE.download()`)
++                self.repo.state.save(cache_file, checksum)
++
+     def status(self, cache, jobs=None, remote=None, show_checksums=False):
+         """Check status of data items in a cloud-agnostic way.
+ 
+diff --git a/dvc/remote/base.py b/dvc/remote/base.py
+--- a/dvc/remote/base.py
++++ b/dvc/remote/base.py
+@@ -80,6 +80,7 @@ class RemoteBASE(object):
+     CHECKSUM_JOBS = max(1, min(4, cpu_count() // 2))
+     DEFAULT_CACHE_TYPES = ["copy"]
+     DEFAULT_NO_TRAVERSE = True
++    DEFAULT_VERIFY = False
+ 
+     state = StateNoop()
+ 
+@@ -93,6 +94,9 @@ def __init__(self, repo, config):
+         self.no_traverse = config.get(
+             Config.SECTION_REMOTE_NO_TRAVERSE, self.DEFAULT_NO_TRAVERSE
+         )
++        self.verify = config.get(
++            Config.SECTION_REMOTE_VERIFY, self.DEFAULT_VERIFY
++        )
+         self._dir_info = {}
+ 
+         types = config.get(Config.SECTION_CACHE_TYPE, None)
+diff --git a/dvc/remote/gdrive.py b/dvc/remote/gdrive.py
+--- a/dvc/remote/gdrive.py
++++ b/dvc/remote/gdrive.py
+@@ -63,6 +63,7 @@ class RemoteGDrive(RemoteBASE):
+     path_cls = CloudURLInfo
+     REQUIRES = {"pydrive2": "pydrive2"}
+     DEFAULT_NO_TRAVERSE = False
++    DEFAULT_VERIFY = True
+ 
+     GDRIVE_USER_CREDENTIALS_DATA = "GDRIVE_USER_CREDENTIALS_DATA"
+     DEFAULT_USER_CREDENTIALS_FILE = "gdrive-user-credentials.json"

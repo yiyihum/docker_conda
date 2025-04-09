@@ -1,0 +1,111 @@
+diff --git a/README.md b/README.md
+index f80bdb0..a8fb92f 100644
+--- a/README.md
++++ b/README.md
+@@ -152,7 +152,7 @@ the incoming request, rather than accessing the ASGI scope and receive channel d
+ 
+ ### Request
+ 
+-Signature: `Request(scope, receive)`
++Signature: `Request(scope, receive=None)`
+ 
+ ```python
+ class App:
+@@ -166,6 +166,11 @@ class App:
+         await response(receive, send)
+ ```
+ 
++Requests present a mapping interface, so you can use them in the same
++way as a `scope`.
++
++For instance: `request['path']` will return the ASGI path.
++
+ #### Method
+ 
+ The request method is accessed as `request.method`.
+diff --git a/starlette/decorators.py b/starlette/decorators.py
+index 8c57531..6c7969b 100644
+--- a/starlette/decorators.py
++++ b/starlette/decorators.py
+@@ -5,8 +5,10 @@ from starlette.types import ASGIInstance, Receive, Send, Scope
+ 
+ def asgi_application(func):
+     def app(scope: Scope) -> ASGIInstance:
++        request = Request(scope)
++
+         async def awaitable(receive: Receive, send: Send) -> None:
+-            request = Request(scope, receive)
++            request.set_receive_channel(receive)
+             response = func(request)
+             await response(receive, send)
+ 
+diff --git a/starlette/request.py b/starlette/request.py
+index 25918e0..b677bee 100644
+--- a/starlette/request.py
++++ b/starlette/request.py
+@@ -1,19 +1,33 @@
+ from starlette.datastructures import URL, Headers, QueryParams
++from collections.abc import Mapping
+ import json
++import typing
+ 
+ 
+-class Request:
+-    def __init__(self, scope, receive):
++class Request(Mapping):
++    def __init__(self, scope, receive=None):
+         self._scope = scope
+         self._receive = receive
+         self._stream_consumed = False
+ 
++    def __getitem__(self, key):
++        return self._scope[key]
++
++    def __iter__(self):
++        return iter(self._scope)
++
++    def __len__(self):
++        return len(self._scope)
++
++    def set_receive_channel(self, receive):
++        self._receive = receive
++
+     @property
+-    def method(self):
++    def method(self) -> str:
+         return self._scope["method"]
+ 
+     @property
+-    def url(self):
++    def url(self) -> URL:
+         if not hasattr(self, "_url"):
+             scheme = self._scope["scheme"]
+             host, port = self._scope["server"]
+@@ -32,7 +46,7 @@ class Request:
+         return self._url
+ 
+     @property
+-    def headers(self):
++    def headers(self) -> Headers:
+         if not hasattr(self, "_headers"):
+             self._headers = Headers(
+                 [
+@@ -43,7 +57,7 @@ class Request:
+         return self._headers
+ 
+     @property
+-    def query_params(self):
++    def query_params(self) -> QueryParams:
+         if not hasattr(self, "_query_params"):
+             query_string = self._scope["query_string"].decode()
+             self._query_params = QueryParams(query_string)
+@@ -57,6 +71,9 @@ class Request:
+         if self._stream_consumed:
+             raise RuntimeError("Stream consumed")
+ 
++        if self._receive is None:
++            raise RuntimeError("Receive channel has not been made available")
++
+         self._stream_consumed = True
+         while True:
+             message = await self._receive()

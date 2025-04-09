@@ -1,0 +1,301 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index 214f013..d291200 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -6,6 +6,8 @@
+ ### Added
+ - `ALLOW_SPLIT_BEFORE_DEFAULT_OR_NAMED_ASSIGNS` allows us to split before
+   default / named assignments.
++- `ARITHMETIC_PRECEDENCE_INDICATION` removes spacing around binary operators
++  if they have higher precedence than other operators in the same expression.
+ ### Changed
+ - `SPACES_BEFORE_COMMENT` can now be assigned to a specific value (standard
+   behavior) or a list of column values. When assigned to a list, trailing 
+@@ -13,6 +15,8 @@
+   the list that is greater than the maximum line length in the block.
+ - Don't modify the vertical spacing of a line that has a comment "pylint:
+   disable=line-too-long". The line is expected to be too long.
++- improved `CONTINUATION_ALIGN_STYLE` to accept quoted or underline-separated
++  option value for passing option with command line arguments.
+ ### Fixed
+ - When retrieving the opening bracket make sure that it's actually an opening
+   bracket.
+@@ -26,6 +30,8 @@
+   multiple lines with the opening bracket on the same line as the key.
+   Therefore, we shouldn't enforce a split because of that.
+ - Increase split penalty around exponent operator.
++- Correct spacing when using binary operators on strings with the
++  `NO_SPACES_AROUND_SELECTED_BINARY_OPERATORS` option enabled.
+ 
+ ## [0.25.0] 2018-11-25
+ ### Added
+diff --git a/README.rst b/README.rst
+index 2465ebc..388ddaa 100644
+--- a/README.rst
++++ b/README.rst
+@@ -333,6 +333,29 @@ Knobs
+ ``ALLOW_SPLIT_BEFORE_DICT_VALUE``
+     Allow splits before the dictionary value.
+ 
++``ARITHMETIC_PRECEDENCE_INDICATION``
++    Let spacing indicate operator precedence. For example:
++
++    .. code-block:: python
++
++        a = 1 * 2 + 3 / 4
++        b = 1 / 2 - 3 * 4
++        c = (1 + 2) * (3 - 4)
++        d = (1 - 2) / (3 + 4)
++        e = 1 * 2 - 3
++        f = 1 + 2 + 3 + 4
++
++    will be formatted as follows to indicate precedence:
++
++    .. code-block:: python
++
++        a = 1*2 + 3/4
++        b = 1/2 - 3*4
++        c = (1+2) * (3-4)
++        d = (1-2) / (3+4)
++        e = 1*2 - 3
++        f = 1 + 2 + 3 + 4
++
+ ``BLANK_LINE_BEFORE_NESTED_CLASS_OR_DEF``
+     Insert a blank line before a ``def`` or ``class`` immediately nested within
+     another ``def`` or ``class``. For example:
+diff --git a/yapf/yapflib/format_token.py b/yapf/yapflib/format_token.py
+index 9b428b3..8d41b90 100644
+--- a/yapf/yapflib/format_token.py
++++ b/yapf/yapflib/format_token.py
+@@ -36,6 +36,8 @@ class Subtype(object):
+   NONE = 0
+   UNARY_OPERATOR = 1
+   BINARY_OPERATOR = 2
++  A_EXPR_OPERATOR = 22
++  M_EXPR_OPERATOR = 23
+   SUBSCRIPT_COLON = 3
+   SUBSCRIPT_BRACKET = 4
+   DEFAULT_OR_NAMED_ASSIGN = 5
+@@ -55,6 +57,7 @@ class Subtype(object):
+   DECORATOR = 18
+   TYPED_NAME = 19
+   TYPED_NAME_ARG_LIST = 20
++  SIMPLE_EXPRESSION = 24
+ 
+ 
+ def _TabbedContinuationAlignPadding(spaces, align_style, tab_width,
+@@ -280,6 +283,30 @@ class FormatToken(object):
+     """Token is a binary operator."""
+     return Subtype.BINARY_OPERATOR in self.subtypes
+ 
++  @property
++  @py3compat.lru_cache()
++  def is_a_expr_op(self):
++    """Token is an a_expr operator."""
++    return Subtype.A_EXPR_OPERATOR in self.subtypes
++
++  @property
++  @py3compat.lru_cache()
++  def is_m_expr_op(self):
++    """Token is an m_expr operator."""
++    return Subtype.M_EXPR_OPERATOR in self.subtypes
++
++  @property
++  @py3compat.lru_cache()
++  def is_arithmetic_op(self):
++    """Token is an arithmetic operator."""
++    return self.is_a_expr_op or self.is_m_expr_op
++
++  @property
++  @py3compat.lru_cache()
++  def is_simple_expr(self):
++    """Token is an operator in a simple expression."""
++    return Subtype.SIMPLE_EXPRESSION in self.subtypes
++
+   @property
+   @py3compat.lru_cache()
+   def name(self):
+diff --git a/yapf/yapflib/style.py b/yapf/yapflib/style.py
+index 8345304..579458d 100644
+--- a/yapf/yapflib/style.py
++++ b/yapf/yapflib/style.py
+@@ -64,6 +64,26 @@ _STYLE_HELP = dict(
+       """),
+     ALLOW_SPLIT_BEFORE_DICT_VALUE=textwrap.dedent("""\
+       Allow splits before the dictionary value."""),
++    ARITHMETIC_PRECEDENCE_INDICATION=textwrap.dedent("""\
++      Let spacing indicate operator precedence. For example:
++
++        a = 1 * 2 + 3 / 4
++        b = 1 / 2 - 3 * 4
++        c = (1 + 2) * (3 - 4)
++        d = (1 - 2) / (3 + 4)
++        e = 1 * 2 - 3
++        f = 1 + 2 + 3 + 4
++
++    will be formatted as follows to indicate precedence:
++
++        a = 1*2 + 3/4
++        b = 1/2 - 3*4
++        c = (1+2) * (3-4)
++        d = (1-2) / (3+4)
++        e = 1*2 - 3
++        f = 1 + 2 + 3 + 4
++
++      """),
+     BLANK_LINE_BEFORE_NESTED_CLASS_OR_DEF=textwrap.dedent("""\
+       Insert a blank line before a 'def' or 'class' immediately nested
+       within another 'def' or 'class'. For example:
+@@ -319,6 +339,7 @@ def CreatePEP8Style():
+       ALLOW_MULTILINE_DICTIONARY_KEYS=False,
+       ALLOW_SPLIT_BEFORE_DEFAULT_OR_NAMED_ASSIGNS=True,
+       ALLOW_SPLIT_BEFORE_DICT_VALUE=True,
++      ARITHMETIC_PRECEDENCE_INDICATION=False,
+       BLANK_LINE_BEFORE_NESTED_CLASS_OR_DEF=False,
+       BLANK_LINE_BEFORE_CLASS_DOCSTRING=False,
+       BLANK_LINE_BEFORE_MODULE_DOCSTRING=False,
+@@ -437,7 +458,7 @@ def _ContinuationAlignStyleStringConverter(s):
+   """Option value converter for a continuation align style string."""
+   accepted_styles = ('SPACE', 'FIXED', 'VALIGN-RIGHT')
+   if s:
+-    r = s.upper()
++    r = s.strip('"\'').replace('_', '-').upper()
+     if r not in accepted_styles:
+       raise ValueError('unknown continuation align style: %r' % (s,))
+   else:
+@@ -489,6 +510,7 @@ _STYLE_OPTION_VALUE_CONVERTER = dict(
+     ALLOW_MULTILINE_DICTIONARY_KEYS=_BoolConverter,
+     ALLOW_SPLIT_BEFORE_DEFAULT_OR_NAMED_ASSIGNS=_BoolConverter,
+     ALLOW_SPLIT_BEFORE_DICT_VALUE=_BoolConverter,
++    ARITHMETIC_PRECEDENCE_INDICATION=_BoolConverter,
+     BLANK_LINE_BEFORE_NESTED_CLASS_OR_DEF=_BoolConverter,
+     BLANK_LINE_BEFORE_CLASS_DOCSTRING=_BoolConverter,
+     BLANK_LINE_BEFORE_MODULE_DOCSTRING=_BoolConverter,
+diff --git a/yapf/yapflib/subtype_assigner.py b/yapf/yapflib/subtype_assigner.py
+index beb8052..af1e0ad 100644
+--- a/yapf/yapflib/subtype_assigner.py
++++ b/yapf/yapflib/subtype_assigner.py
+@@ -187,16 +187,27 @@ class _SubtypeAssigner(pytree_visitor.PyTreeVisitor):
+     # arith_expr ::= term (('+'|'-') term)*
+     for child in node.children:
+       self.Visit(child)
+-      if isinstance(child, pytree.Leaf) and child.value in '+-':
++      if _IsAExprOperator(child):
+         _AppendTokenSubtype(child, format_token.Subtype.BINARY_OPERATOR)
++        _AppendTokenSubtype(child, format_token.Subtype.A_EXPR_OPERATOR)
++
++    if _IsSimpleExpression(node):
++      for child in node.children:
++        if _IsAExprOperator(child):
++          _AppendTokenSubtype(child, format_token.Subtype.SIMPLE_EXPRESSION)
+ 
+   def Visit_term(self, node):  # pylint: disable=invalid-name
+-    # term ::= factor (('*'|'/'|'%'|'//') factor)*
++    # term ::= factor (('*'|'/'|'%'|'//'|'@') factor)*
+     for child in node.children:
+       self.Visit(child)
+-      if (isinstance(child, pytree.Leaf) and
+-          child.value in {'*', '/', '%', '//', '@'}):
++      if _IsMExprOperator(child):
+         _AppendTokenSubtype(child, format_token.Subtype.BINARY_OPERATOR)
++        _AppendTokenSubtype(child, format_token.Subtype.M_EXPR_OPERATOR)
++
++    if _IsSimpleExpression(node):
++      for child in node.children:
++        if _IsMExprOperator(child):
++          _AppendTokenSubtype(child, format_token.Subtype.SIMPLE_EXPRESSION)
+ 
+   def Visit_factor(self, node):  # pylint: disable=invalid-name
+     # factor ::= ('+'|'-'|'~') factor | power
+@@ -446,3 +457,17 @@ def _InsertPseudoParentheses(node):
+     new_node = pytree.Node(syms.atom, [lparen, clone, rparen])
+     node.replace(new_node)
+     _AppendFirstLeafTokenSubtype(clone, format_token.Subtype.DICTIONARY_VALUE)
++
++
++def _IsAExprOperator(node):
++  return isinstance(node, pytree.Leaf) and node.value in {'+', '-'}
++
++
++def _IsMExprOperator(node):
++  return isinstance(node,
++                    pytree.Leaf) and node.value in {'*', '/', '%', '//', '@'}
++
++
++def _IsSimpleExpression(node):
++  """A node with only leafs as children."""
++  return all(map(lambda c: isinstance(c, pytree.Leaf), node.children))
+diff --git a/yapf/yapflib/unwrapped_line.py b/yapf/yapflib/unwrapped_line.py
+index 40f1295..b45d12a 100644
+--- a/yapf/yapflib/unwrapped_line.py
++++ b/yapf/yapflib/unwrapped_line.py
+@@ -227,6 +227,40 @@ def _IsUnaryOperator(tok):
+   return format_token.Subtype.UNARY_OPERATOR in tok.subtypes
+ 
+ 
++def _HasPrecedence(tok):
++  """Whether a binary operation has presedence within its context."""
++  node = tok.node
++
++  # We let ancestor be the statement surrounding the operation that tok is the
++  # operator in.
++  ancestor = node.parent.parent
++
++  while ancestor is not None:
++    # Search through the ancestor nodes in the parse tree for operators with
++    # lower precedence.
++    predecessor_type = pytree_utils.NodeName(ancestor)
++    if predecessor_type in ['arith_expr', 'term']:
++      # An ancestor "arith_expr" or "term" means we have found an operator
++      # with lower presedence than our tok.
++      return True
++    if predecessor_type != 'atom':
++      # We understand the context to look for precedence within as an
++      # arbitrary nesting of "arith_expr", "term", and "atom" nodes. If we
++      # leave this context we have not found a lower presedence operator.
++      return False
++    # Under normal usage we expect a complete parse tree to be available and
++    # we will return before we get an AttributeError from the root.
++    ancestor = ancestor.parent
++
++
++def _PriorityIndicatingNoSpace(tok):
++  """Whether to remove spaces around an operator due to presedence."""
++  if not tok.is_arithmetic_op or not tok.is_simple_expr:
++    # Limit space removal to highest priority arithmetic operators
++    return False
++  return _HasPrecedence(tok)
++
++
+ def _SpaceRequiredBetween(left, right):
+   """Return True if a space is required between the left and right token."""
+   lval = left.value
+@@ -291,9 +325,9 @@ def _SpaceRequiredBetween(left, right):
+       # If there is a type hint, then we don't want to add a space between the
+       # equal sign and the hint.
+       return False
+-    if rval not in '[)]}.':
++    if rval not in '[)]}.' and not right.is_binary_op:
+       # A string followed by something other than a subscript, closing bracket,
+-      # or dot should have a space after it.
++      # dot, or a binary op should have a space after it.
+       return True
+   if left.is_binary_op and lval != '**' and _IsUnaryOperator(right):
+     # Space between the binary operator and the unary operator.
+@@ -310,7 +344,15 @@ def _SpaceRequiredBetween(left, right):
+       return style.Get('SPACES_AROUND_POWER_OPERATOR')
+     # Enforce spaces around binary operators except the blacklisted ones.
+     blacklist = style.Get('NO_SPACES_AROUND_SELECTED_BINARY_OPERATORS')
+-    return lval not in blacklist and rval not in blacklist
++    if lval in blacklist or rval in blacklist:
++      return False
++    if style.Get('ARITHMETIC_PRECEDENCE_INDICATION'):
++      if _PriorityIndicatingNoSpace(left) or _PriorityIndicatingNoSpace(right):
++        return False
++      else:
++        return True
++    else:
++      return True
+   if (_IsUnaryOperator(left) and lval != 'not' and
+       (right.is_name or right.is_number or rval == '(')):
+     # The previous token was a unary op. No space is desired between it and

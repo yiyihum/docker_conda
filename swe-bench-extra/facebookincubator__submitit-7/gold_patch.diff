@@ -1,0 +1,130 @@
+diff --git a/submitit/auto/auto.py b/submitit/auto/auto.py
+index ad502d5..e86daf7 100644
+--- a/submitit/auto/auto.py
++++ b/submitit/auto/auto.py
+@@ -163,7 +163,7 @@ class AutoExecutor(Executor):
+                 continue
+ 
+             valid = executors[ex]._valid_parameters()
+-            if arg not in valid:
++            if arg not in valid | generics:
+                 invalid.append(
+                     f"Unknown argument '{arg}' for executor '{ex}' in parameter '{ex}_{arg}'."
+                     + " Valid arguments: "
+@@ -174,12 +174,20 @@ class AutoExecutor(Executor):
+             invalid.append(f"Known executors: {', '.join(executors.keys())}")
+             raise NameError("\n".join(invalid))
+ 
++        # add cluster specific generic overrides
++        kwargs.update(
++            **{
++                arg: kwargs.pop(f"{ex}_{arg}")
++                for ex, arg in specific
++                if ex == self.cluster and arg in generics
++            }
++        )
+         parameters = self._executor._convert_parameters({k: kwargs[k] for k in kwargs if k in generics})
+         # update parameters in the core executor
+         for (ex, arg) in specific:
+-            if ex != self.cluster:
+-                continue
+-            parameters[arg] = kwargs[f"{ex}_{arg}"]
++            # update cluster specific non-generic arguments
++            if arg not in generics and ex == self.cluster:
++                parameters[arg] = kwargs[f"{ex}_{arg}"]
+ 
+         self._executor._internal_update_parameters(**parameters)
+ 
+diff --git a/submitit/core/core.py b/submitit/core/core.py
+index 39a77a7..dff76d8 100644
+--- a/submitit/core/core.py
++++ b/submitit/core/core.py
+@@ -587,7 +587,10 @@ class Executor(abc.ABC):
+             delayed_batch = self._delayed_batch
+             self._delayed_batch = None
+         if not delayed_batch:
+-            raise RuntimeError('No submission happened during "with executor.batch()" context.')
++            warnings.warn(
++                'No submission happened during "with executor.batch()" context.', category=RuntimeWarning
++            )
++            return
+         jobs, submissions = zip(*delayed_batch)
+         new_jobs = self._internal_process_submissions(submissions)
+         for j, new_j in zip(jobs, new_jobs):
+diff --git a/submitit/core/job_environment.py b/submitit/core/job_environment.py
+index 5084bf3..cf5fa2a 100644
+--- a/submitit/core/job_environment.py
++++ b/submitit/core/job_environment.py
+@@ -46,13 +46,13 @@ class JobEnvironment:
+             n = n[: -len("JobEnvironment")]
+         return n.lower()
+ 
+-    # pylint: disable=no-self-use
+     def activated(self) -> bool:
+         """Tests if we are running inside this environment.
+ 
+-        @plugin-dev: Must be overridden by JobEnvironment implementations.
++        @plugin-dev: assumes that the SUBMITIT_EXECUTOR variable has been
++        set to the executor name
+         """
+-        ...
++        return os.environ.get("SUBMITIT_EXECUTOR", "") == self.name()
+ 
+     @property
+     def hostname(self) -> str:
+diff --git a/submitit/local/local.py b/submitit/local/local.py
+index 3380123..1e1ed2e 100644
+--- a/submitit/local/local.py
++++ b/submitit/local/local.py
+@@ -106,9 +106,6 @@ class LocalJobEnvironment(job_environment.JobEnvironment):
+         "local_rank": "SUBMITIT_LOCAL_LOCALID",
+     }
+ 
+-    def activated(self) -> bool:
+-        return "SUBMITIT_LOCAL_JOB_ID" in os.environ
+-
+     def _requeue(self, countdown: int) -> None:
+         jid = self.job_id
+         logger.get_logger().info(f"Requeued job {jid} ({countdown} remaining timeouts)")
+@@ -218,6 +215,7 @@ def start_controller(
+         SUBMITIT_LOCAL_SIGNAL_DELAY_S=str(int(signal_delay_s)),
+         SUBMITIT_LOCAL_NODEID="0",
+         SUBMITIT_LOCAL_JOB_NUM_NODES="1",
++        SUBMITIT_EXECUTOR="local",
+         CUDA_AVAILABLE_DEVICES=cuda_devices,
+     )
+     process = subprocess.Popen(
+diff --git a/submitit/slurm/slurm.py b/submitit/slurm/slurm.py
+index b35e29e..fe3c181 100644
+--- a/submitit/slurm/slurm.py
++++ b/submitit/slurm/slurm.py
+@@ -175,6 +175,7 @@ def _parse_node_list(node_list: str):
+ 
+ 
+ class SlurmJobEnvironment(job_environment.JobEnvironment):
++
+     _env = {
+         "job_id": "SLURM_JOB_ID",
+         "num_tasks": "SLURM_NTASKS",
+@@ -187,9 +188,6 @@ class SlurmJobEnvironment(job_environment.JobEnvironment):
+         "array_task_id": "SLURM_ARRAY_TASK_ID",
+     }
+ 
+-    def activated(self) -> bool:
+-        return "SLURM_JOB_ID" in os.environ
+-
+     def _requeue(self, countdown: int) -> None:
+         jid = self.job_id
+         subprocess.check_call(["scontrol", "requeue", jid])
+@@ -490,5 +488,10 @@ def _make_sbatch_string(
+         lines += ["", "# setup"] + setup
+     # commandline (this will run the function and args specified in the file provided as argument)
+     # We pass --output and --error here, because the SBATCH command doesn't work as expected with a filename pattern
+-    lines += ["", "# command", f"srun --output '{stdout}' --error '{stderr}' --unbuffered {command}"]
++    lines += [
++        "",
++        "# command",
++        "export SUBMITIT_EXECUTOR=slurm",
++        f"srun --output '{stdout}' --error '{stderr}' --unbuffered {command}",
++    ]
+     return "\n".join(lines)

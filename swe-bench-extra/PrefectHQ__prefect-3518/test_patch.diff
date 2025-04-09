@@ -1,0 +1,185 @@
+diff --git a/tests/cli/test_describe.py b/tests/cli/test_describe.py
+index b06dfb87ba..a56c746142 100644
+--- a/tests/cli/test_describe.py
++++ b/tests/cli/test_describe.py
+@@ -263,7 +263,6 @@ def test_describe_flow_runs(monkeypatch, cloud_api):
+             scheduled_start_time
+             start_time
+             end_time
+-            duration
+             serialized_state
+         }
+     }
+@@ -320,7 +319,6 @@ def test_describe_flow_runs_populated(monkeypatch, cloud_api):
+             scheduled_start_time
+             start_time
+             end_time
+-            duration
+             serialized_state
+         }
+     }
+diff --git a/tests/cli/test_get.py b/tests/cli/test_get.py
+index 70fcef9541..93edc3be0f 100644
+--- a/tests/cli/test_get.py
++++ b/tests/cli/test_get.py
+@@ -195,7 +195,6 @@ def test_get_flow_runs_cloud(monkeypatch, cloud_api):
+             and "STATE" in result.output
+             and "AGE" in result.output
+             and "START TIME" in result.output
+-            and "DURATION" in result.output
+         )
+ 
+         query = """
+@@ -208,7 +207,6 @@ def test_get_flow_runs_cloud(monkeypatch, cloud_api):
+                 created
+                 state
+                 name
+-                duration
+                 start_time
+             }
+         }
+@@ -255,7 +253,6 @@ def test_get_flow_runs_populated(monkeypatch, cloud_api):
+                 created
+                 state
+                 name
+-                duration
+                 start_time
+             }
+         }
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ad70a37d9c..4f582e8562 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -35,7 +35,7 @@ def prefect_home_dir():
+ # ----------------
+ @pytest.fixture(scope="session")
+ def mthread():
+-    "Multi-threaded executor"
++    "Multi-threaded executor using dask distributed"
+     with Client(
+         processes=False, scheduler_port=0, dashboard_address=":0", n_workers=2
+     ) as client:
+@@ -51,12 +51,18 @@ def local():
+ @pytest.fixture()
+ def sync():
+     "Synchronous dask (not dask.distributed) executor"
+-    yield LocalDaskExecutor()
++    yield LocalDaskExecutor(scheduler="sync")
++
++
++@pytest.fixture()
++def mproc_local():
++    "Multiprocessing executor using local dask (not distributed cluster)"
++    yield LocalDaskExecutor(scheduler="processes")
+ 
+ 
+ @pytest.fixture(scope="session")
+ def mproc():
+-    "Multi-processing executor"
++    "Multi-processing executor using dask distributed"
+     with Client(
+         processes=True, scheduler_port=0, dashboard_address=":0", n_workers=2
+     ) as client:
+@@ -64,14 +70,16 @@ def mproc():
+ 
+ 
+ @pytest.fixture()
+-def _switch(mthread, local, sync, mproc):
++def _switch(mthread, local, sync, mproc, mproc_local):
+     """
+     A construct needed so we can parametrize the executor fixture.
+ 
+     This isn't straightforward since each executor needs to be initialized
+     in slightly different ways.
+     """
+-    execs = dict(mthread=mthread, local=local, sync=sync, mproc=mproc)
++    execs = dict(
++        mthread=mthread, local=local, sync=sync, mproc=mproc, mproc_local=mproc_local
++    )
+     return lambda e: execs[e]
+ 
+ 
+diff --git a/tests/core/test_flow.py b/tests/core/test_flow.py
+index 9460bf4e9f..6b763a07ae 100644
+--- a/tests/core/test_flow.py
++++ b/tests/core/test_flow.py
+@@ -22,7 +22,7 @@ from prefect.core.task import Task
+ from prefect.tasks.core import constants
+ from prefect.core.parameter import Parameter
+ from prefect.engine.cache_validators import all_inputs, partial_inputs_only
+-from prefect.engine.executors import LocalExecutor
++from prefect.engine.executors import LocalExecutor, DaskExecutor
+ from prefect.engine.result import Result
+ from prefect.engine.results import LocalResult, PrefectResult
+ from prefect.engine.result_handlers import LocalResultHandler, ResultHandler
+@@ -2928,8 +2928,12 @@ class TestSaveLoad:
+     sys.platform == "win32" or sys.version_info.minor == 6,
+     reason="Windows doesn't support any timeout logic",
+ )
+-@pytest.mark.parametrize("executor", ["local", "sync", "mthread"], indirect=True)
+-def test_timeout_actually_stops_execution(executor):
++@pytest.mark.parametrize(
++    "executor", ["local", "sync", "mthread", "mproc_local", "mproc"], indirect=True
++)
++def test_timeout_actually_stops_execution(
++    executor,
++):
+     # Note: this is a potentially brittle test! In some cases (local and sync) signal.alarm
+     # is used as the mechanism for timing out a task. This passes off the job of measuring
+     # the time for the timeout to the OS, which uses the "wallclock" as reference (the real
+@@ -2943,15 +2947,25 @@ def test_timeout_actually_stops_execution(executor):
+     # the task implementation" we got, but instead do a simple task (create a file) and sleep.
+     # This will drastically reduce the brittleness of the test (but not completely).
+ 
++    # The amount of time to sleep before writing 'invalid' to the file
++    # lower values will decrease test time but increase chances of intermittent failure
++    SLEEP_TIME = 3
++
++    # Determine if the executor is distributed and using daemonic processes which
++    # cannot be cancelled and throw a warning instead.
++    in_daemon_process = isinstance(
++        executor, DaskExecutor
++    ) and not executor.address.startswith("inproc")
++
+     with tempfile.TemporaryDirectory() as call_dir:
+         # Note: a real file must be used in the case of "mthread"
+         FILE = os.path.join(call_dir, "test.txt")
+ 
+-        @prefect.task(timeout=1)
++        @prefect.task(timeout=2)
+         def slow_fn():
+             with open(FILE, "w") as f:
+                 f.write("called!")
+-            time.sleep(2)
++            time.sleep(SLEEP_TIME)
+             with open(FILE, "a") as f:
+                 f.write("invalid")
+ 
+@@ -2962,15 +2976,25 @@ def test_timeout_actually_stops_execution(executor):
+         start_time = time.time()
+         state = flow.run(executor=executor)
+         stop_time = time.time()
+-        time.sleep(max(0, 3 - (stop_time - start_time)))
++
++        # Sleep so 'invalid' will be written if the task is not killed, subtracting the
++        # actual runtime to speed up the test a little
++        time.sleep(max(1, SLEEP_TIME - (stop_time - start_time)))
+ 
+         assert os.path.exists(FILE)
+         with open(FILE, "r") as f:
+-            assert "invalid" not in f.read()
++            # `invalid` should *only be in the file if a daemon process was used
++            assert ("invalid" in f.read()) == in_daemon_process
+ 
+     assert state.is_failed()
+     assert isinstance(state.result[slow_fn], TimedOut)
+     assert isinstance(state.result[slow_fn].result, TimeoutError)
++    # We cannot capture the UserWarning because it is being run by a Dask worker
++    # but we can make sure the TimeoutError includes a note about it
++    assert (
++        "executed in a daemonic subprocess and will continue to run"
++        in str(state.result[slow_fn].result)
++    ) == in_daemon_process
+ 
+ 
+ @pytest.mark.skip("Result handlers not yet deprecated")

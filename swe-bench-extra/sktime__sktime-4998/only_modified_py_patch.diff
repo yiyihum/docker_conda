@@ -1,0 +1,187 @@
+diff --git a/sktime/clustering/k_means.py b/sktime/clustering/k_means.py
+index a763875f4..1423a5d7f 100644
+--- a/sktime/clustering/k_means.py
++++ b/sktime/clustering/k_means.py
+@@ -19,9 +19,15 @@ class TimeSeriesKMeans(TimeSeriesLloyds):
+     n_clusters: int, defaults = 8
+         The number of clusters to form as well as the number of
+         centroids to generate.
+-    init_algorithm: str, defaults = 'random'
+-        Method for initializing cluster centers. Any of the following are valid:
+-        ['kmeans++', 'random', 'forgy']
++    init_algorithm: str, np.ndarray (3d array of shape (n_clusters, n_dimensions,
++        series_length)), defaults = 'random'
++        Method for initializing cluster centers or an array of initial cluster centers.
++        If string, any of the following strings are valid:
++            ['kmeans++', 'random', 'forgy'].
++        If 3D np.ndarray, initializes cluster centers with the provided array. The array
++            must have shape (n_clusters, n_dimensions, series_length) and the number of
++            clusters in the array must be the same as what is provided to the n_clusters
++            argument.
+     metric: str or Callable, defaults = 'dtw'
+         Distance metric to compute similarity between time series. Any of the following
+         are valid: ['dtw', 'euclidean', 'erp', 'edr', 'lcss', 'squared', 'ddtw', 'wdtw',
+@@ -204,10 +210,20 @@ class TimeSeriesKMeans(TimeSeriesLloyds):
+             `MyClass(**params)` or `MyClass(**params[i])` creates a valid test instance.
+             `create_test_instance` uses the first (or only) dictionary in `params`
+         """
+-        return {
++        params1 = {
+             "n_clusters": 2,
+             "metric": "euclidean",
++            "init_algorithm": "random",
+             "n_init": 1,
+             "max_iter": 10,
+             "random_state": 0,
+         }
++        params2 = {
++            "n_clusters": 3,
++            "metric": "dtw",
++            "init_algorithm": np.random.normal(size=(3, 4, 10)),
++            "n_init": 1,
++            "max_iter": 15,
++            "random_state": 1,
++        }
++        return [params1, params2]
+diff --git a/sktime/clustering/k_medoids.py b/sktime/clustering/k_medoids.py
+index c7b1e8c52..2eb531062 100755
+--- a/sktime/clustering/k_medoids.py
++++ b/sktime/clustering/k_medoids.py
+@@ -19,9 +19,15 @@ class TimeSeriesKMedoids(TimeSeriesLloyds):
+     n_clusters: int, defaults = 8
+         The number of clusters to form as well as the number of
+         centroids to generate.
+-    init_algorithm: str, defaults = 'forgy'
+-        Method for initializing cluster centers. Any of the following are valid:
+-        ['kmeans++', 'random', 'forgy']
++    init_algorithm: str, np.ndarray (3d array of shape (n_clusters, n_dimensions,
++        series_length)), defaults = 'forgy'
++        Method for initializing cluster centers or an array of initial cluster centers.
++        If string, any of the following strings are valid:
++            ['kmeans++', 'random', 'forgy'].
++        If 3D np.ndarray, initializes cluster centers with the provided array. The array
++            must have shape (n_clusters, n_dimensions, series_length) and the number of
++            clusters in the array must be the same as what is provided to the n_clusters
++            argument.
+     metric: str or Callable, defaults = 'dtw'
+         Distance metric to compute similarity between time series. Any of the following
+         are valid: ['dtw', 'euclidean', 'erp', 'edr', 'lcss', 'squared', 'ddtw', 'wdtw',
+diff --git a/sktime/clustering/partitioning/_lloyds.py b/sktime/clustering/partitioning/_lloyds.py
+index 82f24bd4f..5d7a755c9 100755
+--- a/sktime/clustering/partitioning/_lloyds.py
++++ b/sktime/clustering/partitioning/_lloyds.py
+@@ -162,9 +162,10 @@ class TimeSeriesLloyds(BaseClusterer, ABC):
+     n_clusters: int, defaults = 8
+         The number of clusters to form as well as the number of
+         centroids to generate.
+-    init_algorithm: str, defaults = 'forgy'
+-        Method for initializing cluster centers. Any of the following are valid:
+-        ['kmeans++', 'random', 'forgy']
++    init_algorithm: str, np.ndarray (3d array of shape (n_clusters, n_dimensions,
++        series_length)), defaults = 'forgy'
++        Method for initializing cluster centers or an array of initial cluster centers.
++        Any of the following strings are valid: ['kmeans++', 'random', 'forgy']
+     metric: str or Callable, defaults = 'dtw'
+         Distance metric to compute similarity between time series. Any of the following
+         are valid: ['dtw', 'euclidean', 'erp', 'edr', 'lcss', 'squared', 'ddtw', 'wdtw',
+@@ -240,6 +241,7 @@ class TimeSeriesLloyds(BaseClusterer, ABC):
+ 
+         self._random_state = None
+         self._init_algorithm = None
++        self._initial_cluster_centers = None
+ 
+         self._distance_params = distance_params
+         if distance_params is None:
+@@ -264,14 +266,33 @@ class TimeSeriesLloyds(BaseClusterer, ABC):
+         self._random_state = check_random_state(self.random_state)
+ 
+         if isinstance(self.init_algorithm, str):
+-            self._init_algorithm = self._init_algorithms.get(self.init_algorithm)
+-        else:
++            if self.init_algorithm not in self._init_algorithms.keys():
++                raise KeyError(
++                    f"The string provided for init_algorithm: {self.init_algorithm} is "
++                    f"invalid. The following are a list of valid init algorithms "
++                    f"strings: {list(self._init_algorithms.keys())}"
++                )
++            self._init_algorithm = self._init_algorithms[self.init_algorithm]
++        elif isinstance(self.init_algorithm, np.ndarray):
++            if self.init_algorithm.ndim != 3:
++                raise ValueError(
++                    "The array provided to init_algorithm is invalid. It must be 3D."
++                )
++            if self.init_algorithm.shape[0] != self.n_clusters:
++                raise ValueError(
++                    f"The number of centers in init_algorithm and n_clusters must be "
++                    f"the same. The number of centres in init_algorithm is "
++                    f"{self.init_algorithm.shape[0]} but n_clusters is "
++                    f"{self.n_clusters}"
++                )
+             self._init_algorithm = self.init_algorithm
+-
+-        if not isinstance(self._init_algorithm, Callable):
++        elif isinstance(self._init_algorithm, Callable):
++            self._init_algorithm = self.init_algorithm
++        else:
+             raise ValueError(
+-                f"The value provided for init_algorim: {self.init_algorithm} is "
+-                f"invalid. The following are a list of valid init algorithms strings: "
++                f"The value provided for init_algorithm: {self.init_algorithm} is "
++                f"invalid. It must be either a string, callable or 3D numpy array."
++                f" The following are a list of valid init algorithms strings: "
+                 f"{list(self._init_algorithms.keys())}"
+             )
+ 
+@@ -377,12 +398,15 @@ class TimeSeriesLloyds(BaseClusterer, ABC):
+             Sum of squared distances of samples to their closest cluster center,
+             weighted by the sample weights if provided.
+         """
+-        cluster_centres = self._init_algorithm(
+-            X,
+-            self.n_clusters,
+-            self._random_state,
+-            distance_metric=self._distance_metric,
+-        )
++        if isinstance(self._init_algorithm, np.ndarray):
++            cluster_centres = self._init_algorithm
++        else:
++            cluster_centres = self._init_algorithm(
++                X,
++                self.n_clusters,
++                self._random_state,
++                distance_metric=self._distance_metric,
++            )
+         old_inertia = np.inf
+         old_labels = None
+         for i in range(self.max_iter):
+diff --git a/sktime/transformations/series/difference.py b/sktime/transformations/series/difference.py
+index a9f205107..47ba58295 100644
+--- a/sktime/transformations/series/difference.py
++++ b/sktime/transformations/series/difference.py
+@@ -142,10 +142,24 @@ def _inverse_diff(X, lags, X_diff_seq=None):
+ 
+     # invert last lag index
+     if X_diff_seq is not None:
++        # Get the train time series before the last difference
+         X_diff_orig = X_diff_seq[len(lags)]
++        # Shift the differenced time series index by the last lag
++        # to match the original time series index
+         X_ix_shift = _shift(X.index, -lag_last)
++        # Get the original time series values for the intersecting
++        # indices between the shifted index and the original index
+         X_update = X_diff_orig.loc[X_ix_shift.intersection(X_diff_orig.index)]
+-
++        # Set the values of the differenced time series to nan for all indices
++        # that are in the indices of the original and the by the sum of all lags
++        # shifted original time series that are available in the differenced time
++        # series (intersection). These are the indices for which no valid differenced
++        # values exist.
++        X.loc[
++            X_diff_orig.index.difference(
++                _shift(X_diff_orig.index, sum(lags) + lag_last)
++            ).intersection(X.index)
++        ] = np.nan
+         X = X.combine_first(X_update)
+ 
+     X_diff_last = X.copy()
+

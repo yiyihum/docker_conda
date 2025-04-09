@@ -1,0 +1,111 @@
+diff --git a/sqlglot/dataframe/sql/functions.py b/sqlglot/dataframe/sql/functions.py
+index 141a302e..a388cb4b 100644
+--- a/sqlglot/dataframe/sql/functions.py
++++ b/sqlglot/dataframe/sql/functions.py
+@@ -661,7 +661,7 @@ def from_utc_timestamp(timestamp: ColumnOrName, tz: ColumnOrName) -> Column:
+ 
+ def to_utc_timestamp(timestamp: ColumnOrName, tz: ColumnOrName) -> Column:
+     tz_column = tz if isinstance(tz, Column) else lit(tz)
+-    return Column.invoke_anonymous_function(timestamp, "TO_UTC_TIMESTAMP", tz_column)
++    return Column.invoke_expression_over_column(timestamp, expression.FromTimeZone, zone=tz_column)
+ 
+ 
+ def timestamp_seconds(col: ColumnOrName) -> Column:
+diff --git a/sqlglot/dialects/bigquery.py b/sqlglot/dialects/bigquery.py
+index 0151e6c8..83ae94ed 100644
+--- a/sqlglot/dialects/bigquery.py
++++ b/sqlglot/dialects/bigquery.py
+@@ -560,6 +560,9 @@ class BigQuery(Dialect):
+             exp.DatetimeAdd: date_add_interval_sql("DATETIME", "ADD"),
+             exp.DatetimeSub: date_add_interval_sql("DATETIME", "SUB"),
+             exp.DateTrunc: lambda self, e: self.func("DATE_TRUNC", e.this, e.text("unit")),
++            exp.FromTimeZone: lambda self, e: self.func(
++                "DATETIME", self.func("TIMESTAMP", e.this, e.args.get("zone")), "'UTC'"
++            ),
+             exp.GenerateSeries: rename_func("GENERATE_ARRAY"),
+             exp.GetPath: path_to_jsonpath(),
+             exp.GroupConcat: rename_func("STRING_AGG"),
+diff --git a/sqlglot/dialects/presto.py b/sqlglot/dialects/presto.py
+index 9b421e7f..6cc6030c 100644
+--- a/sqlglot/dialects/presto.py
++++ b/sqlglot/dialects/presto.py
+@@ -356,6 +356,7 @@ class Presto(Dialect):
+             exp.Encode: lambda self, e: encode_decode_sql(self, e, "TO_UTF8"),
+             exp.FileFormatProperty: lambda self, e: f"FORMAT='{e.name.upper()}'",
+             exp.First: _first_last_sql,
++            exp.FromTimeZone: lambda self, e: f"WITH_TIMEZONE({self.sql(e, 'this')}, {self.sql(e, 'zone')}) AT TIME ZONE 'UTC'",
+             exp.GetPath: path_to_jsonpath(),
+             exp.Group: transforms.preprocess([transforms.unalias_group]),
+             exp.GroupConcat: lambda self, e: self.func(
+diff --git a/sqlglot/dialects/snowflake.py b/sqlglot/dialects/snowflake.py
+index 3cf7f7d1..43a439da 100644
+--- a/sqlglot/dialects/snowflake.py
++++ b/sqlglot/dialects/snowflake.py
+@@ -687,6 +687,9 @@ class Snowflake(Dialect):
+             exp.DayOfYear: rename_func("DAYOFYEAR"),
+             exp.Explode: rename_func("FLATTEN"),
+             exp.Extract: rename_func("DATE_PART"),
++            exp.FromTimeZone: lambda self, e: self.func(
++                "CONVERT_TIMEZONE", e.args.get("zone"), "'UTC'", e.this
++            ),
+             exp.GenerateSeries: lambda self, e: self.func(
+                 "ARRAY_GENERATE_RANGE", e.args["start"], e.args["end"] + 1, e.args.get("step")
+             ),
+diff --git a/sqlglot/dialects/spark2.py b/sqlglot/dialects/spark2.py
+index e27ba185..7ecb06f0 100644
+--- a/sqlglot/dialects/spark2.py
++++ b/sqlglot/dialects/spark2.py
+@@ -133,6 +133,14 @@ class Spark2(Hive):
+             if len(args) == 1
+             else format_time_lambda(exp.StrToTime, "spark")(args),
+             "TO_UNIX_TIMESTAMP": exp.StrToUnix.from_arg_list,
++            "TO_UTC_TIMESTAMP": lambda args: exp.FromTimeZone(
++                this=exp.cast_unless(
++                    seq_get(args, 0) or exp.Var(this=""),
++                    exp.DataType.build("timestamp"),
++                    exp.DataType.build("timestamp"),
++                ),
++                zone=seq_get(args, 1),
++            ),
+             "TRUNC": lambda args: exp.DateTrunc(unit=seq_get(args, 1), this=seq_get(args, 0)),
+             "WEEKOFYEAR": lambda args: exp.WeekOfYear(this=exp.TsOrDsToDate(this=seq_get(args, 0))),
+         }
+@@ -188,6 +196,7 @@ class Spark2(Hive):
+             exp.DayOfYear: rename_func("DAYOFYEAR"),
+             exp.FileFormatProperty: lambda self, e: f"USING {e.name.upper()}",
+             exp.From: transforms.preprocess([_unalias_pivot]),
++            exp.FromTimeZone: lambda self, e: f"TO_UTC_TIMESTAMP({self.sql(e, 'this')}, {self.sql(e, 'zone')})",
+             exp.LogicalAnd: rename_func("BOOL_AND"),
+             exp.LogicalOr: rename_func("BOOL_OR"),
+             exp.Map: _map_sql,
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 597a37fe..7f68015e 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -4171,6 +4171,10 @@ class AtTimeZone(Expression):
+     arg_types = {"this": True, "zone": True}
+ 
+ 
++class FromTimeZone(Expression):
++    arg_types = {"this": True, "zone": True}
++
++
+ class Between(Predicate):
+     arg_types = {"this": True, "low": True, "high": True}
+ 
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index bb26b385..704e9eec 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -2555,6 +2555,11 @@ class Generator:
+         zone = self.sql(expression, "zone")
+         return f"{this} AT TIME ZONE {zone}"
+ 
++    def fromtimezone_sql(self, expression: exp.FromTimeZone) -> str:
++        this = self.sql(expression, "this")
++        zone = self.sql(expression, "zone")
++        return f"{this} AT TIME ZONE {zone} AT TIME ZONE 'UTC'"
++
+     def add_sql(self, expression: exp.Add) -> str:
+         return self.binary(expression, "+")
+ 

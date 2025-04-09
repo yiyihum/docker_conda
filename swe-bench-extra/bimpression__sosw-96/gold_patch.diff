@@ -1,0 +1,242 @@
+diff --git a/sosw/app.py b/sosw/app.py
+index 4aa6713..3858b40 100644
+--- a/sosw/app.py
++++ b/sosw/app.py
+@@ -32,9 +32,10 @@ class Processor:
+     """
+ 
+     DEFAULT_CONFIG = {}
+-    # TODO USE context.invoked_function_arn.
++
+     aws_account = None
+-    aws_region = None
++    aws_region = os.getenv('AWS_REGION', None)
++    lambda_context = None
+ 
+ 
+     def __init__(self, custom_config=None, **kwargs):
+@@ -48,6 +49,10 @@ class Processor:
+         if self.test and not custom_config:
+             raise RuntimeError("You must specify a custom config from your testcase to run processor in test mode.")
+ 
++        self.lambda_context = kwargs.pop('context', None)
++        if self.lambda_context:
++            self.aws_account = trim_arn_to_account(self.lambda_context.invoked_function_arn)
++
+         self.config = self.DEFAULT_CONFIG
+         self.config = recursive_update(self.config, self.get_config(f"{os.environ.get('AWS_LAMBDA_FUNCTION_NAME')}_config"))
+         self.config = recursive_update(self.config, custom_config or {})
+@@ -158,38 +163,33 @@ class Processor:
+     @property
+     def _account(self):
+         """
+-        Get current AWS Account to construct different ARNs. The autodetection process is pretty heavy (~0.3 seconds),
+-        so it is not called by default. This method should be used only if you really need it.
++        Get current AWS Account to construct different ARNs.
++
++        We dont' have this parameter in Environmental variables, only can parse from Context.
++        Context is not global and is supposed to be passed by your `lambda_handler` during initialization.
+ 
+-        It is highly recommended to provide the value of aws_account in your configs.
++        As a fallback we have an autodetection mechanism, but it is pretty heavy (~0.3 seconds).
++        So it is not called by default. This method should be used only if you really need it.
++
++        It is highly recommended to pass the `context` during initialization.
+ 
+         Some things to note:
+          - We store this value in class variable for fast access
+          - If not yet set on the first call we initialise it.
+-         - We first try from your config and only if not provided - use the autodetection.
+-
+-        TODO This method is overcomplicated. Change to to parsing the ARN from context object. But config can overwrite.
+-        TODO https://github.com/bimpression/sosw/issues/40
++         - We first try from context and only if not provided - use the autodetection.
+         """
++
+         if not self.aws_account:
+-            try:
+-                self.aws_account = self.config['aws_account']
+-            except KeyError:
+-                self.aws_account = boto3.client('sts').get_caller_identity().get('Account')
++            self.aws_account = boto3.client('sts').get_caller_identity().get('Account')
+ 
+         return self.aws_account
+ 
+ 
+     @property
+     def _region(self):
+-        # TODO Implement this to get it effectively from context object.
+-        # TODO https://github.com/bimpression/sosw/issues/40
+-        if not self.aws_region:
+-            try:
+-                self.aws_region = self.config['aws_region']
+-            except KeyError:
+-                self.aws_region = 'us-west-2'
+-
++        """
++        Property fetched from AWS Lambda Environmental variables.
++        """
+         return self.aws_region
+ 
+ 
+diff --git a/sosw/components/helpers.py b/sosw/components/helpers.py
+index 0f26f79..2bd13cc 100644
+--- a/sosw/components/helpers.py
++++ b/sosw/components/helpers.py
+@@ -27,6 +27,7 @@ __all__ = ['validate_account_to_dashed',
+            'first_or_none',
+            'recursive_update',
+            'trim_arn_to_name',
++           'trim_arn_to_account',
+            'make_hash',
+            ]
+ 
+@@ -714,6 +715,21 @@ def trim_arn_to_name(arn: str) -> str:
+     return re.search(pattern, arn).group('name')
+ 
+ 
++def trim_arn_to_account(arn: str) -> str:
++    """
++    Extract just the ACCOUNT_ID from full ARN. Supports versions, aliases or raw name (without ARN).
++
++    More information about ARN Format:
++    https://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html#genref-arns
++    """
++
++    # Seems a little messy, but passes more/less any test of different ARNs we tried.
++    pattern = "(arn:aws:[0-9a-zA-Z-]{2,20}:[0-9a-zA-Z-]{0,12}:)?(?P<acc>[0-9]{12})(:[0-9a-zA-Z-]{2,20}[:/])?" \
++              "(?P<name>[0-9a-zA-Z_=,.@-]*)(:)?([0-9a-zA-Z$]*)?"
++
++    return re.search(pattern, arn).group('acc')
++
++
+ def make_hash(o):
+     """
+     Makes a hash from a dictionary, list, tuple or set to any level, that contains
+diff --git a/sosw/scheduler.py b/sosw/scheduler.py
+index 5044d9e..efa0280 100644
+--- a/sosw/scheduler.py
++++ b/sosw/scheduler.py
+@@ -25,6 +25,7 @@ from typing import List, Set, Tuple, Union, Optional, Dict
+ 
+ from sosw.app import Processor
+ from sosw.components.helpers import get_list_of_multiple_or_one_or_empty_from_dict, trim_arn_to_name
++from sosw.components.siblings import SiblingsManager
+ from sosw.labourer import Labourer
+ from sosw.managers.task import TaskManager
+ 
+@@ -32,7 +33,6 @@ from sosw.managers.task import TaskManager
+ logger = logging.getLogger()
+ logger.setLevel(logging.DEBUG)
+ 
+-lambda_context = None
+ 
+ def single_or_plural(attr):
+     """ Simple function. Gives versions with 's' at the end and without it. """
+@@ -79,6 +79,7 @@ class Scheduler(Processor):
+ 
+     # these clients will be initialized by Processor constructor
+     task_client: TaskManager = None
++    siblings_client: SiblingsManager = None
+     s3_client = None
+     sns_client = None
+     base_query = ...
+@@ -93,7 +94,7 @@ class Scheduler(Processor):
+         self.chunkable_attrs = list([x[0] for x in self.config['job_schema']['chunkable_attrs']])
+         assert not any(x.endswith('s') for x in self.chunkable_attrs), \
+             f"We do not currently support attributes that end with 's'. " \
+-            f"In the config you should use singular form of attribute. Received from config: {self.chunkable_attrs}"
++                f"In the config you should use singular form of attribute. Received from config: {self.chunkable_attrs}"
+ 
+ 
+     def __call__(self, event):
+@@ -208,7 +209,7 @@ class Scheduler(Processor):
+         If I call for previous_x_days(pattern='previous_2_days'), I will receive a list of string dates equal to:
+         ['2019-04-26', '2019-04-27']
+         """
+-        assert re.match('previous_[0-9]+_days', pattern) is not None, "Invalid pattern {pattern} for `previous_x_days()`"
++        assert re.match('previous_[0-9]+_days', pattern) is not None, "Invalid pattern {pattern} for `previous_x_days`"
+ 
+         num = int(pattern.split('_')[1])
+         today = datetime.date.today()
+@@ -263,8 +264,6 @@ class Scheduler(Processor):
+         return [str(end_date + datetime.timedelta(days=x)) for x in range(7)]
+ 
+ 
+-
+-
+     def chunk_dates(self, job: Dict, skeleton: Dict = None) -> List[Dict]:
+         """
+         There is a support for multiple not nested parameters to chunk. Dates is one very specific of them.
+@@ -277,7 +276,8 @@ class Scheduler(Processor):
+         period = job.pop('period', None)
+         isolate = job.pop('isolate_days', None)
+ 
+-        PERIOD_KEYS = ['last_[0-9]+_days', '[0-9]+_days_back', 'yesterday', 'today', 'previous_[0-9]+_days', 'last_week']
++        PERIOD_KEYS = ['last_[0-9]+_days', '[0-9]+_days_back', 'yesterday', 'today', 'previous_[0-9]+_days',
++                       'last_week']
+ 
+         if period:
+ 
+@@ -503,8 +503,8 @@ class Scheduler(Processor):
+         if next_attr:
+             for a in attrs:
+                 current_vals = get_list_of_multiple_or_one_or_empty_from_dict(data, a)
+-                logger.debug(
+-                    f"needs_chunking(): For {a} got current_vals: {current_vals} from {data}. Analysing {next_attr}")
++                logger.debug(f"needs_chunking(): For {a} got current_vals: {current_vals} from {data}. "
++                             f"Analysing {next_attr}")
+ 
+                 for val in current_vals:
+ 
+@@ -566,14 +566,12 @@ class Scheduler(Processor):
+             else:
+                 # Spawning another sibling to continue the processing
+                 try:
+-                    global lambda_context
+-
+                     payload = dict(file_name=file_name)
+-                    self.siblings_client.spawn_sibling(lambda_context, payload=payload)
++                    self.siblings_client.spawn_sibling(self.lambda_context, payload=payload)
+                     self.stats['siblings_spawned'] += 1
+ 
+                 except Exception as err:
+-                    logger.exception(f"Could not spawn sibling with context: {lambda_context} and payload: {payload}")
++                    logger.exception(f"Could not spawn sibling with context: {self.lambda_context}, payload: {payload}")
+ 
+             self.upload_and_unlock_queue_file()
+             self.clean_tmp()
+@@ -588,7 +586,7 @@ class Scheduler(Processor):
+         Therefore multiple capacity units are calculated as a fraction of the
+         """
+         logging.debug(dir(self.task_client.dynamo_db_client))
+-        return 1/self.task_client.dynamo_db_client.get_capacity()['write']
++        return 1 / self.task_client.dynamo_db_client.get_capacity()['write']
+ 
+ 
+     @staticmethod
+@@ -647,9 +645,8 @@ class Scheduler(Processor):
+         Return if there is a sufficient execution time for processing ('shutdown period' is in seconds).
+         """
+ 
+-        global lambda_context
++        return self.lambda_context.get_remaining_time_in_millis() > self.config['shutdown_period'] * 1000
+ 
+-        return lambda_context.get_remaining_time_in_millis() > self.config['shutdown_period'] * 1000
+ 
+     def get_and_lock_queue_file(self) -> str:
+         """
+@@ -713,12 +710,10 @@ class Scheduler(Processor):
+         Initialize a unique file_name to store the queue of tasks to write.
+         """
+ 
+-        global lambda_context
+-
+         if name is None:
+             filename_parts = self.config['queue_file'].rsplit('.', 1)
+             assert len(filename_parts) == 2, "Got bad file name"
+-            self._queue_file_name = f"{filename_parts[0]}_{lambda_context.aws_request_id}.{filename_parts[1]}"
++            self._queue_file_name = f"{filename_parts[0]}_{self.lambda_context.aws_request_id}.{filename_parts[1]}"
+         else:
+             self._queue_file_name = name
+ 

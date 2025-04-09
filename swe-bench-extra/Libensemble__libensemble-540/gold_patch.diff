@@ -1,0 +1,208 @@
+diff --git a/.travis.yml b/.travis.yml
+index 18f0bd5a..1680bf51 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -102,7 +102,7 @@ install:
+   - conda install $COMPILERS
+   - conda install libblas libopenblas # Prevent 'File exists' error
+ 
+-  - if [[ "$TRAVIS_PYTHON_VERSION" == "3.8" ]]; then
++  - if [[ "$TRAVIS_PYTHON_VERSION" == "3.8" ]] || [[ "$PY" == "3.8" ]]; then
+       conda install nlopt mpi4py scipy mpich;
+       export PETSC_CONFIGURE_OPTIONS='--with-batch';
+       conda install petsc4py;
+diff --git a/libensemble/gen_funcs/aposmm_localopt_support.py b/libensemble/gen_funcs/aposmm_localopt_support.py
+index d277550d..20734a7e 100644
+--- a/libensemble/gen_funcs/aposmm_localopt_support.py
++++ b/libensemble/gen_funcs/aposmm_localopt_support.py
+@@ -6,6 +6,7 @@ __all__ = ['LocalOptInterfacer', 'run_local_nlopt', 'run_local_tao',
+            'run_local_dfols', 'run_local_scipy_opt', 'run_external_localopt']
+ 
+ import psutil
++from libensemble.tools.tools import osx_set_mp_method
+ import numpy as np
+ from libensemble.message_numbers import STOP_TAG, EVAL_GEN_TAG  # Only used to simulate receiving from manager
+ from multiprocessing import Event, Process, Queue
+@@ -14,6 +15,9 @@ import libensemble.gen_funcs
+ optimizer_list = ['petsc', 'nlopt', 'dfols', 'scipy', 'external']
+ optimizers = libensemble.gen_funcs.rc.aposmm_optimizers
+ 
++# Resolves multiprocessing issues with Python 3.8+ on macOS
++osx_set_mp_method()
++
+ if optimizers is None:
+     from petsc4py import PETSc
+     import nlopt
+diff --git a/libensemble/history.py b/libensemble/history.py
+index 6486bff2..826193ee 100644
+--- a/libensemble/history.py
++++ b/libensemble/history.py
+@@ -2,7 +2,7 @@ import numpy as np
+ import time
+ import logging
+ 
+-from libensemble.tools.fields_keys import libE_fields
++from libensemble.tools.fields_keys import libE_fields, protected_libE_fields
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -96,7 +96,7 @@ class History:
+ 
+         for j, ind in enumerate(new_inds):
+             for field in returned_H.dtype.names:
+-
++                assert field not in protected_libE_fields, "The field '" + field + "' is protected"
+                 if np.isscalar(returned_H[field][j]):
+                     self.H[field][ind] = returned_H[field][j]
+                 else:
+@@ -175,6 +175,7 @@ class History:
+             update_inds = D['sim_id']
+ 
+         for field in D.dtype.names:
++            assert field not in protected_libE_fields, "The field '" + field + "' is protected"
+             self.H[field][update_inds] = D[field]
+ 
+         self.H['gen_time'][update_inds] = time.time()
+diff --git a/libensemble/libE.py b/libensemble/libE.py
+index eaa1053b..a4bf816f 100644
+--- a/libensemble/libE.py
++++ b/libensemble/libE.py
+@@ -16,7 +16,6 @@ is dumped to file, and MPI abort is called.
+ __all__ = ['libE']
+ 
+ import os
+-import platform
+ import logging
+ import random
+ import socket
+@@ -34,7 +33,7 @@ from libensemble.comms.comms import QCommProcess, Timeout
+ from libensemble.comms.logs import manager_logging_config
+ from libensemble.comms.tcp_mgr import ServerQCommManager, ClientQCommManager
+ from libensemble.executors.executor import Executor
+-from libensemble.tools.tools import _USER_SIM_ID_WARNING
++from libensemble.tools.tools import _USER_SIM_ID_WARNING, osx_set_mp_method
+ from libensemble.tools.check_inputs import check_inputs
+ 
+ logger = logging.getLogger(__name__)
+@@ -314,10 +313,8 @@ def libE_local(sim_specs, gen_specs, exit_criteria,
+     #  switched to 'spawn' by default due to 'fork' potentially causing crashes.
+     # These crashes haven't yet been observed with libE, but with 'spawn' runs,
+     #  warnings about leaked semaphore objects are displayed instead.
+-    # The next several statements enforce 'fork' on macOS (Python 3.8)
+-    if platform.system() == 'Darwin':
+-        from multiprocessing import set_start_method
+-        set_start_method('fork', force=True)
++    # This function enforces 'fork' on macOS (Python 3.8)
++    osx_set_mp_method()
+ 
+     # Launch worker team and set up logger
+     wcomms = start_proc_team(nworkers, sim_specs, gen_specs, libE_specs)
+@@ -434,6 +431,8 @@ def libE_tcp_mgr(sim_specs, gen_specs, exit_criteria,
+     port = libE_specs.get('port', 0)
+     authkey = libE_specs.get('authkey', libE_tcp_authkey())
+ 
++    osx_set_mp_method()
++
+     with ServerQCommManager(port, authkey.encode('utf-8')) as manager:
+ 
+         # Get port if needed because of auto-assignment
+diff --git a/libensemble/libE_manager.py b/libensemble/libE_manager.py
+index 452c3779..e594dc75 100644
+--- a/libensemble/libE_manager.py
++++ b/libensemble/libE_manager.py
+@@ -21,9 +21,10 @@ from libensemble.message_numbers import \
+ from libensemble.comms.comms import CommFinishedException
+ from libensemble.libE_worker import WorkerErrMsg
+ from libensemble.tools.tools import _USER_CALC_DIR_WARNING
+-from libensemble.tools.fields_keys import libE_spec_calc_dir_combined
++from libensemble.tools.fields_keys import libE_spec_calc_dir_combined, protected_libE_fields
+ import cProfile
+ import pstats
++import copy
+ 
+ if tuple(np.__version__.split('.')) >= ('1', '15'):
+     from numpy.lib.recfunctions import repack_fields
+@@ -130,6 +131,7 @@ class Manager:
+         timer = Timer()
+         timer.start()
+         self.date_start = timer.date_start.replace(' ', '_')
++        self.safe_mode = libE_specs.get('safe_mode', True)
+         self.hist = hist
+         self.libE_specs = libE_specs
+         self.alloc_specs = alloc_specs
+@@ -261,7 +263,7 @@ class Manager:
+         self.wcomms[w-1].send(Work['tag'], Work)
+         work_rows = Work['libE_info']['H_rows']
+         if len(work_rows):
+-            if 'repack_fields' in dir():
++            if 'repack_fields' in globals():
+                 self.wcomms[w-1].send(0, repack_fields(self.hist.H[Work['H_fields']][work_rows]))
+             else:
+                 self.wcomms[w-1].send(0, self.hist.H[Work['H_fields']][work_rows])
+@@ -428,10 +430,19 @@ class Manager:
+     # --- Main loop
+ 
+     def _alloc_work(self, H, persis_info):
+-        "Calls work allocation function from alloc_specs"
++        """
++        Calls work allocation function from alloc_specs. Copies protected libE
++        fields before the alloc_f call and ensures they weren't modified
++        """
++        if self.safe_mode:
++            saveH = copy.deepcopy(H[protected_libE_fields])
++
+         alloc_f = self.alloc_specs['alloc_f']
+         output = alloc_f(self.W, H, self.sim_specs, self.gen_specs, self.alloc_specs, persis_info)
+ 
++        if self.safe_mode:
++            assert np.array_equal(saveH, H[protected_libE_fields]), "The allocation function modified protected fields"
++
+         if len(output) == 2:
+             output = output + ((0,))
+ 
+diff --git a/libensemble/tools/fields_keys.py b/libensemble/tools/fields_keys.py
+index 0c454970..bc0d3761 100644
+--- a/libensemble/tools/fields_keys.py
++++ b/libensemble/tools/fields_keys.py
+@@ -12,6 +12,13 @@ libE_fields = [('sim_id', int),        # Unique id of entry in H that was genera
+                ]
+ # end_libE_fields_rst_tag
+ 
++protected_libE_fields = ['gen_worker',
++                         'gen_time',
++                         'given',
++                         'returned',
++                         'given_time',
++                         'sim_worker']
++
+ allowed_sim_spec_keys = ['sim_f',  #
+                          'in',     #
+                          'out',    #
+diff --git a/libensemble/tools/tools.py b/libensemble/tools/tools.py
+index 96cfa3bd..4cfd1fd0 100644
+--- a/libensemble/tools/tools.py
++++ b/libensemble/tools/tools.py
+@@ -6,6 +6,7 @@ and user functions.
+ import os
+ import sys
+ import logging
++import platform
+ import numpy as np
+ import pickle
+ 
+@@ -148,3 +149,15 @@ def add_unique_random_streams(persis_info, nstreams):
+ def eprint(*args, **kwargs):
+     """Prints a user message to standard error"""
+     print(*args, file=sys.stderr, **kwargs)
++
++
++# ===================== OSX set multiprocessing start =======================
++# On Python 3.8 on macOS, the default start method for new processes was
++#  switched to 'spawn' by default due to 'fork' potentially causing crashes.
++# These crashes haven't yet been observed with libE, but with 'spawn' runs,
++#  warnings about leaked semaphore objects are displayed instead.
++# The next several statements enforce 'fork' on macOS (Python 3.8)
++def osx_set_mp_method():
++    if platform.system() == 'Darwin':
++        from multiprocessing import set_start_method
++        set_start_method('fork', force=True)

@@ -1,0 +1,281 @@
+diff --git a/opt_einsum/__init__.py b/opt_einsum/__init__.py
+index 3d8b47b..0ec9eb6 100644
+--- a/opt_einsum/__init__.py
++++ b/opt_einsum/__init__.py
+@@ -6,15 +6,18 @@ from . import blas
+ from . import helpers
+ from . import paths
+ from . import path_random
+-# Handle versioneer
+-from ._version import get_versions
+ from .contract import contract, contract_path, contract_expression
+ from .parser import get_symbol
+ from .sharing import shared_intermediates
+ from .paths import BranchBound
+ from .path_random import RandomGreedy
+ 
++# Handle versioneer
++from ._version import get_versions
+ versions = get_versions()
+ __version__ = versions['version']
+ __git_revision__ = versions['full-revisionid']
+ del get_versions, versions
++
++
++paths.register_path_fn('random-greedy', path_random.random_greedy)
+diff --git a/opt_einsum/contract.py b/opt_einsum/contract.py
+index 2f2d262..f7d2d91 100644
+--- a/opt_einsum/contract.py
++++ b/opt_einsum/contract.py
+@@ -13,10 +13,9 @@ from . import compat
+ from . import helpers
+ from . import parser
+ from . import paths
+-from . import path_random
+ from . import sharing
+ 
+-__all__ = ["contract_path", "contract", "format_const_einsum_str", "ContractExpression", "shape_only", "shape_only"]
++__all__ = ["contract_path", "contract", "format_const_einsum_str", "ContractExpression", "shape_only"]
+ 
+ 
+ class PathInfo(object):
+@@ -93,6 +92,9 @@ def _choose_memory_arg(memory_limit, size_list):
+     return int(memory_limit)
+ 
+ 
++_VALID_CONTRACT_KWARGS = {'optimize', 'path', 'memory_limit', 'einsum_call', 'use_blas', 'shapes'}
++
++
+ def contract_path(*operands, **kwargs):
+     """
+     Find a contraction order 'path', without performing the contraction.
+@@ -124,6 +126,9 @@ def contract_path(*operands, **kwargs):
+         Use BLAS functions or not
+     memory_limit : int, optional (default: None)
+         Maximum number of elements allowed in intermediate arrays.
++    shapes : bool, optional
++        Whether ``contract_path`` should assume arrays (the default) or array
++        shapes have been supplied.
+ 
+     Returns
+     -------
+@@ -193,8 +198,7 @@ def contract_path(*operands, **kwargs):
+     """
+ 
+     # Make sure all keywords are valid
+-    valid_contract_kwargs = ['optimize', 'path', 'memory_limit', 'einsum_call', 'use_blas']
+-    unknown_kwargs = [k for (k, v) in kwargs.items() if k not in valid_contract_kwargs]
++    unknown_kwargs = set(kwargs) - _VALID_CONTRACT_KWARGS
+     if len(unknown_kwargs):
+         raise TypeError("einsum_path: Did not understand the following kwargs: {}".format(unknown_kwargs))
+ 
+@@ -206,6 +210,7 @@ def contract_path(*operands, **kwargs):
+         path_type = kwargs.pop('optimize', 'auto')
+ 
+     memory_limit = kwargs.pop('memory_limit', None)
++    shapes = kwargs.pop('shapes', False)
+ 
+     # Hidden option, only einsum should call this
+     einsum_call_arg = kwargs.pop("einsum_call", False)
+@@ -217,7 +222,10 @@ def contract_path(*operands, **kwargs):
+     # Build a few useful list and sets
+     input_list = input_subscripts.split(',')
+     input_sets = [set(x) for x in input_list]
+-    input_shps = [x.shape for x in operands]
++    if shapes:
++        input_shps = operands
++    else:
++        input_shps = [x.shape for x in operands]
+     output_set = set(output_subscript)
+     indices = set(input_subscripts.replace(',', ''))
+ 
+@@ -257,29 +265,17 @@ def contract_path(*operands, **kwargs):
+ 
+     # Compute the path
+     if not isinstance(path_type, (compat.strings, paths.PathOptimizer)):
++        # Custom path supplied
+         path = path_type
+-    elif num_ops == 1:
+-        # Nothing to be optimized
+-        path = [(0, )]
+-    elif num_ops == 2:
++    elif num_ops <= 2:
+         # Nothing to be optimized
+-        path = [(0, 1)]
++        path = [tuple(range(num_ops))]
+     elif isinstance(path_type, paths.PathOptimizer):
++        # Custom path optimizer supplied
+         path = path_type(input_sets, output_set, dimension_dict, memory_arg)
+-    elif path_type == "optimal" or (path_type == "auto" and num_ops <= 4):
+-        path = paths.optimal(input_sets, output_set, dimension_dict, memory_arg)
+-    elif path_type == 'branch-all' or (path_type == "auto" and num_ops <= 6):
+-        path = paths.branch(input_sets, output_set, dimension_dict, memory_arg, nbranch=None)
+-    elif path_type == 'branch-2' or (path_type == "auto" and num_ops <= 8):
+-        path = paths.branch(input_sets, output_set, dimension_dict, memory_arg, nbranch=2)
+-    elif path_type == 'branch-1' or (path_type == "auto" and num_ops <= 14):
+-        path = paths.branch(input_sets, output_set, dimension_dict, memory_arg, nbranch=1)
+-    elif path_type == 'random-greedy':
+-        path = path_random.random_greedy(input_sets, output_set, dimension_dict, memory_arg)
+-    elif path_type in ("auto", "greedy", "eager", "opportunistic"):
+-        path = paths.greedy(input_sets, output_set, dimension_dict, memory_arg)
+     else:
+-        raise KeyError("Path name '{}' not found".format(path_type))
++        path_optimizer = paths.get_path_fn(path_type)
++        path = path_optimizer(input_sets, output_set, dimension_dict, memory_arg)
+ 
+     cost_list = []
+     scale_list = []
+diff --git a/opt_einsum/path_random.py b/opt_einsum/path_random.py
+index 5f40cc8..49bf95e 100644
+--- a/opt_einsum/path_random.py
++++ b/opt_einsum/path_random.py
+@@ -11,13 +11,13 @@ import functools
+ from collections import deque
+ 
+ from . import helpers
+-from .paths import PathOptimizer, ssa_greedy_optimize, get_better_fn, ssa_to_linear, calc_k12_flops
++from . import paths
+ 
+ 
+ __all__ = ["RandomGreedy", "random_greedy"]
+ 
+ 
+-class RandomOptimizer(PathOptimizer):
++class RandomOptimizer(paths.PathOptimizer):
+     """Base class for running any random path finder that benefits
+     from repeated calling, possibly in a parallel fashion. Custom random
+     optimizers should subclass this, and the ``setup`` method should be
+@@ -81,7 +81,7 @@ class RandomOptimizer(PathOptimizer):
+         self.max_repeats = max_repeats
+         self.max_time = max_time
+         self.minimize = minimize
+-        self.better = get_better_fn(minimize)
++        self.better = paths.get_better_fn(minimize)
+         self.parallel = parallel
+         self.pre_dispatch = pre_dispatch
+ 
+@@ -95,7 +95,7 @@ class RandomOptimizer(PathOptimizer):
+     def path(self):
+         """The best path found so far.
+         """
+-        return ssa_to_linear(self.best['ssa_path'])
++        return paths.ssa_to_linear(self.best['ssa_path'])
+ 
+     @property
+     def parallel(self):
+@@ -256,7 +256,7 @@ def thermal_chooser(queue, remaining, nbranch=8, temperature=1, rel_temperature=
+ 
+     # compute relative probability for each potential contraction
+     if temperature == 0.0:
+-        energies = [1 if cost == cmin else 0 for cost in costs]
++        energies = [1 if c == cmin else 0 for c in costs]
+     else:
+         # shift by cmin for numerical reasons
+         energies = [math.exp(-(c - cmin) / temperature) for c in costs]
+@@ -282,7 +282,7 @@ def ssa_path_compute_cost(ssa_path, inputs, output, size_dict):
+     max_size = 0
+ 
+     for i, j in ssa_path:
+-        k12, flops12 = calc_k12_flops(inputs, output, remaining, i, j, size_dict)
++        k12, flops12 = paths.calc_k12_flops(inputs, output, remaining, i, j, size_dict)
+         remaining.discard(i)
+         remaining.discard(j)
+         remaining.add(len(inputs))
+@@ -302,7 +302,7 @@ def _trial_greedy_ssa_path_and_cost(r, inputs, output, size_dict, choose_fn, cos
+     else:
+         random.seed(r)
+ 
+-    ssa_path = ssa_greedy_optimize(inputs, output, size_dict, choose_fn, cost_fn)
++    ssa_path = paths.ssa_greedy_optimize(inputs, output, size_dict, choose_fn, cost_fn)
+     cost, size = ssa_path_compute_cost(ssa_path, inputs, output, size_dict)
+ 
+     return ssa_path, cost, size
+diff --git a/opt_einsum/paths.py b/opt_einsum/paths.py
+index df800bf..8ce6a67 100644
+--- a/opt_einsum/paths.py
++++ b/opt_einsum/paths.py
+@@ -5,6 +5,7 @@ from __future__ import absolute_import, division, print_function
+ 
+ import heapq
+ import random
++import functools
+ import itertools
+ from collections import defaultdict
+ 
+@@ -12,7 +13,8 @@ import numpy as np
+ 
+ from . import helpers
+ 
+-__all__ = ["optimal", "BranchBound", "branch", "greedy"]
++
++__all__ = ["optimal", "BranchBound", "branch", "greedy", "auto", "get_path_fn"]
+ 
+ 
+ _UNLIMITED_MEM = {-1, None, float('inf')}
+@@ -444,6 +446,11 @@ def branch(inputs, output, size_dict, memory_limit=None, **optimizer_kwargs):
+     return optimizer(inputs, output, size_dict, memory_limit)
+ 
+ 
++branch_all = functools.partial(branch, nbranch=None)
++branch_2 = functools.partial(branch, nbranch=2)
++branch_1 = functools.partial(branch, nbranch=1)
++
++
+ def _get_candidate(output, sizes, remaining, footprints, dim_ref_counts, k1, k2, cost_fn):
+     either = k1 | k2
+     two = k1 & k2
+@@ -645,3 +652,53 @@ def greedy(inputs, output, size_dict, memory_limit=None, choose_fn=None, cost_fn
+ 
+     ssa_path = ssa_greedy_optimize(inputs, output, size_dict, cost_fn=cost_fn, choose_fn=choose_fn)
+     return ssa_to_linear(ssa_path)
++
++
++_AUTO_CHOICES = {}
++for i in range(1, 5):
++    _AUTO_CHOICES[i] = optimal
++for i in range(5, 7):
++    _AUTO_CHOICES[i] = branch_all
++for i in range(7, 9):
++    _AUTO_CHOICES[i] = branch_2
++for i in range(9, 15):
++    _AUTO_CHOICES[i] = branch_1
++
++
++def auto(inputs, output, size_dict, memory_limit=None):
++    """Finds the contraction path by automatically choosing the method based on
++    how many input arguments there are.
++    """
++    N = len(inputs)
++    return _AUTO_CHOICES.get(N, greedy)(inputs, output, size_dict, memory_limit)
++
++
++_PATH_OPTIONS = {
++    'auto': auto,
++    'optimal': optimal,
++    'branch-all': branch_all,
++    'branch-2': branch_2,
++    'branch-1': branch_1,
++    'greedy': greedy,
++    'eager': greedy,
++    'opportunistic': greedy,
++}
++
++
++def register_path_fn(name, fn):
++    """Add path finding function ``fn`` as an option with ``name``.
++    """
++    if name in _PATH_OPTIONS:
++        raise KeyError("Path optimizer '{}' already exists.".format(name))
++
++    _PATH_OPTIONS[name.lower()] = fn
++
++
++def get_path_fn(path_type):
++    """Get the correct path finding function from str ``path_type``.
++    """
++    if path_type not in _PATH_OPTIONS:
++        raise KeyError("Path optimizer '{}' not found, valid options are {}."
++                       .format(path_type, set(_PATH_OPTIONS.keys())))
++
++    return _PATH_OPTIONS[path_type]
+

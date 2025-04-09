@@ -1,0 +1,149 @@
+diff --git a/nc_time_axis/tests/integration/test_plot.py b/nc_time_axis/tests/integration/test_plot.py
+index 4b90584..4d9ef70 100644
+--- a/nc_time_axis/tests/integration/test_plot.py
++++ b/nc_time_axis/tests/integration/test_plot.py
+@@ -44,6 +44,23 @@ class Test(unittest.TestCase):
+         result_ydata = line1.get_ydata()
+         np.testing.assert_array_equal(result_ydata, datetimes)
+ 
++    def test_360_day_calendar_raw_universal_dates(self):
++        datetimes = [
++            cftime.datetime(1986, month, 30, calendar="360_day")
++            for month in range(1, 6)
++        ]
++        (line1,) = plt.plot(datetimes)
++        result_ydata = line1.get_ydata()
++        np.testing.assert_array_equal(result_ydata, datetimes)
++
++    def test_no_calendar_raw_universal_dates(self):
++        datetimes = [
++            cftime.datetime(1986, month, 30, calendar=None)
++            for month in range(1, 6)
++        ]
++        with self.assertRaisesRegex(ValueError, "defined"):
++            plt.plot(datetimes)
++
+     def test_fill_between(self):
+         calendar = "360_day"
+         dt = [
+diff --git a/nc_time_axis/tests/unit/test_NetCDFTimeConverter.py b/nc_time_axis/tests/unit/test_NetCDFTimeConverter.py
+index b564801..935ffab 100644
+--- a/nc_time_axis/tests/unit/test_NetCDFTimeConverter.py
++++ b/nc_time_axis/tests/unit/test_NetCDFTimeConverter.py
+@@ -78,6 +78,33 @@ class Test_default_units(unittest.TestCase):
+         result = NetCDFTimeConverter().default_units(val, None)
+         self.assertEqual(result, (calendar, unit, cftime.Datetime360Day))
+ 
++    def test_360_day_calendar_point_raw_universal_date(self):
++        calendar = "360_day"
++        unit = "days since 2000-01-01"
++        val = cftime.datetime(2014, 8, 12, calendar=calendar)
++        result = NetCDFTimeConverter().default_units(val, None)
++        self.assertEqual(result, (calendar, unit, cftime.datetime))
++
++    def test_360_day_calendar_list_raw_universal_date(self):
++        calendar = "360_day"
++        unit = "days since 2000-01-01"
++        val = [cftime.datetime(2014, 8, 12, calendar=calendar)]
++        result = NetCDFTimeConverter().default_units(val, None)
++        self.assertEqual(result, (calendar, unit, cftime.datetime))
++
++    def test_360_day_calendar_nd_raw_universal_date(self):
++        # Test the case where the input is an nd-array.
++        calendar = "360_day"
++        unit = "days since 2000-01-01"
++        val = np.array(
++            [
++                [cftime.datetime(2014, 8, 12, calendar=calendar)],
++                [cftime.datetime(2014, 8, 13, calendar=calendar)],
++            ]
++        )
++        result = NetCDFTimeConverter().default_units(val, None)
++        self.assertEqual(result, (calendar, unit, cftime.datetime))
++
+     def test_nonequal_calendars(self):
+         # Test that different supplied calendars causes an error.
+         calendar_1 = "360_day"
+@@ -89,6 +116,12 @@ class Test_default_units(unittest.TestCase):
+         with self.assertRaisesRegex(ValueError, "not all equal"):
+             NetCDFTimeConverter().default_units(val, None)
+ 
++    def test_no_calendar_point_raw_universal_date(self):
++        calendar = None
++        val = cftime.datetime(2014, 8, 12, calendar=calendar)
++        with self.assertRaisesRegex(ValueError, "defined"):
++            NetCDFTimeConverter().default_units(val, None)
++
+ 
+ class Test_convert(unittest.TestCase):
+     def test_numpy_array(self):
+@@ -141,6 +174,27 @@ class Test_convert(unittest.TestCase):
+         assert result == expected
+         assert len(result) == 1
+ 
++    def test_cftime_raw_universal_date(self):
++        val = cftime.datetime(2014, 8, 12, calendar="noleap")
++        result = NetCDFTimeConverter().convert(val, None, None)
++        expected = 5333.0
++        assert result == expected
++        assert np.isscalar(result)
++
++    def test_cftime_list_universal_date(self):
++        val = [cftime.datetime(2014, 8, 12, calendar="noleap")]
++        result = NetCDFTimeConverter().convert(val, None, None)
++        expected = 5333.0
++        assert result == expected
++        assert len(result) == 1
++
++    def test_cftime_tuple_univeral_date(self):
++        val = (cftime.datetime(2014, 8, 12, calendar="noleap"),)
++        result = NetCDFTimeConverter().convert(val, None, None)
++        expected = 5333.0
++        assert result == expected
++        assert len(result) == 1
++
+     def test_cftime_np_array_CalendarDateTime(self):
+         val = np.array(
+             [CalendarDateTime(cftime.datetime(2012, 6, 4), "360_day")],
+@@ -154,6 +208,13 @@ class Test_convert(unittest.TestCase):
+         result = NetCDFTimeConverter().convert(val, None, None)
+         self.assertEqual(result, np.array([4473.0]))
+ 
++    def test_cftime_np_array_raw_universal_date(self):
++        val = np.array(
++            [cftime.datetime(2012, 6, 4, calendar="360_day")], dtype=object
++        )
++        result = NetCDFTimeConverter().convert(val, None, None)
++        self.assertEqual(result, np.array([4473.0]))
++
+     def test_non_cftime_datetime(self):
+         val = CalendarDateTime(4, "360_day")
+         msg = (
+diff --git a/nc_time_axis/tests/unit/test_NetCDFTimeDateLocator.py b/nc_time_axis/tests/unit/test_NetCDFTimeDateLocator.py
+index 11310a6..a1f060a 100644
+--- a/nc_time_axis/tests/unit/test_NetCDFTimeDateLocator.py
++++ b/nc_time_axis/tests/unit/test_NetCDFTimeDateLocator.py
+@@ -83,6 +83,23 @@ class Test_compute_resolution(unittest.TestCase):
+         )
+ 
+ 
++class Test_compute_resolution_universal_datetime(unittest.TestCase):
++    def check(self, max_n_ticks, num1, num2):
++        locator = NetCDFTimeDateLocator(
++            max_n_ticks=max_n_ticks,
++            calendar=self.calendar,
++            date_unit=self.date_unit,
++        )
++        date1 = cftime.num2date(num1, self.date_unit, calendar=self.calendar)
++        date2 = cftime.num2date(num2, self.date_unit, calendar=self.calendar)
++        return locator.compute_resolution(
++            num1,
++            num2,
++            cftime.datetime(*date1.timetuple(), calendar=self.calendar),
++            cftime.datetime(*date2.timetuple(), calendar=self.calendar),
++        )
++
++
+ class Test_tick_values(unittest.TestCase):
+     def setUp(self):
+         self.date_unit = "days since 2004-01-01 00:00"

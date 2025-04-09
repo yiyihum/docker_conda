@@ -1,0 +1,371 @@
+diff --git a/aiosmtpd/docs/NEWS.rst b/aiosmtpd/docs/NEWS.rst
+index bf31b61..0962d67 100644
+--- a/aiosmtpd/docs/NEWS.rst
++++ b/aiosmtpd/docs/NEWS.rst
+@@ -26,6 +26,15 @@ Fixed/Improved
+   This is the correct, strict interpretation of :rfc:`4954` mentions about ``=``
+ 
+ 
++1.2.4 (aiosmtpd-next)
++=====================
++
++Added
++-----
++* New :meth:`handle_EHLO` interaction where said method can now modify list of responses
++  to the EHLO command (Closes #155)
++
++
+ 1.2.3 (2021-01-14)
+ ==================
+ 
+diff --git a/aiosmtpd/docs/handlers.rst b/aiosmtpd/docs/handlers.rst
+index 7f45007..10d2331 100644
+--- a/aiosmtpd/docs/handlers.rst
++++ b/aiosmtpd/docs/handlers.rst
+@@ -34,16 +34,19 @@ Handler hooks
+ =============
+ 
+ Handlers can implement hooks that get called during the SMTP dialog, or in
+-exceptional cases.  These *handler hooks* are all called asynchronously
++exceptional cases.  These *handler hooks* are all called **asynchronously**
+ (i.e. they are coroutines) and they *must* return a status string, such as
+ ``'250 OK'``.  All handler hooks are optional and default behaviors are
+ carried out by the ``SMTP`` class when a hook is omitted, so you only need to
+ implement the ones you care about.  When a handler hook is defined, it may
+ have additional responsibilities as described below.
+ 
+-All handler hooks take at least three arguments, the ``SMTP`` server instance,
+-:ref:`a session instance, and an envelope instance <sessions_and_envelopes>`.
+-Some methods take additional arguments.
++All handler hooks will be called with at least three arguments:
++(1) the ``SMTP`` server instance,
++(2) :ref:`a session instance <sessions_and_envelopes>`, and
++(3) :ref:`an envelope instance <sessions_and_envelopes>`.
++
++Some handler hooks will receive additional arguments.
+ 
+ The following hooks are currently defined:
+ 
+@@ -54,14 +57,40 @@ The following hooks are currently defined:
+     also set the ``session.host_name`` attribute before returning
+     ``'250 {}'.format(server.hostname)`` as the status.
+ 
++    .. important::
++
++        If the handler sets the ``session.host_name`` attribute to a false-y value
++        (or leave it as the default ``None`` value)
++        it will signal later steps that ``HELO`` failed
++        and need to be performed again.
++
++        This also applies to the :meth:`handle_EHLO` hook below.
++
+ .. py:method:: handle_EHLO(server, session, envelope, hostname)
++               handle_EHLO(server, session, envelope, hostname, responses)
+ 
+     Called during ``EHLO``.  The ``hostname`` argument is the host name given
+-    by the client in the ``EHLO`` command.  If implemented, this hook must
+-    also set the ``session.host_name`` attribute.  This hook may push
+-    additional ``250-<command>`` responses to the client by yielding from
+-    ``server.push(status)`` before returning ``250 HELP`` as the final
+-    response.
++    by the client in the ``EHLO`` command.
++
++    There are two implementation forms.
++
++    The first form accepts only 4 (four) arguments.
++    This hook may push *additional* ``250-<command>`` responses to the client by doing
++    ``await server.push(status)`` before returning ``"250 HELP"`` as the final response.
++
++    **The 4-argument form will be deprecated in version 2.0**
++
++    The second form accept 5 (five) arguments.
++    ``responses`` is a list strings representing the 'planned' responses to the ``EHLO`` command,
++    *including* the last ``250 HELP`` response.
++    The hook must return a list containing the desired responses.
++    *This is the only exception to the requirement of returning a status string.*
++
++    .. important::
++
++        It is strongly recommended to not change element ``[0]`` of the list
++        (containing the hostname of the SMTP server),
++        and to end the list with ``"250 HELP"``
+ 
+ .. py:method:: handle_NOOP(server, session, envelope, arg)
+ 
+@@ -89,7 +118,7 @@ The following hooks are currently defined:
+ 
+     Called during ``RCPT TO``.  The ``address`` argument is the parsed email
+     address given by the client in the ``RCPT TO`` command, and
+-    ``rcpt_options`` are any additional ESMTP recipient options providing by
++    ``rcpt_options`` are any additional ESMTP recipient options provided by
+     the client.  If implemented, this hook should append the address to
+     ``envelope.rcpt_tos`` and may extend ``envelope.rcpt_options`` (both of
+     which are always Python lists).
+@@ -126,7 +155,7 @@ The following hooks are currently defined:
+ 
+ In addition to the SMTP command hooks, the following hooks can also be
+ implemented by handlers.  These have different APIs, and are called
+-synchronously (i.e. they are **not** coroutines).
++**synchronously** (i.e. they are **not** coroutines).
+ 
+ .. py:method:: handle_STARTTLS(server, session, envelope)
+ 
+@@ -142,7 +171,10 @@ synchronously (i.e. they are **not** coroutines).
+     a status string, such as ``'542 Internal server error'``.  If the method
+     returns ``None`` or raises an exception, an exception will be logged, and a
+     ``451`` code will be returned to the client.
+-    **Note:** If client connection losted function will not be called.
++
++    .. important::
++
++        If client connection is lost, this handler will NOT be called.
+ 
+ 
+ .. _auth_hooks:
+diff --git a/aiosmtpd/smtp.py b/aiosmtpd/smtp.py
+index ab8a866..3e3f8c7 100644
+--- a/aiosmtpd/smtp.py
++++ b/aiosmtpd/smtp.py
+@@ -65,7 +65,7 @@ __all__ = [
+     "AuthMechanismType",
+     "MISSING",
+ ]  # Will be added to by @public
+-__version__ = '1.3.0.a1'
++__version__ = '1.3.0a2'
+ __ident__ = 'Python SMTP {}'.format(__version__)
+ log = logging.getLogger('mail.log')
+ 
+@@ -270,6 +270,7 @@ class SMTP(asyncio.StreamReaderProtocol):
+         self._auth_require_tls = auth_require_tls
+         self._auth_callback = auth_callback or login_always_fail
+         self._auth_required = auth_required
++
+         # Get hooks & methods to significantly speedup getattr's
+         self._auth_methods: Dict[str, _AuthMechAttr] = {
+             getattr(
+@@ -294,6 +295,26 @@ class SMTP(asyncio.StreamReaderProtocol):
+             for m in dir(handler)
+             if m.startswith("handle_")
+         }
++
++        # When we've deprecated the 4-arg form of handle_EHLO,
++        # we can -- and should -- remove this whole code block
++        ehlo_hook = self._handle_hooks.get("EHLO", None)
++        if ehlo_hook is None:
++            self._ehlo_hook_ver = None
++        else:
++            ehlo_hook_params = inspect.signature(ehlo_hook).parameters
++            if len(ehlo_hook_params) == 4:
++                self._ehlo_hook_ver = "old"
++                warn("Use the 5-argument handle_EHLO() hook instead of "
++                     "the 4-argument handle_EHLO() hook; "
++                     "support for the 4-argument handle_EHLO() hook will be "
++                     "removed in version 2.0",
++                     DeprecationWarning)
++            elif len(ehlo_hook_params) == 5:
++                self._ehlo_hook_ver = "new"
++            else:
++                raise RuntimeError("Unsupported EHLO Hook")
++
+         self._smtp_methods: Dict[str, Any] = {
+             m.replace("smtp_", ""): getattr(self, m)
+             for m in dir(self)
+@@ -636,32 +657,50 @@ class SMTP(asyncio.StreamReaderProtocol):
+         if not hostname:
+             await self.push('501 Syntax: EHLO hostname')
+             return
++
++        response = []
+         self._set_rset_state()
+         self.session.extended_smtp = True
+-        await self.push('250-%s' % self.hostname)
++        response.append('250-%s' % self.hostname)
+         if self.data_size_limit:
+-            await self.push('250-SIZE %s' % self.data_size_limit)
++            response.append('250-SIZE %s' % self.data_size_limit)
+             self.command_size_limits['MAIL'] += 26
+         if not self._decode_data:
+-            await self.push('250-8BITMIME')
++            response.append('250-8BITMIME')
+         if self.enable_SMTPUTF8:
+-            await self.push('250-SMTPUTF8')
++            response.append('250-SMTPUTF8')
+             self.command_size_limits['MAIL'] += 10
+         if self.tls_context and not self._tls_protocol:
+-            await self.push('250-STARTTLS')
++            response.append('250-STARTTLS')
++        if not self._auth_require_tls or self._tls_protocol:
++            response.append(
++                "250-AUTH " + " ".join(sorted(self._auth_methods.keys()))
++            )
++
+         if hasattr(self, 'ehlo_hook'):
+             warn('Use handler.handle_EHLO() instead of .ehlo_hook()',
+                  DeprecationWarning)
+             await self.ehlo_hook()
+-        if not self._auth_require_tls or self._tls_protocol:
+-            await self.push(
+-                "250-AUTH " + " ".join(sorted(self._auth_methods.keys()))
+-            )
+-        status = await self._call_handler_hook('EHLO', hostname)
+-        if status is MISSING:
++
++        if self._ehlo_hook_ver is None:
+             self.session.host_name = hostname
+-            status = '250 HELP'
+-        await self.push(status)
++            response.append('250 HELP')
++        elif self._ehlo_hook_ver == "old":
++            # Old behavior: Send all responses first...
++            for r in response:
++                await self.push(r)
++            # ... then send the response from the hook.
++            response = [await self._call_handler_hook("EHLO", hostname)]
++            # (The hook might internally send its own responses.)
++        elif self._ehlo_hook_ver == "new":  # pragma: nobranch
++            # New behavior: hand over list of responses so far to the hook, and
++            # REPLACE existing list of responses with what the hook returns.
++            # We will handle the push()ing
++            response.append('250 HELP')
++            response = await self._call_handler_hook("EHLO", hostname, response)
++
++        for r in response:
++            await self.push(r)
+ 
+     @syntax('NOOP [ignored]')
+     async def smtp_NOOP(self, arg):
+diff --git a/conf.py b/conf.py
+index 3968c70..b4a888c 100644
+--- a/conf.py
++++ b/conf.py
+@@ -13,23 +13,41 @@
+ # serve to show the default.
+ 
+ import sys
+-import os
+ import re
+ import datetime
+ 
+ from pathlib import Path
+ 
+-RE__VERSION = re.compile(r"""__version__ = (['"])(?P<ver>[^'"]+)(\1)""")
++try:
++    # noinspection PyPackageRequirements
++    from colorama import (
++        Fore,
++        Style,
++        init as colorama_init,
++    )
++    colorama_init()
++except ImportError:
++    class Fore:
++        CYAN = "\x1b[1;96m"
++        GREEN = "\x1b[1;92m"
++        YELLOW = "\x1b[1;93m"
++
++    class Style:
++        BRIGHT = "\x1b[1m"
++        RESET_ALL = "\x1b[0m"
+ 
+-YELLOW = "\x1b[1;93m"
+-NORM = "\x1b[0m"
++    colorama_init = None
++
++
++RE__VERSION = re.compile(r"""__version__ = (['"])(?P<ver>[^'"]+)(\1)""")
+ 
+ 
+ # If extensions (or modules to document with autodoc) are in another directory,
+ # add these directories to sys.path here. If the directory is relative to the
+ # documentation root, use os.path.abspath to make it absolute, like shown here.
+-sys.path.insert(0, os.path.abspath('.'))
+-sys.path.append(str(Path("aiosmtpd/docs/_exts").expanduser().absolute()))
++_curdir = Path(".").expanduser().absolute()
++sys.path.insert(0, str(_curdir))
++sys.path.append(str(_curdir / "aiosmtpd" / "docs" / "_exts"))
+ 
+ # -- General configuration ------------------------------------------------
+ 
+@@ -300,17 +318,16 @@ def setup(app):
+ 
+ def index_html():
+     import errno
+-    cwd = os.getcwd()
++    cwd = Path(".").expanduser().absolute()
++    htmldir = cwd / "build" / "sphinx" / "html"
+     try:
+         try:
+-            os.makedirs('build/sphinx/html')
+-        except OSError as error:
+-            if error.errno != errno.EEXIST:
+-                raise
+-        os.chdir('build/sphinx/html')
++            htmldir.mkdir()
++        except FileExistsError:
++            pass
+         try:
+-            os.symlink('README.html', 'index.html')
+-            print('index.html -> README.html')
++            (htmldir / "index.html").symlink_to("README.html")
++            print(f'{Fore.CYAN}index.html -> README.html')
+         except OSError as error:
+             # On Windows>= 7, only users with 'SeCreateSymbolicLinkPrivilege' token
+             # can create symlinks.
+@@ -318,14 +335,14 @@ def index_html():
+                     or str(error) == "symbolic link privilege not held"):
+                 # I don't like matching against string, but sometimes this particular
+                 # OSError does not have any errno nor winerror.
+-                print(f"{YELLOW}WARNING: No privilege to create symlinks. "
+-                      f"You have to make one manually{NORM}")
++                print(f"{Fore.YELLOW}WARNING: No privilege to create symlinks. "
++                      f"You have to make one manually")
+             elif error.errno == errno.EEXIST:
+                 pass
+             else:
+                 raise
+     finally:
+-        os.chdir(cwd)
++        print(Style.RESET_ALL)
+ 
+ 
+ import atexit
+diff --git a/tox.ini b/tox.ini
+index 8e46bd9..e481a11 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,4 +1,5 @@
+ [tox]
++minversion = 3.9.0
+ envlist = qa, docs, py{36,37,38,39}-{nocov,cov,diffcov}
+ skip_missing_interpreters = True
+ 
+@@ -25,7 +26,7 @@ deps =
+     colorama
+     coverage[toml]
+     packaging
+-    pytest
++    pytest >= 6.0  # Require >= 6.0 for pyproject.toml support (PEP 517)
+     pytest-cov
+     pytest-mock
+     pytest-profiling
+@@ -45,7 +46,7 @@ setenv =
+     !py36: PY_36=gt
+     py39: PY_39=ge
+     !py39: PY_39=lt
+-    PLATFORM={env:PLATFORM:linux}
++    PLATFORM={env:PLATFORM:posix}
+ passenv =
+     PYTHON*
+     TRAVIS
+@@ -78,8 +79,10 @@ commands =
+ deps:
+     {[qadocs]deps}
+ 
++# I'd love to fold flake8 into pyproject.toml, because the flake8 settings
++# should be "project-wide" settings (enforced not only during tox).
++# But the flake8 maintainers seem to harbor a severe dislike of pyproject.toml.
+ [flake8]
+-exclude = conf.py
+ jobs = 1
+ max-line-length = 88
+ ignore = E123, E133, W503, W504

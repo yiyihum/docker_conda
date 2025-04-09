@@ -1,0 +1,131 @@
+diff --git a/NEWS.rst b/NEWS.rst
+index ac9068e1..2b48f0ae 100644
+--- a/NEWS.rst
++++ b/NEWS.rst
+@@ -20,6 +20,10 @@ New Features
+ * You can now set `repl-ps1` and `repl-ps2` in your `HYSTARTUP` to customize
+   `sys.ps1` and `sys.ps2` for the Hy REPL.
+ 
++Bug Fixes
++------------------------------
++* Tracebacks now point to the correct code in more cases.
++
+ 0.28.0 (released 2024-01-05)
+ =============================
+ 
+diff --git a/docs/semantics.rst b/docs/semantics.rst
+index 626c091d..1dcd5b36 100644
+--- a/docs/semantics.rst
++++ b/docs/semantics.rst
+@@ -3,7 +3,8 @@ Semantics
+ ==============
+ 
+ This chapter describes features of Hy semantics that differ from Python's and
+-aren't better categorized elsewhere, such as in the chapter :doc:`macros`.
++aren't better categorized elsewhere, such as in the chapter :doc:`macros`. Each
++is a potential trap for the unwary.
+ 
+ .. _implicit-names:
+ 
+@@ -71,3 +72,28 @@ following:
+ Why didn't the second run of ``b.hy`` print ``2``? Because ``b.hy`` was
+ unchanged, so it didn't get recompiled, so its bytecode still had the old
+ expansion of the macro ``m``.
++
++Traceback positioning
++---------------------
++
++When an exception results in a traceback, Python uses line and column numbers
++associated with AST nodes to point to the source code associated with the
++exception:
++
++.. code-block:: text
++
++    Traceback (most recent call last):
++      File "cinco.py", line 4, in <module>
++        find()
++      File "cinco.py", line 2, in find
++        print(chippy)
++              ^^^^^^
++    NameError: name 'chippy' is not defined
++
++This position information is stored as attributes of the AST nodes. Hy tries to
++set these attributes appropriately so that it can also produce correctly
++targeted tracebacks, but there are cases where it can't, such as when
++evaluating code that was built at runtime out of explicit calls to :ref:`model
++constructors <models>`. Python still requires line and column numbers, so Hy
++sets these to 1 as a fallback; consequently, tracebacks can point to the
++beginning of a file even though the relevant code isn't there.
+diff --git a/hy/compiler.py b/hy/compiler.py
+index a72af420..5aaa4b1a 100755
+--- a/hy/compiler.py
++++ b/hy/compiler.py
+@@ -422,7 +422,7 @@ class HyASTCompiler:
+             # These are unexpected errors that will--hopefully--never be seen
+             # by the user.
+             f_exc = traceback.format_exc()
+-            exc_msg = "Internal Compiler Bug 😱\n⤷ {}".format(f_exc)
++            exc_msg = "Internal Compiler Bug\n {}".format(f_exc)
+             raise HyCompileError(exc_msg)
+ 
+     def _syntax_error(self, expr, message):
+diff --git a/hy/core/result_macros.py b/hy/core/result_macros.py
+index c4676f79..f43bdabb 100644
+--- a/hy/core/result_macros.py
++++ b/hy/core/result_macros.py
+@@ -135,7 +135,7 @@ def compile_eval_foo_compile(compiler, expr, root, body):
+         raise HyEvalError(str(e), compiler.filename, body, compiler.source)
+ 
+     return (
+-        compiler.compile(as_model(value))
++        compiler.compile(as_model(value).replace(expr))
+         if root == "do-mac"
+         else compiler._compile_branch(body)
+         if root == "eval-and-compile"
+diff --git a/hy/models.py b/hy/models.py
+index 23ccb6c5..ad370d3f 100644
+--- a/hy/models.py
++++ b/hy/models.py
+@@ -385,12 +385,19 @@ class Sequence(Object, tuple):
+     for this purpose.
+     """
+ 
++    _extra_kwargs = ()
++
+     def replace(self, other, recursive=True):
+-        if recursive:
+-            for x in self:
+-                replace_hy_obj(x, other)
+-        Object.replace(self, other)
+-        return self
++        return (
++            Object.replace(
++                Object.replace(
++                    type(self)(
++                        (replace_hy_obj(x, other) for x in self),
++                        **{k: getattr(self, k) for k in self._extra_kwargs}),
++                    self),
++                other)
++            if recursive
++            else Object.replace(self, other))
+ 
+     def __add__(self, other):
+         return self.__class__(
+@@ -431,6 +438,8 @@ class FComponent(Sequence):
+     format spec (if any).
+     """
+ 
++    _extra_kwargs = ("conversion",)
++
+     def __new__(cls, s=None, conversion=None):
+         value = super().__new__(cls, s)
+         value.conversion = conversion
+@@ -465,6 +474,8 @@ class FString(Sequence):
+     :ivar brackets: As in :class:`hy.models.String`.
+     """
+ 
++    _extra_kwargs = ("brackets",)
++
+     def __new__(cls, s=None, brackets=None):
+         value = super().__new__(
+             cls,

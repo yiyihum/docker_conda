@@ -1,0 +1,150 @@
+diff --git a/dvc/command/run.py b/dvc/command/run.py
+--- a/dvc/command/run.py
++++ b/dvc/command/run.py
+@@ -2,6 +2,7 @@
+ import logging
+ 
+ from dvc.command.base import CmdBase, append_doc_link
++from dvc.command.stage import parse_cmd
+ from dvc.exceptions import DvcException
+ 
+ logger = logging.getLogger(__name__)
+@@ -22,7 +23,7 @@ def run(self):
+                 self.args.outs_persist_no_cache,
+                 self.args.checkpoints,
+                 self.args.params,
+-                self.args.command,
++                self.args.cmd,
+             ]
+         ):  # pragma: no cover
+             logger.error(
+@@ -34,7 +35,7 @@ def run(self):
+ 
+         try:
+             self.repo.run(
+-                cmd=self._parsed_cmd(),
++                cmd=parse_cmd(self.args.cmd),
+                 outs=self.args.outs,
+                 outs_no_cache=self.args.outs_no_cache,
+                 metrics=self.args.metrics,
+@@ -67,27 +68,6 @@ def run(self):
+ 
+         return 0
+ 
+-    def _parsed_cmd(self):
+-        """
+-        We need to take into account two cases:
+-
+-        - ['python code.py foo bar']: Used mainly with dvc as a library
+-        - ['echo', 'foo bar']: List of arguments received from the CLI
+-
+-        The second case would need quoting, as it was passed through:
+-                dvc run echo "foo bar"
+-        """
+-        if len(self.args.command) < 2:
+-            return " ".join(self.args.command)
+-
+-        return " ".join(self._quote_argument(arg) for arg in self.args.command)
+-
+-    def _quote_argument(self, argument):
+-        if " " not in argument or '"' in argument:
+-            return argument
+-
+-        return f'"{argument}"'
+-
+ 
+ def add_parser(subparsers, parent_parser):
+     from dvc.command.stage import _add_common_args
+@@ -103,7 +83,6 @@ def add_parser(subparsers, parent_parser):
+     run_parser.add_argument(
+         "-n", "--name", help="Stage name.",
+     )
+-    _add_common_args(run_parser)
+     run_parser.add_argument(
+         "--file", metavar="<filename>", help=argparse.SUPPRESS,
+     )
+@@ -134,7 +113,5 @@ def add_parser(subparsers, parent_parser):
+         default=False,
+         help=argparse.SUPPRESS,
+     )
+-    run_parser.add_argument(
+-        "command", nargs=argparse.REMAINDER, help="Command to execute."
+-    )
++    _add_common_args(run_parser)
+     run_parser.set_defaults(func=CmdRun)
+diff --git a/dvc/command/stage.py b/dvc/command/stage.py
+--- a/dvc/command/stage.py
++++ b/dvc/command/stage.py
+@@ -105,10 +105,32 @@ def log_error(relpath: str, exc: Exception):
+         return 0
+ 
+ 
++def parse_cmd(commands: List[str]) -> str:
++    """
++    We need to take into account two cases:
++
++    - ['python code.py foo bar']: Used mainly with dvc as a library
++    - ['echo', 'foo bar']: List of arguments received from the CLI
++
++    The second case would need quoting, as it was passed through:
++            dvc run echo "foo bar"
++    """
++
++    def quote_argument(arg: str):
++        should_quote = " " in arg and '"' not in arg
++        return f'"{arg}"' if should_quote else arg
++
++    if len(commands) < 2:
++        return " ".join(commands)
++    return " ".join(map(quote_argument, commands))
++
++
+ class CmdStageAdd(CmdBase):
+     def run(self):
+         repo = self.repo
+         kwargs = vars(self.args)
++        kwargs["cmd"] = parse_cmd(kwargs.pop("cmd"))
++
+         stage = repo.stage.create_from_cli(validate=True, **kwargs)
+ 
+         with repo.scm.track_file_changes(config=repo.config):
+@@ -226,7 +248,7 @@ def _add_common_args(parser):
+         metavar="<filename>",
+     )
+     parser.add_argument(
+-        "-C",
++        "-c",
+         "--checkpoints",
+         action="append",
+         default=[],
+@@ -254,6 +276,12 @@ def _add_common_args(parser):
+             "This doesn't affect any DVC operations."
+         ),
+     )
++    parser.add_argument(
++        "cmd",
++        nargs=argparse.REMAINDER,
++        help="Command to execute.",
++        metavar="command",
++    )
+ 
+ 
+ def add_parser(subparsers, parent_parser):
+@@ -282,15 +310,8 @@ def add_parser(subparsers, parent_parser):
+         help=STAGE_ADD_HELP,
+         formatter_class=argparse.RawDescriptionHelpFormatter,
+     )
+-    stage_add_parser.add_argument("name", help="Name of the stage to add")
+     stage_add_parser.add_argument(
+-        "-c",
+-        "--command",
+-        action="append",
+-        default=[],
+-        dest="cmd",
+-        help="Command to execute.",
+-        required=True,
++        "-n", "--name", help="Name of the stage to add", required=True
+     )
+     _add_common_args(stage_add_parser)
+     stage_add_parser.set_defaults(func=CmdStageAdd)
+

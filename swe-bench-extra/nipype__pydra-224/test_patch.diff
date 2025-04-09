@@ -1,0 +1,235 @@
+diff --git a/pydra/engine/tests/test_helpers.py b/pydra/engine/tests/test_helpers.py
+index 862f6b1..5043735 100644
+--- a/pydra/engine/tests/test_helpers.py
++++ b/pydra/engine/tests/test_helpers.py
+@@ -4,17 +4,18 @@ import pytest
+ import cloudpickle as cp
+ 
+ from .utils import multiply
+-from .. import helpers
++from ..helpers import hash_value, hash_function, save, create_pyscript
+ from .. import helpers_file
++from ..specs import File
+ 
+ 
+ def test_save(tmpdir):
+     outdir = Path(tmpdir)
+     with pytest.raises(ValueError):
+-        helpers.save(tmpdir)
++        save(tmpdir)
+     foo = multiply(name="mult", x=1, y=2)
+     # save task
+-    helpers.save(outdir, task=foo)
++    save(outdir, task=foo)
+     del foo
+     # load saved task
+     task_pkl = outdir / "_task.pklz"
+@@ -24,7 +25,7 @@ def test_save(tmpdir):
+     # execute task and save result
+     res = foo()
+     assert res.output.out == 2
+-    helpers.save(outdir, result=res)
++    save(outdir, result=res)
+     del res
+     # load saved result
+     res_pkl = outdir / "_result.pklz"
+@@ -35,10 +36,10 @@ def test_save(tmpdir):
+ def test_create_pyscript(tmpdir):
+     outdir = Path(tmpdir)
+     with pytest.raises(Exception):
+-        helpers.create_pyscript(outdir, "checksum")
++        create_pyscript(outdir, "checksum")
+     foo = multiply(name="mult", x=1, y=2)
+-    helpers.save(outdir, task=foo)
+-    pyscript = helpers.create_pyscript(outdir, foo.checksum)
++    save(outdir, task=foo)
++    pyscript = create_pyscript(outdir, foo.checksum)
+     assert pyscript.exists()
+ 
+ 
+@@ -50,3 +51,76 @@ def test_hash_file(tmpdir):
+         helpers_file.hash_file(outdir / "test.file")
+         == "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     )
++
++
++def test_hashfun_float():
++    import math
++
++    pi_50 = 3.14159265358979323846264338327950288419716939937510
++    pi_15 = 3.141592653589793
++    pi_10 = 3.1415926536
++    # comparing for x that have the same x.as_integer_ratio()
++    assert (
++        math.pi.as_integer_ratio()
++        == pi_50.as_integer_ratio()
++        == pi_15.as_integer_ratio()
++    )
++    assert hash_function(math.pi) == hash_function(pi_15) == hash_function(pi_50)
++    # comparing for x that have different x.as_integer_ratio()
++    assert math.pi.as_integer_ratio() != pi_10.as_integer_ratio()
++    assert hash_function(math.pi) != hash_function(pi_10)
++
++
++def test_hash_value_dict():
++    dict1 = {"a": 10, "b": 5}
++    dict2 = {"b": 5, "a": 10}
++    assert (
++        hash_value(dict1)
++        == hash_value(dict2)
++        == [["a", hash_value(10)], ["b", hash_value(5)]]
++        == [["a", 10], ["b", 5]]
++    )
++
++
++def test_hash_value_list_tpl():
++    lst = [2, 5.6, "ala"]
++    tpl = (2, 5.6, "ala")
++    assert hash_value(lst) == [hash_value(2), hash_value(5.6), hash_value("ala")] == lst
++    assert hash_value(lst) == hash_value(tpl)
++
++
++def test_hash_value_list_dict():
++    lst = [2, {"a": "ala", "b": 1}]
++    hash_value(lst)
++    assert (
++        hash_value(lst)
++        == [hash_value(2), hash_value([["a", "ala"], ["b", 1]])]
++        == [2, [["a", "ala"], ["b", 1]]]
++    )
++
++
++def test_hash_value_files(tmpdir):
++    file_1 = tmpdir.join("file_1.txt")
++    file_2 = tmpdir.join("file_2.txt")
++    with open(file_1, "w") as f:
++        f.write("hello")
++    with open(file_2, "w") as f:
++        f.write("hello")
++
++    assert hash_value(file_1, tp=File) == hash_value(file_2, tp=File)
++    assert hash_value(file_1, tp=str) != hash_value(file_2, tp=str)
++    assert hash_value(file_1) != hash_value(file_2)
++
++
++def test_hash_value_files_list(tmpdir):
++    file_1 = tmpdir.join("file_1.txt")
++    file_2 = tmpdir.join("file_2.txt")
++    with open(file_1, "w") as f:
++        f.write("hello")
++    with open(file_2, "w") as f:
++        f.write("hi")
++
++    assert hash_value([file_1, file_2], tp=File) == [
++        hash_value(file_1, tp=File),
++        hash_value(file_2, tp=File),
++    ]
+diff --git a/pydra/engine/tests/test_specs.py b/pydra/engine/tests/test_specs.py
+index 67ea41e..da98ff8 100644
+--- a/pydra/engine/tests/test_specs.py
++++ b/pydra/engine/tests/test_specs.py
+@@ -289,7 +289,7 @@ def test_input_file_hash_4(tmpdir):
+ 
+     # checking specific hash value
+     hash1 = inputs(in_file=[{"file": file, "int": 3}]).hash
+-    assert hash1 == "0148961a66106e15e55de3ab7e8c49e6227b6db7cdc614dcbae20406feb2548a"
++    assert hash1 == "e0555e78a40a02611674b0f48da97cdd28eee7e9885ecc17392b560c14826f06"
+ 
+     # the same file, but int field changes
+     hash1a = inputs(in_file=[{"file": file, "int": 5}]).hash
+diff --git a/pydra/engine/tests/test_state.py b/pydra/engine/tests/test_state.py
+index 5d451cd..b3c46d2 100644
+--- a/pydra/engine/tests/test_state.py
++++ b/pydra/engine/tests/test_state.py
+@@ -1,6 +1,7 @@
+ import pytest
+ 
+ from ..state import State
++from ..helpers_state import PydraStateError
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -95,27 +96,27 @@ def test_state_1(
+ 
+ 
+ def test_state_2_err():
+-    with pytest.raises(Exception) as exinfo:
++    with pytest.raises(PydraStateError) as exinfo:
+         st = State("NA", splitter={"a"})
+     assert "splitter has to be a string, a tuple or a list" == str(exinfo.value)
+ 
+ 
+ def test_state_3_err():
+-    with pytest.raises(Exception) as exinfo:
++    with pytest.raises(PydraStateError) as exinfo:
+         st = State("NA", splitter=["a", "b"], combiner=("a", "b"))
+     assert "combiner has to be a string or a list" == str(exinfo.value)
+ 
+ 
+ def test_state_4_err():
+     st = State("NA", splitter="a", combiner=["a", "b"])
+-    with pytest.raises(Exception) as exinfo:
++    with pytest.raises(PydraStateError) as exinfo:
+         st.combiner_validation()
+     assert "all combiners have to be in the splitter" in str(exinfo.value)
+ 
+ 
+ def test_state_5_err():
+     st = State("NA", combiner="a")
+-    with pytest.raises(Exception) as exinfo:
++    with pytest.raises(PydraStateError) as exinfo:
+         st.combiner_validation()
+     assert "splitter has to be set before" in str(exinfo.value)
+ 
+@@ -166,7 +167,7 @@ def test_state_connect_1b_exception():
+     """can't provide explicitly NA.a (should be _NA)"""
+     st1 = State(name="NA", splitter="a", other_states={})
+     st2 = State(name="NB", splitter="NA.a")
+-    with pytest.raises(Exception) as excinfo:
++    with pytest.raises(PydraStateError) as excinfo:
+         st2.splitter_validation()
+     assert "consider using _NA" in str(excinfo.value)
+ 
+@@ -175,7 +176,7 @@ def test_state_connect_1b_exception():
+ def test_state_connect_1c_exception(splitter2, other_states2):
+     """can't ask for splitter from node that is not connected"""
+     st1 = State(name="NA", splitter="a")
+-    with pytest.raises(Exception) as excinfo:
++    with pytest.raises(PydraStateError) as excinfo:
+         st2 = State(name="NB", splitter=splitter2, other_states=other_states2)
+         st2.splitter_validation()
+ 
+@@ -691,7 +692,7 @@ def test_state_connect_innerspl_1a():
+ 
+ def test_state_connect_innerspl_1b():
+     """incorrect splitter - Right & Left parts in scalar splitter"""
+-    with pytest.raises(Exception):
++    with pytest.raises(PydraStateError):
+         st1 = State(name="NA", splitter="a")
+         st2 = State(name="NB", splitter=("_NA", "b"), other_states={"NA": (st1, "b")})
+ 
+@@ -1718,7 +1719,7 @@ def test_connect_splitters(
+     ],
+ )
+ def test_connect_splitters_exception_1(splitter, other_states):
+-    with pytest.raises(Exception) as excinfo:
++    with pytest.raises(PydraStateError) as excinfo:
+         st = State(name="CN", splitter=splitter, other_states=other_states)
+     assert "Left and Right splitters are mixed" in str(excinfo.value)
+ 
+@@ -1729,13 +1730,13 @@ def test_connect_splitters_exception_2():
+         splitter="_NB",
+         other_states={"NA": (State(name="NA", splitter="a"), "b")},
+     )
+-    with pytest.raises(Exception) as excinfo:
++    with pytest.raises(PydraStateError) as excinfo:
+         st.set_input_groups()
+     assert "can't ask for splitter from NB" in str(excinfo.value)
+ 
+ 
+ def test_connect_splitters_exception_3():
+-    with pytest.raises(Exception) as excinfo:
++    with pytest.raises(PydraStateError) as excinfo:
+         st = State(
+             name="CN",
+             splitter="_NB",

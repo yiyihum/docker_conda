@@ -1,0 +1,98 @@
+diff --git a/hwtypes/adt.py b/hwtypes/adt.py
+index 64837d8..1be6a4a 100644
+--- a/hwtypes/adt.py
++++ b/hwtypes/adt.py
+@@ -1,6 +1,7 @@
+ from .adt_meta import TupleMeta, ProductMeta, SumMeta, EnumMeta, is_adt_type
+ from collections import OrderedDict
+ from types import MappingProxyType
++import typing as tp
+ 
+ __all__  = ['Tuple', 'Product', 'Sum', 'Enum']
+ __all__ += ['new_instruction', 'is_adt_type']
+@@ -65,17 +66,6 @@ class Tuple(metaclass=TupleMeta):
+ 
+ 
+ class Product(Tuple, metaclass=ProductMeta):
+-    def __new__(cls, *args, **kwargs):
+-        if cls.is_bound:
+-            return super().__new__(cls, *args, **kwargs)
+-        elif len(args) == 1:
+-            #fields, name, bases, namespace
+-            t = type(cls).from_fields(kwargs, args[0], (cls,), {})
+-            return t
+-
+-        else:
+-            raise TypeError('Cannot instance unbound product type')
+-
+     def __repr__(self):
+         return f'{type(self).__name__}({", ".join(f"{k}={v}" for k,v in self.value_dict.items())})'
+ 
+@@ -86,6 +76,28 @@ class Product(Tuple, metaclass=ProductMeta):
+             d[k] = getattr(self, k)
+         return MappingProxyType(d)
+ 
++    @classmethod
++    def from_fields(cls,
++            class_name: str,
++            fields: tp.Mapping[str, type],
++            module: tp.Optional[str] = None,
++            qualname: tp.Optional[str] = None):
++        if cls.is_bound:
++            raise TypeError('Type must not be bound')
++
++        ns = {}
++
++        if module is None:
++            module = cls.__module__
++
++        if qualname is None:
++            qualname = class_name
++
++        ns['__module__'] = module
++        ns['__qualname__'] = qualname
++
++        return cls._from_fields(fields, class_name, (cls,), ns)
++
+ class Sum(metaclass=SumMeta):
+     def __init__(self, value):
+         if not isinstance(value, tuple(type(self).fields)):
+diff --git a/hwtypes/adt_meta.py b/hwtypes/adt_meta.py
+index d1c81bb..8559537 100644
+--- a/hwtypes/adt_meta.py
++++ b/hwtypes/adt_meta.py
+@@ -169,8 +169,6 @@ class ProductMeta(TupleMeta):
+         for k, v in namespace.items():
+             if _is_sunder(k) or _is_dunder(k) or _is_descriptor(v):
+                 ns[k] = v
+-            elif k in _RESERVED_NAMES:
+-                raise ReservedNameError(f'Field name {k} is reserved by the type machinery')
+             elif isinstance(v, type):
+                 if k in fields:
+                     raise TypeError(f'Conflicting definitions of field {k}')
+@@ -180,12 +178,12 @@ class ProductMeta(TupleMeta):
+                 ns[k] = v
+ 
+         if fields:
+-            return mcs.from_fields(fields, name, bases, ns,  **kwargs)
++            return mcs._from_fields(fields, name, bases, ns,  **kwargs)
+         else:
+             return super().__new__(mcs, name, bases, ns, **kwargs)
+ 
+     @classmethod
+-    def from_fields(mcs, fields, name, bases, ns, **kwargs):
++    def _from_fields(mcs, fields, name, bases, ns, **kwargs):
+         # not strictly necessary could iterative over class dict finding
+         # TypedProperty to reconstruct _field_table_ but that seems bad
+         if '_field_table_' in ns:
+@@ -193,6 +191,10 @@ class ProductMeta(TupleMeta):
+         else:
+             ns['_field_table_'] = OrderedDict()
+ 
++        for field in fields:
++            if field in _RESERVED_NAMES:
++                raise ReservedNameError(f'Field name {field} is reserved by the type machinery')
++
+         def _get_tuple_base(bases):
+             for base in bases:
+                 if not isinstance(base, ProductMeta) and isinstance(base, TupleMeta):

@@ -1,0 +1,409 @@
+diff --git a/.travis.yml b/.travis.yml
+index 7aac0cc3..0dd5c85c 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -21,8 +21,8 @@ jobs:
+     - name: pipeline-noop
+       before_install: sudo apt-get install -y systemd-container
+       script:
+-        - sudo env "PATH=$PATH" python3 -m osbuild --libdir . --output . samples/noop.json
+-        - sudo env "PATH=$PATH" python3 -m osbuild --libdir . --output . samples/noop.json
++        - sudo env "PATH=$PATH" python3 -m osbuild --libdir . samples/noop.json
++        - sudo env "PATH=$PATH" python3 -m osbuild --libdir . samples/noop.json
+     - name: f30-boot
+       before_install: sudo apt-get install -y systemd-container yum qemu-kvm
+       script: sudo env "PATH=$PATH" python3 -m test --case f30-boot --build-pipeline samples/build-from-yum.json
+diff --git a/README.md b/README.md
+index 4a7a390f..f2df5d28 100644
+--- a/README.md
++++ b/README.md
+@@ -70,7 +70,7 @@ The above pipeline has no base and produces a qcow2 image.
+ 
+ ```
+ usage: python3 -m osbuild [-h] [--build-pipeline PIPELINE] [--store DIRECTORY]
+-                   [-l DIRECTORY] -o DIRECTORY
++                   [-l DIRECTORY]
+                    PIPELINE
+ 
+ Build operating system images
+@@ -87,11 +87,6 @@ optional arguments:
+   -l DIRECTORY, --libdir DIRECTORY
+                         the directory containing stages, assemblers, and the
+                         osbuild library
+-
+-required named arguments:
+-  -o DIRECTORY, --output DIRECTORY
+-                        provide the empty DIRECTORY as output argument to the
+-                        last stage
+ ```
+ 
+ ### Running example
+@@ -99,7 +94,7 @@ required named arguments:
+ You can build basic qcow2 image of Fedora 30 by running a following command:
+ 
+ ```
+-sudo python3 -m osbuild -o output --libdir . samples/base-qcow2.json
++sudo python3 -m osbuild --libdir . samples/base-qcow2.json
+ ```
+ 
+ - Root rights are required because osbuild heavily relies on creating
+diff --git a/osbuild/__main__.py b/osbuild/__main__.py
+index 8b3481b7..b929f863 100755
+--- a/osbuild/__main__.py
++++ b/osbuild/__main__.py
+@@ -21,9 +21,8 @@ def main():
+                         help="the directory where intermediary os trees are stored")
+     parser.add_argument("-l", "--libdir", metavar="DIRECTORY", type=os.path.abspath,
+                         help="the directory containing stages, assemblers, and the osbuild library")
+-    requiredNamed = parser.add_argument_group('required named arguments')
+-    requiredNamed.add_argument("-o", "--output", dest="output_dir", metavar="DIRECTORY", type=os.path.abspath,
+-                               help="provide the empty DIRECTORY as output argument to the last stage", required=True)
++    parser.add_argument("--json", action="store_true",
++                        help="output results in JSON format")
+     args = parser.parse_args()
+ 
+     with open(args.pipeline_path) as f:
+@@ -35,16 +34,27 @@ def main():
+         pipeline.prepend_build_pipeline(build)
+ 
+     try:
+-        pipeline.run(args.output_dir, args.store, interactive=True, libdir=args.libdir)
++        pipeline.run(args.store, interactive=not args.json, libdir=args.libdir)
+     except KeyboardInterrupt:
+         print()
+         print(f"{RESET}{BOLD}{RED}Aborted{RESET}")
+-        sys.exit(130)
++        return 130
+     except (osbuild.StageFailed, osbuild.AssemblerFailed) as error:
+         print()
+         print(f"{RESET}{BOLD}{RED}{error.name} failed with code {error.returncode}{RESET}")
+-        sys.exit(1)
++        if args.json:
++            print(error.output)
++        return 1
++
++    if args.json:
++        json.dump({
++            "tree_id": pipeline.tree_id,
++            "output_id": pipeline.output_id,
++        }, sys.stdout)
++        sys.stdout.write("\n")
++
++    return 0
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    sys.exit(main())
+diff --git a/osbuild/objectstore.py b/osbuild/objectstore.py
+index ea726277..eaf73d53 100644
+--- a/osbuild/objectstore.py
++++ b/osbuild/objectstore.py
+@@ -13,6 +13,19 @@ __all__ = [
+ ]
+ 
+ 
++@contextlib.contextmanager
++def suppress_oserror(*errnos):
++    """A context manager that suppresses any OSError with an errno in `errnos`.
++
++    Like contextlib.suppress, but can differentiate between OSErrors.
++    """
++    try:
++        yield
++    except OSError as e:
++        if e.errno not in errnos:
++            raise e
++
++
+ class ObjectStore:
+     def __init__(self, store):
+         self.store = store
+@@ -22,29 +35,35 @@ class ObjectStore:
+         os.makedirs(self.objects, exist_ok=True)
+         os.makedirs(self.refs, exist_ok=True)
+ 
+-    def has_tree(self, tree_id):
+-        if not tree_id:
++    def contains(self, object_id):
++        if not object_id:
+             return False
+-        return os.access(f"{self.refs}/{tree_id}", os.F_OK)
++        return os.access(f"{self.refs}/{object_id}", os.F_OK)
+ 
+     @contextlib.contextmanager
+-    def get_tree(self, tree_id):
++    def get(self, object_id):
+         with tempfile.TemporaryDirectory(dir=self.store) as tmp:
+-            if tree_id:
+-                subprocess.run(["mount", "-o", "bind,ro,mode=0755", f"{self.refs}/{tree_id}", tmp], check=True)
++            if object_id:
++                subprocess.run(["mount", "-o", "bind,ro,mode=0755", f"{self.refs}/{object_id}", tmp], check=True)
+                 try:
+                     yield tmp
+                 finally:
+                     subprocess.run(["umount", "--lazy", tmp], check=True)
+             else:
+-                # None was given as tree_id, just return an empty directory
++                # None was given as object_id, just return an empty directory
+                 yield tmp
+ 
+     @contextlib.contextmanager
+-    def new_tree(self, tree_id, base_id=None):
++    def new(self, object_id, base_id=None):
++        """Creates a new directory for `object_id`.
++
++        This method must be used as a context manager. It returns a path to a
++        temporary directory and only commits it when the context completes
++        without raising an exception.
++        """
+         with tempfile.TemporaryDirectory(dir=self.store) as tmp:
+             # the tree that is yielded will be added to the content store
+-            # on success as tree_id
++            # on success as object_id
+ 
+             tree = f"{tmp}/tree"
+             link = f"{tmp}/link"
+@@ -68,20 +87,18 @@ class ObjectStore:
+             finally:
+                 os.close(fd)
+             # the tree is stored in the objects directory using its content
+-            # hash as its name, ideally a given tree_id (i.e., given config)
++            # hash as its name, ideally a given object_id (i.e., given config)
+             # will always produce the same content hash, but that is not
+             # guaranteed
+             output_tree = f"{self.objects}/{treesum_hash}"
+-            try:
++
++            # if a tree with the same treesum already exist, use that
++            with suppress_oserror(errno.ENOTEMPTY):
+                 os.rename(tree, output_tree)
+-            except OSError as e:
+-                if e.errno == errno.ENOTEMPTY:
+-                    pass # tree with the same content hash already exist, use that
+-                else:
+-                    raise
+-            # symlink the tree_id (config hash) in the refs directory to the treesum
+-            # (content hash) in the objects directory. If a symlink by that name
+-            # alreday exists, atomically replace it, but leave the backing object
+-            # in place (it may be in use).
++
++            # symlink the object_id (config hash) in the refs directory to the
++            # treesum (content hash) in the objects directory. If a symlink by
++            # that name alreday exists, atomically replace it, but leave the
++            # backing object in place (it may be in use).
+             os.symlink(f"../objects/{treesum_hash}", link)
+-            os.replace(link, f"{self.refs}/{tree_id}")
++            os.replace(link, f"{self.refs}/{object_id}")
+diff --git a/osbuild/pipeline.py b/osbuild/pipeline.py
+index 13057bab..ee6a4a4a 100644
+--- a/osbuild/pipeline.py
++++ b/osbuild/pipeline.py
+@@ -38,16 +38,20 @@ def print_header(title, options):
+ 
+ class Stage:
+     def __init__(self, name, build, base, options):
+-        m = hashlib.sha256()
+-        m.update(json.dumps(name, sort_keys=True).encode())
+-        m.update(json.dumps(build, sort_keys=True).encode())
+-        m.update(json.dumps(base, sort_keys=True).encode())
+-        m.update(json.dumps(options, sort_keys=True).encode())
+-
+-        self.id = m.hexdigest()
+         self.name = name
++        self.build = build
++        self.base = base
+         self.options = options
+ 
++    @property
++    def id(self):
++        m = hashlib.sha256()
++        m.update(json.dumps(self.name, sort_keys=True).encode())
++        m.update(json.dumps(self.build, sort_keys=True).encode())
++        m.update(json.dumps(self.base, sort_keys=True).encode())
++        m.update(json.dumps(self.options, sort_keys=True).encode())
++        return m.hexdigest()
++
+     def description(self):
+         description = {}
+         description["name"] = self.name
+@@ -78,18 +82,25 @@ class Stage:
+             if check and r.returncode != 0:
+                 raise StageFailed(self.name, r.returncode, r.stdout)
+ 
+-            return {
+-                "name": self.name,
+-                "returncode": r.returncode,
+-                "output": r.stdout
+-            }
++            return r.returncode == 0
+ 
+ 
+ class Assembler:
+-    def __init__(self, name, options):
++    def __init__(self, name, build, base, options):
+         self.name = name
++        self.build = build
++        self.base = base
+         self.options = options
+ 
++    @property
++    def id(self):
++        m = hashlib.sha256()
++        m.update(json.dumps(self.name, sort_keys=True).encode())
++        m.update(json.dumps(self.build, sort_keys=True).encode())
++        m.update(json.dumps(self.base, sort_keys=True).encode())
++        m.update(json.dumps(self.options, sort_keys=True).encode())
++        return m.hexdigest()
++
+     def description(self):
+         description = {}
+         description["name"] = self.name
+@@ -100,7 +111,7 @@ class Assembler:
+     def run(self, tree, build_tree, output_dir=None, interactive=False, check=True, libdir=None):
+         with buildroot.BuildRoot(build_tree) as build_root:
+             if interactive:
+-                print_header(f"Assembling: {self.name}", self.options)
++                print_header(f"Assembler {self.name}: {self.id}", self.options)
+ 
+             args = {
+                 "tree": "/run/osbuild/tree",
+@@ -127,11 +138,7 @@ class Assembler:
+                 if check and r.returncode != 0:
+                     raise AssemblerFailed(self.name, r.returncode, r.stdout)
+ 
+-            return {
+-                "name": self.name,
+-                "returncode": r.returncode,
+-                "output": r.stdout
+-            }
++            return r.returncode == 0
+ 
+ 
+ class Pipeline:
+@@ -140,16 +147,24 @@ class Pipeline:
+         self.stages = []
+         self.assembler = None
+ 
+-    def get_id(self):
++    @property
++    def tree_id(self):
+         return self.stages[-1].id if self.stages else None
+ 
++    @property
++    def output_id(self):
++        return self.assembler.id if self.assembler else None
++
+     def add_stage(self, name, options=None):
+-        build = self.build.get_id() if self.build else None
+-        stage = Stage(name, build, self.get_id(), options or {})
++        build = self.build.tree_id if self.build else None
++        stage = Stage(name, build, self.tree_id, options or {})
+         self.stages.append(stage)
++        if self.assembler:
++            self.assembler.base = stage.id
+ 
+     def set_assembler(self, name, options=None):
+-        self.assembler = Assembler(name, options or {})
++        build = self.build.tree_id if self.build else None
++        self.assembler = Assembler(name, build, self.tree_id, options or {})
+ 
+     def prepend_build_pipeline(self, build):
+         pipeline = self
+@@ -170,7 +185,7 @@ class Pipeline:
+     @contextlib.contextmanager
+     def get_buildtree(self, object_store):
+         if self.build:
+-            with object_store.get_tree(self.build.get_id()) as tree:
++            with object_store.get(self.build.tree_id) as tree:
+                 yield tree
+         else:
+             with tempfile.TemporaryDirectory(dir=object_store.store) as tmp:
+@@ -180,28 +195,22 @@ class Pipeline:
+                 finally:
+                     subprocess.run(["umount", "--lazy", tmp], check=True)
+ 
+-    def run(self, output_dir, store, interactive=False, check=True, libdir=None):
++    def run(self, store, interactive=False, check=True, libdir=None):
+         os.makedirs("/run/osbuild", exist_ok=True)
+         object_store = objectstore.ObjectStore(store)
+-        results = {
+-            "stages": []
+-        }
+         if self.build:
+-            r = self.build.run(None, store, interactive, check, libdir)
+-            results["build"] = r
+-            if r["returncode"] != 0:
+-                results["returncode"] = r["returncode"]
+-                return results
++            if not self.build.run(store, interactive, check, libdir):
++                return False
+ 
+         with self.get_buildtree(object_store) as build_tree:
+             if self.stages:
+-                if not object_store.has_tree(self.get_id()):
++                if not object_store.contains(self.tree_id):
+                     # Find the last stage that already exists in the object store, and use
+                     # that as the base.
+                     base = None
+                     base_idx = -1
+                     for i in reversed(range(len(self.stages))):
+-                        if object_store.has_tree(self.stages[i].id):
++                        if object_store.contains(self.stages[i].id):
+                             base = self.stages[i].id
+                             base_idx = i
+                             break
+@@ -210,33 +219,27 @@ class Pipeline:
+                     # is nondeterministic which of them will end up referenced by the tree_id
+                     # in the content store. However, we guarantee that all tree_id's and all
+                     # generated trees remain valid.
+-                    with object_store.new_tree(self.get_id(), base_id=base) as tree:
++                    with object_store.new(self.tree_id, base_id=base) as tree:
+                         for stage in self.stages[base_idx + 1:]:
+-                            r = stage.run(tree,
+-                                          build_tree,
+-                                          interactive=interactive,
+-                                          check=check,
+-                                          libdir=libdir)
+-                            results["stages"].append(r)
+-                            if r["returncode"] != 0:
+-                                results["returncode"] = r["returncode"]
+-                                return results
+-
+-            if self.assembler:
+-                with object_store.get_tree(self.get_id()) as tree:
+-                    r = self.assembler.run(tree,
+-                                           build_tree,
+-                                           output_dir=output_dir,
+-                                           interactive=interactive,
+-                                           check=check,
+-                                           libdir=libdir)
+-                    results["assembler"] = r
+-                    if r["returncode"] != 0:
+-                        results["returncode"] = r["returncode"]
+-                        return results
+-
+-        results["returncode"] = 0
+-        return results
++                            if not stage.run(tree,
++                                             build_tree,
++                                             interactive=interactive,
++                                             check=check,
++                                             libdir=libdir):
++                                return False
++
++            if self.assembler and not object_store.contains(self.output_id):
++                with object_store.get(self.tree_id) as tree, \
++                    object_store.new(self.output_id) as output_dir:
++                    if not self.assembler.run(tree,
++                                              build_tree,
++                                              output_dir=output_dir,
++                                              interactive=interactive,
++                                              check=check,
++                                              libdir=libdir):
++                        return False
++
++        return True
+ 
+ 
+ def load(description):

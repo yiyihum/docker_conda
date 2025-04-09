@@ -1,0 +1,191 @@
+diff --git a/tests/io/test_dataset_reader.py b/tests/io/test_dataset_reader.py
+index 165fdce..3e9f0f9 100644
+--- a/tests/io/test_dataset_reader.py
++++ b/tests/io/test_dataset_reader.py
+@@ -35,8 +35,8 @@ def matching_data():
+         Tripleg_2 overlaps and extents to the right but is almost not covered by label_0
+         Tripleg_3 overlaps label_1 to the right and the left but is almost fully covered by it.
+     """
+-    one_hour = datetime.timedelta(hours=1)
+-    one_min = datetime.timedelta(minutes=1)
++    one_hour = pd.Timedelta("1h")
++    one_min = pd.Timedelta("1min")
+     time_1 = pd.Timestamp("1970-01-01", tz="utc")
+ 
+     triplegs = [
+@@ -146,14 +146,6 @@ class Test_GetLabels:
+         assert len(labels[20]) == 223
+         assert all(df.columns.tolist() == ["started_at", "finished_at", "mode"] for df in labels.values())
+ 
+-    def test_defaultdict(self):
+-        """Test if non existing entries return a correct empty pd.DataFrame"""
+-        geolife_path = os.path.join("tests", "data", "geolife_modes")
+-        uids = ["010", "020", "178"]
+-        labels = _get_labels(geolife_path, uids)
+-        empty_df = pd.DataFrame(columns=["started_at", "finished_at", "mode"])
+-        assert_frame_equal(labels[-1], empty_df)
+-
+ 
+ class Test_GetDf:
+     def test_example_data(self):
+@@ -242,8 +234,7 @@ class TestGeolife_add_modes_to_triplegs:
+ 
+     def test_mode_matching_multi_user(self, matching_data):
+         tpls, labels_raw = matching_data
+-        # we add an empty DataFrame with labels in the end
+-        labels = {0: labels_raw, 1: pd.DataFrame(columns=labels_raw.columns)}
++        labels = {0: labels_raw}
+         # explicitly change the user_id of the second record
+         tpls.loc[1, "user_id"] = 1
+ 
+diff --git a/tests/io/test_from_geopandas.py b/tests/io/test_from_geopandas.py
+index c04a724..3dc0edd 100644
+--- a/tests/io/test_from_geopandas.py
++++ b/tests/io/test_from_geopandas.py
+@@ -91,6 +91,17 @@ class Test_Trackintel_Model:
+         pfs = _trackintel_model(pfs, tz_cols=["tracked_at"], tz="UTC")
+         assert_geodataframe_equal(pfs, example_positionfixes)
+ 
++    def test_multiple_timezones_in_col(self, example_positionfixes):
++        """Test if datetimes in column don't have the same timezone get casted to UTC."""
++        example_positionfixes["tracked_at"] = [
++            pd.Timestamp("2021-08-01 16:00:00", tz="Europe/Amsterdam"),
++            pd.Timestamp("2021-08-01 16:00:00", tz="Asia/Muscat"),
++            pd.Timestamp("2021-08-01 16:00:00", tz="Pacific/Niue"),
++        ]
++        pfs = _trackintel_model(example_positionfixes, tz_cols=["tracked_at"])
++        example_positionfixes["tracked_at"] = pd.to_datetime(example_positionfixes["tracked_at"], utc=True)
++        assert_geodataframe_equal(pfs, example_positionfixes)
++
+ 
+ class TestRead_Positionfixes_Gpd:
+     """Test `read_positionfixes_gpd()` function."""
+@@ -296,6 +307,17 @@ class TestRead_Trips_Gpd:
+         example_trips.rename(columns=mapper, inplace=True)
+         assert_geodataframe_equal(trips, example_trips)
+ 
++    def test_multiple_timezones_in_col(self, example_trips):
++        """Test if datetimes in column don't have the same timezone get casted to UTC."""
++        example_trips["started_at"] = [
++            pd.Timestamp("2021-08-01 16:00:00", tz="Europe/Amsterdam"),
++            pd.Timestamp("2021-08-01 16:00:00", tz="Asia/Muscat"),
++            pd.Timestamp("2021-08-01 16:00:00", tz="Pacific/Niue"),
++        ]
++        trips = read_trips_gpd(example_trips)
++        example_trips["started_at"] = pd.to_datetime(example_trips["started_at"], utc=True)
++        assert_geodataframe_equal(example_trips, trips)
++
+ 
+ @pytest.fixture
+ def example_tours():
+diff --git a/tests/io/test_postgis.py b/tests/io/test_postgis.py
+index 6b9f03a..3791d46 100644
+--- a/tests/io/test_postgis.py
++++ b/tests/io/test_postgis.py
+@@ -160,6 +160,25 @@ def example_trips():
+     return trips
+ 
+ 
++@pytest.fixture
++def example_tours():
++    """Tours to load into the database."""
++    t1 = pd.Timestamp("1971-01-01 00:00:00", tz="utc")
++    t2 = pd.Timestamp("1971-01-01 05:00:00", tz="utc")
++    t3 = pd.Timestamp("1971-01-02 07:00:00", tz="utc")
++    h = datetime.timedelta(hours=1)
++
++    list_dict = [
++        {"user_id": 0, "started_at": t1, "finished_at": t1 + h},
++        {"user_id": 0, "started_at": t2, "finished_at": t2 + h},
++        {"user_id": 1, "started_at": t3, "finished_at": t3 + h},
++    ]
++    tours = pd.DataFrame(data=list_dict)
++    tours.index.name = "id"
++    assert tours.as_tours
++    return tours
++
++
+ def del_table(con, table):
+     """Delete table in con."""
+     try:
+@@ -291,6 +310,28 @@ class TestPositionfixes:
+         finally:
+             del_table(conn, table)
+ 
++    def test_daylight_saving_tz(self, example_positionfixes, conn_postgis):
++        """Test if function can handle different tz informations in one column.
++
++        PostgreSQL saves all its datetimes in UTC and then on exports them to the local timezone.
++        That all works fine except when the local timezone changed in the past for example with daylight saving.
++        """
++        pfs = example_positionfixes.copy()
++        conn_string, conn = conn_postgis
++        table = "positionfixes"
++        sql = f"SELECT * FROM {table}"
++        t1 = pd.Timestamp("2021-08-01 16:00:00", tz="utc")  # summer time
++        t2 = pd.Timestamp("2021-08-01 15:00:00", tz="utc")  # summer time
++        t3 = pd.Timestamp("2021-02-01 14:00:00", tz="utc")  # winter time
++        pfs["tracked_at"] = [t1, t2, t3]
++        geom_col = pfs.geometry.name
++        try:
++            pfs.as_positionfixes.to_postgis(table, conn_string)
++            pfs_db = ti.io.read_positionfixes_postgis(sql, conn_string, geom_col, index_col="id")
++            assert_geodataframe_equal(pfs, pfs_db)
++        finally:
++            del_table(conn, table)
++
+ 
+ class TestTriplegs:
+     def test_write(self, example_triplegs, conn_postgis):
+@@ -582,6 +623,51 @@ class TestTrips:
+             del_table(conn, table)
+ 
+ 
++class TestTours:
++    """Test of postgis functions for tours."""
++
++    def test_write(self, example_tours, conn_postgis):
++        """Test if write of tours create correct schema in database."""
++        tours = example_tours
++        conn_string, conn = conn_postgis
++        table = "tours"
++        try:
++            tours.as_tours.to_postgis(table, conn_string)
++            columns_db, dtypes = get_table_schema(conn, table)
++            columns = tours.columns.tolist() + [tours.index.name]
++            assert len(columns_db) == len(columns)
++            assert set(columns_db) == set(columns)
++        finally:
++            del_table(conn, table)
++
++    def test_read(self, example_tours, conn_postgis):
++        """Test if tours written to and read back from database are the same."""
++        tours = example_tours
++        conn_string, conn = conn_postgis
++        table = "tours"
++        sql = f"SELECT * FROM {table}"
++
++        try:
++            tours.as_tours.to_postgis(table, conn_string)
++            tours_db = ti.io.read_tours_postgis(sql, conn_string, index_col="id")
++            assert_frame_equal(tours, tours_db)
++        finally:
++            del_table(conn, table)
++
++    def test_no_crs(self, example_tours, conn_postgis):
++        """Test if writing reading to postgis also works correctly without CRS."""
++        tours = example_tours
++        conn_string, conn = conn_postgis
++        table = "tours"
++        sql = f"SELECT * FROM {table}"
++        try:
++            tours.as_tours.to_postgis(table, conn_string)
++            tours_db = ti.io.read_tours_postgis(sql, conn_string, index_col="id")
++            assert_frame_equal(tours, tours_db)
++        finally:
++            del_table(conn, table)
++
++
+ class TestGetSrid:
+     def test_srid(self, example_positionfixes):
+         """Test if `_get_srid` returns the correct srid."""

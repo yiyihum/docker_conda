@@ -1,0 +1,132 @@
+diff --git a/geopandas/array.py b/geopandas/array.py
+index 705caf0..41f75f7 100644
+--- a/geopandas/array.py
++++ b/geopandas/array.py
+@@ -1264,7 +1264,55 @@ class GeometryArray(ExtensionArray):
+         ExtensionArray.argsort
+         """
+         # Note: this is used in `ExtensionArray.argsort`.
+-        raise TypeError("geometries are not orderable")
++        from geopandas.tools.hilbert_curve import _hilbert_distance
++
++        if self.size == 0:
++            # TODO _hilbert_distance fails for empty array
++            return np.array([], dtype="uint32")
++
++        mask_empty = self.is_empty
++        has_empty = mask_empty.any()
++        mask = self.isna() | mask_empty
++        if mask.any():
++            # if there are missing or empty geometries, we fill those with
++            # a dummy geometry so that the _hilbert_distance function can
++            # process those. The missing values are handled separately by
++            # pandas regardless of the values we return here (to sort
++            # first/last depending on 'na_position'), the distances for the
++            # empty geometries are substitued below with an appropriate value
++            geoms = self.copy()
++            indices = np.nonzero(~mask)[0]
++            if indices.size:
++                geom = self[indices[0]]
++            else:
++                # for all-empty/NA, just take random geometry
++                geom = shapely.geometry.Point(0, 0)
++
++            geoms[mask] = geom
++        else:
++            geoms = self
++        if has_empty:
++            # in case we have empty geometries, we need to expand the total
++            # bounds with a small percentage, so the empties can be
++            # deterministically sorted first
++            total_bounds = geoms.total_bounds
++            xoff = (total_bounds[2] - total_bounds[0]) * 0.01
++            yoff = (total_bounds[3] - total_bounds[1]) * 0.01
++            total_bounds += np.array([-xoff, -yoff, xoff, yoff])
++        else:
++            total_bounds = None
++        distances = _hilbert_distance(geoms, total_bounds=total_bounds)
++        if has_empty:
++            # empty geometries are sorted first ("smallest"), so fill in
++            # smallest possible value for uints
++            distances[mask_empty] = 0
++        return distances
++
++    def argmin(self, skipna: bool = True) -> int:
++        raise TypeError("geometries have no minimum or maximum")
++
++    def argmax(self, skipna: bool = True) -> int:
++        raise TypeError("geometries have no minimum or maximum")
+ 
+     def _formatter(self, boxed=False):
+         """Formatting function for scalar values.
+diff --git a/geopandas/base.py b/geopandas/base.py
+index f908f95..abe3c85 100644
+--- a/geopandas/base.py
++++ b/geopandas/base.py
+@@ -3618,9 +3618,11 @@ GeometryCollection
+         """
+         from geopandas.tools.hilbert_curve import _hilbert_distance
+ 
+-        distances = _hilbert_distance(self, total_bounds=total_bounds, level=level)
++        distances = _hilbert_distance(
++            self.geometry.values, total_bounds=total_bounds, level=level
++        )
+ 
+-        return distances
++        return pd.Series(distances, index=self.index, name="hilbert_distance")
+ 
+ 
+ def _get_index_for_parts(orig_idx, outer_idx, ignore_index, index_parts):
+diff --git a/geopandas/tools/hilbert_curve.py b/geopandas/tools/hilbert_curve.py
+index 42189a4..69c6c42 100644
+--- a/geopandas/tools/hilbert_curve.py
++++ b/geopandas/tools/hilbert_curve.py
+@@ -1,8 +1,7 @@
+ import numpy as np
+-import pandas as pd
+ 
+ 
+-def _hilbert_distance(gdf, total_bounds=None, level=16):
++def _hilbert_distance(geoms, total_bounds=None, level=16):
+     """
+     Calculate the distance along a Hilbert curve.
+ 
+@@ -11,7 +10,7 @@ def _hilbert_distance(gdf, total_bounds=None, level=16):
+ 
+     Parameters
+     ----------
+-    gdf : GeoDataFrame
++    geoms : GeometryArray
+     total_bounds : 4-element array
+         Total bounds of geometries - array
+     level : int (1 - 16), default 16
+@@ -20,23 +19,24 @@ def _hilbert_distance(gdf, total_bounds=None, level=16):
+ 
+     Returns
+     ---------
+-    Pandas Series containing distances along the Hilbert curve
++    np.ndarray
++        Array containing distances along the Hilbert curve
+ 
+     """
+-    if gdf.is_empty.any() | gdf.geometry.isna().any():
++    if geoms.is_empty.any() | geoms.isna().any():
+         raise ValueError(
+             "Hilbert distance cannot be computed on a GeoSeries with empty or "
+             "missing geometries.",
+         )
+     # Calculate bounds as numpy array
+-    bounds = gdf.bounds.to_numpy()
++    bounds = geoms.bounds
+ 
+     # Calculate discrete coords based on total bounds and bounds
+     x, y = _continuous_to_discrete_coords(bounds, level, total_bounds)
+     # Compute distance along hilbert curve
+     distances = _encode(level, x, y)
+ 
+-    return pd.Series(distances, index=gdf.index, name="hilbert_distance")
++    return distances
+ 
+ 
+ def _continuous_to_discrete_coords(bounds, level, total_bounds):
+

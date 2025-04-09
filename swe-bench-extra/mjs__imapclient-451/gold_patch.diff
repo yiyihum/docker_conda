@@ -1,0 +1,91 @@
+diff --git a/examples/idle_selector_example.py b/examples/idle_selector_example.py
+new file mode 100644
+index 0000000..e8ff729
+--- /dev/null
++++ b/examples/idle_selector_example.py
+@@ -0,0 +1,36 @@
++from datetime import datetime, timedelta
++from selectors import DefaultSelector, EVENT_READ
++
++from imapclient import IMAPClient
++
++HOST = "localhost"
++USERNAME = "user"
++PASSWORD = "Tr0ub4dor&3"
++RESPONSE_TIMEOUT_SECONDS = 15
++IDLE_SECONDS = 60 * 24
++
++with IMAPClient(HOST, timeout=RESPONSE_TIMEOUT_SECONDS) as server:
++    server.login(USERNAME, PASSWORD)
++    server.select_folder("INBOX", readonly=True)
++    server.idle()
++    print(
++        "Connection is now in IDLE mode,"
++        " send yourself an email or quit with ^c"
++    )
++    try:
++        with DefaultSelector() as selector:
++            selector.register(server.socket(), EVENT_READ, None)
++            now = datetime.now
++            end_at = now() + timedelta(seconds=IDLE_SECONDS)
++            while selector.select((end_at - now()).total_seconds()):
++                responses = server.idle_check(timeout=0)
++                if not responses:
++                    raise ConnectionError(
++                        "Socket readable without data. Likely closed."
++                    )
++                print("Server sent:", responses)
++        print("IDLE time out.")
++    except KeyboardInterrupt:
++        print("")  # Newline after the typically echoed ^C.
++    server.idle_done()
++    print("IDLE mode done")
+diff --git a/imapclient/imapclient.py b/imapclient/imapclient.py
+index 8d58693..a7bc703 100644
+--- a/imapclient/imapclient.py
++++ b/imapclient/imapclient.py
+@@ -11,6 +11,7 @@ import select
+ import socket
+ import sys
+ import re
++import warnings
+ from collections import namedtuple
+ from datetime import datetime, date
+ from operator import itemgetter
+@@ -329,10 +330,26 @@ class IMAPClient(object):
+ 
+     def _set_read_timeout(self):
+         if self._timeout is not None:
+-            self._sock.settimeout(self._timeout.read)
++            self.socket().settimeout(self._timeout.read)
+ 
+     @property
+     def _sock(self):
++        warnings.warn("_sock is deprecated. Use socket().", DeprecationWarning)
++        return self.socket()
++
++    def socket(self):
++        """Returns socket used to connect to server.
++
++        The socket is provided for polling purposes only.
++        It can be used in,
++        for example, :py:meth:`selectors.BaseSelector.register`
++        and :py:meth:`asyncio.loop.add_reader` to wait for data.
++
++        .. WARNING::
++           All other uses of the returned socket are unsupported.
++           This includes reading from and writing to the socket,
++           as they are likely to break internal bookkeeping of messages.
++        """
+         # In py2, imaplib has sslobj (for SSL connections), and sock for non-SSL.
+         # In the py3 version it's just sock.
+         return getattr(self._imap, "sslobj", self._imap.sock)
+@@ -919,7 +936,7 @@ class IMAPClient(object):
+              (1, b'EXISTS'),
+              (1, b'FETCH', (b'FLAGS', (b'\\NotJunk',)))]
+         """
+-        sock = self._sock
++        sock = self.socket()
+ 
+         # make the socket non-blocking so the timeout can be
+         # implemented for this call

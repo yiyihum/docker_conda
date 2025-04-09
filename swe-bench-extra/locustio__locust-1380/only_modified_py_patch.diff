@@ -1,0 +1,96 @@
+diff --git a/locust/main.py b/locust/main.py
+index e5bcfb95..ab9dfc19 100644
+--- a/locust/main.py
++++ b/locust/main.py
+@@ -6,6 +6,7 @@ import signal
+ import socket
+ import sys
+ import time
++import resource 
+ 
+ import gevent
+ 
+@@ -153,6 +154,14 @@ def main():
+         # list() call is needed to consume the dict_view object in Python 3
+         user_classes = list(user_classes.values())
+     
++    try:
++        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 10000:
++            # Increasing the limit to 10000 within a running process should work on at least MacOS.
++            # It does not work on all OS:es, but we should be no worse off for trying.
++            resource.setrlimit(resource.RLIMIT_NOFILE, [10000, resource.RLIM_INFINITY])
++    except:
++        logger.warning("System open file limit setting is not high enough for load testing, and the OS wouldnt allow locust to increase it by itself. See https://docs.locust.io/en/stable/installation.html#increasing-maximum-number-of-open-files-limit for more info.")
++
+     # create locust Environment
+     environment = create_environment(user_classes, options, events=locust.events)
+     
+diff --git a/locust/user/task.py b/locust/user/task.py
+index e474cba8..7e3d0933 100644
+--- a/locust/user/task.py
++++ b/locust/user/task.py
+@@ -218,25 +218,19 @@ class TaskSet(object, metaclass=TaskSetMeta):
+     if not set on the TaskSet.
+     """
+ 
+-    user = None
+-    """Will refer to the root User class instance when the TaskSet has been instantiated"""
+-
+-    parent = None
+-    """
+-    Will refer to the parent TaskSet, or User, class instance when the TaskSet has been 
+-    instantiated. Useful for nested TaskSet classes.
+-    """
++    _user = None
++    _parent = None
+ 
+     def __init__(self, parent):
+         self._task_queue = []
+         self._time_start = time()
+         
+         if isinstance(parent, TaskSet):
+-            self.user = parent.user
++            self._user = parent.user
+         else:
+-            self.user = parent
++            self._user = parent
+ 
+-        self.parent = parent
++        self._parent = parent
+         
+         # if this class doesn't have a min_wait, max_wait or wait_function defined, copy it from Locust
+         if not self.min_wait:
+@@ -246,9 +240,21 @@ class TaskSet(object, metaclass=TaskSetMeta):
+         if not self.wait_function:
+             self.wait_function = self.user.wait_function
+ 
++
++
++    @property
++    def user(self):
++        """:py:class:`User <locust.User>` instance that this TaskSet was created by"""
++        return self._user
++
++    @property
++    def parent(self):
++        """Parent TaskSet instance of this TaskSet (or :py:class:`User <locust.User>` if this is not a nested TaskSet)"""
++        return self._parent
++
+     def on_start(self):
+         """
+-        Called when a User starts executing (enters) this TaskSet
++        Called when a User starts executing this TaskSet
+         """
+         pass
+     
+@@ -392,8 +398,7 @@ class TaskSet(object, metaclass=TaskSetMeta):
+     @property
+     def client(self):
+         """
+-        Reference to the :py:attr:`client <locust.User.client>` attribute of the root
+-        User instance.
++        Shortcut to the client :py:attr:`client <locust.User.client>` attribute of this TaskSet's :py:class:`User <locust.User>`
+         """
+         return self.user.client
+ 
+

@@ -1,0 +1,266 @@
+diff --git a/test/integration/test_diff.py b/test/integration/test_diff.py
+index 102d31a..2d1760d 100644
+--- a/test/integration/test_diff.py
++++ b/test/integration/test_diff.py
+@@ -45,6 +45,18 @@ def test_diff_output_all(builddir):
+     assert "test.py" in result.stdout
+ 
+ 
++def test_diff_output_all_wrapped(builddir):
++    """Test the diff feature with wrapping"""
++    runner = CliRunner()
++    result = runner.invoke(
++        main.cli,
++        ["--debug", "--path", builddir, "diff", _path, "--all", "--wrap"],
++        catch_exceptions=False,
++    )
++    assert result.exit_code == 0, result.stdout
++    assert "test.py" in result.stdout
++
++
+ def test_diff_output_bad_path(builddir):
+     """Test the diff feature with no changes"""
+     runner = CliRunner()
+diff --git a/test/integration/test_index.py b/test/integration/test_index.py
+index 2d9cad8..1146565 100644
+--- a/test/integration/test_index.py
++++ b/test/integration/test_index.py
+@@ -34,3 +34,18 @@ def test_index_with_messages(builddir):
+     assert "add line" in result.stdout
+     assert "remove line" in result.stdout
+     assert result.exit_code == 0, result.stdout
++
++
++def test_index_with_messages_wrapped(builddir):
++    """
++    Test that index works with a build with git commit messages and wrapping
++    """
++    runner = CliRunner()
++    result = runner.invoke(
++        main.cli, ["--path", builddir, "index", "--message", "--wrap"]
++    )
++    assert result.stdout.count("An author") == 3
++    assert "basic test" in result.stdout
++    assert "add line" in result.stdout
++    assert "remove line" in result.stdout
++    assert result.exit_code == 0, result.stdout
+diff --git a/test/integration/test_list_metrics.py b/test/integration/test_list_metrics.py
+new file mode 100644
+index 0000000..660b3ab
+--- /dev/null
++++ b/test/integration/test_list_metrics.py
+@@ -0,0 +1,32 @@
++from click.testing import CliRunner
++
++import wily.__main__ as main
++
++
++def test_list_metrics(builddir):
++    """
++    Test that list-metrics works and is ordered
++    """
++    runner = CliRunner()
++    result = runner.invoke(main.cli, ["list-metrics"])
++    assert result.stdout.count("operator") == 4
++    assert "cyclomatic" in result.stdout
++    assert "maintainability" in result.stdout
++    assert "raw" in result.stdout
++    assert "halstead" in result.stdout
++    # Test ordering
++    i = result.stdout.index
++    assert i("cyclomatic") < i("maintainability") < i("raw") < i("halstead")
++
++
++def test_list_metrics_wrapped(builddir):
++    """
++    Test that list-metrics works with wrapping
++    """
++    runner = CliRunner()
++    result = runner.invoke(main.cli, ["list-metrics", "--wrap"])
++    assert result.stdout.count("operator") == 4
++    assert "cyclomatic" in result.stdout
++    assert "maintainability" in result.stdout
++    assert "raw" in result.stdout
++    assert "halstead" in result.stdout
+diff --git a/test/integration/test_rank.py b/test/integration/test_rank.py
+index fe62e13..5e852df 100644
+--- a/test/integration/test_rank.py
++++ b/test/integration/test_rank.py
+@@ -18,6 +18,15 @@ def test_rank_single_file_default_metric(builddir):
+     assert result.exit_code == 0, result.stdout
+ 
+ 
++def test_rank_single_file_default_metric_wrapped(builddir):
++    """Test the rank feature with default metric and wrapping"""
++    runner = CliRunner()
++    result = runner.invoke(
++        main.cli, ["--path", builddir, "rank", "--wrap", "src/test.py"]
++    )
++    assert result.exit_code == 0, result.stdout
++
++
+ def test_rank_directory_default_metric(builddir):
+     """Test the rank feature with default (AimLow) metric on a directory"""
+     runner = CliRunner()
+diff --git a/test/integration/test_report.py b/test/integration/test_report.py
+index c5fa049..082ca4d 100644
+--- a/test/integration/test_report.py
++++ b/test/integration/test_report.py
+@@ -139,6 +139,18 @@ def test_report_high_metric(builddir):
+     assert "Not found" not in result.stdout
+ 
+ 
++def test_report_wrapped(builddir):
++    """
++    Test that report works with wrapping
++    """
++    runner = CliRunner()
++    result = runner.invoke(
++        main.cli, ["--path", builddir, "report", "--wrap", _path, "raw.comments"]
++    )
++    assert result.exit_code == 0, result.stdout
++    assert "Not found" not in result.stdout
++
++
+ def test_report_short_metric(builddir):
+     """
+     Test that report works with a build on shorthand metric
+diff --git a/test/unit/test_helper.py b/test/unit/test_helper.py
+index 6b29d3a..8e64f55 100644
+--- a/test/unit/test_helper.py
++++ b/test/unit/test_helper.py
+@@ -1,8 +1,133 @@
+ from io import BytesIO, TextIOWrapper
+ from unittest import mock
+ 
++import tabulate
++
+ from wily.config import DEFAULT_GRID_STYLE
+-from wily.helper import get_style
++from wily.helper import get_maxcolwidth, get_style
++
++SHORT_DATA = [list("abcdefgh"), list("abcdefgh")]
++
++MEDIUM_DATA = [["medium_data"] * 2, ["medium_data"] * 2]
++
++LONG_DATA = [["long_data"] * 8, ["long_data"] * 8]
++
++HUGE_DATA = [["huge_data"] * 18, ["huge_data"] * 18]
++
++LONG_LINE_MEDIUM_DATA = [
++    ["long_line_for_some_medium_data"] * 2,
++    ["long_line_for_some_medium_data"] * 2,
++]
++
++
++def test_get_maxcolwidth_no_wrap():
++    result = get_maxcolwidth([], False)
++    assert result is None
++
++
++def test_get_maxcolwidth_wrap_short():
++    for width in range(35, 100):
++        mock_get_terminal_size = mock.Mock(return_value=(width, 24))
++        mock_shutil = mock.Mock(get_terminal_size=mock_get_terminal_size)
++
++        with mock.patch("wily.helper.shutil", mock_shutil):
++            result = get_maxcolwidth(SHORT_DATA[0], True)
++        as_table = tabulate.tabulate(
++            tabular_data=SHORT_DATA,
++            tablefmt="grid",
++            maxcolwidths=result,
++            maxheadercolwidths=result,
++        )
++
++        line = as_table.splitlines()[0]
++        assert len(line) < width
++        assert len(line) >= width / 3
++
++
++def test_get_maxcolwidth_wrap_medium():
++    for width in range(35, 100):
++        mock_get_terminal_size = mock.Mock(return_value=(width, 24))
++        mock_shutil = mock.Mock(get_terminal_size=mock_get_terminal_size)
++
++        with mock.patch("wily.helper.shutil", mock_shutil):
++            result = get_maxcolwidth(MEDIUM_DATA[0], True)
++        as_table = tabulate.tabulate(
++            tabular_data=MEDIUM_DATA,
++            tablefmt="grid",
++            maxcolwidths=result,
++            maxheadercolwidths=result,
++        )
++
++        line = as_table.splitlines()[0]
++        print(line)
++        print(width, len(line))
++        assert len(line) < width
++        if width < 85:
++            assert len(line) >= width / 3
++
++
++def test_get_maxcolwidth_wrap_long_line_medium():
++    for width in range(35, 100):
++        mock_get_terminal_size = mock.Mock(return_value=(width, 24))
++        mock_shutil = mock.Mock(get_terminal_size=mock_get_terminal_size)
++
++        with mock.patch("wily.helper.shutil", mock_shutil):
++            result = get_maxcolwidth(LONG_LINE_MEDIUM_DATA[0], True)
++        as_table = tabulate.tabulate(
++            tabular_data=LONG_LINE_MEDIUM_DATA,
++            tablefmt="grid",
++            maxcolwidths=result,
++            maxheadercolwidths=result,
++        )
++
++        line = as_table.splitlines()[0]
++        print(line)
++        print(width, len(line))
++        assert len(line) < width
++        if width < 85:
++            assert len(line) >= width / 3
++
++
++def test_get_maxcolwidth_wrap_long():
++    for width in range(35, 290):
++        mock_get_terminal_size = mock.Mock(return_value=(width, 24))
++        mock_shutil = mock.Mock(get_terminal_size=mock_get_terminal_size)
++
++        with mock.patch("wily.helper.shutil", mock_shutil):
++            result = get_maxcolwidth(LONG_DATA[0], True)
++        as_table = tabulate.tabulate(
++            tabular_data=LONG_DATA,
++            tablefmt="grid",
++            maxcolwidths=result,
++            maxheadercolwidths=result,
++        )
++
++        line = as_table.splitlines()[0]
++        assert len(line) < width
++        if width < 290:
++            assert len(line) >= width / 3
++
++
++def test_get_maxcolwidth_wrap_huge():
++    for width in range(75, 450):
++        mock_get_terminal_size = mock.Mock(return_value=(width, 24))
++        mock_shutil = mock.Mock(get_terminal_size=mock_get_terminal_size)
++
++        with mock.patch("wily.helper.shutil", mock_shutil):
++            result = get_maxcolwidth(HUGE_DATA[0], True)
++        as_table = tabulate.tabulate(
++            tabular_data=HUGE_DATA,
++            tablefmt="grid",
++            maxcolwidths=result,
++            maxheadercolwidths=result,
++        )
++
++        line = as_table.splitlines()[0]
++        assert len(line) < width
++        if width < 220:
++            assert len(line) >= width / 3
++        else:
++            assert len(line) >= width / 4
+ 
+ 
+ def test_get_style():

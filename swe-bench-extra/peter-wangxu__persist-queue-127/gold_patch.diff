@@ -1,0 +1,135 @@
+diff --git a/README.rst b/README.rst
+index aaa6ae1..13ca369 100644
+--- a/README.rst
++++ b/README.rst
+@@ -31,6 +31,14 @@ and `Pickling Class Instances(Python3) <https://docs.python.org/3/library/pickle
+ This project is based on the achievements of `python-pqueue <https://github.com/balena/python-pqueue>`_
+ and `queuelib <https://github.com/scrapy/queuelib>`_
+ 
++Slack channels
++^^^^^^^^^^^^^^
++
++Join `persist-queue <https://join.slack
++.com/t/persist-queue/shared_invite
++/enQtOTM0MDgzNTQ0MDg3LTNmN2IzYjQ1MDc0MDYzMjI4OGJmNmVkNWE3ZDBjYzg5MDc0OWUzZDJkYTkwODdkZmYwODdjNjUzMTk3MWExNDE>`_ channel
++
++
+ Requirements
+ ------------
+ * Python 2.7 or Python 3.x.
+@@ -193,6 +201,12 @@ The core functions:
+ - ``ack``: mark item as acked
+ - ``nack``: there might be something wrong with current consumer, so mark item as ready and new consumer will get it
+ - ``ack_failed``: there might be something wrong during process, so just mark item as failed.
++- ``clear_acked_data``: perform a sql delete agaist sqlite, it remove the
++latest 1000 items whose status is ``AckStatus.acked`` (note: this does not
++shrink the file size on disk)
++- ``shrink_disk_usage`` perform a ``VACUUM`` against the sqlite, and rebuild
++ the database file, this usually takes long time and frees a lot of disk space
++ after ``clear_acked_data``
+ 
+ .. code-block:: python
+ 
+@@ -480,12 +494,6 @@ Contribution
+ Simply fork this repo and send PR for your code change(also tests to cover your change), remember to give a title and description of your PR. I am willing to
+ enhance this project with you :).
+ 
+-Slack channels
+-^^^^^^^^^^^^^^
+-
+-Join `persist-queue <https://join.slack
+-.com/t/persist-queue/shared_invite
+-/enQtOTM0MDgzNTQ0MDg3LTNmN2IzYjQ1MDc0MDYzMjI4OGJmNmVkNWE3ZDBjYzg5MDc0OWUzZDJkYTkwODdkZmYwODdjNjUzMTk3MWExNDE>`_ channel
+ 
+ License
+ -------
+diff --git a/persistqueue/sqlackqueue.py b/persistqueue/sqlackqueue.py
+index 45ea0f4..0e059c2 100644
+--- a/persistqueue/sqlackqueue.py
++++ b/persistqueue/sqlackqueue.py
+@@ -38,18 +38,18 @@ class SQLiteAckQueue(sqlbase.SQLiteBase):
+                    '{key_column} INTEGER PRIMARY KEY AUTOINCREMENT, '
+                    'data BLOB, timestamp FLOAT, status INTEGER)')
+     # SQL to insert a record
+-    _SQL_INSERT = 'INSERT INTO {table_name} (data, timestamp, status)'\
+-        ' VALUES (?, ?, %s)' % AckStatus.inited
++    _SQL_INSERT = 'INSERT INTO {table_name} (data, timestamp, status)' \
++                  ' VALUES (?, ?, %s)' % AckStatus.inited
+     # SQL to select a record
+     _SQL_SELECT = ('SELECT {key_column}, data, status FROM {table_name} '
+                    'WHERE status < %s '
+                    'ORDER BY {key_column} ASC LIMIT 1' % AckStatus.unack)
+-    _SQL_MARK_ACK_UPDATE = 'UPDATE {table_name} SET status = ?'\
+-        ' WHERE {key_column} = ?'
+-    _SQL_SELECT_WHERE = 'SELECT {key_column}, data FROM {table_name}'\
+-        ' WHERE status < %s AND' \
+-        ' {column} {op} ? ORDER BY {key_column} ASC'\
+-        ' LIMIT 1 ' % AckStatus.unack
++    _SQL_MARK_ACK_UPDATE = 'UPDATE {table_name} SET status = ?' \
++                           ' WHERE {key_column} = ?'
++    _SQL_SELECT_WHERE = 'SELECT {key_column}, data FROM {table_name}' \
++                        ' WHERE status < %s AND' \
++                        ' {column} {op} ? ORDER BY {key_column} ASC' \
++                        ' LIMIT 1 ' % AckStatus.unack
+ 
+     def __init__(self, path, auto_resume=True, **kwargs):
+         super(SQLiteAckQueue, self).__init__(path, **kwargs)
+@@ -65,9 +65,9 @@ class SQLiteAckQueue(sqlbase.SQLiteBase):
+         unack_count = self.unack_count()
+         if unack_count:
+             log.warning("resume %d unack tasks", unack_count)
+-        sql = 'UPDATE {} set status = ?'\
+-            ' WHERE status = ?'.format(self._table_name)
+-        return sql, (AckStatus.ready, AckStatus.unack, )
++        sql = 'UPDATE {} set status = ?' \
++              ' WHERE status = ?'.format(self._table_name)
++        return sql, (AckStatus.ready, AckStatus.unack,)
+ 
+     def put(self, item):
+         obj = self._serializer.dumps(item)
+@@ -82,17 +82,17 @@ class SQLiteAckQueue(sqlbase.SQLiteBase):
+         self.total = self._count()
+ 
+     def _count(self):
+-        sql = 'SELECT COUNT({}) FROM {}'\
+-            ' WHERE status < ?'.format(self._key_column,
+-                                       self._table_name)
++        sql = 'SELECT COUNT({}) FROM {}' \
++              ' WHERE status < ?'.format(self._key_column,
++                                         self._table_name)
+         row = self._getter.execute(sql, (AckStatus.unack,)).fetchone()
+         return row[0] if row else 0
+ 
+     def _ack_count_via_status(self, status):
+-        sql = 'SELECT COUNT({}) FROM {}'\
+-            ' WHERE status = ?'.format(self._key_column,
+-                                       self._table_name)
+-        row = self._getter.execute(sql, (status, )).fetchone()
++        sql = 'SELECT COUNT({}) FROM {}' \
++              ' WHERE status = ?'.format(self._key_column,
++                                         self._table_name)
++        row = self._getter.execute(sql, (status,)).fetchone()
+         return row[0] if row else 0
+ 
+     def unack_count(self):
+@@ -109,7 +109,7 @@ class SQLiteAckQueue(sqlbase.SQLiteBase):
+ 
+     @sqlbase.with_conditional_transaction
+     def _mark_ack_status(self, key, status):
+-        return self._sql_mark_ack_status, (status, key, )
++        return self._sql_mark_ack_status, (status, key,)
+ 
+     @sqlbase.with_conditional_transaction
+     def clear_acked_data(self):
+@@ -123,6 +123,11 @@ class SQLiteAckQueue(sqlbase.SQLiteBase):
+                         max_acked_length=self._MAX_ACKED_LENGTH)
+         return sql, AckStatus.acked
+ 
++    @sqlbase.with_conditional_transaction
++    def shrink_disk_usage(self):
++        sql = """VACUUM"""
++        return sql, ()
++
+     @property
+     def _sql_mark_ack_status(self):
+         return self._SQL_MARK_ACK_UPDATE.format(table_name=self._table_name,

@@ -1,0 +1,212 @@
+diff --git a/example.py b/example.py
+index 05d9b65..1cbb55c 100755
+--- a/example.py
++++ b/example.py
+@@ -146,6 +146,8 @@ def ac_config(client, device_id):
+     print(ac.get_filter_state())
+     print(ac.get_mfilter_state())
+     print(ac.get_energy_target())
++    print(ac.get_power(), " watts")
++    print(ac.get_outdoor_power(), " watts")
+     print(ac.get_volume())
+     print(ac.get_light())
+     print(ac.get_zones())
+@@ -233,14 +235,14 @@ def main() -> None:
+     args = parser.parse_args()
+     country_regex = re.compile(r"^[A-Z]{2,3}$")
+     if not country_regex.match(args.country):
+-        print("Error: Country must be two or three letters" \
++        print("Error: Country must be two or three letters"
+               f" all upper case (e.g. US, NO, KR) got: '{args.country}'",
+               file=sys.stderr)
+         exit(1)
+     language_regex = re.compile(r"^[a-z]{2,3}-[A-Z]{2,3}$")
+     if not language_regex.match(args.language):
+-        print("Error: Language must be a combination of language" \
+-              " and country (e.g. en-US, no-NO, kr-KR)" \
++        print("Error: Language must be a combination of language"
++              " and country (e.g. en-US, no-NO, kr-KR)"
+               f" got: '{args.language}'",
+               file=sys.stderr)
+         exit(1)
+diff --git a/wideq/ac.py b/wideq/ac.py
+index a9afaf5..f4ac1af 100644
+--- a/wideq/ac.py
++++ b/wideq/ac.py
+@@ -249,11 +249,28 @@ class ACDevice(Device):
+ 
+         return self._get_config('EnergyDesiredValue')
+ 
++    def get_outdoor_power(self):
++        """Get instant power usage in watts of the outdoor unit"""
++
++        value = self._get_config('OutTotalInstantPower')
++        return value['OutTotalInstantPower']
++
++    def get_power(self):
++        """Get the instant power usage in watts of the whole unit"""
++
++        value = self._get_config('InOutInstantPower')
++        return value['InOutInstantPower']
++
+     def get_light(self):
+         """Get a Boolean indicating whether the display light is on."""
+ 
+-        value = self._get_control('DisplayControl')
+-        return value == '0'  # Seems backwards, but isn't.
++        try:
++            value = self._get_control('DisplayControl')
++            return value == '0'  # Seems backwards, but isn't.
++        except FailedRequestError:
++            # Device does not support reporting display light status.
++            # Since it's probably not changeable the it must be on.
++            return True
+ 
+     def get_volume(self):
+         """Get the speaker volume level."""
+diff --git a/wideq/client.py b/wideq/client.py
+index f6a1ae8..8369ae2 100644
+--- a/wideq/client.py
++++ b/wideq/client.py
+@@ -11,8 +11,6 @@ from typing import Any, Dict, Generator, List, Optional
+ 
+ from . import core
+ 
+-DEFAULT_COUNTRY = 'US'
+-DEFAULT_LANGUAGE = 'en-US'
+ #: Represents an unknown enum value.
+ _UNKNOWN = 'Unknown'
+ 
+@@ -79,8 +77,8 @@ class Client(object):
+                  gateway: Optional[core.Gateway] = None,
+                  auth: Optional[core.Auth] = None,
+                  session: Optional[core.Session] = None,
+-                 country: str = DEFAULT_COUNTRY,
+-                 language: str = DEFAULT_LANGUAGE) -> None:
++                 country: str = core.DEFAULT_COUNTRY,
++                 language: str = core.DEFAULT_LANGUAGE) -> None:
+         # The three steps required to get access to call the API.
+         self._gateway: Optional[core.Gateway] = gateway
+         self._auth: Optional[core.Auth] = auth
+@@ -146,12 +144,7 @@ class Client(object):
+         client = cls()
+ 
+         if 'gateway' in state:
+-            data = state['gateway']
+-            client._gateway = core.Gateway(
+-                data['auth_base'], data['api_root'], data['oauth_root'],
+-                data.get('country', DEFAULT_COUNTRY),
+-                data.get('language', DEFAULT_LANGUAGE),
+-            )
++            client._gateway = core.Gateway.deserialize(state['gateway'])
+ 
+         if 'auth' in state:
+             data = state['auth']
+@@ -181,19 +174,10 @@ class Client(object):
+         }
+ 
+         if self._gateway:
+-            out['gateway'] = {
+-                'auth_base': self._gateway.auth_base,
+-                'api_root': self._gateway.api_root,
+-                'oauth_root': self._gateway.oauth_root,
+-                'country': self._gateway.country,
+-                'language': self._gateway.language,
+-            }
++            out['gateway'] = self._gateway.serialize()
+ 
+         if self._auth:
+-            out['auth'] = {
+-                'access_token': self._auth.access_token,
+-                'refresh_token': self._auth.refresh_token,
+-            }
++            out['auth'] = self._auth.serialize()
+ 
+         if self._session:
+             out['session'] = self._session.session_id
+@@ -218,8 +202,8 @@ class Client(object):
+         """
+ 
+         client = cls(
+-            country=country or DEFAULT_COUNTRY,
+-            language=language or DEFAULT_LANGUAGE,
++            country=country or core.DEFAULT_COUNTRY,
++            language=language or core.DEFAULT_LANGUAGE,
+         )
+         client._auth = core.Auth(client.gateway, None, refresh_token)
+         client.refresh()
+@@ -308,6 +292,7 @@ RangeValue = namedtuple('RangeValue', ['min', 'max', 'step'])
+ #: This is a value that is a reference to another key in the data that is at
+ #: the same level as the `Value` key.
+ ReferenceValue = namedtuple('ReferenceValue', ['reference'])
++StringValue = namedtuple('StringValue', ['comment'])
+ 
+ 
+ class ModelInfo(object):
+@@ -322,7 +307,7 @@ class ModelInfo(object):
+ 
+         :param name: The name to look up.
+         :returns: One of (`BitValue`, `EnumValue`, `RangeValue`,
+-            `ReferenceValue`).
++            `ReferenceValue`, `StringValue`).
+         :raises ValueError: If an unsupported type is encountered.
+         """
+         d = self.data['Value'][name]
+@@ -339,6 +324,8 @@ class ModelInfo(object):
+         elif d['type'].lower() == 'reference':
+             ref = d['option'][0]
+             return ReferenceValue(self.data[ref])
++        elif d['type'].lower() == 'string':
++            return StringValue(d.get('_comment', ''))
+         else:
+             raise ValueError(
+                 f"unsupported value name: '{name}'"
+diff --git a/wideq/core.py b/wideq/core.py
+index be976a8..7b2a806 100644
+--- a/wideq/core.py
++++ b/wideq/core.py
+@@ -18,6 +18,8 @@ CLIENT_ID = 'LGAO221A02'
+ OAUTH_SECRET_KEY = 'c053c2a6ddeb7ad97cb0eed0dcb31cf8'
+ OAUTH_CLIENT_KEY = 'LGAO221A02'
+ DATE_FORMAT = '%a, %d %b %Y %H:%M:%S +0000'
++DEFAULT_COUNTRY = 'US'
++DEFAULT_LANGUAGE = 'en-US'
+ 
+ 
+ def gen_uuid() -> str:
+@@ -253,6 +255,21 @@ class Gateway(object):
+     def oauth_url(self):
+         return oauth_url(self.auth_base, self.country, self.language)
+ 
++    def serialize(self) -> Dict[str, str]:
++        return {
++            'auth_base': self.auth_base,
++            'api_root': self.api_root,
++            'oauth_root': self.oauth_root,
++            'country': self.country,
++            'language': self.language,
++        }
++
++    @classmethod
++    def deserialize(cls, data: Dict[str, Any]) -> 'Gateway':
++        return cls(data['auth_base'], data['api_root'], data['oauth_root'],
++                   data.get('country', DEFAULT_COUNTRY),
++                   data.get('language', DEFAULT_LANGUAGE))
++
+ 
+ class Auth(object):
+     def __init__(self, gateway, access_token, refresh_token):
+@@ -286,6 +303,12 @@ class Auth(object):
+                                         self.refresh_token)
+         return Auth(self.gateway, new_access_token, self.refresh_token)
+ 
++    def serialize(self) -> Dict[str, str]:
++        return {
++            'access_token': self.access_token,
++            'refresh_token': self.refresh_token,
++        }
++
+ 
+ class Session(object):
+     def __init__(self, auth, session_id) -> None:
+

@@ -1,0 +1,109 @@
+diff --git a/aesara/tensor/math_opt.py b/aesara/tensor/math_opt.py
+index e90d6b425..ad0eeb92b 100644
+--- a/aesara/tensor/math_opt.py
++++ b/aesara/tensor/math_opt.py
+@@ -11,7 +11,6 @@ from functools import reduce
+ import numpy as np
+ 
+ import aesara.scalar.basic as aes
+-from aesara import compile
+ from aesara.assert_op import assert_op
+ from aesara.configdefaults import config
+ from aesara.graph.basic import Constant, Variable
+@@ -74,6 +73,7 @@ from aesara.tensor.math import (
+     expm1,
+     ge,
+     int_div,
++    isinf,
+     log,
+     log1p,
+     makeKeepDims,
+@@ -2286,34 +2286,33 @@ def local_log1p(fgraph, node):
+ @register_stabilize
+ @register_specialize
+ @local_optimizer([log])
+-def local_log_add(fgraph, node):
+-    # log(exp(x)+exp(y))
+-    #
+-    # Suppose x >= y
+-    # log(exp(x) + exp(y))
+-    # log(exp(x) * (1 + exp(y)/exp(x)))
+-    # x + log(1 + exp(y)/exp(x))
+-    # x + log1p(exp(y)/exp(x))
+-    # x + log1p(exp(y-x))
++def local_log_add_exp(fgraph, node):
++    # log(exp(x)+exp(y)+exp(z)) = max + log(x-max, y-max, z-max)
++
+     if node.op == log:
+         z = node.inputs[0]
+         if z.owner and z.owner.op == add:
+             zi = z.owner.inputs
+-            if len(zi) != 2:
+-                # -- upgrading Maximum to handle multiple inputs wasn't trivial
+-                #    TODO
+-                # raise NotImplementedError()
+-                return
+             pre_exp = [x.owner.inputs[0] for x in zi if x.owner and x.owner.op == exp]
++            # all arguments to add are exp(<something>)
+             if len(pre_exp) == len(zi):
+-                # all arguments to add are exp(<something>)
+-                max_pre = maximum(*pre_exp)
+-
+-                ret = max_pre + log1p(exp(add(*[p - max_pre for p in pre_exp])))
+-                ret.tag.values_eq_approx = values_eq_approx_remove_inf
++                # Do not offset when max_pre = -np.inf, to avoid nan in the output
++                # Switch statement is placed directly inside add to break the self-symmetry
++                # of the returned output (otherwise the optimization would not stabilize)
++                max_pre = reduce(maximum, pre_exp)
++                ret = max_pre + log(
++                    add(
++                        *[
++                            switch(isinf(max_pre), exp(max_pre), exp(p - max_pre))
++                            for p in pre_exp
++                        ]
++                    )
++                )
+                 return [ret]
+ 
+ 
++@register_stabilize
++@register_specialize
+ @local_optimizer([log])
+ def local_log_sum_exp(fgraph, node):
+     # log(sum_i(exp(x_i))) = x_max + log(sum_i(exp(x_i - x_max)))
+@@ -2342,7 +2341,19 @@ def local_log_sum_exp(fgraph, node):
+     max_pre_exp = aet_max(pre_exp, axis=axis)
+     max_pre_exp_keepdims = makeKeepDims(pre_exp, max_pre_exp, axis)
+ 
+-    ret = max_pre_exp + log(aet_sum(exp(pre_exp - max_pre_exp_keepdims), axis=axis))
++    # Do not offset when max_pre = -np.inf, to avoid nan in the output
++    # Switch statement is placed directly inside sum to break the self-symmetry
++    # of the returned output (otherwise the optimization would not stabilize)
++    ret = max_pre_exp + log(
++        aet_sum(
++            switch(
++                isinf(max_pre_exp_keepdims),
++                exp(max_pre_exp_keepdims),
++                exp(pre_exp - max_pre_exp_keepdims),
++            ),
++            axis=axis,
++        ),
++    )
+ 
+     # Restore the dimshuffle op, if any.
+     if dimshuffle_op:
+@@ -2351,14 +2362,6 @@ def local_log_sum_exp(fgraph, node):
+     return [ret]
+ 
+ 
+-compile.optdb.register(
+-    "local_log_sum_exp",
+-    in2out(local_log_sum_exp, ignore_newtrees=True),
+-    1.6,
+-    "fast_run",
+-)
+-
+-
+ def add_calculate(num, denum, aslist=False, out_type=None):
+     # TODO: make sure that this function and mul_calculate are similar
+     if out_type is None:

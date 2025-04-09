@@ -1,0 +1,142 @@
+diff --git a/pullnrun/_log.py b/pullnrun/_log.py
+index 3a9533f..df25bfa 100644
+--- a/pullnrun/_log.py
++++ b/pullnrun/_log.py
+@@ -1,3 +1,8 @@
++from os import getenv
++from uuid import uuid4
++
++from pullnrun._utils import get_log_entry, timestamp
++
+ def _status(output_dict):
+     status = output_dict.get('status')
+     if status == 'SUCCESS':
+@@ -8,6 +13,31 @@ def _status(output_dict):
+         return '\u25B6'
+     return ' '
+ 
++def _duration(output_dict):
++    start = output_dict.get('meta', {}).get('start')
++    end = output_dict.get('meta', {}).get('end')
++
++    if not start or not end:
++        return ''
++
++    duration = end - start
++
++    if duration >= 1000:
++        return f'{duration/1000:.3f} s'
++    return f'{duration} ms'
++
++def _main_text(output_dict):
++    if output_dict.get('status') == 'STARTED':
++        id_ = output_dict.get('data', {}).get('id')
++        return f'Started pullnrun execution with id {id_}'
++
++    if output_dict.get('status') in ('SUCCESS', 'ERROR'):
++        success = output_dict.get('data', {}).get('success')
++        fail = output_dict.get('data', {}).get('fail')
++        duration = _duration(output_dict)
++
++        return f'Finished pullnrun execution in {duration}: {success} out of {success + fail} actions succeeded.'
++
+ def _http_details(output_dict):
+     type_ = output_dict.get('type', '')
+     status_code = str(output_dict.get('data', {}).get('status_code', '')).rjust(4)
+@@ -39,22 +69,13 @@ def _s3_details(output_dict):
+ 
+     return detail
+ 
+-def _duration(output_dict):
+-    start = output_dict.get('meta', {}).get('start')
+-    end = output_dict.get('meta', {}).get('end')
+-
+-    if not start or not end:
+-        return ''
+-
+-    duration = end - start
+-
+-    if duration >= 1000:
+-        return f'({duration/1000:.3f} s)'
+-    return f'({duration} ms)'
+-
+ def log_to_console(output_dict):
+-    status = _status(output_dict)
+     type_ = output_dict.get('type', '')
++    if type_ == 'main':
++        print(_main_text(output_dict))
++        return
++
++    status = _status(output_dict)
+     stage = type_.upper()[:4].ljust(4)
+ 
+     status_code = ''.rjust(4)
+@@ -71,9 +92,32 @@ def log_to_console(output_dict):
+         output = output_dict.get('data', {}).get('output')
+ 
+     duration = _duration(output_dict)
++    duration = f'({duration})' if duration else ''
+ 
+     print(f'{status} {status_code} {stage} {detail} {duration}')
+ 
+     if output:
+         end = '\n' if output[-1] != '\n' else ''
+-        print(f'\n{output}{end}')
+\ No newline at end of file
++        print(f'\n{output}{end}')
++
++class Log:
++    def __init__(self, quiet=False):
++        self._start = None
++        self._end = None
++        self._id = getenv('PULLNRUN_ID', str(uuid4()))
++        self._to_console = not quiet
++
++    def __call__(self, log_entry):
++        if self._to_console:
++            log_to_console(log_entry)
++
++    def start(self):
++        self._start = timestamp()
++        if self._to_console:
++            log_to_console(get_log_entry('main', 'STARTED', start=self._start, id=self._id))
++
++    def end(self, success, fail):
++        self._end = timestamp()
++        status = 'SUCCESS' if success > 0 and fail == 0 else 'ERROR'
++        if self._to_console:
++            log_to_console(get_log_entry('main', status, start=self._start, end=self._end, success=success, fail=fail))
+diff --git a/pullnrun/_main.py b/pullnrun/_main.py
+index 06a6605..d9ec3d4 100644
+--- a/pullnrun/_main.py
++++ b/pullnrun/_main.py
+@@ -8,7 +8,7 @@ except ImportError:
+ from jsonschema import validate
+ 
+ from ._utils import as_list
+-from ._log import log_to_console
++from ._log import Log
+ 
+ from ._pull import pull
+ from ._push import push
+@@ -24,8 +24,12 @@ def _validate(input_dict):
+     schema = json.loads(resources.read_text('pullnrun', 'schema.json'))
+     validate(instance=input_dict, schema=schema)
+ 
+-def main(input_dict, log=log_to_console):
++def main(input_dict, quiet=False):
+     _validate(input_dict)
++
++    log = Log(quiet)
++    log.start()
++
+     success, error = (0, 0, )
+ 
+     for stage, function in FUNCTION_MAPPINGS.items():
+@@ -36,4 +40,5 @@ def main(input_dict, log=log_to_console):
+             else:
+                 error += 1
+ 
++    log.end(success, error)
+     return (success, error, )
+

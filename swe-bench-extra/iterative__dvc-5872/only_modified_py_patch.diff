@@ -1,0 +1,560 @@
+diff --git a/dvc/command/experiments.py b/dvc/command/experiments.py
+--- a/dvc/command/experiments.py
++++ b/dvc/command/experiments.py
+@@ -426,43 +426,6 @@ def run(self):
+         return 0
+ 
+ 
+-def _show_diff(
+-    diff,
+-    title="",
+-    markdown=False,
+-    no_path=False,
+-    old=False,
+-    precision=DEFAULT_PRECISION,
+-):
+-    from dvc.utils.diff import table
+-
+-    rows = []
+-    for fname, diff_ in diff.items():
+-        sorted_diff = OrderedDict(sorted(diff_.items()))
+-        for item, change in sorted_diff.items():
+-            row = [] if no_path else [fname]
+-            row.append(item)
+-            if old:
+-                row.append(_format_field(change.get("old"), precision))
+-            row.append(_format_field(change["new"], precision))
+-            row.append(
+-                _format_field(
+-                    change.get("diff", "diff not supported"), precision
+-                )
+-            )
+-            rows.append(row)
+-
+-    header = [] if no_path else ["Path"]
+-    header.append(title)
+-    if old:
+-        header.extend(["Old", "New"])
+-    else:
+-        header.append("Value")
+-    header.append("Change")
+-
+-    return table(header, rows, markdown)
+-
+-
+ class CmdExperimentsDiff(CmdBase):
+     def run(self):
+ 
+@@ -473,41 +436,43 @@ def run(self):
+                 all=self.args.all,
+                 param_deps=self.args.param_deps,
+             )
+-
+-            if self.args.show_json:
+-                import json
+-
+-                logger.info(json.dumps(diff))
+-            else:
+-                if self.args.precision is None:
+-                    precision = DEFAULT_PRECISION
+-                else:
+-                    precision = self.args.precision
+-
+-                diffs = [("metrics", "Metric"), ("params", "Param")]
+-                for key, title in diffs:
+-                    table = _show_diff(
+-                        diff[key],
+-                        title=title,
+-                        markdown=self.args.show_md,
+-                        no_path=self.args.no_path,
+-                        old=self.args.old,
+-                        precision=precision,
+-                    )
+-                    if table:
+-                        logger.info(table)
+-                        logger.info("")
+-
+         except DvcException:
+             logger.exception("failed to show experiments diff")
+             return 1
+ 
++        if self.args.show_json:
++            import json
++
++            logger.info(json.dumps(diff))
++        else:
++            from dvc.compare import show_diff
++
++            precision = self.args.precision or DEFAULT_PRECISION
++            diffs = [("metrics", "Metric"), ("params", "Param")]
++            for idx, (key, title) in enumerate(diffs):
++                if idx:
++                    from dvc.ui import ui
++
++                    # we are printing tables even in `--quiet` mode
++                    # so we should also be printing the "table" separator
++                    ui.write(force=True)
++
++                show_diff(
++                    diff[key],
++                    title=title,
++                    markdown=self.args.show_md,
++                    no_path=self.args.no_path,
++                    old=self.args.old,
++                    on_empty_diff="diff not supported",
++                    precision=precision if key == "metrics" else None,
++                )
++
+         return 0
+ 
+ 
+ class CmdExperimentsRun(CmdRepro):
+     def run(self):
+-        from dvc.command.metrics import _show_metrics
++        from dvc.compare import show_metrics
+ 
+         if self.args.checkpoint_resume:
+             if self.args.reset:
+@@ -538,7 +503,7 @@ def run(self):
+         if self.args.metrics and results:
+             metrics = self.repo.metrics.show(revs=list(results))
+             metrics.pop("workspace", None)
+-            logger.info(_show_metrics(metrics))
++            logger.info(show_metrics(metrics))
+ 
+         return 0
+ 
+diff --git a/dvc/command/metrics.py b/dvc/command/metrics.py
+--- a/dvc/command/metrics.py
++++ b/dvc/command/metrics.py
+@@ -11,64 +11,6 @@
+ DEFAULT_PRECISION = 5
+ 
+ 
+-def _show_metrics(
+-    metrics,
+-    markdown=False,
+-    all_branches=False,
+-    all_tags=False,
+-    all_commits=False,
+-    precision=None,
+-):
+-    from dvc.utils.diff import format_dict, table
+-    from dvc.utils.flatten import flatten
+-
+-    # When `metrics` contains a `None` key, it means that some files
+-    # specified as `targets` in `repo.metrics.show` didn't contain any metrics.
+-    missing = metrics.pop(None, None)
+-    with_rev = any([all_branches, all_tags, all_commits])
+-    header_set = set()
+-    rows = []
+-
+-    if precision is None:
+-        precision = DEFAULT_PRECISION
+-
+-    def _round(val):
+-        if isinstance(val, float):
+-            return round(val, precision)
+-        return val
+-
+-    for _branch, val in metrics.items():
+-        for _fname, metric in val.items():
+-            if not isinstance(metric, dict):
+-                header_set.add("")
+-                continue
+-            for key, _val in flatten(format_dict(metric)).items():
+-                header_set.add(key)
+-    header = sorted(header_set)
+-    for branch, val in metrics.items():
+-        for fname, metric in val.items():
+-            row = []
+-            if with_rev:
+-                row.append(branch)
+-            row.append(fname)
+-            if not isinstance(metric, dict):
+-                row.append(str(metric))
+-                rows.append(row)
+-                continue
+-            flattened_val = flatten(format_dict(metric))
+-
+-            for i in header:
+-                row.append(_round(flattened_val.get(i)))
+-            rows.append(row)
+-    header.insert(0, "Path")
+-    if with_rev:
+-        header.insert(0, "Revision")
+-
+-    if missing:
+-        raise BadMetricError(missing)
+-    return table(header, rows, markdown)
+-
+-
+ class CmdMetricsBase(CmdBase):
+     UNINITIALIZED = True
+ 
+@@ -83,60 +25,34 @@ def run(self):
+                 all_commits=self.args.all_commits,
+                 recursive=self.args.recursive,
+             )
+-
+-            if self.args.show_json:
+-                import json
+-
+-                logger.info(json.dumps(metrics))
+-            else:
+-                table = _show_metrics(
+-                    metrics,
+-                    self.args.show_md,
+-                    self.args.all_branches,
+-                    self.args.all_tags,
+-                    self.args.all_commits,
+-                    self.args.precision,
+-                )
+-                if table:
+-                    logger.info(table)
+         except DvcException:
+             logger.exception("")
+             return 1
+ 
+-        return 0
+-
+-
+-def _show_diff(diff, markdown=False, no_path=False, precision=None):
+-    from collections import OrderedDict
+-
+-    from dvc.utils.diff import table
++        if self.args.show_json:
++            import json
+ 
+-    if precision is None:
+-        precision = DEFAULT_PRECISION
++            logger.info(json.dumps(metrics))
++        else:
++            from dvc.compare import show_metrics
+ 
+-    def _round(val):
+-        if isinstance(val, float):
+-            return round(val, precision)
++            # When `metrics` contains a `None` key, it means that some files
++            # specified as `targets` in `repo.metrics.show` didn't contain any
++            # metrics.
++            missing = metrics.pop(None, None)
++            if missing:
++                raise BadMetricError(missing)
+ 
+-        return val
+-
+-    rows = []
+-    for fname, mdiff in diff.items():
+-        sorted_mdiff = OrderedDict(sorted(mdiff.items()))
+-        for metric, change in sorted_mdiff.items():
+-            row = [] if no_path else [fname]
+-            row.append(metric)
+-            row.append(_round(change.get("old")))
+-            row.append(_round(change["new"]))
+-            row.append(_round(change.get("diff")))
+-            rows.append(row)
+-
+-    header = [] if no_path else ["Path"]
+-    header.append("Metric")
+-    header.extend(["Old", "New"])
+-    header.append("Change")
++            show_metrics(
++                metrics,
++                markdown=self.args.show_md,
++                all_branches=self.args.all_branches,
++                all_tags=self.args.all_tags,
++                all_commits=self.args.all_commits,
++                precision=self.args.precision or DEFAULT_PRECISION,
++            )
+ 
+-    return table(header, rows, markdown)
++        return 0
+ 
+ 
+ class CmdMetricsDiff(CmdMetricsBase):
+@@ -149,25 +65,25 @@ def run(self):
+                 recursive=self.args.recursive,
+                 all=self.args.all,
+             )
+-
+-            if self.args.show_json:
+-                import json
+-
+-                logger.info(json.dumps(diff))
+-            else:
+-                table = _show_diff(
+-                    diff,
+-                    self.args.show_md,
+-                    self.args.no_path,
+-                    precision=self.args.precision,
+-                )
+-                if table:
+-                    logger.info(table)
+-
+         except DvcException:
+             logger.exception("failed to show metrics diff")
+             return 1
+ 
++        if self.args.show_json:
++            import json
++
++            logger.info(json.dumps(diff))
++        else:
++            from dvc.compare import show_diff
++
++            show_diff(
++                diff,
++                title="Metric",
++                markdown=self.args.show_md,
++                no_path=self.args.no_path,
++                precision=self.args.precision or DEFAULT_PRECISION,
++            )
++
+         return 0
+ 
+ 
+diff --git a/dvc/command/params.py b/dvc/command/params.py
+--- a/dvc/command/params.py
++++ b/dvc/command/params.py
+@@ -1,6 +1,5 @@
+ import argparse
+ import logging
+-from collections import OrderedDict
+ 
+ from dvc.command import completion
+ from dvc.command.base import CmdBase, append_doc_link, fix_subparsers
+@@ -9,27 +8,6 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def _show_diff(diff, markdown=False, no_path=False):
+-    from dvc.utils.diff import table
+-
+-    rows = []
+-    for fname, pdiff in diff.items():
+-        sorted_pdiff = OrderedDict(sorted(pdiff.items()))
+-        for param, change in sorted_pdiff.items():
+-            row = [] if no_path else [fname]
+-            row.append(param)
+-            row.append(change["old"])
+-            row.append(change["new"])
+-            rows.append(row)
+-
+-    header = [] if no_path else ["Path"]
+-    header.append("Param")
+-    header.append("Old")
+-    header.append("New")
+-
+-    return table(header, rows, markdown)
+-
+-
+ class CmdParamsDiff(CmdBase):
+     UNINITIALIZED = True
+ 
+@@ -42,20 +20,25 @@ def run(self):
+                 all=self.args.all,
+                 deps=self.args.deps,
+             )
+-
+-            if self.args.show_json:
+-                import json
+-
+-                logger.info(json.dumps(diff))
+-            else:
+-                table = _show_diff(diff, self.args.show_md, self.args.no_path)
+-                if table:
+-                    logger.info(table)
+-
+         except DvcException:
+             logger.exception("failed to show params diff")
+             return 1
+ 
++        if self.args.show_json:
++            import json
++
++            logger.info(json.dumps(diff))
++        else:
++            from dvc.compare import show_diff
++
++            show_diff(
++                diff,
++                title="Param",
++                markdown=self.args.show_md,
++                no_path=self.args.no_path,
++                show_changes=False,
++            )
++
+         return 0
+ 
+ 
+diff --git a/dvc/command/repro.py b/dvc/command/repro.py
+--- a/dvc/command/repro.py
++++ b/dvc/command/repro.py
+@@ -3,7 +3,6 @@
+ 
+ from dvc.command import completion
+ from dvc.command.base import CmdBase, append_doc_link
+-from dvc.command.metrics import _show_metrics
+ from dvc.command.status import CmdDataStatus
+ 
+ logger = logging.getLogger(__name__)
+@@ -20,8 +19,10 @@ def run(self):
+             )
+ 
+         if self.args.metrics:
++            from dvc.compare import show_metrics
++
+             metrics = self.repo.metrics.show()
+-            logger.info(_show_metrics(metrics))
++            show_metrics(metrics)
+ 
+         return 0
+ 
+diff --git a/dvc/compare.py b/dvc/compare.py
+--- a/dvc/compare.py
++++ b/dvc/compare.py
+@@ -1,3 +1,4 @@
++from collections.abc import Mapping
+ from itertools import chain, repeat, zip_longest
+ from operator import itemgetter
+ from typing import (
+@@ -167,3 +168,137 @@ def render(self, **kwargs: Any):
+     def as_dict(self):
+         keys = self.keys()
+         return [dict(zip(keys, row)) for row in self]
++
++
++def _format_field(val: Any, precision: int = None) -> str:
++    def _format(_val):
++        if isinstance(_val, float) and precision:
++            fmt = f"{{:.{precision}g}}"
++            return fmt.format(_val)
++        if isinstance(_val, Mapping):
++            return {k: _format(v) for k, v in _val.items()}
++        if isinstance(_val, list):
++            return [_format(x) for x in _val]
++        return _val
++
++    return str(_format(val))
++
++
++def diff_table(
++    diff,
++    title: str,
++    old: bool = True,
++    no_path: bool = False,
++    show_changes: bool = True,
++    precision: int = None,
++    on_empty_diff: str = None,
++) -> TabularData:
++    headers: List[str] = ["Path", title, "Old", "New", "Change"]
++    fill_value = "-"
++    td = TabularData(headers, fill_value=fill_value)
++
++    for fname, diff_in_file in diff.items():
++        for item, change in sorted(diff_in_file.items()):
++            old_value = with_value(change.get("old"), fill_value)
++            new_value = with_value(change.get("new"), fill_value)
++            diff_value = with_value(
++                change.get("diff", on_empty_diff), fill_value
++            )
++            td.append(
++                [
++                    fname,
++                    str(item),
++                    _format_field(old_value, precision),
++                    _format_field(new_value, precision),
++                    _format_field(diff_value, precision),
++                ]
++            )
++
++    if no_path:
++        td.drop("Path")
++
++    if not show_changes:
++        td.drop("Change")
++
++    if not old:
++        td.drop("Old")
++        td.rename("New", "Value")
++
++    return td
++
++
++def show_diff(
++    diff,
++    title: str,
++    old: bool = True,
++    no_path: bool = False,
++    show_changes: bool = True,
++    precision: int = None,
++    on_empty_diff: str = None,
++    markdown: bool = False,
++) -> None:
++    td = diff_table(
++        diff,
++        title=title,
++        old=old,
++        no_path=no_path,
++        show_changes=show_changes,
++        precision=precision,
++        on_empty_diff=on_empty_diff,
++    )
++    td.render(markdown=markdown)
++
++
++def metrics_table(
++    metrics,
++    all_branches: bool = False,
++    all_tags: bool = False,
++    all_commits: bool = False,
++    precision: int = None,
++):
++    from dvc.utils.diff import format_dict
++    from dvc.utils.flatten import flatten
++
++    td = TabularData(["Revision", "Path"], fill_value="-")
++
++    for branch, val in metrics.items():
++        for fname, metric in val.items():
++            row_data: Dict[str, str] = {
++                "Revision": branch,
++                "Path": fname,
++            }
++            flattened = (
++                flatten(format_dict(metric))
++                if isinstance(metric, dict)
++                else {"": metric}
++            )
++            row_data.update(
++                {k: _format_field(v, precision) for k, v in flattened.items()}
++            )
++            td.row_from_dict(row_data)
++
++    rev, path, *metrics_headers = td.keys()
++    td.project(rev, path, *sorted(metrics_headers))
++
++    if not any([all_branches, all_tags, all_commits]):
++        td.drop("Revision")
++
++    return td
++
++
++def show_metrics(
++    metrics,
++    markdown: bool = False,
++    all_branches: bool = False,
++    all_tags: bool = False,
++    all_commits: bool = False,
++    precision: int = None,
++) -> None:
++    td = metrics_table(
++        metrics,
++        all_branches=all_branches,
++        all_tags=all_tags,
++        all_commits=all_commits,
++        precision=precision,
++    )
++    td.render(markdown=markdown)
+

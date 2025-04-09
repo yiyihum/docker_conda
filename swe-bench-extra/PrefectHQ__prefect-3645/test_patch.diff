@@ -1,0 +1,80 @@
+diff --git a/tests/core/test_task_map.py b/tests/core/test_task_map.py
+index 7646d486d7..18fbd48d27 100644
+--- a/tests/core/test_task_map.py
++++ b/tests/core/test_task_map.py
+@@ -1154,3 +1154,34 @@ class TestFlatMap:
+             state.result[z].message
+             == "At least one upstream state has an unmappable result."
+         )
++
++
++def test_mapped_retries_regenerate_child_pipelines():
++    """
++    This test sets up a situation analogous to one found in Cloud: if a reduce task fails, and a user
++    retries it in the future, we want to make sure that the mapped children pipelines are correctly
++    regenerated.  When run against Cloud, these child tasks will correctly query for their states and
++    the run will proceed with the correct data.
++
++    This test mimics this scenario by running this flow with a provided set of states that only contain
++    metadata about the runs with no actual data to reference.  The child runs should still be produced
++    based only on the n_map_states attribute of the parent.
++    """
++    idt = IdTask()
++    ll = ListTask()
++    with Flow("test") as flow:
++        mapped = idt.map(ll)
++        reduced = idt(mapped)
++
++    flow_state = flow.run()
++    assert flow_state.is_successful()
++    assert flow_state.result[mapped].is_mapped()
++    assert flow_state.result[reduced].is_successful()
++    assert flow_state.result[reduced].result == [1, 2, 3]
++
++    second_pass_states = {mapped: Mapped(n_map_states=3), ll: Success(result=Result())}
++
++    new_state = flow.run(task_states=second_pass_states)
++    assert new_state.is_successful()
++    assert new_state.result[mapped].is_mapped()
++    assert new_state.result[reduced].is_successful()
+diff --git a/tests/engine/test_task_runner.py b/tests/engine/test_task_runner.py
+index 841623656d..5cc5bd63af 100644
+--- a/tests/engine/test_task_runner.py
++++ b/tests/engine/test_task_runner.py
+@@ -1891,6 +1891,23 @@ class TestCheckTaskReadyToMapStep:
+             )
+         assert exc.value.state.is_mapped()
+ 
++    @pytest.mark.parametrize("state", [Pending(), Mapped(), Scheduled()])
++    def test_run_mapped_returns_cached_inputs_if_rerun(self, state):
++        """
++        This is important to communicate result information back to the
++        FlowRunner for regenerating the mapped children.
++        """
++        result = LocalResult(value="y")
++        edge = Edge(Task(), Task(), key="x")
++        with pytest.raises(ENDRUN) as exc:
++            TaskRunner(task=Task()).check_task_ready_to_map(
++                state=state, upstream_states={edge: Success(result=result)}
++            )
++        if state.is_mapped():
++            assert exc.value.state.cached_inputs == dict(x=result)
++        else:
++            assert exc.value.state.cached_inputs == dict()
++
+     def test_run_mapped_returns_failed_if_no_success_upstream(self):
+         with pytest.raises(ENDRUN) as exc:
+             TaskRunner(task=Task()).check_task_ready_to_map(
+diff --git a/tests/test_configuration.py b/tests/test_configuration.py
+index d6a5e457f1..5cd9cba9cd 100644
+--- a/tests/test_configuration.py
++++ b/tests/test_configuration.py
+@@ -67,7 +67,7 @@ def config(test_config_file_path, monkeypatch):
+     )
+     monkeypatch.setenv("PATH", "1/2/3")
+     monkeypatch.setenv(
+-        "PREFECT_TEST__ENV_VARS__ESCAPED_CHARACTERS", r"line 1\nline 2\rand 3\tand 4"
++        "PREFECT_TEST__ENV_VARS__ESCAPED_CHARACTERS", "line 1\nline 2\rand 3\tand 4"
+     )
+ 
+     yield configuration.load_configuration(

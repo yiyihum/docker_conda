@@ -1,0 +1,247 @@
+diff --git a/hydrate/__main__.py b/hydrate/__main__.py
+index c61bb5d..bb04e88 100644
+--- a/hydrate/__main__.py
++++ b/hydrate/__main__.py
+@@ -9,7 +9,7 @@ import sys
+ from pathlib import Path
+ 
+ from .cluster import Cluster
+-from .component import Component, get_full_matches
++from .component import Component, match_components
+ from .hld import generate_HLD
+ from .scrape import get_repo_components
+ 
+@@ -26,20 +26,20 @@ def main(args):
+     print("Connected!")
+ 
+     print("Collecting information from the cluster...")
+-    cluster_components = my_cluster.get_components()
++    cc = my_cluster.get_components()
+ 
+     print("Collecting Fabrikate Components from GitHub...")
+-    repo_components = get_repo_components()
++    rc = get_repo_components()
+ 
+     print("Comparing Fabrikate Components to Cluster Deployments...")
+-    full_matches = get_full_matches(repo_components, cluster_components)
++    subcomponents, category_indeces = match_components(rc, cc)
+ 
+     verbose_print("Creating Component object...")
+     my_component = Component(args.name, path="./manifests")
+ 
+     verbose_print("Creating the list of subcomponents...")
+     sub_list = []
+-    for component in full_matches:
++    for component in subcomponents:
+         component.delete_none_attrs()
+         sub_list.append(component)
+ 
+@@ -47,19 +47,22 @@ def main(args):
+ 
+     print("Writing HLD...")
+ 
++    output_file = None
+     if args.dry_run:
+         verbose_print("Writing component.yaml to terminal...")
+-        generate_HLD(my_component, sys.stdout)
++        generate_HLD(my_component, sys.stdout, category_indeces)
++
+     else:
+         if args.output:
+             verbose_print("Writing component.yaml to {}.".format(args.output))
+-            output = os.path.join(args.output, "component.yaml")
+-            with open(output, "w") as of:
+-                generate_HLD(my_component, of)
++            output_file = os.path.join(args.output, "component.yaml")
++
+         else:
+             verbose_print("Writing to component.yaml...")
+-            with open("component.yaml", "w") as of:
+-                generate_HLD(my_component, of)
++            output_file = "component.yaml"
++
++        with open(output_file, "w") as of:
++            generate_HLD(my_component, of, category_indeces)
+ 
+ 
+ def parse_args():
+diff --git a/hydrate/cluster.py b/hydrate/cluster.py
+index e9d274b..cfedb27 100644
+--- a/hydrate/cluster.py
++++ b/hydrate/cluster.py
+@@ -1,6 +1,7 @@
+ """Kubernetes Cluster API Class."""
+ from kubernetes import client, config
+ from .component import Component
++import re
+ 
+ 
+ class Cluster():
+@@ -16,7 +17,8 @@ class Cluster():
+         self.kubeconfig = kubeconfig
+         self.apps_v1_api = None
+         self.core_v1_api = None
+-        self.namespaced_pods = {}
++        self.namespaced_pods = dict()
++        self.namespaced_deployments = dict()
+ 
+     def connect_to_cluster(self):
+         """Connect to the cluster. Set API attributes."""
+@@ -32,24 +34,49 @@ class Cluster():
+ 
+         """
+         components = []
++        default_deps = self.get_namespaced_deployments("default")
+         namespaces = self.get_namespaces()
+         namespaces = self.remove_defaults(namespaces)
+-        # Scenario where cluster contains namespaces other than default ones
++        # Scenario where cluster applications live in namespaces
+         if namespaces:
+-            components = [namespace for namespace in namespaces]
+-            components = [get_first_word(comp) for comp in components]
+-            components = [Component(name) for name in components]
+-        # Scenario where cluster applications all live in the default namespace
+-        else:
+-            pods = self.get_namespaced_pods("default")
+-            components = self.process_cluster_objects(pods)
++            first_words = [get_first_word(name) for name in namespaces]
++            components.extend([Component(word) for word in first_words])
++        # Scenario where cluster applications live in default
++        if default_deps:
++            dep_names = [
++                re.sub(r'-deployment', '', dep) for dep in default_deps]
++            components.extend([Component(n) for n in dep_names])
++
+         return components
+ 
++    def get_statefulsets(self):
++        """Query the cluster for statefulsets."""
++        ret = self.apps_v1_api.list_stateful_set_for_all_namespaces()
++        with open("statefulsets.json", "w") as of:
++            of.write(dict(ret))
++
+     def get_namespaces(self):
+         """Query the cluster for namespaces."""
+         ret = self.core_v1_api.list_namespace()
+         return [i.metadata.name for i in ret.items]
+ 
++    def get_namespaced_deployments(self, namespace):
++        """Store the list of deployments in the namespace.
++
++        Args:
++            namespace: The namespace to look in.
++
++        Return:
++            deployment_list: list of pods found in the namespace.
++        """
++        if namespace in self.namespaced_deployments:
++            return self.namespaced_deployments[namespace]
++        else:
++            ret = self.apps_v1_api.list_namespaced_deployment(namespace)
++            deployment_list = [i.metadata.name for i in ret.items]
++            self.namespaced_pods[namespace] = deployment_list
++            return deployment_list
++
+     def get_namespaced_pods(self, namespace):
+         """Store the list of pods in the namespace.
+ 
+diff --git a/hydrate/component.py b/hydrate/component.py
+index 3b929d4..139404f 100644
+--- a/hydrate/component.py
++++ b/hydrate/component.py
+@@ -66,10 +66,37 @@ class Component():
+                 delattr(self, key)
+ 
+ 
++def match_components(repo_components, cluster_components):
++    """Match cluster and repo components."""
++    subcomponents = []
++    category_indeces = []
++    rc = repo_components
++    cc = cluster_components
++    full_matches, fm_leftovers = get_full_matches(rc, cc)
++
++    # Indeces are determined by the length of the previous category
++    if full_matches:
++        subcomponents.extend(full_matches)
++        category_indeces.append((0, "Full Match Components"))
++
++    if fm_leftovers:
++        subcomponents.extend(fm_leftovers)
++        category_indeces.append((len(full_matches), "No Match Deployments"))
++
++    return subcomponents, category_indeces
++
++
+ def get_full_matches(repo_components, cluster_components):
+-    """Return the Fabrikate Components that fully match the cluster."""
++    """Determine which components fully match the cluster.
++
++    Returns:
++        full_matches: list of components
++        leftovers: list of components
++
++    """
+     full_matches = []
+     cluster_set = set()
++    leftovers = None
+     for cc in cluster_components:
+         cluster_set.add(cc.name)
+     for rc in repo_components:
+@@ -81,5 +108,6 @@ def get_full_matches(repo_components, cluster_components):
+ 
+     if cluster_set:
+         print("Leftover deployments in cluster: {}".format(cluster_set))
++        leftovers = [cc for cc in cluster_components if cc.name in cluster_set]
+ 
+-    return full_matches
++    return full_matches, leftovers
+diff --git a/hydrate/hld.py b/hydrate/hld.py
+index 7f869f5..8ee8f79 100644
+--- a/hydrate/hld.py
++++ b/hydrate/hld.py
+@@ -1,18 +1,28 @@
+ """Use to construct the High-Level Deployment."""
++from ruamel.yaml.comments import CommentedMap, CommentedSeq
+ from ruamel.yaml import YAML
+ yaml = YAML()
+ 
++OFFSET = 2
+ 
+-def generate_HLD(component, output):
++
++def generate_HLD(component, output, comment_indeces=None):
+     """Create HLD yaml file.
+ 
+     Args:
+         component: Component object
+         output: filestream
++        comment_indeces: List of tuples (index, comment text)
+ 
+     """
+     component.delete_none_attrs()
+-    yaml.indent(mapping=2, sequence=4, offset=2)
++    yaml.indent(mapping=2, sequence=4, offset=OFFSET)
+     d = component.asdict()
++    if comment_indeces:
++        d = CommentedMap(d)
++        lst = CommentedSeq(d["subcomponents"])
++        for idx, comment in comment_indeces:
++            lst.yaml_set_comment_before_after_key(idx, comment, OFFSET)
++        d["subcomponents"] = lst
+ 
+     yaml.dump(d, output)
+diff --git a/hydrate/scrape.py b/hydrate/scrape.py
+index 88623d7..23f010f 100644
+--- a/hydrate/scrape.py
++++ b/hydrate/scrape.py
+@@ -6,7 +6,7 @@ from .component import Component
+ 
+ # URL to the Fabrikate Component Definitions
+ FAB_DEFS_URL = "https://github.com/microsoft/fabrikate-definitions"
+-FAB_DEFS_API = "https://api.github.com/repos/microsoft/fabrikate-definitions/contents/definitions"
++FAB_DEFS_API = "https://api.github.com/repos/microsoft/fabrikate-definitions/contents/definitions"  # noqa
+ 
+ 
+ def get_repo_components():
+

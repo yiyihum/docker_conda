@@ -1,0 +1,67 @@
+diff --git a/src/tox/config/loader/ini/__init__.py b/src/tox/config/loader/ini/__init__.py
+index 5822555e..55d67be3 100644
+--- a/src/tox/config/loader/ini/__init__.py
++++ b/src/tox/config/loader/ini/__init__.py
+@@ -29,8 +29,10 @@ class IniLoader(StrConvert, Loader[str]):
+         super().__init__(overrides)
+ 
+     def load_raw(self, key: str, conf: Optional["Config"], env_name: Optional[str]) -> str:
+-        value = self._section[key]
++        return self.process_raw(conf, env_name, self._section[key])
+ 
++    @staticmethod
++    def process_raw(conf: Optional["Config"], env_name: Optional[str], value: str) -> str:
+         # strip comments
+         elements: List[str] = []
+         for line in value.split("\n"):
+@@ -38,7 +40,6 @@ class IniLoader(StrConvert, Loader[str]):
+                 part = _COMMENTS.sub("", line)
+                 elements.append(part.replace("\\#", "#"))
+         strip_comments = "\n".join(elements)
+-
+         if conf is None:  # conf is None when we're loading the global tox configuration file for the CLI
+             factor_filtered = strip_comments  # we don't support factor and replace functionality there
+         else:
+diff --git a/src/tox/config/loader/ini/replace.py b/src/tox/config/loader/ini/replace.py
+index 3e9d193f..06facf61 100644
+--- a/src/tox/config/loader/ini/replace.py
++++ b/src/tox/config/loader/ini/replace.py
+@@ -120,9 +120,10 @@ def replace_reference(
+             for src in _config_value_sources(settings["env"], settings["section"], current_env, conf, loader):
+                 try:
+                     if isinstance(src, SectionProxy):
+-                        return src[key]
++                        return loader.process_raw(conf, current_env, src[key])
+                     value = src.load(key, chain)
+                     as_str, _ = stringify(value)
++                    as_str = as_str.replace("#", r"\#")  # escape comment characters as these will be stripped
+                     return as_str
+                 except KeyError as exc:  # if fails, keep trying maybe another source can satisfy
+                     exception = exc
+diff --git a/src/tox/config/loader/str_convert.py b/src/tox/config/loader/str_convert.py
+index 01a114e6..ba373af8 100644
+--- a/src/tox/config/loader/str_convert.py
++++ b/src/tox/config/loader/str_convert.py
+@@ -47,8 +47,10 @@ class StrConvert(Convert[str]):
+     @staticmethod
+     def to_command(value: str) -> Command:
+         is_win = sys.platform == "win32"
++        value = value.replace(r"\#", "#")
+         splitter = shlex.shlex(value, posix=not is_win)
+         splitter.whitespace_split = True
++        splitter.commenters = ""  # comments handled earlier, and the shlex does not know escaped comment characters
+         args: List[str] = []
+         pos = 0
+         try:
+diff --git a/src/tox/config/set_env.py b/src/tox/config/set_env.py
+index ce836516..acfd52fa 100644
+--- a/src/tox/config/set_env.py
++++ b/src/tox/config/set_env.py
+@@ -41,6 +41,7 @@ class SetEnv:
+             return self._materialized[item]
+         raw = self._raw[item]
+         result = self.replacer(raw, chain)  # apply any replace options
++        result = result.replace(r"\#", "#")  # unroll escaped comment with replacement
+         self._materialized[item] = result
+         self._raw.pop(item, None)  # if the replace requires the env we may be called again, so allow pop to fail
+         return result

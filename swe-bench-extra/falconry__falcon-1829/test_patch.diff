@@ -1,0 +1,80 @@
+diff --git a/tests/test_inspect.py b/tests/test_inspect.py
+index 575547b..4dbe24a 100644
+--- a/tests/test_inspect.py
++++ b/tests/test_inspect.py
+@@ -146,10 +146,12 @@ class TestInspectApp:
+         assert all(isinstance(s, inspect.SinkInfo) for s in sinks)
+         assert sinks[-1].prefix == '/sink_fn'
+         assert sinks[-1].name == 'sinkFn'
+-        assert '_inspect_fixture.py' in sinks[-1].source_info
++        if not asgi:
++            assert '_inspect_fixture.py' in sinks[-1].source_info
+         assert sinks[-2].prefix == '/sink_cls'
+         assert sinks[-2].name == 'SinkClass'
+-        assert '_inspect_fixture.py' in sinks[-2].source_info
++        if not asgi:
++            assert '_inspect_fixture.py' in sinks[-2].source_info
+ 
+     @pytest.mark.skipif(sys.version_info < (3, 6), reason='dict order is not stable')
+     def test_error_handler(self, asgi):
+diff --git a/tests/test_sinks.py b/tests/test_sinks.py
+index f151533..1694ea8 100644
+--- a/tests/test_sinks.py
++++ b/tests/test_sinks.py
+@@ -5,7 +5,7 @@ import pytest
+ import falcon
+ import falcon.testing as testing
+ 
+-from _util import create_app  # NOQA
++from _util import create_app, disable_asgi_non_coroutine_wrapping  # NOQA
+ 
+ 
+ class Proxy:
+@@ -27,6 +27,14 @@ class SinkAsync(Sink):
+         super().__call__(req, resp, **kwargs)
+ 
+ 
++def kitchen_sink(req, resp, **kwargs):
++    resp.set_header('X-Missing-Feature', 'kitchen-sink')
++
++
++async def async_kitchen_sink(req, resp, **kwargs):
++    kitchen_sink(req, resp, **kwargs)
++
++
+ class BookCollection(testing.SimpleTestResource):
+     pass
+ 
+@@ -137,3 +145,32 @@ class TestDefaultRouting:
+         response = client.simulate_request(path='/books/123')
+         assert resource.called
+         assert response.status == falcon.HTTP_200
++
++
++class TestSinkMethodCompatibility:
++
++    def _verify_kitchen_sink(self, client):
++        resp = client.simulate_request('BREW', '/features')
++        assert resp.status_code == 200
++        assert resp.headers.get('X-Missing-Feature') == 'kitchen-sink'
++
++    def test_add_async_sink(self, client, asgi):
++        if not asgi:
++            with pytest.raises(falcon.CompatibilityError):
++                client.app.add_sink(async_kitchen_sink)
++        else:
++            client.app.add_sink(async_kitchen_sink, '/features')
++            self._verify_kitchen_sink(client)
++
++    def test_add_sync_sink(self, client, asgi):
++        if asgi:
++            with disable_asgi_non_coroutine_wrapping():
++                with pytest.raises(falcon.CompatibilityError):
++                    client.app.add_sink(kitchen_sink)
++        else:
++            client.app.add_sink(kitchen_sink, '/features')
++            self._verify_kitchen_sink(client)
++
++    def test_add_sync_sink_with_wrapping(self, client, asgi):
++        client.app.add_sink(kitchen_sink, '/features')
++        self._verify_kitchen_sink(client)

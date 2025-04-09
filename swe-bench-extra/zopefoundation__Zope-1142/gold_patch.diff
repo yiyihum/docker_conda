@@ -1,0 +1,150 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index e99b7b40f..c4b17af07 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -29,6 +29,9 @@ https://github.com/zopefoundation/Zope/blob/4.x/CHANGES.rst
+   Note: ``mapply`` still does not support keyword only, var positional
+   and var keyword parameters.
+ 
++- Make Zope's parameters for denial of service protection configurable
++  `#1141 <https://github.com/zopefoundation/Zope/issues/1141>_`.
++
+ 
+ 5.8.3 (2023-06-15)
+ ------------------
+diff --git a/src/ZPublisher/HTTPRequest.py b/src/ZPublisher/HTTPRequest.py
+index 39239ae1a..7983898e1 100644
+--- a/src/ZPublisher/HTTPRequest.py
++++ b/src/ZPublisher/HTTPRequest.py
+@@ -53,9 +53,9 @@ from .cookie import getCookieValuePolicy
+ 
+ # DOS attack protection -- limiting the amount of memory for forms
+ # probably should become configurable
+-FORM_MEMORY_LIMIT = 2 ** 20  # memory limit for forms
+-FORM_DISK_LIMIT = 2 ** 30    # disk limit for forms
+-FORM_MEMFILE_LIMIT = 4000    # limit for `BytesIO` -> temporary file switch
++FORM_MEMORY_LIMIT = 2 ** 20   # memory limit for forms
++FORM_DISK_LIMIT = 2 ** 30     # disk limit for forms
++FORM_MEMFILE_LIMIT = 2 ** 12  # limit for `BytesIO` -> temporary file switch
+ 
+ 
+ # This may get overwritten during configuration
+@@ -1354,6 +1354,8 @@ def sane_environment(env):
+ 
+ class ValueDescriptor:
+     """(non data) descriptor to compute `value` from `file`."""
++    VALUE_LIMIT = FORM_MEMORY_LIMIT
++
+     def __get__(self, inst, owner=None):
+         if inst is None:
+             return self
+@@ -1364,6 +1366,8 @@ class ValueDescriptor:
+             fpos = None
+         try:
+             v = file.read()
++            if self.VALUE_LIMIT and file.read(1):
++                raise BadRequest("data exceeds memory limit")
+             if fpos is None:
+                 # store the value as we cannot read it again
+                 inst.value = v
+diff --git a/src/Zope2/Startup/handlers.py b/src/Zope2/Startup/handlers.py
+index 7369369bf..35b4a4f66 100644
+--- a/src/Zope2/Startup/handlers.py
++++ b/src/Zope2/Startup/handlers.py
+@@ -90,3 +90,11 @@ def handleWSGIConfig(cfg, multihandler):
+         if not name.startswith('_'):
+             handlers[name] = value
+     return multihandler(handlers)
++
++
++def dos_protection(cfg):
++    if cfg is None:
++        return
++    from ZPublisher import HTTPRequest
++    for attr in cfg.getSectionAttributes():
++        setattr(HTTPRequest, attr.upper(), getattr(cfg, attr))
+diff --git a/src/Zope2/Startup/wsgischema.xml b/src/Zope2/Startup/wsgischema.xml
+index 1a536fc18..d593c36da 100644
+--- a/src/Zope2/Startup/wsgischema.xml
++++ b/src/Zope2/Startup/wsgischema.xml
+@@ -80,6 +80,34 @@
+ 
+   </sectiontype>
+ 
++  <sectiontype name="dos_protection">
++
++    <description>Defines parameters for DOS attack protection</description>
++
++    <key name="form-memory-limit" datatype="byte-size" default="1MB">
++      <description>
++       The maximum size for each part in a multipart post request,
++       for the complete body in an urlencoded post request
++       and for the complete request body when accessed as bytes
++       (rather than a file).
++      </description>
++    </key>
++
++    <key name="form-disk-limit" datatype="byte-size" default="1GB">
++      <description>
++       The maximum size of a POST request body
++      </description>
++    </key>
++
++    <key name="form-memfile-limit" datatype="byte-size" default="4KB">
++      <description>
++       The value of form variables of type file with larger size 
++       are stored on disk rather than in memory.
++      </description>
++    </key>
++  </sectiontype>
++
++
+   <!-- end of type definitions -->
+ 
+   <!-- schema begins  -->
+@@ -385,4 +413,7 @@
+    <metadefault>off</metadefault>
+   </key>
+ 
++  <section type="dos_protection" handler="dos_protection"
++           name="*" attribute="dos_protection" />
++
+ </schema>
+diff --git a/src/Zope2/utilities/skel/etc/zope.conf.in b/src/Zope2/utilities/skel/etc/zope.conf.in
+index 39c8c8f20..110f621bb 100644
+--- a/src/Zope2/utilities/skel/etc/zope.conf.in
++++ b/src/Zope2/utilities/skel/etc/zope.conf.in
+@@ -250,3 +250,33 @@ instancehome $INSTANCE
+ #    security-policy-implementation python
+ #    verbose-security on
+ 
++<dos_protection>
++# 
++# Description:
++#   You can use this section to configure Zope's
++#   parameters for denial of service attack protection.
++#   The examples below document the default values.
++
++# Parameter: form-memory-limit
++# Description: 
++#    The maximum size for each part in a multipart post request,
++#    for the complete body in an urlencoded post request
++#    and for the complete request body when accessed as bytes
++#    (rather than a file).
++# Example:
++#    form-memory-limit 1MB
++
++# Parameter: form-disk-limit
++# Description: 
++#    The maximum size of a POST request body
++# Example:
++#    form-disk-limit 1GB
++
++# Parameter: form-memfile-limit
++# Description: 
++#    The value of form variables of type file with larger size
++#    are stored on disk rather than in memory.
++# Example:
++#    form-memfile-limit 4KB
++
++</dos_protection>

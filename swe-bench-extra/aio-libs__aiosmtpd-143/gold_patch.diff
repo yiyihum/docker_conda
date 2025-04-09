@@ -1,0 +1,93 @@
+diff --git a/.travis.yml b/.travis.yml
+index 6f1e947..cdecf91 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -9,6 +9,11 @@ matrix:
+       env: INTERP=py35 PYTHONASYNCIODEBUG=1
+     - python: "3.6"
+       env: INTERP=py36 PYTHONASYNCIODEBUG=1
++before_script:
++  # Disable IPv6. Ref travis-ci/travis-ci#8711
++  - echo 0 | sudo tee /proc/sys/net/ipv6/conf/all/disable_ipv6
+ script:
+   - tox -e $INTERP-nocov,$INTERP-cov,qa,docs
+   - 'if [ "$TRAVIS_PULL_REQUEST" != "false" ]; then tox -e $INTERP-diffcov; fi'
++before_script:
++  - echo 0 | sudo tee /proc/sys/net/ipv6/conf/all/disable_ipv6
+diff --git a/aiosmtpd/controller.py b/aiosmtpd/controller.py
+index c529ff9..1df9c2c 100644
+--- a/aiosmtpd/controller.py
++++ b/aiosmtpd/controller.py
+@@ -10,6 +10,11 @@ from public import public
+ class Controller:
+     def __init__(self, handler, loop=None, hostname=None, port=8025, *,
+                  ready_timeout=1.0, enable_SMTPUTF8=True, ssl_context=None):
++        """
++        `Documentation can be found here
++        <http://aiosmtpd.readthedocs.io/en/latest/aiosmtpd\
++/docs/controller.html#controller-api>`_.
++        """
+         self.handler = handler
+         self.hostname = '::1' if hostname is None else hostname
+         self.port = port
+diff --git a/aiosmtpd/docs/controller.rst b/aiosmtpd/docs/controller.rst
+index ca134b6..ab0a81a 100644
+--- a/aiosmtpd/docs/controller.rst
++++ b/aiosmtpd/docs/controller.rst
+@@ -168,7 +168,15 @@ Controller API
+    *loop* is the asyncio event loop to use.  If not given,
+    :meth:`asyncio.new_event_loop()` is called to create the event loop.
+ 
+-   *hostname* and *port* are passed directly to your loop's
++   *hostname* is passed to your loop's
++   :meth:`AbstractEventLoop.create_server` method as the
++   ``host`` parameter,
++   except None (default) is translated to '::1'. To bind
++   dual-stack locally, use 'localhost'. To bind `dual-stack
++   <https://en.wikipedia.org/wiki/IPv6#Dual-stack_IP_implementation>`_
++   on all interfaces, use ''.
++
++   *port* is passed directly to your loop's
+    :meth:`AbstractEventLoop.create_server` method.
+ 
+    *ready_timeout* is float number of seconds that the controller will wait in
+diff --git a/aiosmtpd/smtp.py b/aiosmtpd/smtp.py
+index 681732a..24661a6 100644
+--- a/aiosmtpd/smtp.py
++++ b/aiosmtpd/smtp.py
+@@ -234,10 +234,20 @@ class SMTP(asyncio.StreamReaderProtocol):
+                 # re-encoded back to the original bytes when the SMTP command
+                 # is handled.
+                 if i < 0:
+-                    command = line.upper().decode(encoding='ascii')
++                    try:
++                        command = line.upper().decode(encoding='ascii')
++                    except UnicodeDecodeError:
++                        await self.push('500 Error: bad syntax')
++                        continue
++
+                     arg = None
+                 else:
+-                    command = line[:i].upper().decode(encoding='ascii')
++                    try:
++                        command = line[:i].upper().decode(encoding='ascii')
++                    except UnicodeDecodeError:
++                        await self.push('500 Error: bad syntax')
++                        continue
++
+                     arg = line[i+1:].strip()
+                     # Remote SMTP servers can send us UTF-8 content despite
+                     # whether they've declared to do so or not.  Some old
+diff --git a/examples/server.py b/examples/server.py
+index 792be44..db8b78b 100644
+--- a/examples/server.py
++++ b/examples/server.py
+@@ -6,7 +6,7 @@ from aiosmtpd.handlers import Sink
+ 
+ 
+ async def amain(loop):
+-    cont = Controller(Sink(), hostname='::0', port=8025)
++    cont = Controller(Sink(), hostname='', port=8025)
+     cont.start()
+ 
+ 

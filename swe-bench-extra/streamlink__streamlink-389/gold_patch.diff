@@ -1,0 +1,195 @@
+diff --git a/docs/plugin_matrix.rst b/docs/plugin_matrix.rst
+index fd3c8d39..846f39e2 100644
+--- a/docs/plugin_matrix.rst
++++ b/docs/plugin_matrix.rst
+@@ -137,6 +137,7 @@ tv4play             - tv4play.se         Yes   Yes   Streams may be geo-restrict
+                                                      Only non-premium streams currently supported.
+                     - fotbollskanalen.se
+ tv8                 tv8.com.tr           Yes   No
++tv8cat              tv8.cat              Yes   No    Streams may be geo-restricted to Spain/Catalunya.
+ tv360               tv360.com.tr         Yes   No
+ tvcatchup           - tvcatchup.com      Yes   No    Streams may be geo-restricted to Great Britain.
+ tvplayer            tvplayer.com         Yes   No    Streams may be geo-restricted to Great Britain. Premium streams are not supported.
+diff --git a/src/streamlink/plugins/tf1.py b/src/streamlink/plugins/tf1.py
+index 337677e6..f1e6fad8 100644
+--- a/src/streamlink/plugins/tf1.py
++++ b/src/streamlink/plugins/tf1.py
+@@ -11,9 +11,9 @@ class TF1(Plugin):
+     url_re = re.compile(r"https?://(?:www\.)?(?:tf1\.fr/(\w+)/direct|(lci).fr/direct)/?")
+     embed_url = "http://www.wat.tv/embedframe/live{0}"
+     embed_re = re.compile(r"urlLive.*?:.*?\"(http.*?)\"", re.MULTILINE)
+-    api_url = "http://www.wat.tv/get/androidlive{0}/591997"
+-    swf_url = "http://www.wat.tv/images/v70/PlayerWat.swf?rev=04.00.861"
+-    hds_channel_remap = {"tf1": "connect"}
++    api_url = "http://www.wat.tv/get/{0}/591997"
++    swf_url = "http://www.wat.tv/images/v70/PlayerLite.swf"
++    hds_channel_remap = {"tf1": "androidliveconnect", "lci": "androidlivelci"}
+     hls_channel_remap = {"lci": "LCI", "tf1": "V4"}
+ 
+     @classmethod
+@@ -21,13 +21,15 @@ class TF1(Plugin):
+         return cls.url_re.match(url) is not None
+ 
+     def _get_hds_streams(self, channel):
+-        channel = self.hds_channel_remap.get(channel, channel)
++        channel = self.hds_channel_remap.get(channel, "{0}live".format(channel))
+         manifest_url = http.get(self.api_url.format(channel),
+-                                params={"getURL": 1}).text
++                                params={"getURL": 1},
++                                headers={"User-Agent": useragents.FIREFOX}).text
+ 
+         for s in HDSStream.parse_manifest(self.session,
+                                           manifest_url,
+-                                          pvswf=self.swf_url).items():
++                                          pvswf=self.swf_url,
++                                          headers={"User-Agent": useragents.FIREFOX}).items():
+             yield s
+ 
+     def _get_hls_streams(self, channel):
+@@ -41,8 +43,11 @@ class TF1(Plugin):
+         if m:
+             hls_stream_url = m.group(1)
+ 
+-            for s in HLSStream.parse_variant_playlist(self.session, hls_stream_url).items():
+-                yield s
++            try:
++                for s in HLSStream.parse_variant_playlist(self.session, hls_stream_url).items():
++                    yield s
++            except:
++                self.logger.error("Failed to load the HLS playlist for {0}", channel)
+ 
+     def _get_streams(self):
+         m = self.url_re.match(self.url)
+diff --git a/src/streamlink/plugins/tv8cat.py b/src/streamlink/plugins/tv8cat.py
+new file mode 100644
+index 00000000..7c1acf83
+--- /dev/null
++++ b/src/streamlink/plugins/tv8cat.py
+@@ -0,0 +1,79 @@
++from __future__ import print_function
++import re
++
++from streamlink.plugin import Plugin
++from streamlink.plugin.api import http
++from streamlink.compat import urlparse, parse_qsl
++from streamlink.plugin.api import useragents
++from streamlink.plugin.api import validate
++from streamlink.stream import HLSStream
++from streamlink.stream import RTMPStream
++from streamlink.utils import parse_json
++
++
++class TV8cat(Plugin):
++    url_re = re.compile(r"https?://(?:www\.)?tv8\.cat/directe/?")
++    live_iframe = "http://www.8tv.cat/wp-content/themes/8tv/_/inc/_live_html.php"
++    iframe_re = re.compile(r'iframe .*?src="((?:https?)?//[^"]*?)"')
++    account_id_re = re.compile(r"accountId:\"(\d+?)\"")
++    policy_key_re = re.compile(r"policyKey:\"(.+?)\"")
++    britecove = "https://edge.api.brightcove.com/playback/v1/accounts/{account_id}/videos/{video_id}"
++    britecove_schema = validate.Schema({
++        "sources": [
++            {"height": int,
++             validate.optional("src"): validate.url(),
++             validate.optional("app_name"): validate.url(scheme="rtmp"),
++             validate.optional("stream_name"): validate.text}
++        ]
++    })
++
++    @classmethod
++    def can_handle_url(cls, url):
++        return cls.url_re.match(url) is not None
++
++    def _find_iframe(self, res):
++        iframe = self.iframe_re.search(res.text)
++        url = iframe and iframe.group(1)
++        if url and url.startswith("//"):
++            p = urlparse(self.url)
++            url = "{0}:{1}".format(p.scheme, url)
++        return url
++
++    def _britecove_params(self, url):
++        res = http.get(url, headers={"User-Agent": useragents.FIREFOX,
++                                     "Referer": self.url})
++        acc = self.account_id_re.search(res.text)
++        pk = self.policy_key_re.search(res.text)
++
++        query = dict(parse_qsl(urlparse(url).query))
++        return {"video_id": query.get("videoId"),
++                "account_id": acc and acc.group(1),
++                "policy_key": pk and pk.group(1),
++                }
++
++    def _get_stream_data(self, **params):
++        api_url = self.britecove.format(**params)
++        res = http.get(api_url, headers={"Accept": "application/json;pk={policy_key}".format(**params)})
++        return parse_json(res.text, schema=self.britecove_schema)
++
++    def _get_streams(self):
++        res = http.get(self.live_iframe)
++        britecove_url = self._find_iframe(res)
++
++        if britecove_url:
++            self.logger.debug("Found britecove embed url: {0}", britecove_url)
++            params = self._britecove_params(britecove_url)
++            self.logger.debug("Got britecode params: {0}", params)
++            stream_info = self._get_stream_data(**params)
++            for source in stream_info.get("sources"):
++                if source.get("src"):
++                    for s in HLSStream.parse_variant_playlist(self.session, source.get("src")).items():
++                        yield s
++                else:
++                    q = "{0}p".format(source.get("height"))
++                    s = RTMPStream(self.session,
++                                   {"rtmp": source.get("app_name"),
++                                    "playpath": source.get("stream_name")})
++                    yield q, s
++
++__plugin__ = TV8cat
+diff --git a/src/streamlink/stream/hds.py b/src/streamlink/stream/hds.py
+index 68605bc2..c7e168ee 100644
+--- a/src/streamlink/stream/hds.py
++++ b/src/streamlink/stream/hds.py
+@@ -2,8 +2,10 @@ from __future__ import division
+ 
+ import base64
+ import hmac
++import random
+ import re
+ import os.path
++import string
+ 
+ from binascii import unhexlify
+ from collections import namedtuple
+@@ -68,11 +70,15 @@ class HDSStreamWriter(SegmentedStreamWriter):
+             return
+ 
+         try:
++            request_params = self.stream.request_params.copy()
++            params = request_params.pop("params", {})
++            params.pop("g", None)
+             return self.session.http.get(fragment.url,
+                                          stream=True,
+                                          timeout=self.timeout,
+                                          exception=StreamError,
+-                                         **self.stream.request_params)
++                                         params=params,
++                                         **request_params)
+         except StreamError as err:
+             self.logger.error("Failed to open fragment {0}-{1}: {2}",
+                               fragment.segment, fragment.fragment, err)
+@@ -442,6 +448,7 @@ class HDSStream(Stream):
+ 
+         if "akamaihd" in url or is_akamai:
+             request_params["params"]["hdcore"] = HDCORE_VERSION
++            request_params["params"]["g"] = cls.cache_buster_string(12)
+ 
+         res = session.http.get(url, exception=IOError, **request_params)
+         manifest = session.http.xml(res, "manifest XML", ignore_ns=True,
+@@ -586,3 +593,7 @@ class HDSStream(Stream):
+         params.extend(parse_qsl(hdntl, keep_blank_values=True))
+ 
+         return params
++
++    @staticmethod
++    def cache_buster_string(length):
++        return "".join([random.choice(string.ascii_uppercase) for i in range(length)])

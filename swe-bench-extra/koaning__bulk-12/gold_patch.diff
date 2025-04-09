@@ -1,0 +1,141 @@
+diff --git a/Makefile b/Makefile
+index bd4bb88..31c68ae 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,6 +4,7 @@ clean:
+ 	rm -rf .pytest_cache
+ 	rm -rf build
+ 	rm -rf dist
++	rm -rf downloads
+ 
+ pypi: clean
+ 	python setup.py sdist
+@@ -12,10 +13,12 @@ pypi: clean
+ 
+ install:
+ 	python -m pip install --upgrade pip
+-	python -m pip install -e .
++	python -m pip install -e ".[dev]"
+ 
+ serve:
+ 	python -m bulk text cluestarred.csv
+ 
+ test:
+ 	pytest
++
++check: clean test clean
+\ No newline at end of file
+diff --git a/bulk/__main__.py b/bulk/__main__.py
+index b561430..d5770fd 100644
+--- a/bulk/__main__.py
++++ b/bulk/__main__.py
+@@ -17,8 +17,10 @@ app = typer.Typer(
+ app.add_typer(util_app, name="util")
+ 
+ 
++
+ @app.command("version")
+ def version():
++    """Prints the version."""
+     print("0.1.0")
+ 
+ 
+diff --git a/bulk/_bokeh_utils.py b/bulk/_bokeh_utils.py
+index 5276d85..67dd7f5 100644
+--- a/bulk/_bokeh_utils.py
++++ b/bulk/_bokeh_utils.py
+@@ -20,6 +20,9 @@ def get_color_mapping(df: pd.DataFrame) -> Tuple[Optional[bokeh.transform.transf
+         all_values = list(df["color"].dropna().unique())
+         if len(all_values) == 2:
+             all_values.extend([""])
++        elif len(all_values) > len(Category10) + 2:
++            raise ValueError(f"Too many classes defined, the limit for visualisation is {len(Category10) + 2}. "
++                             f"Got {len(all_values)}.")
+         mapper = factor_cmap(
+             field_name="color",
+             palette=Category10[len(all_values)],
+diff --git a/bulk/download.py b/bulk/download.py
+new file mode 100644
+index 0000000..61337a3
+--- /dev/null
++++ b/bulk/download.py
+@@ -0,0 +1,55 @@
++import shutil
++import pathlib
++import pandas as pd
++import tarfile
++import urllib.request
++import typer
++
++
++app = typer.Typer(
++    name="download",
++    add_completion=False,
++    help="Download datasets.",
++    no_args_is_help=True,
++)
++
++
++@app.command("tinyplanet")
++def tinyplanet(force: bool = typer.Option(False, help="Force the download", is_flag=True)):
++    """
++    Download the tiny planet dataset.
++
++    The dataset contains satellite images to track the human footprint in the Amazon rainforest.
++    
++    This dataset was uses the same dataresource as the fast.ai project, found here:
++    https://docs.fast.ai/data.external.html
++
++    It is a small subset of a dataset that was originally found as part of a Kaggle competition, found here:
++    https://www.kaggle.com/c/planet-understanding-the-amazon-from-space
++    """
++    src = pathlib.Path("downloads/tinyplanet/tinyplanet.tgz")
++    if not force and src.parent.exists():
++        print("The tinyplanet dataset already exists")
++        raise typer.Exit(1)
++    src.parent.mkdir(exist_ok=True, parents=True)
++    dst = pathlib.Path("downloads/tinyplanet")
++    
++    # Download and untar
++    urllib.request.urlretrieve("https://s3.amazonaws.com/fast-ai-sample/planet_tiny.tgz", str(src))
++    with tarfile.open(str(src), 'r:gz') as tar:
++        tar.extractall(str(dst))
++    src.unlink()
++
++    # Move files into nice positions
++    glob = pathlib.Path("downloads/tinyplanet/planet_tiny/train").glob("*.jpg")
++    pathlib.Path("downloads/tinyplanet/images").mkdir(exist_ok=True, parents=True)
++    for file in glob:
++        file.rename(f"downloads/tinyplanet/images/{file.name}")
++
++    # Move the labels file 
++    (pd.read_csv("downloads/tinyplanet/planet_tiny/labels.csv")
++      .assign(image=lambda d: d['image_name'].str.replace("train_", ""))
++      .drop(columns=["image_name"])
++      .to_csv("downloads/tinyplanet/labels.csv", index=False))
++
++    shutil.rmtree("downloads/tinyplanet/planet_tiny")
+diff --git a/bulk/util.py b/bulk/util.py
+index 66519af..2dcee54 100644
+--- a/bulk/util.py
++++ b/bulk/util.py
+@@ -1,15 +1,17 @@
+-from typing import List
+ import pathlib 
++from typing import List
+ 
+ import typer
+ import pandas as pd
++from bulk.download import app as download_app
+ 
+ app = typer.Typer(
+     name="util",
+     add_completion=False,
+-    help="Utilities for data.",
++    help="Extra utilities.",
+     no_args_is_help=True,
+ )
++app.add_typer(download_app, name="download")
+ 
+ 
+ @app.command("concat")

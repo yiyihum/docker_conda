@@ -1,0 +1,124 @@
+diff --git a/rdflib/plugins/sparql/algebra.py b/rdflib/plugins/sparql/algebra.py
+index 1429012b..5f6a774a 100644
+--- a/rdflib/plugins/sparql/algebra.py
++++ b/rdflib/plugins/sparql/algebra.py
+@@ -335,7 +335,11 @@ def translateGroupGraphPattern(graphPattern: CompValue) -> CompValue:
+     """
+ 
+     if graphPattern.name == "SubSelect":
+-        return ToMultiSet(translate(graphPattern)[0])
++        # The first output from translate cannot be None for a subselect query
++        # as it can only be None for certain DESCRIBE queries.
++        # type error: Argument 1 to "ToMultiSet" has incompatible type "Optional[CompValue]";
++        #   expected "Union[List[Dict[Variable, str]], CompValue]"
++        return ToMultiSet(translate(graphPattern)[0])  # type: ignore[arg-type]
+ 
+     if not graphPattern.part:
+         graphPattern.part = []  # empty { }
+@@ -623,7 +627,7 @@ def translateValues(
+     return Values(res)
+ 
+ 
+-def translate(q: CompValue) -> Tuple[CompValue, List[Variable]]:
++def translate(q: CompValue) -> Tuple[Optional[CompValue], List[Variable]]:
+     """
+     http://www.w3.org/TR/sparql11-query/#convertSolMod
+ 
+@@ -635,9 +639,27 @@ def translate(q: CompValue) -> Tuple[CompValue, List[Variable]]:
+ 
+     # TODO: Var scope test
+     VS: Set[Variable] = set()
+-    traverse(q.where, functools.partial(_findVars, res=VS))
+ 
+-    # all query types have a where part
++    # All query types have a WHERE clause EXCEPT some DESCRIBE queries
++    # where only explicit IRIs are provided.
++    if q.name == "DescribeQuery":
++        # For DESCRIBE queries, use the vars provided in q.var.
++        # If there is no WHERE clause, vars should be explicit IRIs to describe.
++        # If there is a WHERE clause, vars can be any combination of explicit IRIs
++        # and variables.
++        VS = set(q.var)
++
++        # If there is no WHERE clause, just return the vars projected
++        if q.where is None:
++            return None, list(VS)
++
++        # Otherwise, evaluate the WHERE clause like SELECT DISTINCT
++        else:
++            q.modifier = "DISTINCT"
++
++    else:
++        traverse(q.where, functools.partial(_findVars, res=VS))
++
+     # depth-first recursive generation of mapped query tree
+     M = translateGroupGraphPattern(q.where)
+ 
+diff --git a/rdflib/plugins/sparql/evaluate.py b/rdflib/plugins/sparql/evaluate.py
+index aafd0fe7..06fc170d 100644
+--- a/rdflib/plugins/sparql/evaluate.py
++++ b/rdflib/plugins/sparql/evaluate.py
+@@ -309,7 +309,7 @@ def evalPart(ctx: QueryContext, part: CompValue):
+         return evalServiceQuery(ctx, part)
+ 
+     elif part.name == "DescribeQuery":
+-        raise Exception("DESCRIBE not implemented")
++        return evalDescribeQuery(ctx, part)
+ 
+     else:
+         raise Exception("I dont know: %s" % part.name)
+@@ -585,6 +585,41 @@ def evalConstructQuery(ctx: QueryContext, query) -> Dict[str, Union[str, Graph]]
+     return res
+ 
+ 
++def evalDescribeQuery(ctx: QueryContext, query) -> Dict[str, Union[str, Graph]]:
++    # Create a result graph and bind namespaces from the graph being queried
++    graph = Graph()
++    # type error: Item "None" of "Optional[Graph]" has no attribute "namespaces"
++    for pfx, ns in ctx.graph.namespaces():  # type: ignore[union-attr]
++        graph.bind(pfx, ns)
++
++    to_describe = set()
++
++    # Explicit IRIs may be provided to a DESCRIBE query.
++    # If there is a WHERE clause, explicit IRIs may be provided in
++    # addition to projected variables. Find those explicit IRIs and
++    # prepare to describe them.
++    for iri in query.PV:
++        if isinstance(iri, URIRef):
++            to_describe.add(iri)
++
++    # If there is a WHERE clause, evaluate it then find the unique set of
++    # resources to describe across all bindings and projected variables
++    if query.p is not None:
++        bindings = evalPart(ctx, query.p)
++        to_describe.update(*(set(binding.values()) for binding in bindings))
++
++    # Get a CBD for all resources identified to describe
++    for resource in to_describe:
++        # type error: Item "None" of "Optional[Graph]" has no attribute "cbd"
++        graph += ctx.graph.cbd(resource)  # type: ignore[union-attr]
++
++    res: Dict[str, Union[str, Graph]] = {}
++    res["type_"] = "DESCRIBE"
++    res["graph"] = graph
++
++    return res
++
++
+ def evalQuery(graph: Graph, query: Query, initBindings, base=None):
+ 
+     initBindings = dict((Variable(k), v) for k, v in initBindings.items())
+diff --git a/rdflib/plugins/sparql/parser.py b/rdflib/plugins/sparql/parser.py
+index 2035b4f0..2a897f82 100644
+--- a/rdflib/plugins/sparql/parser.py
++++ b/rdflib/plugins/sparql/parser.py
+@@ -1479,7 +1479,7 @@ DescribeQuery = Comp(
+     "DescribeQuery",
+     Keyword("DESCRIBE")
+     + (OneOrMore(ParamList("var", VarOrIri)) | "*")
+-    + Param("datasetClause", ZeroOrMore(DatasetClause))
++    + ZeroOrMore(ParamList("datasetClause", DatasetClause))
+     + Optional(WhereClause)
+     + SolutionModifier
+     + ValuesClause,

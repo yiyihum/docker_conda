@@ -1,0 +1,96 @@
+diff --git a/tests/integration/test_subscriptions_api.py b/tests/integration/test_subscriptions_api.py
+index e1ea533..7046c02 100644
+--- a/tests/integration/test_subscriptions_api.py
++++ b/tests/integration/test_subscriptions_api.py
+@@ -128,7 +128,12 @@ def result_pages(status=None, size=40):
+ # must disable the default.
+ res_api_mock = respx.mock(assert_all_called=False)
+ 
+-# 1. Request for status: created. Response has three pages.
++# 1. CSV results
++res_api_mock.route(
++    M(url__startswith=TEST_URL), M(params__contains={'format': 'csv'})).mock(
++        side_effect=[Response(200, text="id,status\n1234-abcd,SUCCESS\n")])
++
++# 2. Request for status: created. Response has three pages.
+ res_api_mock.route(
+     M(url__startswith=TEST_URL),
+     M(params__contains={'status': 'created'})).mock(side_effect=[
+@@ -136,12 +141,12 @@ res_api_mock.route(
+         for page in result_pages(status={'created'}, size=40)
+     ])
+ 
+-# 2. Request for status: queued. Response has a single empty page.
++# 3. Request for status: queued. Response has a single empty page.
+ res_api_mock.route(M(url__startswith=TEST_URL),
+                    M(params__contains={'status': 'queued'})).mock(
+                        side_effect=[Response(200, json={'results': []})])
+ 
+-# 3. No status requested. Response is the same as for 1.
++# 4. No status requested. Response is the same as for 1.
+ res_api_mock.route(M(url__startswith=TEST_URL)).mock(
+     side_effect=[Response(200, json=page) for page in result_pages(size=40)])
+ 
+@@ -276,6 +281,18 @@ async def test_get_results_success():
+         assert len(results) == 100
+ 
+ 
++@pytest.mark.anyio
++@res_api_mock
++async def test_get_results_csv():
++    """Subscription CSV fetched, has the expected items."""
++    async with Session() as session:
++        client = SubscriptionsClient(session, base_url=TEST_URL)
++        results = [res async for res in client.get_results_csv("42")]
++        import csv
++        rows = list(csv.reader(results))
++        assert rows == [['id', 'status'], ['1234-abcd', 'SUCCESS']]
++
++
+ paging_cycle_api_mock = respx.mock()
+ 
+ # Identical next links is a hangup we want to avoid.
+diff --git a/tests/integration/test_subscriptions_cli.py b/tests/integration/test_subscriptions_cli.py
+index 3f9feef..5fe4b42 100644
+--- a/tests/integration/test_subscriptions_cli.py
++++ b/tests/integration/test_subscriptions_cli.py
+@@ -306,3 +306,11 @@ def test_request_catalog_success(invoke, geom_geojson):
+     ])
+     assert json.loads(result.output) == source
+     assert result.exit_code == 0  # success.
++
++
++@res_api_mock
++def test_subscriptions_results_csv(invoke):
++    """Get results as CSV."""
++    result = invoke(['results', 'test', '--csv'])
++    assert result.exit_code == 0  # success.
++    assert result.output.splitlines() == ['id,status', '1234-abcd,SUCCESS']
+diff --git a/tests/unit/test_subscription_request.py b/tests/unit/test_subscription_request.py
+index b22983b..69c5bae 100644
+--- a/tests/unit/test_subscription_request.py
++++ b/tests/unit/test_subscription_request.py
+@@ -346,3 +346,23 @@ def test_toar_tool_success():
+ 
+     expected = {"type": "toar", "parameters": {"scale_factor": 12345}}
+     assert res == expected
++
++
++def test_pv_source_success(geom_geojson):
++    """Configure a planetary variable subscription source."""
++    # NOTE: this function does not yet validate type and id.
++    # The nonsense values are intended to fail when the function does
++    # add validation.
++    source = subscription_request.planetary_variable_source(
++        "var1",
++        "VAR1-abcd",
++        geometry=geom_geojson,
++        start_time=datetime(2021, 3, 1),
++        end_time=datetime(2021, 3, 2),
++    )
++
++    assert source["type"] == "var1"
++    params = source["parameters"]
++    assert params["id"] == "VAR1-abcd"
++    assert params["geometry"] == geom_geojson
++    assert params["start_time"].startswith("2021-03-01")

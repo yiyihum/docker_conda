@@ -1,0 +1,132 @@
+diff --git a/src/__init__.py b/src/__init__.py
+deleted file mode 100644
+index e69de29b..00000000
+diff --git a/src/oaklib/cli.py b/src/oaklib/cli.py
+index 1f3b0fc5..f92e7dd5 100644
+--- a/src/oaklib/cli.py
++++ b/src/oaklib/cli.py
+@@ -2354,10 +2354,25 @@ def apply_obsolete(output, output_type, terms):
+     show_default=True,
+     help="If true, then all sources are in the main input ontology",
+ )
++@click.option(
++    "--add-labels/--no-add-labels",
++    default=False,
++    show_default=True,
++    help="Populate empty labels with URI fragments or CURIE local IDs, for ontologies that use semantic IDs",
++)
++@predicates_option
+ @output_option
+ @output_type_option
+ def diff_via_mappings(
+-    source, mapping_input, intra, other_input, other_input_type, output_type, output
++    source,
++    mapping_input,
++    intra,
++    add_labels,
++    other_input,
++    other_input_type,
++    predicates,
++    output_type,
++    output,
+ ):
+     """
+     Calculates a relational diff between ontologies in two sources using the combined mappings
+@@ -2388,8 +2403,22 @@ def diff_via_mappings(
+     else:
+         mappings = None
+         logging.info("Mappings will be derived from ontologies")
++    if source:
++        sources = list(source)
++        if len(sources) == 1:
++            raise ValueError(
++                f"If --source is specified, must pass more than one. You specified: {sources}"
++            )
++    else:
++        sources = None
++    actual_predicates = _process_predicates_arg(predicates)
+     for r in calculate_pairwise_relational_diff(
+-        oi, other_oi, sources=list(source), mappings=mappings
++        oi,
++        other_oi,
++        sources=sources,
++        mappings=mappings,
++        add_labels=add_labels,
++        predicates=actual_predicates,
+     ):
+         writer.emit(r)
+ 
+diff --git a/src/oaklib/utilities/mapping/cross_ontology_diffs.py b/src/oaklib/utilities/mapping/cross_ontology_diffs.py
+index 1cbc3c5e..dfe93bca 100644
+--- a/src/oaklib/utilities/mapping/cross_ontology_diffs.py
++++ b/src/oaklib/utilities/mapping/cross_ontology_diffs.py
+@@ -16,6 +16,7 @@ from oaklib.interfaces import MappingProviderInterface, RelationGraphInterface
+ from oaklib.interfaces.obograph_interface import OboGraphInterface
+ from oaklib.types import CURIE, PRED_CURIE
+ from oaklib.utilities.graph.networkx_bridge import mappings_to_graph
++from oaklib.utilities.label_utilities import add_labels_to_object
+ 
+ ONE_TO_ZERO = MappingCardinalityEnum(MappingCardinalityEnum["1:0"])
+ ONE_TO_MANY = MappingCardinalityEnum(MappingCardinalityEnum["1:n"])
+@@ -77,6 +78,8 @@ def calculate_pairwise_relational_diff(
+     right_oi: MappingProviderInterface,
+     sources: List[str],
+     mappings: Optional[List[Mapping]] = None,
++    predicates: Optional[List[PRED_CURIE]] = None,
++    add_labels=False,
+ ) -> Iterator[RelationalDiff]:
+     """
+     Calculates a relational diff between ontologies in two sources using the combined mappings
+@@ -97,12 +100,42 @@ def calculate_pairwise_relational_diff(
+     g = mappings_to_graph(mappings)
+     if isinstance(left_oi, OboGraphInterface) and isinstance(right_oi, OboGraphInterface):
+         for subject_child in left_oi.all_entity_curies():
++            if not curie_has_prefix(subject_child, sources):
++                continue
+             for pred, subject_parent in relation_dict_as_tuples(
+                 left_oi.get_outgoing_relationship_map_by_curie(subject_child)
+             ):
++                if predicates and pred not in predicates:
++                    continue
++                if not curie_has_prefix(subject_parent, sources):
++                    continue
+                 for r in calculate_pairwise_relational_diff_for_edge(
+-                    left_oi, right_oi, sources, g, subject_child, pred, subject_parent
++                    left_oi,
++                    right_oi,
++                    sources,
++                    g,
++                    subject_child,
++                    pred,
++                    subject_parent,
++                    predicates=predicates,
+                 ):
++                    if add_labels:
++                        add_labels_to_object(
++                            left_oi,
++                            r,
++                            [
++                                ("left_subject_id", "left_subject_label"),
++                                ("left_object_id", "left_object_label"),
++                            ],
++                        )
++                        add_labels_to_object(
++                            right_oi,
++                            r,
++                            [
++                                ("right_subject_id", "right_subject_label"),
++                                ("right_object_id", "right_object_label"),
++                            ],
++                        )
+                     yield r
+     else:
+         raise NotImplementedError
+@@ -157,6 +190,7 @@ def calculate_pairwise_relational_diff_for_edge(
+     candidates: List[RelationalDiff] = []
+     for right_subject in right_subject_list:
+         right_subject_ancs = list(right_oi.ancestors(right_subject, predicates=predicates))
++        # logging.debug(f"RIGHT: {right_subject} // ANCS[{predicates}] = {right_subject_ancs}")
+         right_subject_parents = []
+         right_subject_direct_outgoing = defaultdict(list)
+         for p, o in right_oi.get_outgoing_relationships(right_subject):
+

@@ -1,0 +1,259 @@
+diff --git a/xonsh/lexer.py b/xonsh/lexer.py
+index a0f55feb..ddebd59a 100644
+--- a/xonsh/lexer.py
++++ b/xonsh/lexer.py
+@@ -23,7 +23,8 @@ from xonsh.tokenize import (
+     ERRORTOKEN,
+     GREATER,
+     INDENT,
+-    IOREDIRECT,
++    IOREDIRECT1,
++    IOREDIRECT2,
+     LESS,
+     MATCH,
+     NAME,
+@@ -101,7 +102,8 @@ def token_map():
+     }
+     for op, typ in _op_map.items():
+         tm[(OP, op)] = typ
+-    tm[IOREDIRECT] = "IOREDIRECT"
++    tm[IOREDIRECT1] = "IOREDIRECT1"
++    tm[IOREDIRECT2] = "IOREDIRECT2"
+     tm[STRING] = "STRING"
+     tm[DOLLARNAME] = "DOLLAR_NAME"
+     tm[NUMBER] = "NUMBER"
+@@ -255,7 +257,7 @@ def handle_redirect(state, token):
+     key = (typ, st) if (typ, st) in token_map else typ
+     new_tok = _new_token(token_map[key], st, token.start)
+     if state["pymode"][-1][0]:
+-        if typ == IOREDIRECT:
++        if typ in (IOREDIRECT1, IOREDIRECT2):
+             # Fix Python mode code that was incorrectly recognized as an
+             # IOREDIRECT by the tokenizer (see issue #4994).
+             # The tokenizer does not know when the code should be tokenized in
+@@ -310,7 +312,8 @@ def special_handlers():
+         LESS: handle_redirect,
+         GREATER: handle_redirect,
+         RIGHTSHIFT: handle_redirect,
+-        IOREDIRECT: handle_redirect,
++        IOREDIRECT1: handle_redirect,
++        IOREDIRECT2: handle_redirect,
+         (OP, "<"): handle_redirect,
+         (OP, ">"): handle_redirect,
+         (OP, ">>"): handle_redirect,
+diff --git a/xonsh/parsers/base.py b/xonsh/parsers/base.py
+index e5ede659..c4a6c524 100644
+--- a/xonsh/parsers/base.py
++++ b/xonsh/parsers/base.py
+@@ -3432,12 +3432,20 @@ class BaseParser:
+ 
+     def p_subproc_atom_redirect(self, p):
+         """
+-        subproc_atom : GT
+-                     | LT
+-                     | RSHIFT
+-                     | IOREDIRECT
+-        """
+-        p0 = ast.const_str(s=p[1], lineno=self.lineno, col_offset=self.col)
++        subproc_atom : GT WS subproc_atom
++                     | LT WS subproc_atom
++                     | RSHIFT WS subproc_atom
++                     | IOREDIRECT1 WS subproc_atom
++                     | IOREDIRECT2
++        """
++        operator = ast.const_str(s=p[1], lineno=self.lineno, col_offset=self.col)
++        elts = [operator] if len(p) == 2 else [operator, p[3]]
++        p0 = ast.Tuple(
++            elts=elts,
++            ctx=ast.Load(),
++            lineno=self.lineno,
++            col_offset=self.col,
++        )
+         p0._cliarg_action = "append"
+         p[0] = p0
+ 
+@@ -3523,7 +3531,8 @@ class BaseParser:
+             "LT",
+             "LSHIFT",
+             "RSHIFT",
+-            "IOREDIRECT",
++            "IOREDIRECT1",
++            "IOREDIRECT2",
+             "SEARCHPATH",
+             "INDENT",
+             "DEDENT",
+diff --git a/xonsh/parsers/completion_context.py b/xonsh/parsers/completion_context.py
+index 04d34350..0984d967 100644
+--- a/xonsh/parsers/completion_context.py
++++ b/xonsh/parsers/completion_context.py
+@@ -330,7 +330,8 @@ class CompletionContextParser:
+         "LT",
+         "GT",
+         "RSHIFT",
+-        "IOREDIRECT",
++        "IOREDIRECT1",
++        "IOREDIRECT2",
+     }
+     used_tokens |= io_redir_tokens
+     artificial_tokens = {"ANY"}
+diff --git a/xonsh/procs/specs.py b/xonsh/procs/specs.py
+index 9a0c639f..7c538a1b 100644
+--- a/xonsh/procs/specs.py
++++ b/xonsh/procs/specs.py
+@@ -172,10 +172,6 @@ def _O2E_MAP():
+     return frozenset({f"{o}>{e}" for e in _REDIR_ERR for o in _REDIR_OUT if o != ""})
+ 
+ 
+-def _is_redirect(x):
+-    return isinstance(x, str) and _REDIR_REGEX.match(x)
+-
+-
+ def safe_open(fname, mode, buffering=-1):
+     """Safely attempts to open a file in for xonsh subprocs."""
+     # file descriptors
+@@ -401,7 +397,7 @@ class SubprocSpec:
+         else:
+             safe_close(value)
+             msg = "Multiple inputs for stdin for {0!r}"
+-            msg = msg.format(" ".join(self.args))
++            msg = msg.format(self.get_command_str())
+             raise xt.XonshError(msg)
+ 
+     @property
+@@ -417,7 +413,7 @@ class SubprocSpec:
+         else:
+             safe_close(value)
+             msg = "Multiple redirections for stdout for {0!r}"
+-            msg = msg.format(" ".join(self.args))
++            msg = msg.format(self.get_command_str())
+             raise xt.XonshError(msg)
+ 
+     @property
+@@ -433,9 +429,14 @@ class SubprocSpec:
+         else:
+             safe_close(value)
+             msg = "Multiple redirections for stderr for {0!r}"
+-            msg = msg.format(" ".join(self.args))
++            msg = msg.format(self.get_command_str())
+             raise xt.XonshError(msg)
+ 
++    def get_command_str(self):
++        return " ".join(
++            " ".join(arg) if isinstance(arg, tuple) else arg for arg in self.args
++        )
++
+     #
+     # Execution methods
+     #
+@@ -579,8 +580,7 @@ class SubprocSpec:
+         spec = kls(cmd, cls=cls, **kwargs)
+         # modifications that alter cmds must come after creating instance
+         # perform initial redirects
+-        spec.redirect_leading()
+-        spec.redirect_trailing()
++        spec.resolve_redirects()
+         # apply aliases
+         spec.resolve_alias()
+         spec.resolve_binary_loc()
+@@ -590,26 +590,16 @@ class SubprocSpec:
+         spec.resolve_stack()
+         return spec
+ 
+-    def redirect_leading(self):
+-        """Manage leading redirects such as with '< input.txt COMMAND'."""
+-        while len(self.cmd) >= 3 and self.cmd[0] == "<":
+-            self.stdin = safe_open(self.cmd[1], "r")
+-            self.cmd = self.cmd[2:]
+-
+-    def redirect_trailing(self):
+-        """Manages trailing redirects."""
+-        while True:
+-            cmd = self.cmd
+-            if len(cmd) >= 3 and _is_redirect(cmd[-2]):
+-                streams = _redirect_streams(cmd[-2], cmd[-1])
+-                self.stdin, self.stdout, self.stderr = streams
+-                self.cmd = cmd[:-2]
+-            elif len(cmd) >= 2 and _is_redirect(cmd[-1]):
+-                streams = _redirect_streams(cmd[-1])
++    def resolve_redirects(self):
++        """Manages redirects."""
++        new_cmd = []
++        for c in self.cmd:
++            if isinstance(c, tuple):
++                streams = _redirect_streams(*c)
+                 self.stdin, self.stdout, self.stderr = streams
+-                self.cmd = cmd[:-1]
+             else:
+-                break
++                new_cmd.append(c)
++        self.cmd = new_cmd
+ 
+     def resolve_alias(self):
+         """Sets alias in command, if applicable."""
+@@ -667,8 +657,7 @@ class SubprocSpec:
+         else:
+             self.cmd = alias + self.cmd[1:]
+             # resolve any redirects the aliases may have applied
+-            self.redirect_leading()
+-            self.redirect_trailing()
++            self.resolve_redirects()
+         if self.binary_loc is None:
+             return
+         try:
+diff --git a/xonsh/tokenize.py b/xonsh/tokenize.py
+index 5127286c..a31fef8a 100644
+--- a/xonsh/tokenize.py
++++ b/xonsh/tokenize.py
+@@ -110,7 +110,8 @@ __all__ = token.__all__ + [  # type:ignore
+     "ATDOLLAR",
+     "ATEQUAL",
+     "DOLLARNAME",
+-    "IOREDIRECT",
++    "IOREDIRECT1",
++    "IOREDIRECT2",
+     "MATCH",
+     "CASE",
+ ]
+@@ -135,8 +136,11 @@ N_TOKENS += 3
+ SEARCHPATH = N_TOKENS
+ tok_name[N_TOKENS] = "SEARCHPATH"
+ N_TOKENS += 1
+-IOREDIRECT = N_TOKENS
+-tok_name[N_TOKENS] = "IOREDIRECT"
++IOREDIRECT1 = N_TOKENS
++tok_name[N_TOKENS] = "IOREDIRECT1"
++N_TOKENS += 1
++IOREDIRECT2 = N_TOKENS
++tok_name[N_TOKENS] = "IOREDIRECT2"
+ N_TOKENS += 1
+ DOLLARNAME = N_TOKENS
+ tok_name[N_TOKENS] = "DOLLARNAME"
+@@ -335,10 +339,11 @@ _redir_map = (
+ )
+ IORedirect = group(group(*_redir_map), f"{group(*_redir_names)}>>?")
+ 
+-_redir_check_0 = set(_redir_map)
+-_redir_check_1 = {f"{i}>" for i in _redir_names}.union(_redir_check_0)
++_redir_check_map = frozenset(_redir_map)
++
++_redir_check_1 = {f"{i}>" for i in _redir_names}
+ _redir_check_2 = {f"{i}>>" for i in _redir_names}.union(_redir_check_1)
+-_redir_check = frozenset(_redir_check_2)
++_redir_check_single = frozenset(_redir_check_2)
+ 
+ Operator = group(
+     r"\*\*=?",
+@@ -1004,8 +1009,10 @@ def _tokenize(readline, encoding, tolerant=False, tokenize_ioredirects=True):
+                     continue
+                 token, initial = line[start:end], line[start]
+ 
+-                if token in _redir_check:
+-                    yield TokenInfo(IOREDIRECT, token, spos, epos, line)
++                if token in _redir_check_single:
++                    yield TokenInfo(IOREDIRECT1, token, spos, epos, line)
++                elif token in _redir_check_map:
++                    yield TokenInfo(IOREDIRECT2, token, spos, epos, line)
+                 elif initial in numchars or (  # ordinary number
+                     initial == "." and token != "." and token != "..."
+                 ):
+

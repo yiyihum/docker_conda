@@ -1,0 +1,215 @@
+diff --git a/fffw/encoding/filters.py b/fffw/encoding/filters.py
+index 2564388..f42e5b2 100644
+--- a/fffw/encoding/filters.py
++++ b/fffw/encoding/filters.py
+@@ -19,9 +19,33 @@ __all__ = [
+     'Split',
+     'Trim',
+     'Upload',
++    'ensure_video',
++    'ensure_audio',
+ ]
+ 
+ 
++def ensure_video(meta: Meta, *_: Meta) -> VideoMeta:
++    """
++    Checks that first passed stream is a video stream
++
++    :returns: first passed stream
++    """
++    if not isinstance(meta, VideoMeta):
++        raise TypeError(meta)
++    return meta
++
++
++def ensure_audio(meta: Meta, *_: Meta) -> AudioMeta:
++    """
++    Checks that first passed stream is a audio stream
++
++    :returns: first passed stream
++    """
++    if not isinstance(meta, AudioMeta):
++        raise TypeError(meta)
++    return meta
++
++
+ @dataclass
+ class Filter(mixins.StreamValidationMixin, base.Node, Params):
+     """
+@@ -163,9 +187,7 @@ class Scale(VideoFilter):
+     height: int = param(name='h')
+ 
+     def transform(self, *metadata: Meta) -> Meta:
+-        meta = metadata[0]
+-        if not isinstance(meta, VideoMeta):
+-            raise TypeError(meta)
++        meta = ensure_video(*metadata)
+         par = meta.dar / (self.width / self.height)
+         return replace(meta, width=self.width, height=self.height, par=par)
+ 
+@@ -331,16 +353,8 @@ class Concat(Filter):
+         duration = TS(0)
+         scenes = []
+         streams: List[str] = []
+-        samples = 0
+-        sampling_rate = None
+         for meta in metadata:
+             duration += meta.duration
+-            if isinstance(meta, AudioMeta):
+-                samples += meta.samples
+-                if sampling_rate is None:
+-                    sampling_rate = meta.sampling_rate
+-                else:
+-                    assert sampling_rate == meta.sampling_rate
+             scenes.extend(meta.scenes)
+             for stream in meta.streams:
+                 if not streams or streams[-1] != stream:
+@@ -348,8 +362,11 @@ class Concat(Filter):
+                     # contiguous duplicates.
+                     streams.append(stream)
+         kwargs = dict(duration=duration, scenes=scenes, streams=streams)
+-        if samples != 0:
+-            kwargs['samples'] = samples
++        meta = metadata[0]
++        if isinstance(meta, AudioMeta):
++            # Recompute samples and sampling rate: sampling rate from first
++            # input, samples count corresponds duration.
++            kwargs['samples'] = round(meta.sampling_rate * duration)
+         return replace(metadata[0], **kwargs)
+ 
+ 
+@@ -389,7 +406,5 @@ class Upload(VideoFilter):
+ 
+     def transform(self, *metadata: Meta) -> VideoMeta:
+         """ Marks a stream as uploaded to a device."""
+-        meta = super().transform(*metadata)
+-        if not isinstance(meta, VideoMeta):
+-            raise ValueError(meta)
++        meta = ensure_video(*metadata)
+         return replace(meta, device=self.device)
+diff --git a/fffw/wrapper/base.py b/fffw/wrapper/base.py
+index b595a09..d8326b8 100644
+--- a/fffw/wrapper/base.py
++++ b/fffw/wrapper/base.py
+@@ -5,13 +5,78 @@ from asyncio.subprocess import Process
+ from dataclasses import dataclass
+ from logging import getLogger
+ from types import TracebackType
+-from typing import Tuple, List, Any, Optional, cast, Callable, Union, TextIO, \
+-    Type
++from typing import Tuple, List, Any, Optional, cast, Callable, Union, TextIO
++from typing import Type, AsyncIterator
+ 
+ from fffw.wrapper.helpers import quote, ensure_binary, ensure_text
+ from fffw.wrapper.params import Params
+ 
+ 
++class UniversalLineReader:
++    """
++    Reads bytes from asyncio.StreamReader and splits it to lines with either
++    CR or LF, or even CRLF.
++
++    https://docs.python.org/3/glossary.html#term-universal-newlines
++
++    >>> # noinspection PyUnresolvedReferences
++    ... line_iter = UniversalLineReader(process.stderr)
++    >>> async for line in line_iter:
++    ...    print(line)
++
++    """
++
++    def __init__(self,
++                 reader: asyncio.StreamReader,
++                 bufsize: int = 10 * io.DEFAULT_BUFFER_SIZE,
++                 blocksize: int = io.DEFAULT_BUFFER_SIZE,
++                 encoding: str = 'utf8') -> None:
++        """
++        :param reader: asynchronous stream reader, i.e. stdout/stderr of
++            asyncio Process instance.
++        :param bufsize: max buffer size
++        :param blocksize: read block size
++        :param encoding: text encoding
++        """
++        self.blocksize = blocksize
++        self.reader = reader
++        self.bufsize = bufsize
++        self.buffer = b''
++        self.encoding = encoding
++        self.at_eof = False
++
++    def __aiter__(self) -> AsyncIterator[str]:
++        return self.readlines()
++
++    async def readlines(self) -> AsyncIterator[str]:
++        while not self.at_eof:
++            # StreamReader supports only LF line separator. This leads to buffer
++            # overrun when it contains only CR-terminated lines. Thus, we read
++            # blocks manually and then split it to lines with universal line
++            # separator.
++            block = await self.reader.read(self.blocksize)
++            # empty read means that stream is closed
++            self.at_eof = len(block) == 0
++
++            # checking max buffer size
++            buffered = len(self.buffer) + len(block)
++            if buffered > self.bufsize:
++                raise asyncio.LimitOverrunError("buffer overrun", buffered)
++
++            self.buffer += block
++            if self.buffer:
++                # Split buffer to line with any of CR, LF of CRLF separators
++                # Last line is buffered to handle the case when CRLF sequence is
++                # being split to subsequent reads.
++                [*lines, self.buffer] = self.buffer.splitlines(keepends=True)
++                for line in lines:
++                    yield line.decode(self.encoding)
++        # We always leave one non-empty line above, but stream may be empty. In
++        # this case we don't want to yield empty line.
++        if self.buffer:
++            yield self.buffer.decode(self.encoding)
++
++
+ class Runner:
+     """ Wrapper for Popen process for non-blocking streams handling."""
+ 
+@@ -69,7 +134,7 @@ class Runner:
+         """
+         Handles read from stdout/stderr.
+ 
+-        Reads lines from reader and feeds it to callback. Values, filtered by
++        Reads lines from stream and feeds it to callback. Values, filtered by
+         callback, are written to output buffer.
+ 
+         :param reader: Process.stdout or Process.stderr instance
+@@ -78,14 +143,10 @@ class Runner:
+         """
+         if callback is None or reader is None:
+             return
+-        while True:
+-            line = await reader.readline()
+-            if line:
+-                data = callback(line.decode())
+-                if data:
+-                    output.write(data)
+-            else:
+-                break
++        async for line in UniversalLineReader(reader):
++            data = callback(line)
++            if data:
++                output.write(data)
+ 
+     @staticmethod
+     async def write(writer: Optional[asyncio.StreamWriter],
+diff --git a/setup.py b/setup.py
+index 95909f1..a4ad5a9 100644
+--- a/setup.py
++++ b/setup.py
+@@ -85,6 +85,7 @@ setup(
+         'Programming Language :: Python :: 3.6',
+         'Programming Language :: Python :: 3.7',
+         'Programming Language :: Python :: 3.8',
++        'Programming Language :: Python :: 3.9',
+         'Topic :: Multimedia :: Video :: Conversion',
+     ]
+ 
+

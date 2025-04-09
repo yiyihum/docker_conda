@@ -1,0 +1,198 @@
+diff --git a/IPython/core/history.py b/IPython/core/history.py
+index 9b0b2cbd0..1a89060e9 100644
+--- a/IPython/core/history.py
++++ b/IPython/core/history.py
+@@ -202,7 +202,6 @@ def __init__(self, profile="default", hist_file="", **traits):
+         config : :class:`~traitlets.config.loader.Config`
+             Config object. hist_file can also be set through this.
+         """
+-        # We need a pointer back to the shell for various tasks.
+         super(HistoryAccessor, self).__init__(**traits)
+         # defer setting hist_file from kwarg until after init,
+         # otherwise the default kwarg value would clobber any value
+@@ -344,11 +343,6 @@ def get_last_session_id(self):
+     def get_tail(self, n=10, raw=True, output=False, include_latest=False):
+         """Get the last n lines from the history database.
+ 
+-        Most recent entry last.
+-
+-        Completion will be reordered so that that the last ones are when
+-        possible from current session.
+-
+         Parameters
+         ----------
+         n : int
+@@ -367,31 +361,12 @@ def get_tail(self, n=10, raw=True, output=False, include_latest=False):
+         self.writeout_cache()
+         if not include_latest:
+             n += 1
+-        # cursor/line/entry
+-        this_cur = list(
+-            self._run_sql(
+-                "WHERE session == ? ORDER BY line DESC LIMIT ?  ",
+-                (self.session_number, n),
+-                raw=raw,
+-                output=output,
+-            )
+-        )
+-        other_cur = list(
+-            self._run_sql(
+-                "WHERE session != ? ORDER BY session DESC, line DESC LIMIT ?",
+-                (self.session_number, n),
+-                raw=raw,
+-                output=output,
+-            )
++        cur = self._run_sql(
++            "ORDER BY session DESC, line DESC LIMIT ?", (n,), raw=raw, output=output
+         )
+-
+-        everything = this_cur + other_cur
+-
+-        everything = everything[:n]
+-
+         if not include_latest:
+-            return list(everything)[:0:-1]
+-        return list(everything)[::-1]
++            return reversed(list(cur)[1:])
++        return reversed(list(cur))
+ 
+     @catch_corrupt_db
+     def search(self, pattern="*", raw=True, search_raw=True,
+@@ -560,7 +535,6 @@ def _dir_hist_default(self):
+     def __init__(self, shell=None, config=None, **traits):
+         """Create a new history manager associated with a shell instance.
+         """
+-        # We need a pointer back to the shell for various tasks.
+         super(HistoryManager, self).__init__(shell=shell, config=config,
+             **traits)
+         self.save_flag = threading.Event()
+@@ -656,6 +630,59 @@ def get_session_info(self, session=0):
+ 
+         return super(HistoryManager, self).get_session_info(session=session)
+ 
++    @catch_corrupt_db
++    def get_tail(self, n=10, raw=True, output=False, include_latest=False):
++        """Get the last n lines from the history database.
++
++        Most recent entry last.
++
++        Completion will be reordered so that that the last ones are when
++        possible from current session.
++
++        Parameters
++        ----------
++        n : int
++            The number of lines to get
++        raw, output : bool
++            See :meth:`get_range`
++        include_latest : bool
++            If False (default), n+1 lines are fetched, and the latest one
++            is discarded. This is intended to be used where the function
++            is called by a user command, which it should not return.
++
++        Returns
++        -------
++        Tuples as :meth:`get_range`
++        """
++        self.writeout_cache()
++        if not include_latest:
++            n += 1
++        # cursor/line/entry
++        this_cur = list(
++            self._run_sql(
++                "WHERE session == ? ORDER BY line DESC LIMIT ?  ",
++                (self.session_number, n),
++                raw=raw,
++                output=output,
++            )
++        )
++        other_cur = list(
++            self._run_sql(
++                "WHERE session != ? ORDER BY session DESC, line DESC LIMIT ?",
++                (self.session_number, n),
++                raw=raw,
++                output=output,
++            )
++        )
++
++        everything = this_cur + other_cur
++
++        everything = everything[:n]
++
++        if not include_latest:
++            return list(everything)[:0:-1]
++        return list(everything)[::-1]
++
+     def _get_range_session(self, start=1, stop=None, raw=True, output=False):
+         """Get input and output history from the current session. Called by
+         get_range, and takes similar parameters."""
+diff --git a/IPython/terminal/shortcuts.py b/IPython/terminal/shortcuts.py
+index 6c1ba0418..a68be9a6f 100644
+--- a/IPython/terminal/shortcuts.py
++++ b/IPython/terminal/shortcuts.py
+@@ -140,6 +140,18 @@ def _following_text():
+         _following_text_cache[pattern] = condition
+         return condition
+ 
++    @Condition
++    def not_inside_unclosed_string():
++        app = get_app()
++        s = app.current_buffer.document.text_before_cursor
++        # remove escaped quotes
++        s = s.replace('\\"', "").replace("\\'", "")
++        # remove triple-quoted string literals
++        s = re.sub(r"(?:\"\"\"[\s\S]*\"\"\"|'''[\s\S]*''')", "", s)
++        # remove single-quoted string literals
++        s = re.sub(r"""(?:"[^"]*["\n]|'[^']*['\n])""", "", s)
++        return not ('"' in s or "'" in s)
++
+     # auto match
+     @kb.add("(", filter=focused_insert & auto_match & following_text(r"[,)}\]]|$"))
+     def _(event):
+@@ -160,7 +172,7 @@ def _(event):
+         '"',
+         filter=focused_insert
+         & auto_match
+-        & preceding_text(r'^([^"]+|"[^"]*")*$')
++        & not_inside_unclosed_string
+         & following_text(r"[,)}\]]|$"),
+     )
+     def _(event):
+@@ -171,13 +183,35 @@ def _(event):
+         "'",
+         filter=focused_insert
+         & auto_match
+-        & preceding_text(r"^([^']+|'[^']*')*$")
++        & not_inside_unclosed_string
+         & following_text(r"[,)}\]]|$"),
+     )
+     def _(event):
+         event.current_buffer.insert_text("''")
+         event.current_buffer.cursor_left()
+ 
++    @kb.add(
++        '"',
++        filter=focused_insert
++        & auto_match
++        & not_inside_unclosed_string
++        & preceding_text(r'^.*""$'),
++    )
++    def _(event):
++        event.current_buffer.insert_text('""""')
++        event.current_buffer.cursor_left(3)
++
++    @kb.add(
++        "'",
++        filter=focused_insert
++        & auto_match
++        & not_inside_unclosed_string
++        & preceding_text(r"^.*''$"),
++    )
++    def _(event):
++        event.current_buffer.insert_text("''''")
++        event.current_buffer.cursor_left(3)
++
+     # raw string
+     @kb.add(
+         "(", filter=focused_insert & auto_match & preceding_text(r".*(r|R)[\"'](-*)$")
+

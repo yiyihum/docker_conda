@@ -1,0 +1,137 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index df99d47..043401f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
+ 
+ ### Added
+ 
+-- Next to `p:parent_task` it's also possible to use `before:parent_task` for better readability.
++- Next to `p:parent_task` it's also possible to use `before:parent_task` to specifiy task dependencies.
++- In addition to `before:other_task`, it's also possible to use `after:other_task` to specify task dependencies.
+ 
+ ## [1.2.0] - 2018-06-16
+ 
+diff --git a/README.md b/README.md
+index d58af14..a8d5551 100644
+--- a/README.md
++++ b/README.md
+@@ -214,33 +214,34 @@ Or show all next actions, e.g. for a specific context:
+ $ next-action --all @store
+ (B) Buy paint to +PaintHouse @store @weekend
+ (G) Buy wood for new +DogHouse @store
+-Buy groceries @store +DinnerParty p:meal
++Buy groceries @store +DinnerParty before:meal
+ ```
+ 
+ Note again that completed tasks, tasks with a future creation or threshold date, and blocked tasks are never shown since they can't be a next action.
+ 
+ ### Task dependencies
+ 
+-*Next-action* takes task dependencies into account when determining the next actions. For example, that cooking a meal depends on buying groceries can be specified in the todo.txt file as follows:
++*Next-action* takes task dependencies into account when determining the next actions. For example, that cooking a meal depends on buying groceries and that doing the dishes comes after cooking the meal can be specified as follows:
+ 
+ ```text
+-Buy groceries @store +DinnerParty p:meal
++Buy groceries @store +DinnerParty before:meal
+ Cook meal @home +DinnerParty id:meal
++Do the dishes @home +DinnerParty after:meal
+ ```
+ 
+-`Buy groceries` has `Cook meal` as its `p`-parent task. This means that buying groceries blocks cooking the meal; cooking can't be done until buying the groceries has been completed:
++This means that buying groceries blocks cooking the meal; cooking, and thus doing the dishes as well, can't be done until buying the groceries has been completed:
+ 
+ ```console
+ $ next-action --all +DinnerParty
+-Buy groceries @store +DinnerParty p:meal
++Buy groceries @store +DinnerParty before:meal
+ ```
+ 
+ Notes:
+ 
+ - The ids can be any string without whitespace.
+-- Instead of `p` you can also use `before` for better readability, e.g. `Do this before:that`.
+-- A parent task can have multiple child tasks, meaning that the parent task remains blocked until all children are completed.
+-- A child task can block multiple parents by repeating the parent, e.g. `Buy groceries before:cooking and before:invites`.
++- Instead of `before` you can also use `p` (for "parent") because some other tools that work with *Todo.txt* files use that.
++- A task can come before multiple other tasks by repeating the before key, e.g. `Buy groceries before:cooking and before:sending_invites`.
++- A task can come after multiple other tasks by repeating the after key, e.g. `Eat meal after:cooking and after:setting_the_table`.
+ 
+ ### Styling the output
+ 
+@@ -422,7 +423,7 @@ To run the unit tests:
+ $ python -m unittest
+ .............................................................................................................................................................................................................................
+ ----------------------------------------------------------------------
+-Ran 221 tests in 1.758s
++Ran 221 tests in 1.637s
+ 
+ OK
+ ```
+@@ -435,7 +436,7 @@ To create the unit test coverage report run the unit tests under coverage with:
+ $ coverage run --branch -m unittest
+ .............................................................................................................................................................................................................................
+ ----------------------------------------------------------------------
+-Ran 221 tests in 4.562s
++Ran 221 tests in 2.085s
+ 
+ OK
+ ```
+@@ -447,7 +448,7 @@ $ coverage report --fail-under=100 --omit=".venv/*" --skip-covered
+ Name    Stmts   Miss Branch BrPart  Cover
+ -----------------------------------------
+ -----------------------------------------
+-TOTAL    1175      0    150      0   100%
++TOTAL    1188      0    150      0   100%
+ 
+ 25 files skipped due to complete coverage.
+ ```
+diff --git a/docs/todo.txt b/docs/todo.txt
+index 0d9176c..36c7342 100644
+--- a/docs/todo.txt
++++ b/docs/todo.txt
+@@ -7,8 +7,9 @@ Borrow ladder from the neighbors +PaintHouse @home
+ Buy flowers due:2018-02-14
+ (L) Pay June invoice @home due:2018-06-28
+ (K) Pay July invoice @home due:2018-07-28
+-Buy groceries @store +DinnerParty p:meal
++Buy groceries @store +DinnerParty before:meal
+ Cook meal @home +DinnerParty id:meal
++Do the dishes @home +DinnerParty after:meal
+ x This is a completed task
+ 9999-01-01 Start preparing for five-digit years
+ Start preparing for emigration to Mars t:3000-01-01
+diff --git a/next_action/todotxt/task.py b/next_action/todotxt/task.py
+index 94afcd2..63eb8c9 100644
+--- a/next_action/todotxt/task.py
++++ b/next_action/todotxt/task.py
+@@ -85,20 +85,21 @@ class Task(object):
+ 
+     def is_blocked(self, tasks: Iterable["Task"]) -> bool:
+         """ Return whether a task is blocked, i.e. whether it has uncompleted child tasks. """
+-        return any([task for task in tasks if not task.is_completed() and self.task_id() in task.parent_ids()])
++        return any([task for task in tasks if not task.is_completed() and
++                    (self.task_id() in task.parent_ids() or task.task_id() in self.child_ids())])
+ 
+-    def task_id(self) -> str:
+-        """ Return the id of the task. """
+-        match = re.search(r"\bid:(\S+)\b", self.text)
+-        return match.group(1) if match else ""
++    def child_ids(self) -> Set[str]:
++        """ Return the ids of the child tasks. """
++        return {match.group(1) for match in re.finditer(r"\bafter:(\S+)\b", self.text)}
+ 
+     def parent_ids(self) -> Set[str]:
+         """ Return the ids of the parent tasks. """
+         return {match.group(2) for match in re.finditer(r"\b(p|before):(\S+)\b", self.text)}
+ 
+-    def parents(self, tasks: Iterable["Task"]) -> Iterable["Task"]:
+-        """ Return the parent tasks. """
+-        return [task for task in tasks if task.task_id() in self.parent_ids()]
++    def task_id(self) -> str:
++        """ Return the id of the task. """
++        match = re.search(r"\bid:(\S+)\b", self.text)
++        return match.group(1) if match else ""
+ 
+     def __prefixed_items(self, prefix: str) -> Set[str]:
+         """ Return the prefixed items in the task. """

@@ -1,0 +1,360 @@
+diff --git a/dvc/commands/experiments/gc.py b/dvc/commands/experiments/gc.py
+--- a/dvc/commands/experiments/gc.py
++++ b/dvc/commands/experiments/gc.py
+@@ -12,8 +12,8 @@
+ def _raise_error_if_all_disabled(**kwargs):
+     if not any(kwargs.values()):
+         raise InvalidArgumentError(
+-            "Either of `-w|--workspace`, `-a|--all-branches`, `-T|--all-tags` "
+-            "or `--all-commits` needs to be set."
++            "Either of `-w|--workspace`, `-a|--all-branches`, `-T|--all-tags`,"
++            " `--all-commits` or `--date` needs to be set."
+         )
+ 
+ 
+@@ -23,6 +23,7 @@ def run(self):
+             all_branches=self.args.all_branches,
+             all_tags=self.args.all_tags,
+             all_commits=self.args.all_commits,
++            commit_date=self.args.commit_date,
+             workspace=self.args.workspace,
+         )
+ 
+@@ -31,13 +32,21 @@ def run(self):
+         msg += "the workspace"
+         if self.args.all_commits:
+             msg += " and all git commits"
+-        elif self.args.all_branches and self.args.all_tags:
+-            msg += " and all git branches and tags"
+-        elif self.args.all_branches:
+-            msg += " and all git branches"
+-        elif self.args.all_tags:
+-            msg += " and all git tags"
++        else:
++            if self.args.all_branches and self.args.all_tags:
++                msg += " and all git branches and tags"
++            elif self.args.all_branches:
++                msg += " and all git branches"
++            elif self.args.all_tags:
++                msg += " and all git tags"
++
++            if self.args.commit_date:
++                msg += (
++                    " and all git commits before date "
++                    f"{self.args.commit_date}"
++                )
+         msg += " of the current repo."
++
+         if self.args.queued:
+             msg += " Run queued experiments will be preserved."
+         else:
+@@ -54,6 +63,7 @@ def run(self):
+             all_tags=self.args.all_tags,
+             all_commits=self.args.all_commits,
+             workspace=self.args.workspace,
++            commit_date=self.args.commit_date,
+             queued=self.args.queued,
+         )
+ 
+@@ -110,6 +120,17 @@ def add_parser(experiments_subparsers, parent_parser):
+         default=False,
+         help="Keep experiments derived from all Git commits.",
+     )
++    experiments_gc_parser.add_argument(
++        "--date",
++        type=str,
++        dest="commit_date",
++        metavar="<YYYY-MM-DD>",
++        default=None,
++        help=(
++            "Keep experiments from the commits after (inclusive) a certain "
++            "date. Date must match the extended ISO 8601 format (YYYY-MM-DD)."
++        ),
++    )
+     experiments_gc_parser.add_argument(
+         "--queued",
+         action="store_true",
+diff --git a/dvc/commands/gc.py b/dvc/commands/gc.py
+--- a/dvc/commands/gc.py
++++ b/dvc/commands/gc.py
+@@ -17,6 +17,8 @@ def run(self):
+             all_branches=self.args.all_branches,
+             all_tags=self.args.all_tags,
+             all_commits=self.args.all_commits,
++            all_experiments=self.args.all_experiments,
++            commit_date=self.args.commit_date,
+             workspace=self.args.workspace,
+         )
+ 
+@@ -25,13 +27,20 @@ def run(self):
+         msg += "the workspace"
+         if self.args.all_commits:
+             msg += " and all git commits"
+-        elif self.args.all_branches and self.args.all_tags:
+-            msg += " and all git branches and tags"
+-        elif self.args.all_branches:
+-            msg += " and all git branches"
+-        elif self.args.all_tags:
+-            msg += " and all git tags"
+-        elif self.args.all_experiments:
++        else:
++            if self.args.all_branches and self.args.all_tags:
++                msg += " and all git branches and tags"
++            elif self.args.all_branches:
++                msg += " and all git branches"
++            elif self.args.all_tags:
++                msg += " and all git tags"
++            if self.args.commit_date:
++                msg += (
++                    " and all git commits before date "
++                    f"{self.args.commit_date}"
++                )
++
++        if self.args.all_experiments:
+             msg += " and all experiments"
+ 
+         if self.args.repos:
+@@ -53,6 +62,7 @@ def run(self):
+             all_tags=self.args.all_tags,
+             all_commits=self.args.all_commits,
+             all_experiments=self.args.all_experiments,
++            commit_date=self.args.commit_date,
+             cloud=self.args.cloud,
+             remote=self.args.remote,
+             force=self.args.force,
+@@ -104,6 +114,18 @@ def add_parser(subparsers, parent_parser):
+         default=False,
+         help="Keep data files for all Git commits.",
+     )
++    gc_parser.add_argument(
++        "--date",
++        type=str,
++        dest="commit_date",
++        metavar="<YYYY-MM-DD>",
++        default=None,
++        help=(
++            "Keep cached data referenced in the commits after ( inclusive )"
++            " a certain time. Date must match the extended ISO 8601 format "
++            "(YYYY-MM-DD)."
++        ),
++    )
+     gc_parser.add_argument(
+         "--all-experiments",
+         action="store_true",
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -386,6 +386,7 @@ def used_objs(
+         all_tags=False,
+         all_commits=False,
+         all_experiments=False,
++        commit_date: Optional[str] = None,
+         remote=None,
+         force=False,
+         jobs=None,
+@@ -416,6 +417,7 @@ def used_objs(
+             all_tags=all_tags,
+             all_commits=all_commits,
+             all_experiments=all_experiments,
++            commit_date=commit_date,
+         ):
+             for odb, objs in self.index.used_objs(
+                 targets,
+diff --git a/dvc/repo/brancher.py b/dvc/repo/brancher.py
+--- a/dvc/repo/brancher.py
++++ b/dvc/repo/brancher.py
+@@ -1,3 +1,5 @@
++from typing import Optional
++
+ from dvc.scm import iter_revs
+ 
+ 
+@@ -8,6 +10,7 @@ def brancher(  # noqa: E302
+     all_tags=False,
+     all_commits=False,
+     all_experiments=False,
++    commit_date: Optional[str] = None,
+     sha_only=False,
+ ):
+     """Generator that iterates over specified revisions.
+@@ -17,6 +20,9 @@ def brancher(  # noqa: E302
+         all_branches (bool): iterate over all available branches.
+         all_commits (bool): iterate over all commits.
+         all_tags (bool): iterate over all available tags.
++        commit_date (str): Keep experiments from the commits after(include)
++                            a certain date. Date must match the extended
++                            ISO 8601 format (YYYY-MM-DD).
+         sha_only (bool): only return git SHA for a revision.
+ 
+     Yields:
+@@ -62,6 +68,7 @@ def brancher(  # noqa: E302
+         all_tags=all_tags,
+         all_commits=all_commits,
+         all_experiments=all_experiments,
++        commit_date=commit_date,
+     )
+ 
+     try:
+@@ -72,7 +79,9 @@ def brancher(  # noqa: E302
+             self.root_dir = self.fs.path.join("/", *repo_root_parts)
+ 
+             if cwd_parts:
+-                cwd = self.fs.path.join("/", *cwd_parts)
++                cwd = self.fs.path.join(  # type: ignore[unreachable]
++                    "/", *cwd_parts
++                )
+                 self.fs.path.chdir(cwd)
+ 
+             # ignore revs that don't contain repo root
+diff --git a/dvc/repo/experiments/gc.py b/dvc/repo/experiments/gc.py
+--- a/dvc/repo/experiments/gc.py
++++ b/dvc/repo/experiments/gc.py
+@@ -15,6 +15,7 @@ def gc(
+     all_tags: Optional[bool] = False,
+     all_commits: Optional[bool] = False,
+     workspace: Optional[bool] = False,
++    commit_date: Optional[str] = None,
+     queued: Optional[bool] = False,
+ ):
+     keep_revs = set(
+@@ -22,6 +23,7 @@ def gc(
+             all_branches=all_branches,
+             all_tags=all_tags,
+             all_commits=all_commits,
++            commit_date=commit_date,
+             sha_only=True,
+         )
+     )
+diff --git a/dvc/repo/gc.py b/dvc/repo/gc.py
+--- a/dvc/repo/gc.py
++++ b/dvc/repo/gc.py
+@@ -1,4 +1,5 @@
+ import logging
++from typing import Optional
+ 
+ from dvc.exceptions import InvalidArgumentError
+ 
+@@ -11,7 +12,7 @@ def _raise_error_if_all_disabled(**kwargs):
+     if not any(kwargs.values()):
+         raise InvalidArgumentError(
+             "Either of `-w|--workspace`, `-a|--all-branches`, `-T|--all-tags` "
+-            "`--all-experiments` or `--all-commits` needs to be set."
++            "`--all-experiments`, `--all-commits` or `--date` needs to be set."
+         )
+ 
+ 
+@@ -25,6 +26,7 @@ def gc(
+     all_tags=False,
+     all_commits=False,
+     all_experiments=False,
++    commit_date: Optional[str] = None,
+     force=False,
+     jobs=None,
+     repos=None,
+@@ -40,6 +42,7 @@ def gc(
+         all_commits=all_commits,
+         all_branches=all_branches,
+         all_experiments=all_experiments,
++        commit_date=commit_date,
+     )
+ 
+     from contextlib import ExitStack
+@@ -64,6 +67,7 @@ def gc(
+                 all_tags=all_tags,
+                 all_commits=all_commits,
+                 all_experiments=all_experiments,
++                commit_date=commit_date,
+                 remote=remote,
+                 force=force,
+                 jobs=jobs,
+diff --git a/dvc/scm.py b/dvc/scm.py
+--- a/dvc/scm.py
++++ b/dvc/scm.py
+@@ -176,20 +176,7 @@ def resolve_rev(scm: "Git", rev: str) -> str:
+         raise RevError(str(exc))
+ 
+ 
+-def iter_revs(
+-    scm: "Git",
+-    revs: Optional[List[str]] = None,
+-    num: int = 1,
+-    all_branches: bool = False,
+-    all_tags: bool = False,
+-    all_commits: bool = False,
+-    all_experiments: bool = False,
+-) -> Mapping[str, List[str]]:
+-
+-    if not any([revs, all_branches, all_tags, all_commits, all_experiments]):
+-        return {}
+-
+-    revs = revs or []
++def _get_n_commits(scm: "Git", revs: List[str], num: int) -> List[str]:
+     results = []
+     for rev in revs:
+         if num == 0:
+@@ -205,6 +192,37 @@ def iter_revs(
+             except RevError:
+                 break
+             n += 1
++    return results
++
++
++def iter_revs(
++    scm: "Git",
++    revs: Optional[List[str]] = None,
++    num: int = 1,
++    all_branches: bool = False,
++    all_tags: bool = False,
++    all_commits: bool = False,
++    all_experiments: bool = False,
++    commit_date: Optional[str] = None,
++) -> Mapping[str, List[str]]:
++    from scmrepo.exceptions import SCMError as _SCMError
++
++    from dvc.repo.experiments.utils import exp_commits
++
++    if not any(
++        [
++            revs,
++            all_branches,
++            all_tags,
++            all_commits,
++            all_experiments,
++            commit_date,
++        ]
++    ):
++        return {}
++
++    revs = revs or []
++    results: List[str] = _get_n_commits(scm, revs, num)
+ 
+     if all_commits:
+         results.extend(scm.list_all_commits())
+@@ -215,9 +233,24 @@ def iter_revs(
+         if all_tags:
+             results.extend(scm.list_tags())
+ 
+-    if all_experiments:
+-        from dvc.repo.experiments.utils import exp_commits
++        if commit_date:
++            from datetime import datetime
+ 
++            commit_datestamp = datetime.strptime(
++                commit_date, "%Y-%m-%d"
++            ).timestamp()
++
++            def _time_filter(rev):
++                try:
++                    if scm.resolve_commit(rev).commit_date >= commit_datestamp:
++                        return True
++                    return False
++                except _SCMError:
++                    return True
++
++            results.extend(filter(_time_filter, scm.list_all_commits()))
++
++    if all_experiments:
+         results.extend(exp_commits(scm))
+ 
+     rev_resolver = partial(resolve_rev, scm)
+

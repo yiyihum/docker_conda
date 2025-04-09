@@ -1,0 +1,118 @@
+diff --git a/scrapyd/tests/test_dont_load_settings.py b/scrapyd/tests/test_dont_load_settings.py
+index 95806ff..ea40d26 100644
+--- a/scrapyd/tests/test_dont_load_settings.py
++++ b/scrapyd/tests/test_dont_load_settings.py
+@@ -17,8 +17,11 @@ class SettingsSafeModulesTest(unittest.TestCase):
+         for m in self.SETTINGS_SAFE_MODULES:
+             __import__(m)
+ 
+-            assert 'scrapy.conf' not in sys.modules, \
++            self.assertNotIn(
++                'scrapy.conf',
++                sys.modules,
+                 "Module %r must not cause the scrapy.conf module to be loaded" % m
++            )
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scrapyd/tests/test_eggstorage.py b/scrapyd/tests/test_eggstorage.py
+index 9bbedee..4b8ba3b 100644
+--- a/scrapyd/tests/test_eggstorage.py
++++ b/scrapyd/tests/test_eggstorage.py
+@@ -1,4 +1,5 @@
+ from io import BytesIO
++from unittest.mock import patch
+ 
+ from twisted.trial import unittest
+ from zope.interface import implementer
+@@ -39,8 +40,8 @@ class TestConfigureEggStorage(unittest.TestCase):
+         app = application(config)
+         app_eggstorage = app.getComponent(IEggStorage)
+ 
+-        assert isinstance(app_eggstorage, SomeFakeEggStorage)
+-        assert app_eggstorage.list_projects() == ['hello_world']
++        self.assertIsInstance(app_eggstorage, SomeFakeEggStorage)
++        self.assertEqual(app_eggstorage.list_projects(), ['hello_world'])
+ 
+ 
+ class EggStorageTest(unittest.TestCase):
+@@ -53,6 +54,18 @@ class EggStorageTest(unittest.TestCase):
+     def test_interface(self):
+         verifyObject(IEggStorage, self.eggst)
+ 
++    @patch('scrapyd.eggstorage.glob', new=lambda x: ['ddd', 'abc', 'bcaa'])
++    def test_list_hashes(self):
++        versions = self.eggst.list('any')
++
++        self.assertEqual(versions, ['abc', 'bcaa', 'ddd'])
++
++    @patch('scrapyd.eggstorage.glob', new=lambda x: ['9', '2', '200', '3', '4'])
++    def test_list_semantic_versions(self):
++        versions = self.eggst.list('any')
++
++        self.assertEqual(versions, ['2', '3', '4', '9', '200'])
++
+     def test_put_get_list_delete(self):
+         self.eggst.put(BytesIO(b"egg01"), 'mybot', '01')
+         self.eggst.put(BytesIO(b"egg03"), 'mybot', '03/ver')
+diff --git a/scrapyd/tests/test_sqlite.py b/scrapyd/tests/test_sqlite.py
+index 01faad8..c04f6dd 100644
+--- a/scrapyd/tests/test_sqlite.py
++++ b/scrapyd/tests/test_sqlite.py
+@@ -24,11 +24,11 @@ class JsonSqliteDictTest(unittest.TestCase):
+     def test_in(self):
+         d = self.dict_class()
+ 
+-        self.assertFalse('test' in d)
++        self.assertNotIn('test', d)
+ 
+         d['test'] = 123
+ 
+-        self.assertTrue('test' in d)
++        self.assertIn('test', d)
+ 
+     def test_keyerror(self):
+         d = self.dict_class()
+diff --git a/scrapyd/tests/test_utils.py b/scrapyd/tests/test_utils.py
+index dc0b0f0..7e1805d 100644
+--- a/scrapyd/tests/test_utils.py
++++ b/scrapyd/tests/test_utils.py
+@@ -11,7 +11,7 @@ from twisted.trial import unittest
+ 
+ from scrapyd import get_application
+ from scrapyd.interfaces import IEggStorage
+-from scrapyd.utils import UtilsCache, get_crawl_args, get_spider_list
++from scrapyd.utils import UtilsCache, get_crawl_args, get_spider_list, sorted_versions
+ 
+ 
+ def get_pythonpath_scrapyd():
+@@ -30,14 +30,14 @@ class UtilsTest(unittest.TestCase):
+         cargs = get_crawl_args(msg)
+ 
+         self.assertEqual(cargs, ['lala', '-a', 'arg1=val1'])
+-        assert all(isinstance(x, str) for x in cargs), cargs
++        self.assertTrue(all(isinstance(x, str) for x in cargs), cargs)
+ 
+     def test_get_crawl_args_with_settings(self):
+         msg = {'_project': 'lolo', '_spider': 'lala', 'arg1': u'val1', 'settings': {'ONE': 'two'}}
+         cargs = get_crawl_args(msg)
+ 
+         self.assertEqual(cargs, ['lala', '-a', 'arg1=val1', '-s', 'ONE=two'])
+-        assert all(isinstance(x, str) for x in cargs), cargs
++        self.assertTrue(all(isinstance(x, str) for x in cargs), cargs)
+ 
+ 
+ class GetSpiderListTest(unittest.TestCase):
+@@ -119,3 +119,12 @@ class GetSpiderListTest(unittest.TestCase):
+         with mock.patch('scrapyd.utils.Popen', wraps=popen_wrapper):
+             exc = self.assertRaises(RuntimeError, get_spider_list, 'mybot3', pythonpath=pypath)
+         self.assertRegex(str(exc).rstrip(), r'Exception: This should break the `scrapy list` command$')
++
++
++@pytest.mark.parametrize("versions,expected", [
++    (['zzz', 'b', 'ddd', 'a', 'x'], ['a', 'b', 'ddd', 'x', 'zzz']),
++    (["10", "1", "9"], ["1", "9", "10"]),
++    (["2.11", "2.01", "2.9"], ["2.01", "2.9", "2.11"])
++])
++def test_sorted_versions(versions, expected):
++    assert sorted_versions(versions) == expected

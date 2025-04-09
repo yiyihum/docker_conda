@@ -1,0 +1,148 @@
+diff --git a/src/pdm/models/repositories.py b/src/pdm/models/repositories.py
+index 6ae8308b..52bbf459 100644
+--- a/src/pdm/models/repositories.py
++++ b/src/pdm/models/repositories.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import posixpath
+ import sys
+ from functools import lru_cache, wraps
+ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, TypeVar, cast
+@@ -17,7 +18,13 @@ from pdm.models.requirements import (
+ )
+ from pdm.models.search import SearchResultParser
+ from pdm.models.specifiers import PySpecSet
+-from pdm.utils import cd, normalize_name, url_without_fragments
++from pdm.utils import (
++    cd,
++    normalize_name,
++    path_to_url,
++    url_to_path,
++    url_without_fragments,
++)
+ 
+ if TYPE_CHECKING:
+     from pdm._types import CandidateInfo, SearchResult, Source
+@@ -392,8 +399,8 @@ class LockedRepository(BaseRepository):
+         return {can.req.identify(): can for can in self.packages.values()}
+ 
+     def _read_lockfile(self, lockfile: Mapping[str, Any]) -> None:
+-        with cd(self.environment.project.root):
+-            backend = self.environment.project.backend
++        root = self.environment.project.root
++        with cd(root):
+             for package in lockfile.get("package", []):
+                 version = package.get("version")
+                 if version:
+@@ -406,8 +413,8 @@ class LockedRepository(BaseRepository):
+                 }
+                 req = Requirement.from_req_dict(package_name, req_dict)
+                 if req.is_file_or_url and req.path and not req.url:  # type: ignore
+-                    req.url = backend.relative_path_to_url(  # type: ignore
+-                        req.path.as_posix()  # type: ignore
++                    req.url = path_to_url(  # type: ignore
++                        posixpath.join(root, req.path)  # type: ignore
+                     )
+                 can = make_candidate(req, name=package_name, version=version)
+                 can_id = self._identify_candidate(can)
+@@ -426,10 +433,16 @@ class LockedRepository(BaseRepository):
+ 
+     def _identify_candidate(self, candidate: Candidate) -> tuple:
+         url = getattr(candidate.req, "url", None)
++        if url is not None:
++            url = url_without_fragments(url)
++            url = self.environment.project.backend.expand_line(url)
++            if url.startswith("file://"):
++                path = posixpath.normpath(url_to_path(url))
++                url = path_to_url(path)
+         return (
+             candidate.identify(),
+             candidate.version if not url else None,
+-            url_without_fragments(url) if url else None,
++            url,
+             candidate.req.editable,
+         )
+ 
+diff --git a/src/pdm/models/requirements.py b/src/pdm/models/requirements.py
+index fb39f60c..77206405 100644
+--- a/src/pdm/models/requirements.py
++++ b/src/pdm/models/requirements.py
+@@ -5,6 +5,7 @@ import functools
+ import inspect
+ import json
+ import os
++import posixpath
+ import re
+ import secrets
+ import urllib.parse as urlparse
+@@ -278,8 +279,15 @@ class FileRequirement(Requirement):
+     def str_path(self) -> str | None:
+         if not self.path:
+             return None
+-        result = self.path.as_posix()
+-        if not self.path.is_absolute() and not result.startswith(("./", "../")):
++        if self.path.is_absolute():
++            try:
++                result = self.path.relative_to(Path.cwd()).as_posix()
++            except ValueError:
++                return self.path.as_posix()
++        else:
++            result = self.path.as_posix()
++        result = posixpath.normpath(result)
++        if not result.startswith(("./", "../")):
+             result = "./" + result
+         if result.startswith("./../"):
+             result = result[2:]
+diff --git a/src/pdm/resolver/providers.py b/src/pdm/resolver/providers.py
+index 77b3301f..3bfae8ef 100644
+--- a/src/pdm/resolver/providers.py
++++ b/src/pdm/resolver/providers.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ from typing import TYPE_CHECKING, Callable, cast
+ 
+ from packaging.specifiers import InvalidSpecifier, SpecifierSet
+@@ -7,7 +8,7 @@ from resolvelib import AbstractProvider
+ 
+ from pdm.models.candidates import Candidate, make_candidate
+ from pdm.models.repositories import LockedRepository
+-from pdm.models.requirements import parse_requirement, strip_extras
++from pdm.models.requirements import FileRequirement, parse_requirement, strip_extras
+ from pdm.resolver.python import (
+     PythonCandidate,
+     PythonRequirement,
+@@ -157,18 +158,23 @@ class BaseProvider(AbstractProvider):
+ 
+         return matches_gen
+ 
++    def _compare_file_reqs(self, req1: FileRequirement, req2: FileRequirement) -> bool:
++        backend = self.repository.environment.project.backend
++        if req1.path and req2.path:
++            return os.path.normpath(req1.path) == os.path.normpath(req2.path)
++        left = backend.expand_line(url_without_fragments(req1.get_full_url()))
++        right = backend.expand_line(url_without_fragments(req2.get_full_url()))
++        return left == right
++
+     def is_satisfied_by(self, requirement: Requirement, candidate: Candidate) -> bool:
+         if isinstance(requirement, PythonRequirement):
+             return is_python_satisfied_by(requirement, candidate)
+         elif candidate.identify() in self.overrides:
+             return True
+         if not requirement.is_named:
+-            backend = self.repository.environment.project.backend
+-            return not candidate.req.is_named and backend.expand_line(
+-                url_without_fragments(candidate.req.get_full_url())  # type: ignore
+-            ) == backend.expand_line(
+-                url_without_fragments(requirement.get_full_url())  # type: ignore
+-            )
++            if candidate.req.is_named:
++                return False
++            return self._compare_file_reqs(requirement, candidate.req)  # type: ignore
+         version = candidate.version
+         this_name = self.repository.environment.project.name
+         if version is None or candidate.name == this_name:
+

@@ -1,0 +1,237 @@
+diff --git a/docs/plugin_matrix.rst b/docs/plugin_matrix.rst
+index fc9e7792..6efe7ef9 100644
+--- a/docs/plugin_matrix.rst
++++ b/docs/plugin_matrix.rst
+@@ -134,6 +134,7 @@ openrectv           openrec.tv           Yes   Yes
+ orf_tvthek          tvthek.orf.at        Yes   Yes
+ ovvatv              ovva.tv              Yes   No
+ pandatv             panda.tv             Yes   ?
++pcyourfreetv        pc-yourfreetv.com    Yes   --    Requires a login.
+ periscope           periscope.tv         Yes   Yes   Replay/VOD is supported.
+ picarto             picarto.tv           Yes   --
+ playtv              playtv.fr            Yes   --    Streams may be geo-restricted to France.
+diff --git a/src/streamlink/plugins/pcyourfreetv.py b/src/streamlink/plugins/pcyourfreetv.py
+new file mode 100644
+index 00000000..912a31c8
+--- /dev/null
++++ b/src/streamlink/plugins/pcyourfreetv.py
+@@ -0,0 +1,62 @@
++import re
++
++from streamlink.plugin import Plugin, PluginOptions
++from streamlink.plugin.api import http
++from streamlink.stream import HLSStream
++
++
++class PCYourFreeTV(Plugin):
++    _login_url = 'http://pc-yourfreetv.com/home.php'
++    _url_re = re.compile(r'http://pc-yourfreetv\.com/index_player\.php\?channel=.+?&page_id=\d+')
++    _video_url_re = re.compile(r"jwplayer\('.+?'\)\.setup\({.+?file: \"(?P<video_url>[^\"]+?)\".+?}\);", re.DOTALL)
++
++    options = PluginOptions({
++        'username': None,
++        'password': None
++    })
++
++    @classmethod
++    def can_handle_url(cls, url):
++        return PCYourFreeTV._url_re.match(url)
++
++    def login(self, username, password):
++        res = http.post(
++            self._login_url,
++            data={
++                'user_name': username,
++                'user_pass': password,
++                'login': 'Login'
++            }
++        )
++
++        return username in res.text
++
++    def _get_streams(self):
++        username = self.get_option('username')
++        password = self.get_option('password')
++
++        if username is None or password is None:
++            self.logger.error("PC-YourFreeTV requires authentication, use --pcyourfreetv-username"
++                              "and --pcyourfreetv-password to set your username/password combination")
++            return
++
++        if self.login(username, password):
++            self.logger.info("Successfully logged in as {0}", username)
++
++        # Retrieve URL page and search for stream data
++        res = http.get(self.url)
++        match = self._video_url_re.search(res.text)
++        if match is None:
++            return
++        video_url = match.group('video_url')
++        if '.m3u8' in video_url:
++            streams = HLSStream.parse_variant_playlist(self.session, video_url)
++            if len(streams) != 0:
++                for stream in streams.items():
++                    yield stream
++            else:
++                # Not a HLS playlist
++                yield 'live', HLSStream(self.session, video_url)
++
++
++__plugin__ = PCYourFreeTV
+diff --git a/src/streamlink/plugins/twitch.py b/src/streamlink/plugins/twitch.py
+index 47cc583a..80440d22 100644
+--- a/src/streamlink/plugins/twitch.py
++++ b/src/streamlink/plugins/twitch.py
+@@ -247,7 +247,7 @@ class TwitchAPI(object):
+         return self.call_subdomain("tmi", "/hosts", format="", **params)
+ 
+     def clip_status(self, channel, clip_name, schema):
+-        return http.json(self.call_subdomain("clips", "/api/v1/clips/" + channel + "/" + clip_name + "/status", format=""), schema=schema)
++        return http.json(self.call_subdomain("clips", "/api/v2/clips/" + clip_name + "/status", format=""), schema=schema)
+ 
+     # Unsupported/Removed private API calls
+ 
+@@ -282,19 +282,36 @@ class Twitch(Plugin):
+ 
+     def __init__(self, url):
+         Plugin.__init__(self, url)
+-        match = _url_re.match(url).groupdict()
+-        self._channel = match.get("channel") and match.get("channel").lower()
+-        self._channel_id = None
+-        self.subdomain = match.get("subdomain")
+-        self.video_type = match.get("video_type")
+-        if match.get("videos_id"):
+-            self.video_type = "v"
+-        self.video_id = match.get("video_id") or match.get("videos_id")
+-        self.clip_name = match.get("clip_name")
+         self._hosted_chain = []
+-
++        match = _url_re.match(url).groupdict()
+         parsed = urlparse(url)
+         self.params = parse_query(parsed.query)
++        self.subdomain = match.get("subdomain")
++        self.video_id = None
++        self.video_type = None
++        self._channel_id = None
++        self._channel = None
++        self.clip_name = None
++
++        if self.subdomain == "player":
++            # pop-out player
++            if self.params.get("video"):
++                try:
++                    self.video_type = self.params["video"][0]
++                    self.video_id = self.params["video"][1:]
++                except IndexError:
++                    self.logger.debug("Invalid video param: {0}", self.params["video"])
++            self._channel = self.params.get("channel")
++        elif self.subdomain == "clips":
++            # clip share URL
++            self.clip_name = match.get("channel")
++        else:
++            self._channel = match.get("channel") and match.get("channel").lower()
++            self.video_type = match.get("video_type")
++            if match.get("videos_id"):
++                self.video_type = "v"
++            self.video_id = match.get("video_id") or match.get("videos_id")
++            self.clip_name = match.get("clip_name")
+ 
+         self.api = TwitchAPI(beta=self.subdomain == "beta", version=5)
+         self.usher = UsherService()
+@@ -596,7 +613,7 @@ class Twitch(Plugin):
+                 return self._get_video_streams()
+         elif self.clip_name:
+             return self._get_clips()
+-        else:
++        elif self._channel:
+             return self._get_hls_streams("live")
+ 
+ 
+diff --git a/src/streamlink_cli/argparser.py b/src/streamlink_cli/argparser.py
+index 49e4eafd..c9b57e7d 100644
+--- a/src/streamlink_cli/argparser.py
++++ b/src/streamlink_cli/argparser.py
+@@ -1204,6 +1204,20 @@ plugin.add_argument(
+     A LiveEdu account password to use with --liveedu-email.
+     """
+ )
++plugin.add_argument(
++    "--pcyourfreetv-username",
++    metavar="USERNAME",
++    help="""
++    The username used to register with pc-yourfreetv.com.
++    """
++)
++plugin.add_argument(
++    "--pcyourfreetv-password",
++    metavar="PASSWORD",
++    help="""
++    A pc-yourfreetv.com account password to use with --pcyourfreetv-username.
++    """
++)
+ 
+ # Deprecated options
+ stream.add_argument(
+diff --git a/src/streamlink_cli/main.py b/src/streamlink_cli/main.py
+index dffbfc23..c1b1997d 100644
+--- a/src/streamlink_cli/main.py
++++ b/src/streamlink_cli/main.py
+@@ -244,14 +244,17 @@ def output_stream(stream):
+     """Open stream, create output and finally write the stream to output."""
+     global output
+ 
++    success_open = False
+     for i in range(args.retry_open):
+         try:
+             stream_fd, prebuffer = open_stream(stream)
++            success_open = True
+             break
+         except StreamError as err:
+-            console.logger.error("{0}", err)
+-    else:
+-        return
++            console.logger.error("Try {0}/{1}: Could not open stream {2} ({3})", i+1, args.retry_open, stream, err)
++
++    if not success_open:
++        console.exit("Could not open stream {0}, tried {1} times, exiting", stream, args.retry_open)
+ 
+     output = create_output()
+ 
+@@ -307,14 +310,14 @@ def read_stream(stream, output, prebuffer, chunk_size=8192):
+                 elif is_http and err.errno in ACCEPTABLE_ERRNO:
+                     console.logger.info("HTTP connection closed")
+                 else:
+-                    console.logger.error("Error when writing to output: {0}", err)
++                    console.exit("Error when writing to output: {0}, exiting", err)
+ 
+                 break
+     except IOError as err:
+-        console.logger.error("Error when reading from stream: {0}", err)
+-
+-    stream.close()
+-    console.logger.info("Stream ended")
++        console.exit("Error when reading from stream: {0}, exiting", err)
++    finally:
++        stream.close()
++        console.logger.info("Stream ended")
+ 
+ 
+ def handle_stream(plugin, streams, stream_name):
+@@ -913,6 +916,17 @@ def setup_plugin_options():
+     if liveedu_password:
+         streamlink.set_plugin_option("liveedu", "password", liveedu_password)
+ 
++    if args.pcyourfreetv_username:
++        streamlink.set_plugin_option("pcyourfreetv", "username", args.pcyourfreetv_username)
++
++    if args.pcyourfreetv_username and not args.pcyourfreetv_password:
++        pcyourfreetv_password = console.askpass("Enter pc-yourfreetv.com password: ")
++    else:
++        pcyourfreetv_password = args.pcyourfreetv_password
++
++    if pcyourfreetv_password:
++        streamlink.set_plugin_option("pcyourfreetv", "password", pcyourfreetv_password)
++
+     # Deprecated options
+     if args.jtv_legacy_names:
+         console.logger.warning("The option --jtv/twitch-legacy-names is "

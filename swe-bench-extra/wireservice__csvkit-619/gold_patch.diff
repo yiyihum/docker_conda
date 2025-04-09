@@ -1,0 +1,76 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index a9645ce..fb00cfa 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -11,6 +11,7 @@ Backwards-incompatible changes:
+ 
+ * The --doublequote long flag is gone, and the -b short flag is now an alias for --no-doublequote.
+ * When using the --columns or --not-columns options, you must not have spaces around the comma-separated values, unless the column names contain spaces.
++* When sorting, null values are now greater than other values instead of less than.
+ * CSVKitReader, CSVKitWriter, CSVKitDictReader, and CSVKitDictWriter have been removed. Use agate.csv.reader, agate.csv.writer, agate.csv.DictReader and agate.csv.DictWriter.
+ * Drop Python 2.6 support.
+ 
+@@ -39,8 +40,10 @@ Fixes:
+ * csvclean with standard input works on Windows.
+ * csvgrep returns the input file's line numbers if the --linenumbers flag is set.
+ * csvgrep can match multiline values.
++* csvgrep correctly operates on ragged rows.
+ * csvsql correctly escapes `%` characters in SQL queries.
+ * csvstack supports stacking a single file.
++* csvstat always reports frequencies.
+ * FilteringCSVReader's any_match argument works correctly.
+ * All tools handle empty files without error.
+ 
+diff --git a/csvkit/grep.py b/csvkit/grep.py
+index 975d111..58fc0ee 100644
+--- a/csvkit/grep.py
++++ b/csvkit/grep.py
+@@ -64,7 +64,11 @@ class FilteringCSVReader(six.Iterator):
+ 
+     def test_row(self, row):
+         for idx, test in self.patterns.items():
+-            result = test(row[idx])
++            try:
++                value = row[idx]
++            except IndexError:
++                value = ''
++            result = test(value)
+             if self.any_match:
+                 if result:
+                     return not self.inverse  # True
+diff --git a/csvkit/utilities/csvsort.py b/csvkit/utilities/csvsort.py
+index 4d043b8..afe439a 100644
+--- a/csvkit/utilities/csvsort.py
++++ b/csvkit/utilities/csvsort.py
+@@ -35,7 +35,7 @@ class CSVSort(CSVKitUtility):
+ 
+         table = agate.Table.from_csv(self.input_file, sniff_limit=self.args.sniff_limit, header=not self.args.no_header_row, column_types=self.get_column_types(), **self.reader_kwargs)
+         column_ids = parse_column_identifiers(self.args.columns, table.column_names, column_offset=self.get_column_offset())
+-        table = table.order_by(lambda row: [(row[column_id] is not None, row[column_id]) for column_id in column_ids], reverse=self.args.reverse)
++        table = table.order_by(column_ids, reverse=self.args.reverse)
+         table.to_csv(self.output_file, **self.writer_kwargs)
+ 
+ 
+diff --git a/csvkit/utilities/csvstat.py b/csvkit/utilities/csvstat.py
+index e6b143c..56e8019 100644
+--- a/csvkit/utilities/csvstat.py
++++ b/csvkit/utilities/csvstat.py
+@@ -142,14 +142,13 @@ class CSVStat(CSVKitUtility):
+ 
+                     self.output_file.write('\tUnique values: %i\n' % len(stats['unique']))
+ 
+-                    if len(stats['unique']) != len(values):
+-                        self.output_file.write('\t%i most frequent values:\n' % MAX_FREQ)
+-                        for value, count in stats['freq']:
+-                            self.output_file.write(('\t\t%s:\t%s\n' % (six.text_type(value), count)))
+-
+                     if c.type == six.text_type:
+                         self.output_file.write('\tMax length: %i\n' % stats['len'])
+ 
++                self.output_file.write('\t%i most frequent values:\n' % MAX_FREQ)
++                for value, count in stats['freq']:
++                    self.output_file.write(('\t\t%s:\t%s\n' % (six.text_type(value), count)))
++
+         if not operations:
+             self.output_file.write('\n')
+             self.output_file.write('Row count: %s\n' % tab.count_rows())

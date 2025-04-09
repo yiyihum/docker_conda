@@ -1,0 +1,127 @@
+diff --git a/locust/main.py b/locust/main.py
+index fe3186d8..a42308b4 100644
+--- a/locust/main.py
++++ b/locust/main.py
+@@ -282,6 +282,16 @@ def parse_options():
+         help="show program's version number and exit"
+     )
+ 
++    # set the exit code to post on errors
++    parser.add_option(
++        '--exit-code-on-error',
++        action='store',
++        type="int",
++        dest='exit_code_on_error',
++        default=1,
++        help="sets the exit code to post on error"
++    )
++
+     # Finalize
+     # Return three-tuple of parser + the output from parse_args (opt obj, args)
+     opts, args = parser.parse_args()
+@@ -554,7 +564,7 @@ def main():
+         main_greenlet.join()
+         code = 0
+         if len(runners.locust_runner.errors):
+-            code = 1
++            code = options.exit_code_on_error
+         shutdown(code=code)
+     except KeyboardInterrupt as e:
+         shutdown(0)
+diff --git a/locust/stats.py b/locust/stats.py
+index 4ba20644..7ec6a9b7 100644
+--- a/locust/stats.py
++++ b/locust/stats.py
+@@ -121,6 +121,7 @@ class RequestStats(object):
+         """
+         self.start_time = time.time()
+         self.total.reset()
++        self.errors = {}
+         for r in six.itervalues(self.entries):
+             r.reset()
+     
+@@ -276,7 +277,7 @@ class StatsEntry(object):
+     @property
+     def fail_ratio(self):
+         try:
+-            return float(self.num_failures) / (self.num_requests + self.num_failures)
++            return float(self.num_failures) / self.num_requests
+         except ZeroDivisionError:
+             if self.num_failures > 0:
+                 return 1.0
+@@ -734,3 +735,25 @@ def distribution_csv():
+             rows.append('"%s",0,"N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A"' % s.name)
+ 
+     return "\n".join(rows)
++
++def failures_csv():
++    """"Return the contents of the 'failures' tab as a CSV."""
++    from . import runners
++
++    rows = [
++        ",".join((
++            '"Method"',
++            '"Name"',
++            '"Error"',
++            '"Occurences"',
++        ))
++    ]
++
++    for s in sort_stats(runners.locust_runner.stats.errors):
++        rows.append('"%s","%s","%s",%i' % (
++            s.method,
++            s.name,
++            s.error,
++            s.occurences,
++        ))
++    return "\n".join(rows)
+\ No newline at end of file
+diff --git a/locust/templates/index.html b/locust/templates/index.html
+index ce4e6b72..9623eec7 100644
+--- a/locust/templates/index.html
++++ b/locust/templates/index.html
+@@ -148,6 +148,7 @@
+                     <div style="margin-top:20px;">
+                         <a href="./stats/requests/csv">Download request statistics CSV</a><br>
+                         <a href="./stats/distribution/csv">Download response time distribution CSV</a><br>
++                        <a href="./stats/failures/csv">Download failures CSV</a><br>
+                         <a href="./exceptions/csv">Download exceptions CSV</a>
+                     </div>
+                 </div>
+diff --git a/locust/web.py b/locust/web.py
+index aa31599e..97c87f1a 100644
+--- a/locust/web.py
++++ b/locust/web.py
+@@ -17,7 +17,7 @@ from six.moves import StringIO, xrange
+ 
+ from . import runners
+ from .runners import MasterLocustRunner
+-from .stats import distribution_csv, median_from_dict, requests_csv, sort_stats
++from .stats import distribution_csv, failures_csv, median_from_dict, requests_csv, sort_stats
+ from .util.cache import memoize
+ 
+ logger = logging.getLogger(__name__)
+@@ -69,6 +69,7 @@ def stop():
+ @app.route("/stats/reset")
+ def reset_stats():
+     runners.locust_runner.stats.reset_all()
++    runners.locust_runner.exceptions = {}
+     return "ok"
+     
+ @app.route("/stats/requests/csv")
+@@ -89,6 +90,15 @@ def distribution_stats_csv():
+     response.headers["Content-disposition"] = disposition
+     return response
+ 
++@app.route("/stats/failures/csv")
++def failures_stats_csv():
++    response = make_response(failures_csv())
++    file_name = "failures_{0}.csv".format(time())
++    disposition = "attachment;filename={0}".format(file_name)
++    response.headers["Content-type"] = "text/csv"
++    response.headers["Content-disposition"] = disposition
++    return response
++
+ @app.route('/stats/requests')
+ @memoize(timeout=DEFAULT_CACHE_TIME, dynamic_timeout=True)
+ def request_stats():

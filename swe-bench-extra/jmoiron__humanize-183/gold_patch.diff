@@ -1,0 +1,199 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 5320a9e..518e990 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -11,17 +11,17 @@ repos:
+       - id: black
+         args: ["--target-version", "py36"]
+ 
++  - repo: https://github.com/PyCQA/isort
++    rev: 5.6.4
++    hooks:
++      - id: isort
++
+   - repo: https://gitlab.com/pycqa/flake8
+     rev: 3.8.4
+     hooks:
+       - id: flake8
+         additional_dependencies: [flake8-2020, flake8-implicit-str-concat]
+ 
+-  - repo: https://github.com/timothycrosley/isort
+-    rev: 5.6.4
+-    hooks:
+-      - id: isort
+-
+   - repo: https://github.com/pre-commit/pygrep-hooks
+     rev: v1.7.0
+     hooks:
+@@ -33,6 +33,7 @@ repos:
+       - id: check-merge-conflict
+       - id: check-toml
+       - id: check-yaml
++      - id: end-of-file-fixer
+ 
+   - repo: https://github.com/PyCQA/pydocstyle
+     rev: 5.1.1
+@@ -41,6 +42,11 @@ repos:
+         args: ["--convention", "google"]
+         files: "src/"
+ 
++  - repo: https://github.com/tox-dev/tox-ini-fmt
++    rev: 0.5.0
++    hooks:
++      - id: tox-ini-fmt
++
+   - repo: https://github.com/asottile/setup-cfg-fmt
+     rev: v1.15.1
+     hooks:
+diff --git a/setup.cfg b/setup.cfg
+index bc71a94..e0335c4 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -56,12 +56,7 @@ max_line_length = 88
+ convention = google
+ 
+ [tool:isort]
+-known_third_party = freezegun,humanize,pkg_resources,pytest,setuptools
+-force_grid_wrap = 0
+-include_trailing_comma = True
+-line_length = 88
+-multi_line_output = 3
+-use_parentheses = True
++profile = black
+ 
+ [tool:pytest]
+ addopts = --color=yes
+diff --git a/src/humanize/__init__.py b/src/humanize/__init__.py
+index 44d7c1d..96b2655 100644
+--- a/src/humanize/__init__.py
++++ b/src/humanize/__init__.py
+@@ -1,7 +1,8 @@
+ """Main package for humanize."""
+ import pkg_resources
++
+ from humanize.filesize import naturalsize
+-from humanize.i18n import activate, deactivate
++from humanize.i18n import activate, deactivate, thousands_separator
+ from humanize.number import apnumber, fractional, intcomma, intword, ordinal, scientific
+ from humanize.time import (
+     naturaldate,
+@@ -30,5 +31,6 @@ __all__ = [
+     "ordinal",
+     "precisedelta",
+     "scientific",
++    "thousands_separator",
+     "VERSION",
+ ]
+diff --git a/src/humanize/i18n.py b/src/humanize/i18n.py
+index 95e7be9..d2625b6 100644
+--- a/src/humanize/i18n.py
++++ b/src/humanize/i18n.py
+@@ -3,12 +3,18 @@ import gettext as gettext_module
+ import os.path
+ from threading import local
+ 
+-__all__ = ["activate", "deactivate", "gettext", "ngettext"]
++__all__ = ["activate", "deactivate", "gettext", "ngettext", "thousands_separator"]
+ 
+ _TRANSLATIONS = {None: gettext_module.NullTranslations()}
+ _CURRENT = local()
+ 
+ 
++# Mapping of locale to thousands separator
++_THOUSANDS_SEPARATOR = {
++    "fr_FR": " ",
++}
++
++
+ def _get_default_locale_path():
+     try:
+         if __file__ is None:
+@@ -129,3 +135,16 @@ def gettext_noop(message):
+         str: Original text, unchanged.
+     """
+     return message
++
++
++def thousands_separator() -> str:
++    """Return the thousands separator for a locale, default to comma.
++
++    Returns:
++         str: Thousands separator.
++    """
++    try:
++        sep = _THOUSANDS_SEPARATOR[_CURRENT.locale]
++    except (AttributeError, KeyError):
++        sep = ","
++    return sep
+diff --git a/src/humanize/number.py b/src/humanize/number.py
+index 0fef81f..f425395 100644
+--- a/src/humanize/number.py
++++ b/src/humanize/number.py
+@@ -8,6 +8,7 @@ from fractions import Fraction
+ from .i18n import gettext as _
+ from .i18n import gettext_noop as N_
+ from .i18n import pgettext as P_
++from .i18n import thousands_separator
+ 
+ 
+ def ordinal(value):
+@@ -97,9 +98,10 @@ def intcomma(value, ndigits=None):
+     Returns:
+         str: string containing commas every three digits.
+     """
++    sep = thousands_separator()
+     try:
+         if isinstance(value, str):
+-            float(value.replace(",", ""))
++            float(value.replace(sep, ""))
+         else:
+             float(value)
+     except (TypeError, ValueError):
+@@ -110,7 +112,7 @@ def intcomma(value, ndigits=None):
+     else:
+         orig = str(value)
+ 
+-    new = re.sub(r"^(-?\d+)(\d{3})", r"\g<1>,\g<2>", orig)
++    new = re.sub(r"^(-?\d+)(\d{3})", fr"\g<1>{sep}\g<2>", orig)
+     if orig == new:
+         return new
+     else:
+diff --git a/tox.ini b/tox.ini
+index 294b122..b961099 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,6 +1,6 @@
+ [tox]
+ envlist =
+-    py{36, 37, 38, 39, py3}
++    py{py3, 39, 38, 37, 36}
+ 
+ [testenv]
+ extras =
+@@ -9,14 +9,19 @@ commands =
+     {envpython} -m pytest --cov humanize --cov tests --cov-report xml {posargs}
+ 
+ [testenv:docs]
+-deps = -r docs/requirements.txt
+-commands = mkdocs build
++deps =
++    -rdocs/requirements.txt
++commands =
++    mkdocs build
+ 
+ [testenv:lint]
+-deps = pre-commit
+-commands = pre-commit run --all-files --show-diff-on-failure
++passenv =
++    PRE_COMMIT_COLOR
+ skip_install = true
+-passenv = PRE_COMMIT_COLOR
++deps =
++    pre-commit
++commands =
++    pre-commit run --all-files --show-diff-on-failure
+ 
+ [pytest]
+-addopts = --doctest-modules
+\ No newline at end of file
++addopts = --doctest-modules

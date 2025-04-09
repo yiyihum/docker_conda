@@ -1,0 +1,173 @@
+diff --git a/src/electionguard/group.py b/src/electionguard/group.py
+index 95d8fe5..adfd67f 100644
+--- a/src/electionguard/group.py
++++ b/src/electionguard/group.py
+@@ -23,6 +23,16 @@ class ElementModQ(NamedTuple):
+ 
+     elem: mpz
+ 
++    def to_hex(self) -> str:
++        """
++        Converts from the element to the hex representation of bytes. This is preferable to directly
++        accessing `elem`, whose representation might change.
++        """
++        h = format(self.elem, "02x")
++        if len(h) % 2:
++            h = "0" + h
++        return h
++
+     def to_int(self) -> int:
+         """
+         Converts from the element to a regular integer. This is preferable to directly
+@@ -65,6 +75,16 @@ class ElementModP(NamedTuple):
+ 
+     elem: mpz
+ 
++    def to_hex(self) -> str:
++        """
++        Converts from the element to the hex representation of bytes. This is preferable to directly
++        accessing `elem`, whose representation might change.
++        """
++        h = format(self.elem, "02x")
++        if len(h) % 2:
++            h = "0" + h
++        return h
++
+     def to_int(self) -> int:
+         """
+         Converts from the element to a regular integer. This is preferable to directly
+@@ -125,6 +145,19 @@ ElementModQorInt = Union[ElementModQ, int]
+ ElementModPorInt = Union[ElementModP, int]
+ 
+ 
++def hex_to_q(input: str) -> Optional[ElementModQ]:
++    """
++    Given a hex string representing bytes, returns an ElementModQ.
++    Returns `None` if the number is out of the allowed
++    [0,Q) range.
++    """
++    i = int(input, 16)
++    if 0 <= i < Q:
++        return ElementModQ(mpz(i))
++    else:
++        return None
++
++
+ def int_to_q(input: Union[str, int]) -> Optional[ElementModQ]:
+     """
+     Given a Python integer, returns an ElementModQ.
+diff --git a/src/electionguard/guardian.py b/src/electionguard/guardian.py
+index 4c1f072..c2eed67 100644
+--- a/src/electionguard/guardian.py
++++ b/src/electionguard/guardian.py
+@@ -7,7 +7,7 @@ from .elgamal import ElGamalCiphertext
+ from .group import (
+     ElementModP,
+     ElementModQ,
+-    int_to_q,
++    hex_to_q,
+     mult_p,
+     pow_q,
+     pow_p,
+@@ -498,7 +498,7 @@ class Guardian(ElectionObjectBase):
+                 f"compensate decrypt guardian {self.object_id} failed decryption for {missing_guardian_id}"
+             )
+             return None
+-        partial_secret_key = get_optional(int_to_q(int(decrypted_value)))
++        partial_secret_key = get_optional(hex_to_q(decrypted_value))
+ 
+         # 𝑀_{𝑖,l} = 𝐴^P𝑖_{l}
+         partial_decryption = elgamal.partial_decrypt(partial_secret_key)
+diff --git a/src/electionguard/hash.py b/src/electionguard/hash.py
+index d244214..9d13192 100644
+--- a/src/electionguard/hash.py
++++ b/src/electionguard/hash.py
+@@ -80,15 +80,15 @@ def hash_elems(*a: CRYPTO_HASHABLE_ALL) -> ElementModQ:
+             hash_me = "null"
+ 
+         elif isinstance(x, ElementModP) or isinstance(x, ElementModQ):
+-            hash_me = str(x.to_int())
++            hash_me = x.to_hex()
+         elif isinstance(x, CryptoHashable):
+-            hash_me = str(x.crypto_hash().to_int())
++            hash_me = x.crypto_hash().to_hex()
+         elif isinstance(x, str):
+             # strings are iterable, so it's important to handle them before the following check
+             hash_me = x
+         elif isinstance(x, Sequence):
+             # The simplest way to deal with lists, tuples, and such are to crunch them recursively.
+-            hash_me = str(hash_elems(*x).to_int())
++            hash_me = hash_elems(*x).to_hex()
+         else:
+             hash_me = str(x)
+         h.update((hash_me + "|").encode("utf-8"))
+diff --git a/src/electionguard/key_ceremony.py b/src/electionguard/key_ceremony.py
+index 58ac9ff..a2d4b92 100644
+--- a/src/electionguard/key_ceremony.py
++++ b/src/electionguard/key_ceremony.py
+@@ -19,7 +19,7 @@ from .elgamal import (
+     elgamal_combine_public_keys,
+     elgamal_keypair_random,
+ )
+-from .group import int_to_q, rand_q, ElementModP, ElementModQ
++from .group import hex_to_q, rand_q, ElementModP, ElementModQ
+ from .rsa import rsa_keypair, rsa_decrypt, rsa_encrypt
+ from .schnorr import SchnorrProof, make_schnorr_proof
+ from .serializable import Serializable
+@@ -143,8 +143,7 @@ def generate_elgamal_auxiliary_key_pair() -> AuxiliaryKeyPair:
+     """
+     elgamal_key_pair = elgamal_keypair_random()
+     return AuxiliaryKeyPair(
+-        str(elgamal_key_pair.secret_key.to_int()),
+-        str(elgamal_key_pair.public_key.to_int()),
++        elgamal_key_pair.secret_key.to_hex(), elgamal_key_pair.public_key.to_hex(),
+     )
+ 
+ 
+@@ -190,7 +189,7 @@ def generate_election_partial_key_backup(
+     value = compute_polynomial_coordinate(
+         auxiliary_public_key.sequence_order, polynomial
+     )
+-    encrypted_value = encrypt(str(value.to_int()), auxiliary_public_key.key)
++    encrypted_value = encrypt(value.to_hex(), auxiliary_public_key.key)
+     if encrypted_value is None:
+         return None
+     return ElectionPartialKeyBackup(
+@@ -240,7 +239,7 @@ def verify_election_partial_key_backup(
+         return ElectionPartialKeyVerification(
+             backup.owner_id, backup.designated_id, verifier_id, False
+         )
+-    value = get_optional(int_to_q(int(decrypted_value)))
++    value = get_optional(hex_to_q(decrypted_value))
+     return ElectionPartialKeyVerification(
+         backup.owner_id,
+         backup.designated_id,
+diff --git a/src/electionguard/rsa.py b/src/electionguard/rsa.py
+index f2e41df..265d2b8 100644
+--- a/src/electionguard/rsa.py
++++ b/src/electionguard/rsa.py
+@@ -68,11 +68,9 @@ def rsa_encrypt(message: str, public_key: str) -> Optional[str]:
+     """
+     data = bytes(public_key, ISO_ENCODING)
+     rsa_public_key: RSAPublicKey = load_pem_public_key(data, backend=default_backend())
+-    integer = int(message)
+-    bits = count_set_bits(integer)
+-    if bits > MAX_BITS:
++    plaintext = bytes.fromhex(message)
++    if len(plaintext) > MAX_BITS:
+         return None
+-    plaintext = integer.to_bytes(bits, BYTE_ORDER)
+     ciphertext = rsa_public_key.encrypt(plaintext, PKCS1v15())
+     return str(ciphertext, ISO_ENCODING)
+ 
+@@ -95,8 +93,8 @@ def rsa_decrypt(encrypted_message: str, private_key: str) -> Optional[str]:
+         plaintext = rsa_private_key.decrypt(ciphertext, PKCS1v15())
+     except ValueError:
+         return None
+-    integer = int.from_bytes(plaintext, BYTE_ORDER)
+-    return str(integer)
++    hex_str = plaintext.hex()
++    return hex_str
+ 
+ 
+ def count_set_bits(n: int) -> int:

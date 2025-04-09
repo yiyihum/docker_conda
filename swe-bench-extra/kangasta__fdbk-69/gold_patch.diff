@@ -1,0 +1,199 @@
+diff --git a/fdbk/_db_connection.py b/fdbk/_db_connection.py
+index a92fd00..af155fe 100644
+--- a/fdbk/_db_connection.py
++++ b/fdbk/_db_connection.py
+@@ -212,7 +212,8 @@ class DBConnection:
+             until=None,
+             limit=None,
+             aggregate_to=None,
+-            aggregate_with=None):
++            aggregate_with=None,
++            aggregate_always=False):
+         '''Get summary of the topic data
+ 
+         Args:
+@@ -222,6 +223,8 @@ class DBConnection:
+             limit: Number of entries to include from the most recent
+             aggregate_to: Aggregate data into specified number of data points
+             aggregate_with: Aggregate data with speficied function
++            aggregate_always: Aggregate data even if datas length is
++                shorter than aggregate_to value. Disabled by default.
+ 
+         Returns:
+             Dictionary with summary of the topic
+@@ -242,7 +245,7 @@ class DBConnection:
+         }
+ 
+         results, warnings = run_data_tools(
+-            topic_d, data_d, aggregate_to, aggregate_with)
++            topic_d, data_d, aggregate_to, aggregate_with, aggregate_always,)
+         summary_d["warnings"].extend(warnings)
+ 
+         results, warnings = post_process(results)
+@@ -258,9 +261,15 @@ class DBConnection:
+             until=None,
+             limit=None,
+             aggregate_to=None,
+-            aggregate_with=None):
++            aggregate_with=None,
++            aggregate_always=False):
+         data_d = self.get_data(topic_d.get("id"), since, until, limit)
+-        return run_data_tools(topic_d, data_d, aggregate_to, aggregate_with)
++        return run_data_tools(
++            topic_d,
++            data_d,
++            aggregate_to,
++            aggregate_with,
++            aggregate_always)
+ 
+     def _run_data_tools_for_many(self,
+                                  topic_ids=None,
+@@ -269,7 +278,8 @@ class DBConnection:
+                                  until=None,
+                                  limit=None,
+                                  aggregate_to=None,
+-                                 aggregate_with=None):
++                                 aggregate_with=None,
++                                 aggregate_always=False):
+         executor = ThreadPoolExecutor()
+         warnings = []
+ 
+@@ -293,7 +303,14 @@ class DBConnection:
+         }
+ 
+         jobs = []
+-        params = (since, until, limit, aggregate_to, aggregate_with,)
++        params = (
++            since,
++            until,
++            limit,
++            aggregate_to,
++            aggregate_with,
++            aggregate_always,
++        )
+         for topic_d in topics.values():
+             jobs.append(
+                 executor.submit(
+@@ -324,7 +341,8 @@ class DBConnection:
+             until=None,
+             limit=None,
+             aggregate_to=None,
+-            aggregate_with=None):
++            aggregate_with=None,
++            aggregate_always=False):
+         '''Get overview of the data
+ 
+         Args:
+@@ -337,6 +355,8 @@ class DBConnection:
+             limit: Number of entries to include from the most recent
+             aggregate_to: Aggregate data into specified number of data points
+             aggregate_with: Aggregate data with speficied function
++            aggregate_always: Aggregate data even if datas length is
++                shorter than aggregate_to value. Disabled by default.
+ 
+         Returns:
+             Dictionary with overview of the topics data
+@@ -351,7 +371,8 @@ class DBConnection:
+             until=until,
+             limit=limit,
+             aggregate_to=aggregate_to,
+-            aggregate_with=aggregate_with)
++            aggregate_with=aggregate_with,
++            aggregate_always=aggregate_always)
+ 
+ 
+ ConnectionClass = DBConnection
+diff --git a/fdbk/data_tools/_aggregate.py b/fdbk/data_tools/_aggregate.py
+index 2283bbe..861cbe5 100644
+--- a/fdbk/data_tools/_aggregate.py
++++ b/fdbk/data_tools/_aggregate.py
+@@ -21,7 +21,20 @@ def _get_keys(data_point):
+     return [key for key in data_point if key != 'timestamp']
+ 
+ 
+-def aggregate(data, aggregate_to, aggregate_with=None):
++def aggregate(data, aggregate_to, aggregate_with=None, aggregate_always=False):
++    '''Aggregate data to less data points
++
++    Args:
++        data: Data before aggregation
++        aggregate_to: Number of data points to aggregate data to.
++        aggregate_with: Value function to use to when combining data-points.
++            Defaults to average.
++        aggregate_always: If true, data is aggregated even if datas length is
++            shorter than aggregate_to value. Disabled by default.
++
++    Returns:
++        List of aggregated data-points
++    '''
+     if not aggregate_with:
+         aggregate_with = 'average'
+ 
+@@ -32,6 +45,9 @@ def aggregate(data, aggregate_to, aggregate_with=None):
+         warnings.append(no_data())
+         return ([], warnings,)
+ 
++    if len(data) <= aggregate_to and not aggregate_always:
++        return (data, warnings,)
++
+     if aggregate_with not in VALUE_FUNCS:
+         warnings.append(method_not_supported(aggregate_with))
+         return ([], warnings,)
+diff --git a/fdbk/data_tools/_utils.py b/fdbk/data_tools/_utils.py
+index d55fe52..97b0b85 100644
+--- a/fdbk/data_tools/_utils.py
++++ b/fdbk/data_tools/_utils.py
+@@ -184,7 +184,12 @@ def post_process(statistics):
+     return _process(funcs, statistics)
+ 
+ 
+-def run_data_tools(topic_d, data, aggregate_to=None, aggregate_with=None):
++def run_data_tools(
++        topic_d,
++        data,
++        aggregate_to=None,
++        aggregate_with=None,
++        aggregate_always=False):
+     results = []
+     warnings = []
+ 
+@@ -194,7 +199,7 @@ def run_data_tools(topic_d, data, aggregate_to=None, aggregate_with=None):
+ 
+     if aggregate_to:
+         chart_data, aggregate_warnings = aggregate(
+-            data, aggregate_to, aggregate_with)
++            data, aggregate_to, aggregate_with, aggregate_always)
+         warnings.extend(aggregate_warnings)
+     else:
+         chart_data = data
+diff --git a/fdbk/server/_server_handlers.py b/fdbk/server/_server_handlers.py
+index 2bd815a..32a3538 100644
+--- a/fdbk/server/_server_handlers.py
++++ b/fdbk/server/_server_handlers.py
+@@ -4,6 +4,10 @@
+ from dateutil.parser import isoparse
+ 
+ 
++def _parse_boolean(param):
++    return str(param).lower() == 'true'
++
++
+ def _parse_param(param, parser):
+     try:
+         return parser(param)
+@@ -22,8 +26,13 @@ def parse_filter_parameters(args, include_aggregate=False):
+         return query
+ 
+     aggregate = dict(
+-        aggregate_to=_parse_param(args.get('aggregate_to'), int),
+-        aggregate_with=args.get('aggregate_with')
++        aggregate_to=_parse_param(
++            args.get('aggregate_to'),
++            int),
++        aggregate_with=args.get('aggregate_with'),
++        aggregate_always=_parse_param(
++            args.get('aggregate_always'),
++            _parse_boolean),
+     )
+ 
+     return {**aggregate, **query}

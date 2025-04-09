@@ -1,0 +1,180 @@
+diff --git a/BTrees/BTreeTemplate.c b/BTrees/BTreeTemplate.c
+index 42d2880..ce77853 100644
+--- a/BTrees/BTreeTemplate.c
++++ b/BTrees/BTreeTemplate.c
+@@ -219,6 +219,8 @@ BTree_check(BTree *self)
+     return result;
+ }
+ 
++#define _BGET_REPLACE_TYPE_ERROR 1
++#define _BGET_ALLOW_TYPE_ERROR 0
+ /*
+ ** _BTree_get
+ **
+@@ -229,6 +231,14 @@ BTree_check(BTree *self)
+ **      keyarg      the key to search for, as a Python object
+ **      has_key     true/false; when false, try to return the associated
+ **                  value; when true, return a boolean
++**      replace_type_err    true/false: When true, ignore the TypeError from
++**                            a key conversion issue, instead
++**                            transforming it into a KeyError set. If
++**                            you are just reading/searching, set to
++**                            true. If you will be adding/updating,
++**                             however,  set to false. Or use
++**                            _BGET_REPLACE_TYPE_ERROR
++**                            and _BGET_ALLOW_TYPE_ERROR, respectively.
+ ** Return
+ **      When has_key false:
+ **          If key exists, its associated value.
+@@ -239,14 +249,22 @@ BTree_check(BTree *self)
+ **          If key doesn't exist, 0.
+ */
+ static PyObject *
+-_BTree_get(BTree *self, PyObject *keyarg, int has_key)
++_BTree_get(BTree *self, PyObject *keyarg, int has_key, int replace_type_err)
+ {
+     KEY_TYPE key;
+     PyObject *result = NULL;    /* guilty until proved innocent */
+     int copied = 1;
+ 
+     COPY_KEY_FROM_ARG(key, keyarg, copied);
+-    UNLESS (copied) return NULL;
++    UNLESS (copied)
++    {
++        if (replace_type_err && PyErr_ExceptionMatches(PyExc_TypeError))
++        {
++            PyErr_Clear();
++            PyErr_SetObject(PyExc_KeyError, keyarg);
++        }
++        return NULL;
++    }
+ 
+     PER_USE_OR_RETURN(self, NULL);
+     if (self->len == 0)
+@@ -289,7 +307,7 @@ Done:
+ static PyObject *
+ BTree_get(BTree *self, PyObject *key)
+ {
+-    return _BTree_get(self, key, 0);
++    return _BTree_get(self, key, 0, _BGET_REPLACE_TYPE_ERROR);
+ }
+ 
+ /* Create a new bucket for the BTree or TreeSet using the class attribute
+@@ -1940,7 +1958,7 @@ BTree_getm(BTree *self, PyObject *args)
+ 
+     UNLESS (PyArg_ParseTuple(args, "O|O", &key, &d))
+         return NULL;
+-    if ((r=_BTree_get(self, key, 0)))
++    if ((r=_BTree_get(self, key, 0, _BGET_REPLACE_TYPE_ERROR)))
+         return r;
+     UNLESS (PyErr_ExceptionMatches(PyExc_KeyError))
+         return NULL;
+@@ -1952,7 +1970,7 @@ BTree_getm(BTree *self, PyObject *args)
+ static PyObject *
+ BTree_has_key(BTree *self, PyObject *key)
+ {
+-    return _BTree_get(self, key, 1);
++    return _BTree_get(self, key, 1, _BGET_REPLACE_TYPE_ERROR);
+ }
+ 
+ static PyObject *
+@@ -1965,7 +1983,7 @@ BTree_setdefault(BTree *self, PyObject *args)
+     if (! PyArg_UnpackTuple(args, "setdefault", 2, 2, &key, &failobj))
+         return NULL;
+ 
+-    value = _BTree_get(self, key, 0);
++    value = _BTree_get(self, key, 0, _BGET_ALLOW_TYPE_ERROR);
+     if (value != NULL)
+         return value;
+ 
+@@ -1998,7 +2016,7 @@ BTree_pop(BTree *self, PyObject *args)
+     if (! PyArg_UnpackTuple(args, "pop", 1, 2, &key, &failobj))
+         return NULL;
+ 
+-    value = _BTree_get(self, key, 0);
++    value = _BTree_get(self, key, 0, _BGET_ALLOW_TYPE_ERROR);
+     if (value != NULL)
+     {
+         /* Delete key and associated value. */
+@@ -2043,7 +2061,7 @@ BTree_pop(BTree *self, PyObject *args)
+ static int
+ BTree_contains(BTree *self, PyObject *key)
+ {
+-    PyObject *asobj = _BTree_get(self, key, 1);
++    PyObject *asobj = _BTree_get(self, key, 1, _BGET_REPLACE_TYPE_ERROR);
+     int result = -1;
+ 
+     if (asobj != NULL)
+@@ -2051,6 +2069,11 @@ BTree_contains(BTree *self, PyObject *key)
+         result = INT_AS_LONG(asobj) ? 1 : 0;
+         Py_DECREF(asobj);
+     }
++    else if (PyErr_ExceptionMatches(PyExc_KeyError))
++    {
++        PyErr_Clear();
++        result = 0;
++    }
+     return result;
+ }
+ 
+diff --git a/BTrees/_base.py b/BTrees/_base.py
+index 07498a3..3158d91 100644
+--- a/BTrees/_base.py
++++ b/BTrees/_base.py
+@@ -269,7 +269,7 @@ def _no_default_comparison(key):
+             lt = None  # pragma: no cover PyPy3
+     if (lt is None and
+         getattr(key, '__cmp__', None) is None):
+-        raise TypeError("Can't use default __cmp__")
++        raise TypeError("Object has default comparison")
+ 
+ class Bucket(_BucketBase):
+ 
+@@ -863,7 +863,12 @@ class _Tree(_Base):
+             return child._findbucket(key)
+ 
+     def __contains__(self, key):
+-        return key in (self._findbucket(self._to_key(key)) or ())
++        try:
++            tree_key = self._to_key(key)
++        except TypeError:
++            # Can't convert the key, so can't possibly be in the tree
++            return False
++        return key in (self._findbucket(tree_key) or ())
+ 
+     def has_key(self, key):
+         index = self._search(key)
+diff --git a/CHANGES.rst b/CHANGES.rst
+index ac79910..834fbfb 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -4,7 +4,19 @@
+ 4.3.2 (unreleased)
+ ------------------
+ 
+-- TBD
++- Make the CPython implementation consistent with the pure-Python
++  implementation and no longer raise ``TypeError`` for an object key
++  (in object-keyed trees) with default comparison on ``__getitem__``,
++  ``get`` or ``in`` operations. Instead, the results will be a
++  ``KeyError``, the default value, and ``False``, respectively.
++  Previously, CPython raised a ``TypeError`` in those cases, while the
++  Python implementation behaved as specified.
++
++  Likewise, non-integer keys in integer-keyed trees
++  will raise ``KeyError``, return the default and return ``False``,
++  respectively, in both implementations. Previously, pure-Python
++  raised a ``KeyError``, returned the default, and raised a
++  ``TypeError``, while CPython raised ``TypeError`` in all three cases.
+ 
+ 4.3.1 (2016-05-16)
+ ------------------
+@@ -21,7 +33,7 @@
+ - When testing ``PURE_PYTHON`` environments under ``tox``, avoid poisoning
+   the user's global wheel cache.
+ 
+-- Ensure that he pure-Python implementation, used on PyPy and when a C
++- Ensure that the pure-Python implementation, used on PyPy and when a C
+   compiler isn't available for CPython, pickles identically to the C
+   version. Unpickling will choose the best available implementation.
+   This change prevents interoperability problems and database corruption if

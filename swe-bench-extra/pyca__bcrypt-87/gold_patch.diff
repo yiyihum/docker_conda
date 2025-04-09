@@ -1,0 +1,122 @@
+diff --git a/.travis.yml b/.travis.yml
+index 456aba7..bbcb336 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -30,6 +30,7 @@ matrix:
+       env: TOXENV=pypy CC=clang
+     - python: 2.7
+       env: TOXENV=pep8
++    - env: TOXENV=packaging
+     - python: 3.5
+       env: TOXENV=py3pep8
+     - language: generic
+diff --git a/MANIFEST.in b/MANIFEST.in
+index 622d66b..93a4480 100644
+--- a/MANIFEST.in
++++ b/MANIFEST.in
+@@ -1,3 +1,11 @@
+ include LICENSE README.rst
++
++include tox.ini .coveragerc
+ include src/build_bcrypt.py
++
+ recursive-include src/_csrc *
++recursive-include tests *.py
++
++exclude requirements.txt tasks.py .travis.yml
++
++prune .travis
+diff --git a/README.rst b/README.rst
+index 0883286..b8c75a9 100644
+--- a/README.rst
++++ b/README.rst
+@@ -40,6 +40,7 @@ Changelog
+ 3.1.0
+ -----
+ * Added support for ``checkpw`` as another method of verifying a password.
++* Ensure that you get a ``$2y$`` hash when you input a ``$2y$`` salt.
+ 
+ 3.0.0
+ -----
+diff --git a/src/bcrypt/__init__.py b/src/bcrypt/__init__.py
+index d6acb84..abc9d75 100644
+--- a/src/bcrypt/__init__.py
++++ b/src/bcrypt/__init__.py
+@@ -39,10 +39,6 @@ __all__ = [
+ _normalize_re = re.compile(b"^\$2y\$")
+ 
+ 
+-def _normalize_prefix(salt):
+-    return _normalize_re.sub(b"$2b$", salt)
+-
+-
+ def gensalt(rounds=12, prefix=b"2b"):
+     if prefix not in (b"2a", b"2b"):
+         raise ValueError("Supported prefixes are b'2a' or b'2b'")
+@@ -75,7 +71,13 @@ def hashpw(password, salt):
+     # on $2a$, so we do it here to preserve compatibility with 2.0.0
+     password = password[:72]
+ 
+-    salt = _normalize_prefix(salt)
++    # When the original 8bit bug was found the original library we supported
++    # added a new prefix, $2y$, that fixes it. This prefix is exactly the same
++    # as the $2b$ prefix added by OpenBSD other than the name. Since the
++    # OpenBSD library does not support the $2y$ prefix, if the salt given to us
++    # is for the $2y$ prefix, we'll just mugne it so that it's a $2b$ prior to
++    # passing it into the C library.
++    original_salt, salt = salt, _normalize_re.sub(b"$2b$", salt)
+ 
+     hashed = _bcrypt.ffi.new("unsigned char[]", 128)
+     retval = _bcrypt.lib.bcrypt_hashpass(password, salt, hashed, len(hashed))
+@@ -83,7 +85,13 @@ def hashpw(password, salt):
+     if retval != 0:
+         raise ValueError("Invalid salt")
+ 
+-    return _bcrypt.ffi.string(hashed)
++    # Now that we've gotten our hashed password, we want to ensure that the
++    # prefix we return is the one that was passed in, so we'll use the prefix
++    # from the original salt and concatenate that with the return value (minus
++    # the return value's prefix). This will ensure that if someone passed in a
++    # salt with a $2y$ prefix, that they get back a hash with a $2y$ prefix
++    # even though we munged it to $2b$.
++    return original_salt[:4] + _bcrypt.ffi.string(hashed)[4:]
+ 
+ 
+ def checkpw(password, hashed_password):
+@@ -96,9 +104,6 @@ def checkpw(password, hashed_password):
+             "password and hashed_password may not contain NUL bytes"
+         )
+ 
+-    # If the user supplies a $2y$ prefix we normalize to $2b$
+-    hashed_password = _normalize_prefix(hashed_password)
+-
+     ret = hashpw(password, hashed_password)
+ 
+     return _bcrypt.lib.timingsafe_bcmp(ret, hashed_password, len(ret)) == 0
+diff --git a/tox.ini b/tox.ini
+index abc6283..264d9aa 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,5 +1,5 @@
+ [tox]
+-envlist = py26,py27,pypy,py33,py34,py35,pep8,py3pep8
++envlist = py26,py27,pypy,py33,py34,py35,pep8,py3pep8,packaging
+ 
+ [testenv]
+ # If you add a new dep here you probably need to add it in setup.py as well
+@@ -27,6 +27,15 @@ deps =
+ commands =
+     flake8 .
+ 
++[testenv:packaging]
++deps =
++    check-manifest
++    readme_renderer
++commands =
++    check-manifest
++    python setup.py check --metadata --restructuredtext --strict
++
++
+ [flake8]
+ exclude = .tox,*.egg
+ select = E,W,F,N,I

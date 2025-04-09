@@ -1,0 +1,93 @@
+diff --git a/marge/app.py b/marge/app.py
+index 49402d7..db40ce1 100644
+--- a/marge/app.py
++++ b/marge/app.py
+@@ -32,7 +32,7 @@ def time_interval(str_interval):
+         ) from err
+ 
+ 
+-def _parse_config(args):
++def _parse_config(args):  # pylint: disable=too-many-statements
+ 
+     def regexp(str_regex):
+         try:
+@@ -237,6 +237,12 @@ def _parse_config(args):
+         action='store_true',
+         help='Run marge-bot as a single CLI command, not a service'
+     )
++    parser.add_argument(
++        '--guarantee-final-pipeline',
++        action='store_true',
++        help='Guaranteed final pipeline when assigned to marge-bot'
++    )
++
+     config = parser.parse_args(args)
+ 
+     if config.use_merge_strategy and config.batch:
+@@ -342,6 +348,7 @@ def main(args=None):
+                 use_no_ff_batches=options.use_no_ff_batches,
+                 use_merge_commit_batches=options.use_merge_commit_batches,
+                 skip_ci_batches=options.skip_ci_batches,
++                guarantee_final_pipeline=options.guarantee_final_pipeline,
+             ),
+             batch=options.batch,
+             cli=options.cli,
+diff --git a/marge/job.py b/marge/job.py
+index 7c0cd44..c93bf55 100644
+--- a/marge/job.py
++++ b/marge/job.py
+@@ -460,6 +460,7 @@ JOB_OPTIONS = [
+     'use_no_ff_batches',
+     'use_merge_commit_batches',
+     'skip_ci_batches',
++    'guarantee_final_pipeline',
+ ]
+ 
+ 
+@@ -476,6 +477,7 @@ class MergeJobOptions(namedtuple('MergeJobOptions', JOB_OPTIONS)):
+             add_tested=False, add_part_of=False, add_reviewers=False, reapprove=False,
+             approval_timeout=None, embargo=None, ci_timeout=None, fusion=Fusion.rebase,
+             use_no_ff_batches=False, use_merge_commit_batches=False, skip_ci_batches=False,
++            guarantee_final_pipeline=False,
+     ):
+         approval_timeout = approval_timeout or timedelta(seconds=0)
+         embargo = embargo or IntervalUnion.empty()
+@@ -492,6 +494,7 @@ class MergeJobOptions(namedtuple('MergeJobOptions', JOB_OPTIONS)):
+             use_no_ff_batches=use_no_ff_batches,
+             use_merge_commit_batches=use_merge_commit_batches,
+             skip_ci_batches=skip_ci_batches,
++            guarantee_final_pipeline=guarantee_final_pipeline,
+         )
+ 
+ 
+diff --git a/marge/single_merge_job.py b/marge/single_merge_job.py
+index 7d3cb59..1f8155b 100644
+--- a/marge/single_merge_job.py
++++ b/marge/single_merge_job.py
+@@ -13,6 +13,7 @@ class SingleMergeJob(MergeJob):
+     def __init__(self, *, api, user, project, repo, options, merge_request):
+         super().__init__(api=api, user=user, project=project, repo=repo, options=options)
+         self._merge_request = merge_request
++        self._options = options
+ 
+     def execute(self):
+         merge_request = self._merge_request
+@@ -61,7 +62,17 @@ class SingleMergeJob(MergeJob):
+                 merge_request.comment("Someone skipped the queue! Will have to try again...")
+                 continue
+ 
+-            log.info('Commit id to merge %r (into: %r)', actual_sha, target_sha)
++            if _updated_sha == actual_sha and self._options.guarantee_final_pipeline:
++                log.info('No commits on target branch to fuse, triggering pipeline...')
++                merge_request.comment("jenkins retry")
++                time.sleep(30)
++
++            log.info(
++                'Commit id to merge %r into: %r (updated sha: %r)',
++                actual_sha,
++                target_sha,
++                _updated_sha
++            )
+             time.sleep(5)
+ 
+             sha_now = Commit.last_on_branch(source_project.id, merge_request.source_branch, api).id

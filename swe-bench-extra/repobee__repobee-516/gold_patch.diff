@@ -1,0 +1,261 @@
+diff --git a/src/_repobee/cli/mainparser.py b/src/_repobee/cli/mainparser.py
+index 7e2c255..16d7f61 100644
+--- a/src/_repobee/cli/mainparser.py
++++ b/src/_repobee/cli/mainparser.py
+@@ -635,7 +635,7 @@ def _add_extension_parsers(
+             parents.append(repo_name_parser)
+ 
+         def _add_ext_parser(
+-            parents: List[argparse.ArgumentParser],
++            name=None, parents: List[argparse.ArgumentParser] = None
+         ) -> argparse.ArgumentParser:
+             """Add a new parser either to the extension command's category (if
+             specified), or to the top level subparsers (if category is not
+@@ -644,24 +644,48 @@ def _add_extension_parsers(
+             return (
+                 parsers_mapping.get(cmd.category) or subparsers
+             ).add_parser(
+-                cmd.name,
++                name or cmd.name,
+                 help=cmd.help,
+                 description=cmd.description,
+                 parents=parents,
+                 formatter_class=_OrderedFormatter,
+             )
+ 
+-        if cmd.name in plug.cli.CoreCommand:
++        category = (
++            cmd.name.category
++            if isinstance(cmd.name, plug.cli.Action)
++            else cmd.category
++        )
++        if category and category not in parsers_mapping:
++            # new category
++            category_cmd = subparsers.add_parser(
++                category.name,
++                help=category.help,
++                description=category.description,
++            )
++            category_parsers = category_cmd.add_subparsers(dest=ACTION)
++            category_parsers.required = True
++            parsers_mapping[category] = category_parsers
++
++        if cmd.name in parsers_mapping:
+             ext_parser = parsers_mapping[cmd.name]
+             cmd.parser(
+                 config=parsed_config,
+                 show_all_opts=show_all_opts,
+                 parser=ext_parser,
+             )
++        elif isinstance(cmd.name, plug.cli.Action):
++            action = cmd.name
++            ext_parser = _add_ext_parser(parents=parents, name=action.name)
++            cmd.parser(
++                config=parsed_config,
++                show_all_opts=show_all_opts,
++                parser=ext_parser,
++            )
+         elif callable(cmd.parser):
+             action = cmd.category.get(cmd.name) if cmd.category else None
+             ext_parser = parsers_mapping.get(action) or _add_ext_parser(
+-                parents
++                parents=parents
+             )
+             cmd.parser(
+                 config=parsed_config,
+@@ -670,7 +694,7 @@ def _add_extension_parsers(
+             )
+         else:
+             parents.append(cmd.parser)
+-            ext_parser = _add_ext_parser(parents)
++            ext_parser = _add_ext_parser(parents=parents)
+ 
+         try:
+             _add_traceback_arg(ext_parser)
+diff --git a/src/_repobee/main.py b/src/_repobee/main.py
+index d423e27..431acda 100644
+--- a/src/_repobee/main.py
++++ b/src/_repobee/main.py
+@@ -102,7 +102,7 @@ def run(
+         parsed_args, api, ext_commands = _parse_args(
+             cmd, config_file, show_all_opts
+         )
+-        _repobee.cli.dispatch.dispatch_command(
++        return _repobee.cli.dispatch.dispatch_command(
+             parsed_args, api, config_file, ext_commands
+         )
+     finally:
+diff --git a/src/repobee_plug/_pluginmeta.py b/src/repobee_plug/_pluginmeta.py
+index a74cf78..c686161 100644
+--- a/src/repobee_plug/_pluginmeta.py
++++ b/src/repobee_plug/_pluginmeta.py
+@@ -160,7 +160,7 @@ def _generate_command_func(attrdict: Mapping[str, Any]) -> Callable:
+ 
+         return _containers.ExtensionCommand(
+             parser=functools.partial(_attach_options, plugin=self),
+-            name=settings.action_name
++            name=settings.action
+             or self.__class__.__name__.lower().replace("_", "-"),
+             help=settings.help,
+             description=settings.description,
+diff --git a/src/repobee_plug/cli.py b/src/repobee_plug/cli.py
+index eb3e7d2..4c2180c 100644
+--- a/src/repobee_plug/cli.py
++++ b/src/repobee_plug/cli.py
+@@ -3,7 +3,17 @@ import abc
+ import collections
+ import enum
+ import itertools
+-from typing import List, Tuple, Optional, Set, Mapping, Iterable, Any, Callable
++from typing import (
++    List,
++    Tuple,
++    Optional,
++    Set,
++    Mapping,
++    Iterable,
++    Any,
++    Callable,
++    Union,
++)
+ 
+ from repobee_plug import _containers
+ 
+@@ -49,7 +59,7 @@ _Option.__new__.__defaults__ = (None,) * len(_Option._fields)
+ _CommandSettings = collections.namedtuple(
+     "_CommandSettings",
+     [
+-        "action_name",
++        "action",
+         "category",
+         "help",
+         "description",
+@@ -66,7 +76,7 @@ _CommandExtensionSettings = collections.namedtuple(
+ 
+ 
+ def command_settings(
+-    action_name: Optional[str] = None,
++    action: Optional[Union[str, "Action"]] = None,
+     category: Optional["CoreCommand"] = None,
+     help: str = "",
+     description: str = "",
+@@ -100,10 +110,13 @@ def command_settings(
+         Hello, world!
+ 
+     Args:
+-        action_name: The name of the action that the command will be
+-            available under. Defaults to the name of the plugin class.
++        action: The name of this command, or a :py:class:`Action` object that
++            defines both category and action for the command. Defaults to the
++            name of the plugin class.
+         category: The category to place this command in. If not specified,
+-            then the command will be top-level (i.e. uncategorized).
++            then the command will be top-level (i.e. uncategorized). If
++            ``action`` is an :py:class:`Action` (as opposed to a ``str``),
++            then this argument is not allowed.
+         help: A help section for the command. This appears when listing the
+             help section of the command's category.
+         description: A help section for the command. This appears when
+@@ -114,9 +127,19 @@ def command_settings(
+         config_section_name: The name of the configuration section the
+             command should look for configurable options in. Defaults
+             to the name of the plugin the command is defined in.
++    Returns:
++        A settings object used internally by RepoBee.
+     """
++    if isinstance(action, Action):
++        if category:
++            raise TypeError(
++                "argument 'category' not allowed when argument 'action' is an "
++                "Action object"
++            )
++        category = action.category
++
+     return _CommandSettings(
+-        action_name=action_name,
++        action=action,
+         category=category,
+         help=help,
+         description=description,
+@@ -126,6 +149,26 @@ def command_settings(
+     )
+ 
+ 
++def category(
++    name: str, action_names: List[str], help: str = "", description: str = ""
++) -> "Category":
++    """Create a category for CLI actions.
++
++    Args:
++        name: Name of the category.
++        action_names: The actions of this category.
++    Returns:
++        A CLI category.
++    """
++    action_names = set(action_names)
++    return Category(
++        name=name,
++        action_names=action_names,
++        help=help,
++        description=description,
++    )
++
++
+ def command_extension_settings(
+     actions: List["Action"], config_section_name: Optional[str] = None
+ ) -> _CommandExtensionSettings:
+@@ -375,29 +418,37 @@ class Category(ImmutableMixin, abc.ABC):
+ 
+     For example, the command ``repobee issues list`` has category ``issues``
+     and action ``list``. Actions are unique only within their category.
+-
+-    Attributes:
+-        name: Name of this category.
+-        actions: A tuple of names of actions applicable to this category.
+     """
+ 
++    help: str = ""
++    description: str = ""
+     name: str
+     actions: Tuple["Action"]
+     action_names: Set[str]
+     _action_table: Mapping[str, "Action"]
+ 
+-    def __init__(self):
++    def __init__(
++        self,
++        name: Optional[str] = None,
++        action_names: Optional[Set[str]] = None,
++        help: Optional[str] = None,
++        description: Optional[str] = None,
++    ):
+         # determine the name of this category based on the runtime type of the
+         # inheriting class
+-        name = self.__class__.__name__.lower().strip("_")
++        name = name or self.__class__.__name__.lower().strip("_")
+         # determine the action names based on type annotations in the
+         # inheriting class
+-        action_names = {
++        action_names = (action_names or set()) | {
+             name
+             for name, tpe in self.__annotations__.items()
+-            if issubclass(tpe, Action)
++            if isinstance(tpe, type) and issubclass(tpe, Action)
+         }
+ 
++        object.__setattr__(self, "help", help or self.help)
++        object.__setattr__(
++            self, "description", description or self.description
++        )
+         object.__setattr__(self, "name", name)
+         object.__setattr__(self, "action_names", set(action_names))
+         # This is just to reserve the name 'actions'
+@@ -410,7 +461,7 @@ class Category(ImmutableMixin, abc.ABC):
+         actions = []
+         for action_name in action_names:
+             action = Action(action_name.replace("_", "-"), self)
+-            object.__setattr__(self, action_name, action)
++            object.__setattr__(self, action_name.replace("-", "_"), action)
+             actions.append(action)
+ 
+         object.__setattr__(self, "actions", tuple(actions))

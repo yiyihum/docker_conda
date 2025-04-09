@@ -1,0 +1,121 @@
+diff --git a/twine/commands/check.py b/twine/commands/check.py
+index f71b2c9..b55dabf 100644
+--- a/twine/commands/check.py
++++ b/twine/commands/check.py
+@@ -24,18 +24,16 @@ try:
+ except ImportError:
+     from _io import StringIO
+ 
+-import readme_renderer.markdown
+ import readme_renderer.rst
+-import readme_renderer.txt
+ 
+ from twine.commands import _find_dists
+ from twine.package import PackageFile
+ 
+ _RENDERERS = {
+     None: readme_renderer.rst,  # Default if description_content_type is None
+-    "text/plain": readme_renderer.txt,
++    "text/plain": None,  # Rendering cannot fail
+     "text/x-rst": readme_renderer.rst,
+-    "text/markdown": readme_renderer.markdown,
++    "text/markdown": None,  # Rendering cannot fail
+ }
+ 
+ 
+@@ -101,7 +99,11 @@ def check(dists, output_stream=sys.stdout):
+             output_stream.write('warning: `long_description` missing.\n')
+             output_stream.write("Passed\n")
+         else:
+-            if renderer.render(description, stream=stream, **params) is None:
++            if (
++                renderer
++                and renderer.render(description, stream=stream, **params)
++                is None
++            ):
+                 failure = True
+                 output_stream.write("Failed\n")
+                 output_stream.write(
+diff --git a/twine/settings.py b/twine/settings.py
+index 8e270fd..d4e3d1a 100644
+--- a/twine/settings.py
++++ b/twine/settings.py
+@@ -235,7 +235,11 @@ class Settings(object):
+         )
+ 
+     def _handle_authentication(self, username, password):
+-        self.username = utils.get_username(username, self.repository_config)
++        self.username = utils.get_username(
++            self.repository_config['repository'],
++            username,
++            self.repository_config
++        )
+         self.password = utils.get_password(
+             self.repository_config['repository'],
+             self.username,
+diff --git a/twine/utils.py b/twine/utils.py
+index 57eefb3..a4f6419 100644
+--- a/twine/utils.py
++++ b/twine/utils.py
+@@ -203,6 +203,23 @@ def get_userpass_value(cli_value, config, key, prompt_strategy=None):
+         return None
+ 
+ 
++def get_username_from_keyring(system):
++    if 'keyring' not in sys.modules:
++        return
++
++    try:
++        getter = sys.modules['keyring'].get_credential
++    except AttributeError:
++        return None
++
++    try:
++        creds = getter(system, None)
++        if creds:
++            return creds.username
++    except Exception as exc:
++        warnings.warn(str(exc))
++
++
+ def password_prompt(prompt_text):  # Always expects unicode for our own sanity
+     prompt = prompt_text
+     # Workaround for https://github.com/pypa/twine/issues/116
+@@ -221,6 +238,13 @@ def get_password_from_keyring(system, username):
+         warnings.warn(str(exc))
+ 
+ 
++def username_from_keyring_or_prompt(system):
++    return (
++        get_username_from_keyring(system)
++        or input_func('Enter your username: ')
++    )
++
++
+ def password_from_keyring_or_prompt(system, username):
+     return (
+         get_password_from_keyring(system, username)
+@@ -228,11 +252,18 @@ def password_from_keyring_or_prompt(system, username):
+     )
+ 
+ 
+-get_username = functools.partial(
+-    get_userpass_value,
+-    key='username',
+-    prompt_strategy=functools.partial(input_func, 'Enter your username: '),
+-)
++def get_username(system, cli_value, config):
++    return get_userpass_value(
++        cli_value,
++        config,
++        key='username',
++        prompt_strategy=functools.partial(
++            username_from_keyring_or_prompt,
++            system,
++        ),
++    )
++
++
+ get_cacert = functools.partial(
+     get_userpass_value,
+     key='ca_cert',

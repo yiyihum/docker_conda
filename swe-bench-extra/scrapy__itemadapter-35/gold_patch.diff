@@ -1,0 +1,260 @@
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index dc8bdac..1d26f9a 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -39,7 +39,7 @@ jobs:
+     runs-on: ubuntu-latest
+     strategy:
+       matrix:
+-        python-version: [3.5, 3.6, 3.7, 3.8]
++        python-version: [3.6, 3.7, 3.8]
+ 
+     steps:
+     - uses: actions/checkout@v2
+diff --git a/README.md b/README.md
+index ecac8be..da7a53e 100644
+--- a/README.md
++++ b/README.md
+@@ -19,7 +19,7 @@ Currently supported types are:
+ 
+ ## Requirements
+ 
+-* Python 3.5+
++* Python 3.6+
+ * [`scrapy`](https://scrapy.org/): optional, needed to interact with `scrapy` items
+ * `dataclasses` ([stdlib](https://docs.python.org/3/library/dataclasses.html) in Python 3.7+,
+   or its [backport](https://pypi.org/project/dataclasses/) in Python 3.6): optional, needed
+@@ -163,13 +163,23 @@ _`itemadapter.utils.is_item(obj: Any) -> bool`_
+ Return `True` if the given object belongs to one of the supported types,
+ `False` otherwise.
+ 
++### `get_field_meta_from_class` function
++
++_`itemadapter.utils.get_field_meta_from_class(item_class: type, field_name: str) -> MappingProxyType`_
++
++Given an item class and a field name, return a
++[`MappingProxyType`](https://docs.python.org/3/library/types.html#types.MappingProxyType)
++object, which is a read-only mapping with metadata about the given field. If the item class does not
++support field metadata, or there is no metadata for the given field, an empty object is returned.
++
+ 
+ ## Metadata support
+ 
+ `scrapy.item.Item`, `dataclass` and `attrs` objects allow the inclusion of
+-arbitrary field metadata, which can be retrieved with the
+-`ItemAdapter.get_field_meta` method. The definition procedure depends on the
+-underlying type.
++arbitrary field metadata. This can be retrieved from an item instance with the
++`itemadapter.adapter.ItemAdapter.get_field_meta` method, or from an item class
++with the `itemadapter.utils.get_field_meta_from_class` function.
++The definition procedure depends on the underlying type.
+ 
+ #### `scrapy.item.Item` objects
+ 
+diff --git a/itemadapter/__init__.py b/itemadapter/__init__.py
+index 61b5cdd..a066e2d 100644
+--- a/itemadapter/__init__.py
++++ b/itemadapter/__init__.py
+@@ -1,5 +1,5 @@
+ from .adapter import ItemAdapter  # noqa: F401
+-from .utils import is_item  # noqa: F401
++from .utils import get_field_meta_from_class, is_item  # noqa: F401
+ 
+ 
+ __version__ = "0.1.0"
+diff --git a/itemadapter/adapter.py b/itemadapter/adapter.py
+index 4312f2e..50e9bfa 100644
+--- a/itemadapter/adapter.py
++++ b/itemadapter/adapter.py
+@@ -2,7 +2,13 @@ from collections.abc import KeysView, MutableMapping
+ from types import MappingProxyType
+ from typing import Any, Iterator
+ 
+-from .utils import is_item, is_attrs_instance, is_dataclass_instance, is_scrapy_item
++from .utils import (
++    get_field_meta_from_class,
++    is_attrs_instance,
++    is_dataclass_instance,
++    is_item,
++    is_scrapy_item,
++)
+ 
+ 
+ class ItemAdapter(MutableMapping):
+@@ -86,28 +92,7 @@ class ItemAdapter(MutableMapping):
+         The returned value is an instance of types.MappingProxyType, i.e. a dynamic read-only view
+         of the original mapping, which gets automatically updated if the original mapping changes.
+         """
+-        if is_scrapy_item(self.item):
+-            return MappingProxyType(self.item.fields[field_name])
+-        elif is_dataclass_instance(self.item):
+-            from dataclasses import fields
+-
+-            for field in fields(self.item):
+-                if field.name == field_name:
+-                    return field.metadata  # type: ignore
+-            raise KeyError(
+-                "%s does not support field: %s" % (self.item.__class__.__name__, field_name)
+-            )
+-        elif is_attrs_instance(self.item):
+-            from attr import fields_dict
+-
+-            try:
+-                return fields_dict(self.item.__class__)[field_name].metadata  # type: ignore
+-            except KeyError:
+-                raise KeyError(
+-                    "%s does not support field: %s" % (self.item.__class__.__name__, field_name)
+-                )
+-        else:
+-            return MappingProxyType({})
++        return get_field_meta_from_class(self.item.__class__, field_name)
+ 
+     def field_names(self) -> KeysView:
+         """
+diff --git a/itemadapter/utils.py b/itemadapter/utils.py
+index 5c22dd3..6ddd52f 100644
+--- a/itemadapter/utils.py
++++ b/itemadapter/utils.py
+@@ -1,31 +1,52 @@
++from types import MappingProxyType
+ from typing import Any
+ 
+ 
++def _get_scrapy_item_classes() -> tuple:
++    try:
++        import scrapy
++    except ImportError:
++        return ()
++    else:
++        try:
++            _base_item_cls = getattr(scrapy.item, "_BaseItem", scrapy.item.BaseItem)  # deprecated
++            return (scrapy.item.Item, _base_item_cls)
++        except AttributeError:
++            return (scrapy.item.Item,)
++
++
++def _is_dataclass(obj: Any) -> bool:
++    try:
++        import dataclasses
++    except ImportError:
++        return False
++    return dataclasses.is_dataclass(obj)
++
++
++def _is_attrs_class(obj: Any) -> bool:
++    try:
++        import attr
++    except ImportError:
++        return False
++    return attr.has(obj)
++
++
+ def is_dataclass_instance(obj: Any) -> bool:
+     """
+     Return True if the given object is a dataclass object, False otherwise.
+ 
+-    This function always returns False in py35. In py36, it returns False
+-    if the "dataclasses" backport is not available.
++    In py36, this function returns False if the "dataclasses" backport is not available.
+ 
+     Taken from https://docs.python.org/3/library/dataclasses.html#dataclasses.is_dataclass.
+     """
+-    try:
+-        import dataclasses
+-    except ImportError:
+-        return False
+-    return dataclasses.is_dataclass(obj) and not isinstance(obj, type)
++    return _is_dataclass(obj) and not isinstance(obj, type)
+ 
+ 
+ def is_attrs_instance(obj: Any) -> bool:
+     """
+     Return True if the given object is a attrs-based object, False otherwise.
+     """
+-    try:
+-        import attr
+-    except ImportError:
+-        return False
+-    return attr.has(obj) and not isinstance(obj, type)
++    return _is_attrs_class(obj) and not isinstance(obj, type)
+ 
+ 
+ def is_scrapy_item(obj: Any) -> bool:
+@@ -56,3 +77,39 @@ def is_item(obj: Any) -> bool:
+         or is_dataclass_instance(obj)
+         or is_attrs_instance(obj)
+     )
++
++
++def get_field_meta_from_class(item_class: type, field_name: str) -> MappingProxyType:
++    """
++    Return a read-only mapping with metadata for the given field name, within the given item class.
++    If there is no metadata for the field, or the item class does not support field metadata,
++    an empty object is returned.
++
++    Field metadata is taken from different sources, depending on the item type:
++    * scrapy.item.Item: corresponding scrapy.item.Field object
++    * dataclass items: "metadata" attribute for the corresponding field
++    * attrs items: "metadata" attribute for the corresponding field
++
++    The returned value is an instance of types.MappingProxyType, i.e. a dynamic read-only view
++    of the original mapping, which gets automatically updated if the original mapping changes.
++    """
++    if issubclass(item_class, _get_scrapy_item_classes()):
++        return MappingProxyType(item_class.fields[field_name])  # type: ignore
++    elif _is_dataclass(item_class):
++        from dataclasses import fields
++
++        for field in fields(item_class):
++            if field.name == field_name:
++                return field.metadata  # type: ignore
++        raise KeyError("%s does not support field: %s" % (item_class.__name__, field_name))
++    elif _is_attrs_class(item_class):
++        from attr import fields_dict
++
++        try:
++            return fields_dict(item_class)[field_name].metadata  # type: ignore
++        except KeyError:
++            raise KeyError("%s does not support field: %s" % (item_class.__name__, field_name))
++    elif issubclass(item_class, dict):
++        return MappingProxyType({})
++    else:
++        raise TypeError("%s is not a valid item class" % (item_class,))
+diff --git a/setup.py b/setup.py
+index 587fe63..76fc982 100644
+--- a/setup.py
++++ b/setup.py
+@@ -16,11 +16,11 @@ setuptools.setup(
+     author_email="eugenio.lacuesta@gmail.com",
+     url="https://github.com/scrapy/itemadapter",
+     packages=["itemadapter"],
++    python_requires=">=3.6",
+     classifiers=[
+         "Development Status :: 3 - Alpha",
+         "License :: OSI Approved :: BSD License",
+         "Programming Language :: Python",
+-        "Programming Language :: Python :: 3.5",
+         "Programming Language :: Python :: 3.6",
+         "Programming Language :: Python :: 3.7",
+         "Programming Language :: Python :: 3.8",
+diff --git a/tox.ini b/tox.ini
+index b806947..bef3467 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,5 +1,5 @@
+ [tox]
+-envlist = flake8,typing,black,py35,py36,py37,py38
++envlist = flake8,typing,black,py36,py37,py38
+ 
+ [testenv]
+ deps =
+@@ -7,9 +7,6 @@ deps =
+ commands =
+     pytest --verbose --cov=itemadapter --cov-report=term-missing --cov-report=html --cov-report=xml {posargs: itemadapter tests}
+ 
+-[testenv:py35]
+-basepython = python3.5
+-
+ [testenv:py36]
+ basepython = python3.6
+ 

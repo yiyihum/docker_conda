@@ -1,0 +1,121 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 567c5f7..446716b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - `-h` alias for `--help` option [#172](https://github.com/scanapi/scanapi/pull/172)
+ - Test results to report [#177](https://github.com/scanapi/scanapi/pull/177)
+ - Add test errors to the report [#187](https://github.com/scanapi/scanapi/pull/187)
++- Hides sensitive info in URL [#185](https://github.com/scanapi/scanapi/pull/185)
+ 
+ ### Changed
+ - Unified keys validation in a single method [#151](https://github.com/scanapi/scanapi/pull/151)
+diff --git a/scanapi/hide_utils.py b/scanapi/hide_utils.py
+new file mode 100644
+index 0000000..25a1572
+--- /dev/null
++++ b/scanapi/hide_utils.py
+@@ -0,0 +1,41 @@
++from scanapi.settings import settings
++
++HEADERS = "headers"
++BODY = "body"
++URL = "url"
++
++ALLOWED_ATTRS_TO_HIDE = (HEADERS, BODY, URL)
++SENSITIVE_INFO_SUBSTITUTION_FLAG = "SENSITIVE_INFORMATION"
++
++
++def hide_sensitive_info(response):
++    report_settings = settings.get("report", {})
++    request = response.request
++    request_settings = report_settings.get("hide-request", {})
++    response_settings = report_settings.get("hide-response", {})
++
++    _hide(request, request_settings)
++    _hide(response, response_settings)
++
++
++def _hide(http_msg, hide_settings):
++    for http_attr in hide_settings:
++        secret_fields = hide_settings[http_attr]
++        for field in secret_fields:
++            _override_info(http_msg, http_attr, field)
++
++
++def _override_info(http_msg, http_attr, secret_field):
++    if (
++        secret_field in getattr(http_msg, http_attr)
++        and http_attr in ALLOWED_ATTRS_TO_HIDE
++    ):
++        if http_attr == URL:
++            new_url = getattr(http_msg, http_attr).replace(
++                secret_field, SENSITIVE_INFO_SUBSTITUTION_FLAG
++            )
++            setattr(http_msg, http_attr, new_url)
++        else:
++            getattr(http_msg, http_attr)[
++                secret_field
++            ] = SENSITIVE_INFO_SUBSTITUTION_FLAG
+diff --git a/scanapi/tree/request_node.py b/scanapi/tree/request_node.py
+index 7ae0ab8..6e04786 100644
+--- a/scanapi/tree/request_node.py
++++ b/scanapi/tree/request_node.py
+@@ -15,7 +15,8 @@ from scanapi.tree.tree_keys import (
+     TESTS_KEY,
+     VARS_KEY,
+ )
+-from scanapi.utils import join_urls, hide_sensitive_info, validate_keys
++from scanapi.utils import join_urls, validate_keys
++from scanapi.hide_utils import hide_sensitive_info
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/scanapi/utils.py b/scanapi/utils.py
+index 67b5e95..ad53343 100644
+--- a/scanapi/utils.py
++++ b/scanapi/utils.py
+@@ -1,7 +1,4 @@
+ from scanapi.errors import InvalidKeyError, MissingMandatoryKeyError
+-from scanapi.settings import settings
+-
+-ALLOWED_ATTRS_TO_HIDE = ("headers body").split()
+ 
+ 
+ def join_urls(first_url, second_url):
+@@ -22,16 +19,6 @@ def validate_keys(keys, available_keys, required_keys, scope):
+     _validate_required_keys(keys, required_keys, scope)
+ 
+ 
+-def hide_sensitive_info(response):
+-    report_settings = settings.get("report", {})
+-    request = response.request
+-    request_settings = report_settings.get("hide-request", {})
+-    response_settings = report_settings.get("hide-response", {})
+-
+-    _hide(request, request_settings)
+-    _hide(response, response_settings)
+-
+-
+ def _validate_allowed_keys(keys, available_keys, scope):
+     for key in keys:
+         if not key in available_keys:
+@@ -42,18 +29,3 @@ def _validate_required_keys(keys, required_keys, scope):
+     if not set(required_keys) <= set(keys):
+         missing_keys = set(required_keys) - set(keys)
+         raise MissingMandatoryKeyError(missing_keys, scope)
+-
+-
+-def _hide(http_msg, hide_settings):
+-    for http_attr in hide_settings:
+-        secret_fields = hide_settings[http_attr]
+-        for field in secret_fields:
+-            _override_info(http_msg, http_attr, field)
+-
+-
+-def _override_info(http_msg, http_attr, secret_field):
+-    if (
+-        secret_field in getattr(http_msg, http_attr)
+-        and http_attr in ALLOWED_ATTRS_TO_HIDE
+-    ):
+-        getattr(http_msg, http_attr)[secret_field] = "SENSITIVE_INFORMATION"

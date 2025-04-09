@@ -1,0 +1,117 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 79f241d..21c9159 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -7,6 +7,9 @@ OAuth2.0 Provider - Bugfixes
+ 
+   * #753: Fix acceptance of valid IPv6 addresses in URI validation
+ 
++OAuth2.0 Provider - Features
++  * #751: OIDC add support of refreshing ID Tokens
++
+ OAuth2.0 Client - Bugfixes
+ 
+   * #730: Base OAuth2 Client now has a consistent way of managing the `scope`: it consistently
+@@ -25,6 +28,8 @@ OAuth2.0 Provider - Bugfixes
+   * #746: OpenID Connect Hybrid - fix nonce not passed to add_id_token
+   * #756: Different prompt values are now handled according to spec (e.g. prompt=none)
+   * #759: OpenID Connect - fix Authorization: Basic parsing
++  * #751: The RefreshTokenGrant modifiers now take the same arguments as the
++    AuthorizationCodeGrant modifiers (`token`, `token_handler`, `request`).
+ 
+ General
+   * #716: improved skeleton validator for public vs private client
+diff --git a/docs/oauth2/oidc/refresh_token.rst b/docs/oauth2/oidc/refresh_token.rst
+new file mode 100644
+index 0000000..01d2d7f
+--- /dev/null
++++ b/docs/oauth2/oidc/refresh_token.rst
+@@ -0,0 +1,6 @@
++OpenID Authorization Code
++-------------------------
++
++.. autoclass:: oauthlib.openid.connect.core.grant_types.RefreshTokenGrant
++    :members:
++    :inherited-members:
+diff --git a/oauthlib/oauth2/rfc6749/grant_types/refresh_token.py b/oauthlib/oauth2/rfc6749/grant_types/refresh_token.py
+index 8698a3d..f801de4 100644
+--- a/oauthlib/oauth2/rfc6749/grant_types/refresh_token.py
++++ b/oauthlib/oauth2/rfc6749/grant_types/refresh_token.py
+@@ -63,7 +63,7 @@ class RefreshTokenGrant(GrantTypeBase):
+                                            refresh_token=self.issue_new_refresh_tokens)
+ 
+         for modifier in self._token_modifiers:
+-            token = modifier(token)
++            token = modifier(token, token_handler, request)
+ 
+         self.request_validator.save_token(token, request)
+ 
+diff --git a/oauthlib/openid/connect/core/grant_types/__init__.py b/oauthlib/openid/connect/core/grant_types/__init__.py
+index 887a585..8dad5f6 100644
+--- a/oauthlib/openid/connect/core/grant_types/__init__.py
++++ b/oauthlib/openid/connect/core/grant_types/__init__.py
+@@ -10,3 +10,4 @@ from .dispatchers import (
+ )
+ from .hybrid import HybridGrant
+ from .implicit import ImplicitGrant
++from .refresh_token import RefreshTokenGrant
+diff --git a/oauthlib/openid/connect/core/grant_types/refresh_token.py b/oauthlib/openid/connect/core/grant_types/refresh_token.py
+new file mode 100644
+index 0000000..43e4499
+--- /dev/null
++++ b/oauthlib/openid/connect/core/grant_types/refresh_token.py
+@@ -0,0 +1,34 @@
++"""
++oauthlib.openid.connect.core.grant_types
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++"""
++import logging
++
++from oauthlib.oauth2.rfc6749.grant_types.refresh_token import (
++    RefreshTokenGrant as OAuth2RefreshTokenGrant,
++)
++
++from .base import GrantTypeBase
++
++log = logging.getLogger(__name__)
++
++
++class RefreshTokenGrant(GrantTypeBase):
++
++    def __init__(self, request_validator=None, **kwargs):
++        self.proxy_target = OAuth2RefreshTokenGrant(
++            request_validator=request_validator, **kwargs)
++        self.register_token_modifier(self.add_id_token)
++
++    def add_id_token(self, token, token_handler, request):
++        """
++        Construct an initial version of id_token, and let the
++        request_validator sign or encrypt it.
++
++        The authorization_code version of this method is used to
++        retrieve the nonce accordingly to the code storage.
++        """
++        if not self.request_validator.refresh_id_token(request):
++            return token
++
++        return super().add_id_token(token, token_handler, request)
+diff --git a/oauthlib/openid/connect/core/request_validator.py b/oauthlib/openid/connect/core/request_validator.py
+index e8f334b..47c4cd9 100644
+--- a/oauthlib/openid/connect/core/request_validator.py
++++ b/oauthlib/openid/connect/core/request_validator.py
+@@ -306,3 +306,15 @@ class RequestValidator(OAuth2RequestValidator):
+         Method is used by:
+             UserInfoEndpoint
+         """
++
++    def refresh_id_token(self, request):
++        """Whether the id token should be refreshed. Default, True
++
++        :param request: OAuthlib request.
++        :type request: oauthlib.common.Request
++        :rtype: True or False
++
++        Method is used by:
++            RefreshTokenGrant
++        """
++        return True

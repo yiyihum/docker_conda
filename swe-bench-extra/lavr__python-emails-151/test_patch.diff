@@ -1,0 +1,105 @@
+diff --git a/.github/workflows/tests.yaml b/.github/workflows/tests.yaml
+index e508d08..871bb40 100644
+--- a/.github/workflows/tests.yaml
++++ b/.github/workflows/tests.yaml
+@@ -22,7 +22,7 @@ jobs:
+           - {name: '2.7', python: '2.7', os: ubuntu-16.04, tox: py27}
+     services:
+       postfix:
+-        image: juanluisbaptiste/postfix
++        image: lavr/docker-postfix
+         env:
+           SMTP_SERVER: smtp.gmail.com
+           SMTP_PORT: 587
+@@ -53,11 +53,13 @@ jobs:
+       - name: run rests
+         env:
+           SMTP_TEST_SUBJECT_SUFFIX: "github-actions sha:${{ github.sha }} run_id:${{ github.run_id }}"
++          SMTP_TEST_MAIL_FROM: python-emails-tests@lavr.me
++          SMTP_TEST_MAIL_TO: python-emails-tests@lavr.me
+           SMTP_TEST_SETS: LOCAL
+-          SMTP_TEST_LOCAL_TO: python-emails-tests@lavr.me
+           SMTP_TEST_LOCAL_WITHOUT_TLS: true
+           SMTP_TEST_LOCAL_HOST: 127.0.0.1
+           SMTP_TEST_LOCAL_PORT: 2525
++
+           SMTP_TEST_GMAIL_TO: python-emails-tests@lavr.me
+           SMTP_TEST_GMAIL_USER: ${{ secrets.SMTP_TEST_GMAIL_USER }}
+           SMTP_TEST_GMAIL_PASSWORD: ${{ secrets.SMTP_TEST_GMAIL_PASSWORD }}
+diff --git a/emails/testsuite/message/helpers.py b/emails/testsuite/message/helpers.py
+index 6fe2144..9050bce 100644
+--- a/emails/testsuite/message/helpers.py
++++ b/emails/testsuite/message/helpers.py
+@@ -5,10 +5,11 @@ import os
+ import emails
+ from emails.template import JinjaTemplate
+ 
+-TO_EMAIL = os.environ.get('TEST_TO_EMAIL') or 'python.emails.test.2@yandex.ru'
+-FROM_EMAIL = os.environ.get('TEST_FROM_EMAIL') or 'python-emails@lavr.me'
++TO_EMAIL = os.environ.get('SMTP_TEST_MAIL_TO') or 'python.emails.test.2@yandex.ru'
++FROM_EMAIL = os.environ.get('SMTP_TEST_MAIL_FROM') or 'python-emails@lavr.me'
+ ROOT = os.path.dirname(__file__)
+ 
++
+ def common_email_data(**kw):
+     T = JinjaTemplate
+     data = {'charset': 'utf-8',
+diff --git a/emails/testsuite/message/test_message.py b/emails/testsuite/message/test_message.py
+index 55a838d..51fead3 100644
+--- a/emails/testsuite/message/test_message.py
++++ b/emails/testsuite/message/test_message.py
+@@ -147,6 +147,13 @@ def test_message_addresses():
+     assert m.mail_to == [("웃", "b@c.d"), (None, "e@f.g")]
+ 
+ 
++def test_rfc6532_address():
++    m = Message()
++    m.mail_to = "anaïs@example.com"
++    m.html = 'X'
++    assert m.as_string()
++
++
+ def test_message_policy():
+ 
+     if is_py34_plus:
+diff --git a/emails/testsuite/message/test_send.py b/emails/testsuite/message/test_send.py
+index 2493211..d3be34b 100644
+--- a/emails/testsuite/message/test_send.py
++++ b/emails/testsuite/message/test_send.py
+@@ -26,6 +26,9 @@ def get_letters():
+     del data['html']
+     yield emails.loader.from_url(url=url, message_params=data, images_inline=True), None
+ 
++    # Email with utf-8 "to"
++    yield emails.Message(**common_email_data(mail_to="anaïs@lavr.me", subject="UTF-8 To")), None
++
+ 
+ def test_send_letters():
+ 
+@@ -33,10 +36,9 @@ def test_send_letters():
+         for tag, server in get_servers():
+             server.patch_message(m)
+             print(tag, server.params)
+-            response = m.send(smtp=server.params, render=render)
+-            print(server.params)
+-            assert response.success or response.status_code in (421, 451)  # gmail not always like test emails
+-            server.sleep()
++            response = m.send(smtp=server.params, render=render, smtp_mail_options=['smtputf8'])
++            assert response.success
++            # server.sleep()
+ 
+ 
+ def test_send_with_context_manager():
+diff --git a/emails/testsuite/smtp_servers.py b/emails/testsuite/smtp_servers.py
+index ba6e981..4b0afd2 100644
+--- a/emails/testsuite/smtp_servers.py
++++ b/emails/testsuite/smtp_servers.py
+@@ -41,7 +41,7 @@ def smtp_server_from_env(name='GMAIL'):
+         return v
+ 
+     def _valid_smtp(data):
+-        return data['to_email'] and data['host']
++        return data['host']
+ 
+     smtp_info = dict(
+         from_email=_var("FROM", default=DEFAULT_FROM),

@@ -1,0 +1,93 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 506e985..861d321 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -1,3 +1,8 @@
++v3.1.0
++=======
++
++* fix #297 - correct the invocation in version_from_scm and deprecate it as its exposed by accident
++
+ v3.0.6
+ ======
+ * fix #295 - correctly handle selfinstall from tarballs
+diff --git a/src/setuptools_scm/__init__.py b/src/setuptools_scm/__init__.py
+index 49c0c4b..72b7b22 100644
+--- a/src/setuptools_scm/__init__.py
++++ b/src/setuptools_scm/__init__.py
+@@ -24,8 +24,14 @@ version = {version!r}
+ 
+ 
+ def version_from_scm(root):
++    warnings.warn(
++        "version_from_scm is deprecated please use get_version",
++        category=DeprecationWarning,
++    )
++    config = Configuration()
++    config.root = root
+     # TODO: Is it API?
+-    return _version_from_entrypoint(root, "setuptools_scm.parse_scm")
++    return _version_from_entrypoint(config, "setuptools_scm.parse_scm")
+ 
+ 
+ def _call_entrypoint_fn(config, fn):
+diff --git a/src/setuptools_scm/file_finder_git.py b/src/setuptools_scm/file_finder_git.py
+index d886d06..b7b55ed 100644
+--- a/src/setuptools_scm/file_finder_git.py
++++ b/src/setuptools_scm/file_finder_git.py
+@@ -1,8 +1,11 @@
+ import os
+ import subprocess
+ import tarfile
+-
++import logging
+ from .file_finder import scm_find_files
++from .utils import trace
++
++log = logging.getLogger(__name__)
+ 
+ 
+ def _git_toplevel(path):
+@@ -14,6 +17,7 @@ def _git_toplevel(path):
+                 universal_newlines=True,
+                 stderr=devnull,
+             )
++        trace("find files toplevel", out)
+         return os.path.normcase(os.path.realpath(out.strip()))
+     except subprocess.CalledProcessError:
+         # git returned error, we are not in a git repo
+@@ -23,12 +27,8 @@ def _git_toplevel(path):
+         return None
+ 
+ 
+-def _git_ls_files_and_dirs(toplevel):
+-    # use git archive instead of git ls-file to honor
+-    # export-ignore git attribute
+-    cmd = ["git", "archive", "--prefix", toplevel + os.path.sep, "HEAD"]
+-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=toplevel)
+-    tf = tarfile.open(fileobj=proc.stdout, mode="r|*")
++def _git_interpret_archive(fd, toplevel):
++    tf = tarfile.open(fileobj=fd, mode="r|*")
+     git_files = set()
+     git_dirs = {toplevel}
+     for member in tf.getmembers():
+@@ -40,6 +40,19 @@ def _git_ls_files_and_dirs(toplevel):
+     return git_files, git_dirs
+ 
+ 
++def _git_ls_files_and_dirs(toplevel):
++    # use git archive instead of git ls-file to honor
++    # export-ignore git attribute
++    cmd = ["git", "archive", "--prefix", toplevel + os.path.sep, "HEAD"]
++    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=toplevel)
++    try:
++        return _git_interpret_archive(proc.stdout, toplevel)
++    except Exception:
++        if proc.wait() != 0:
++            log.exception("listing git files failed - pretending there aren't any")
++        return (), ()
++
++
+ def git_find_files(path=""):
+     toplevel = _git_toplevel(path)
+     if not toplevel:

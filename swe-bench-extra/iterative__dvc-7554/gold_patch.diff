@@ -1,0 +1,106 @@
+diff --git a/dvc/external_repo.py b/dvc/external_repo.py
+--- a/dvc/external_repo.py
++++ b/dvc/external_repo.py
+@@ -3,7 +3,7 @@
+ import tempfile
+ import threading
+ from contextlib import contextmanager
+-from typing import Dict
++from typing import TYPE_CHECKING, Dict
+ 
+ from funcy import retry, wrap_with
+ 
+@@ -19,6 +19,9 @@
+ from dvc.scm import CloneError, map_scm_exception
+ from dvc.utils import relpath
+ 
++if TYPE_CHECKING:
++    from scmrepo import Git
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -201,14 +204,12 @@ def _clone_default_branch(url, rev, for_write=False):
+                     # given repo URL it is easier/safer for us to work with
+                     # full clones in this case.
+                     logger.debug("erepo: unshallowing clone for '%s'", url)
+-                    git.fetch(unshallow=True)
+-                    _merge_upstream(git)
++                    _pull(git, unshallow=True)
+                     shallow = False
+                     CLONES[url] = (clone_path, shallow)
+                 else:
+                     logger.debug("erepo: git pull '%s'", url)
+-                    git.fetch()
+-                    _merge_upstream(git)
++                    _pull(git)
+         else:
+             from dvc.scm import clone
+ 
+@@ -227,7 +228,9 @@ def _clone_default_branch(url, rev, for_write=False):
+                             "erepo: using shallow clone for branch '%s'", rev
+                         )
+                 except CloneError:
+-                    pass
++                    git_dir = os.path.join(clone_path, ".git")
++                    if os.path.exists(git_dir):
++                        _remove(git_dir)
+             if not git:
+                 git = clone(url, clone_path)
+                 shallow = False
+@@ -239,7 +242,15 @@ def _clone_default_branch(url, rev, for_write=False):
+     return clone_path, shallow
+ 
+ 
+-def _merge_upstream(git):
++def _pull(git: "Git", unshallow: bool = False):
++    from dvc.repo.experiments.utils import fetch_all_exps
++
++    git.fetch(unshallow=unshallow)
++    _merge_upstream(git)
++    fetch_all_exps(git, "origin")
++
++
++def _merge_upstream(git: "Git"):
+     from scmrepo.exceptions import SCMError
+ 
+     try:
+diff --git a/dvc/repo/experiments/utils.py b/dvc/repo/experiments/utils.py
+--- a/dvc/repo/experiments/utils.py
++++ b/dvc/repo/experiments/utils.py
+@@ -191,3 +191,16 @@ def check_ref_format(scm: "Git", ref: ExpRefInfo):
+             f"Invalid exp name {ref.name}, the exp name must follow rules in "
+             "https://git-scm.com/docs/git-check-ref-format"
+         )
++
++
++def fetch_all_exps(scm: "Git", url: str, progress: Optional[Callable] = None):
++    refspecs = [
++        f"{ref}:{ref}"
++        for ref in iter_remote_refs(scm, url, base=EXPS_NAMESPACE)
++        if not (ref.startswith(EXEC_NAMESPACE) or ref == EXPS_STASH)
++    ]
++    scm.fetch_refspecs(
++        url,
++        refspecs,
++        progress=progress,
++    )
+diff --git a/dvc/scm.py b/dvc/scm.py
+--- a/dvc/scm.py
++++ b/dvc/scm.py
+@@ -101,9 +101,14 @@ def update_git(self, event: "GitProgressEvent") -> None:
+ def clone(url: str, to_path: str, **kwargs):
+     from scmrepo.exceptions import CloneError as InternalCloneError
+ 
++    from dvc.repo.experiments.utils import fetch_all_exps
++
+     with TqdmGit(desc="Cloning") as pbar:
+         try:
+-            return Git.clone(url, to_path, progress=pbar.update_git, **kwargs)
++            git = Git.clone(url, to_path, progress=pbar.update_git, **kwargs)
++            if "shallow_branch" not in kwargs:
++                fetch_all_exps(git, "origin", progress=pbar.update_git)
++            return git
+         except InternalCloneError as exc:
+             raise CloneError(str(exc))
+ 

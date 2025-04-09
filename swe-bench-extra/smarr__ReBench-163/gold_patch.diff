@@ -1,0 +1,172 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index e155817..9455a1d 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -54,7 +54,7 @@ jobs:
+         run: |
+           pip install pylint
+           pylint rebench
+-        if: startsWith(matrix.python-version, '3.')
++        if: matrix.python-version == '3.9'
+ 
+       - name: Upload coverage results to Coveralls
+         run: coveralls
+diff --git a/rebench/environment.py b/rebench/environment.py
+index 7c9775b..54f0b41 100644
+--- a/rebench/environment.py
++++ b/rebench/environment.py
+@@ -33,14 +33,17 @@ def _exec(cmd):
+ _source = None
+ 
+ 
+-def determine_source_details():
++def determine_source_details(configurator):
+     global _source  # pylint: disable=global-statement
+     if _source:
+         return _source
+ 
+     result = {}
++    git_cmd = ['git']
++    if configurator and configurator.options and configurator.options.git_repo:
++        git_cmd += ['-C', configurator.options.git_repo]
+ 
+-    is_git_repo = _exec(['git', 'rev-parse']) is not None
++    is_git_repo = _exec(git_cmd + ['rev-parse']) is not None
+     if not is_git_repo:
+         result['repoURL'] = None
+         result['branchOrTag'] = None
+@@ -53,7 +56,7 @@ def determine_source_details():
+         _source = result
+         return result
+ 
+-    repo_url = _exec(['git', 'ls-remote', '--get-url']) if is_git_repo else None
++    repo_url = _exec(git_cmd + ['ls-remote', '--get-url']) if is_git_repo else None
+     if repo_url is None:
+         repo_url = ''
+ 
+@@ -64,13 +67,13 @@ def determine_source_details():
+             netloc="{}@{}".format(parsed.username, parsed.hostname))
+     result['repoURL'] = _encode_str(parsed.geturl())
+ 
+-    result['branchOrTag'] = _exec(['git', 'show', '-s', '--format=%D', 'HEAD'])
+-    result['commitId'] = _exec(['git', 'rev-parse', 'HEAD'])
+-    result['commitMsg'] = _exec(['git', 'show', '-s', '--format=%B', 'HEAD'])
+-    result['authorName'] = _exec(['git', 'show', '-s', '--format=%aN', 'HEAD'])
+-    result['committerName'] = _exec(['git', 'show', '-s', '--format=%cN', 'HEAD'])
+-    result['authorEmail'] = _exec(['git', 'show', '-s', '--format=%aE', 'HEAD'])
+-    result['committerEmail'] = _exec(['git', 'show', '-s', '--format=%cE', 'HEAD'])
++    result['branchOrTag'] = _exec(git_cmd + ['show', '-s', '--format=%D', 'HEAD'])
++    result['commitId'] = _exec(git_cmd + ['rev-parse', 'HEAD'])
++    result['commitMsg'] = _exec(git_cmd + ['show', '-s', '--format=%B', 'HEAD'])
++    result['authorName'] = _exec(git_cmd + ['show', '-s', '--format=%aN', 'HEAD'])
++    result['committerName'] = _exec(git_cmd + ['show', '-s', '--format=%cN', 'HEAD'])
++    result['authorEmail'] = _exec(git_cmd + ['show', '-s', '--format=%aE', 'HEAD'])
++    result['committerEmail'] = _exec(git_cmd + ['show', '-s', '--format=%cE', 'HEAD'])
+ 
+     _source = result
+     return result
+diff --git a/rebench/persistence.py b/rebench/persistence.py
+index e736e5a..bfb37b7 100644
+--- a/rebench/persistence.py
++++ b/rebench/persistence.py
+@@ -50,18 +50,23 @@ class DataStore(object):
+ 
+     def get(self, filename, configurator):
+         if filename not in self._files:
+-            source = determine_source_details()
++            source = determine_source_details(configurator)
++            if configurator.use_rebench_db and source['commitId'] is None:
++                raise UIError("Reporting to ReBenchDB is enabled, "
++                              + "but failed to obtain source details. "
++                              + "If ReBench is run outside of the relevant repo "
++                              + "set the path with --git-repo", None)
+             if configurator.use_rebench_db and 'repo_url' in configurator.rebench_db:
+                 source['repoURL'] = configurator.rebench_db['repo_url']
+ 
+             if configurator.options and configurator.options.branch:
+                 source['branchOrTag'] = configurator.options.branch
+ 
+-            p = _FilePersistence(filename, self, configurator.discard_old_data, self._ui)
++            p = _FilePersistence(filename, self, configurator, self._ui)
+             self._ui.debug_output_info('ReBenchDB enabled: {e}\n', e=configurator.use_rebench_db)
+ 
+             if configurator.use_rebench_db:
+-                db = _ReBenchDB(configurator.get_rebench_db_connector(), self, self._ui)
++                db = _ReBenchDB(configurator, self, self._ui)
+                 p = _CompositePersistence(p, db)
+ 
+             self._files[filename] = p
+@@ -165,7 +170,7 @@ class _CompositePersistence(_AbstractPersistence):
+ 
+ class _FilePersistence(_ConcretePersistence):
+ 
+-    def __init__(self, data_filename, data_store, discard_old_data, ui):
++    def __init__(self, data_filename, data_store, configurator, ui):
+         super(_FilePersistence, self).__init__(data_store, ui)
+         if not data_filename:
+             raise ValueError("DataPointPersistence expects a filename " +
+@@ -173,13 +178,15 @@ class _FilePersistence(_ConcretePersistence):
+ 
+         self._data_filename = data_filename
+         self._file = None
+-        if discard_old_data:
++        if configurator.discard_old_data:
+             self._discard_old_data()
+         self._lock = Lock()
+         self._read_start_time()
+         if not self._start_time:
+             self._start_time = get_current_time()
+ 
++        self._configurator = configurator
++
+     def _discard_old_data(self):
+         self._truncate_file(self._data_filename)
+ 
+@@ -294,7 +301,8 @@ class _FilePersistence(_ConcretePersistence):
+         shebang_line = "#!%s\n" % (subprocess.list2cmdline(sys.argv))
+         shebang_line += _START_TIME_LINE + self._start_time + "\n"
+         shebang_line += "# Environment: " + json.dumps(determine_environment()) + "\n"
+-        shebang_line += "# Source: " + json.dumps(determine_source_details()) + "\n"
++        shebang_line += "# Source: " + json.dumps(
++            determine_source_details(self._configurator)) + "\n"
+ 
+         try:
+             # pylint: disable-next=unspecified-encoding,consider-using-with
+@@ -339,10 +347,11 @@ class _FilePersistence(_ConcretePersistence):
+ 
+ class _ReBenchDB(_ConcretePersistence):
+ 
+-    def __init__(self, rebench_db, data_store, ui):
++    def __init__(self, configurator, data_store, ui):
+         super(_ReBenchDB, self).__init__(data_store, ui)
+         # TODO: extract common code, possibly
+-        self._rebench_db = rebench_db
++        self._configurator = configurator
++        self._rebench_db = configurator.get_rebench_db_connector()
+ 
+         self._lock = Lock()
+ 
+@@ -406,7 +415,7 @@ class _ReBenchDB(_ConcretePersistence):
+             'criteria': criteria_index,
+             'env': determine_environment(),
+             'startTime': self._start_time,
+-            'source': determine_source_details()}, num_measurements)
++            'source': determine_source_details(self._configurator)}, num_measurements)
+ 
+     def close(self):
+         with self._lock:
+diff --git a/rebench/rebench.py b/rebench/rebench.py
+index 462e00e..0d7fcb9 100755
+--- a/rebench/rebench.py
++++ b/rebench/rebench.py
+@@ -178,6 +178,10 @@ Argument:
+                                default=True,
+                                help='Override configuration and '
+                                     'disable any reporting to Codespeed and ReBenchDB.')
++        codespeed.add_argument('--git-repo', dest='git_repo', default=None,
++                               help='Path to the git repository with the source for the ' +
++                                    'experiment. This is useful when the experiment is run ' +
++                                    'from a different location, for instance a RAM disk, or tmpfs.')
+ 
+         rebench_db = parser.add_argument_group(
+             'Reporting to ReBenchDB',

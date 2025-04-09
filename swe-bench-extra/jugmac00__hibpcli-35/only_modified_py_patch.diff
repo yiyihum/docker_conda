@@ -1,0 +1,101 @@
+diff --git a/hibpcli/cli.py b/hibpcli/cli.py
+index d82084e..41240b5 100644
+--- a/hibpcli/cli.py
++++ b/hibpcli/cli.py
+@@ -1,5 +1,6 @@
+ import click
+ 
++from hibpcli.exceptions import ApiError
+ from hibpcli.keepass import check_passwords_from_db
+ from hibpcli.password import Password
+ 
+@@ -23,29 +24,36 @@ def keepass(path, password):
+          password = click.prompt(
+             "Please enter the master password for the database", hide_input=True
+         )
+-    # needs error handling
+-    rv = check_passwords_from_db(path=path, master_password=password)
+-    if rv:
+-        click.echo("The passwords of following entries are leaked:")
+-        click.echo(rv)
++    try:
++        rv = check_passwords_from_db(path=path, master_password=password)
++    except ApiError as e:
++        click.echo(str(e))
+     else:
+-        click.echo("Hooray, everything is safe!")
++        if rv:
++            click.echo("The passwords of following entries are leaked:")
++            click.echo(rv)
++        else:
++            click.echo("Hooray, everything is safe!")
+ 
+ 
+ @click.command()
+ @click.option('--password', default=None, help='Password which should be checked.')
+ def password(password):
+     """Check a single password."""
+-    #breakpoint()
+     if password is None:
+          password = click.prompt(
+             "Please enter a password which should be checked", hide_input=True
+         )
+     p = Password(password)
+-    if p.is_leaked():
+-        click.echo("Please change your password!")
++    try:
++        is_leaked = p.is_leaked()
++    except ApiError as e:
++        click.echo(str(e))
+     else:
+-        click.echo("Your password is safe!")
++        if is_leaked:
++            click.echo("Please change your password!")
++        else:
++            click.echo("Your password is safe!")
+ 
+ main.add_command(keepass)
+ main.add_command(password)
+diff --git a/hibpcli/password.py b/hibpcli/password.py
+index 52aec95..5b9ce80 100644
+--- a/hibpcli/password.py
++++ b/hibpcli/password.py
+@@ -1,5 +1,8 @@
+ import hashlib
+ import httpx
++import socket
++
++from hibpcli.exceptions import ApiError
+ 
+ 
+ class Password:
+@@ -9,15 +12,19 @@ class Password:
+     def is_leaked(self):
+         hex_digest = self._generate_hash()
+         first_hash_part, second_hash_part = hex_digest[:5], hex_digest[5:]
+-        result = httpx.get(
+-            f"https://api.pwnedpasswords.com/range/{first_hash_part}"
+-        ).text
+-        # the result is text with entries split by new line
+-        # one entry consists of the rest of the hash and count of
+-        # leak, separated by a colon
+-        # cut off string - information after the hash is of no interest
+-        partial_hash_list = [line[:35] for line in result.splitlines()]
+-        return second_hash_part in partial_hash_list
++        try:
++            result = httpx.get(
++                f"https://api.pwnedpasswords.com/range/{first_hash_part}"
++            ).text
++        except socket.gaierror as e:
++            raise ApiError("Error: Could not get a result from the API.")
++        else:
++            # the result is text with entries split by new line
++            # one entry consists of the rest of the hash and count of
++            # leak, separated by a colon
++            # cut off string - information after the hash is of no interest
++            partial_hash_list = [line[:35] for line in result.splitlines()]
++            return second_hash_part in partial_hash_list
+ 
+     def _generate_hash(self):
+         hash_object = hashlib.sha1(bytes(self.password, "UTF-8"))
+

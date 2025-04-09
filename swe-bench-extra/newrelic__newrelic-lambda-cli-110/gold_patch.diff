@@ -1,0 +1,105 @@
+diff --git a/README.md b/README.md
+index f386693..99329ca 100644
+--- a/README.md
++++ b/README.md
+@@ -154,6 +154,7 @@ newrelic-lambda layers install \
+ | `--exclude` or `-e` | No | A function name to exclude while installing layers. Can provide multiple `--exclude` arguments. Only checked when `all`, `installed` and `not-installed` are used. See `newrelic-lambda functions list` for function names. |
+ | `--layer-arn` or `-l` | No | Specify a specific layer version ARN to use. This is auto detected by default. |
+ | `--upgrade` or `-u` | No | Permit upgrade to the latest layer version for this region and runtime. |
++| `--enable-extension` or `-x` | No | Enable the [New Relic Lambda Extension](https://github.com/newrelic/newrelic-lambda-extension). |
+ | `--aws-profile` or `-p` | No | The AWS profile to use for this command. Can also use `AWS_PROFILE`. Will also check `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables if not using AWS CLI. |
+ | `--aws-region` or `-r` | No | The AWS region this function is located. Can use `AWS_DEFAULT_REGION` environment variable. Defaults to AWS session region. |
+ 
+diff --git a/newrelic_lambda_cli/cli/layers.py b/newrelic_lambda_cli/cli/layers.py
+index 9807f0e..7a8ab3f 100644
+--- a/newrelic_lambda_cli/cli/layers.py
++++ b/newrelic_lambda_cli/cli/layers.py
+@@ -63,6 +63,12 @@ def register(group):
+     help="Permit upgrade of function layers to new version.",
+     is_flag=True,
+ )
++@click.option(
++    "--enable-extension",
++    "-x",
++    help="Enable the New Relic Lambda Extension",
++    is_flag=True,
++)
+ @click.pass_context
+ def install(
+     ctx,
+@@ -74,6 +80,7 @@ def install(
+     excludes,
+     layer_arn,
+     upgrade,
++    enable_extension,
+ ):
+     """Install New Relic AWS Lambda Layers"""
+     session = boto3.Session(profile_name=aws_profile, region_name=aws_region)
+@@ -92,6 +99,7 @@ def install(
+                 layer_arn,
+                 nr_account_id,
+                 upgrade,
++                enable_extension,
+                 ctx.obj["VERBOSE"],
+             )
+             for function in functions
+diff --git a/newrelic_lambda_cli/layers.py b/newrelic_lambda_cli/layers.py
+index ce3d47a..9215a24 100644
+--- a/newrelic_lambda_cli/layers.py
++++ b/newrelic_lambda_cli/layers.py
+@@ -19,7 +19,9 @@ def index(region, runtime):
+     return layers_response.get("Layers", [])
+ 
+ 
+-def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
++def _add_new_relic(
++    config, region, layer_arn, account_id, allow_upgrade, enable_extension
++):
+     runtime = config["Configuration"]["Runtime"]
+     if runtime not in utils.RUNTIME_CONFIG:
+         failure(
+@@ -36,7 +38,7 @@ def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
+             "upgrade or reinstall to latest layer version."
+             % config["Configuration"]["FunctionArn"]
+         )
+-        return False
++        return True
+ 
+     existing_layers = [
+         layer["Arn"]
+@@ -96,10 +98,23 @@ def _add_new_relic(config, region, layer_arn, account_id, allow_upgrade):
+     if handler != runtime_handler:
+         update_kwargs["Environment"]["Variables"]["NEW_RELIC_LAMBDA_HANDLER"] = handler
+ 
++    if enable_extension:
++        update_kwargs["Environment"]["Variables"][
++            "NEW_RELIC_LAMBDA_EXTENSION_ENABLED"
++        ] = "true"
++
+     return update_kwargs
+ 
+ 
+-def install(session, function_arn, layer_arn, account_id, allow_upgrade, verbose):
++def install(
++    session,
++    function_arn,
++    layer_arn,
++    account_id,
++    allow_upgrade,
++    enable_extension,
++    verbose,
++):
+     client = session.client("lambda")
+     config = get_function(session, function_arn)
+     if not config:
+@@ -108,7 +123,9 @@ def install(session, function_arn, layer_arn, account_id, allow_upgrade, verbose
+ 
+     region = session.region_name
+ 
+-    update_kwargs = _add_new_relic(config, region, layer_arn, account_id, allow_upgrade)
++    update_kwargs = _add_new_relic(
++        config, region, layer_arn, account_id, allow_upgrade, enable_extension
++    )
+     if not update_kwargs:
+         return False
+ 

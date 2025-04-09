@@ -1,0 +1,126 @@
+diff --git a/pybryt/cli.py b/pybryt/cli.py
+index 88981fe..2920198 100644
+--- a/pybryt/cli.py
++++ b/pybryt/cli.py
+@@ -101,8 +101,10 @@ def check(ref, stu, name, output_nb, output, output_type):
+               help="Execute notebooks in parallel using the multiprocessing library")
+ @click.option("-o", "--output", default=None, type=click.Path(), 
+               help="Path at which to write the pickled student implementation")
++@click.option("--timeout", default=1200, type=click.INT, 
++              help="Timeout for notebook execution in seconds")
+ @click.argument("subm", nargs=-1, type=click.Path(exists=True, dir_okay=False))
+-def execute(subm, parallel, output):
++def execute(subm, parallel, output, timeout):
+     """
+     Execute student submissions to generate memory footprints.
+ 
+@@ -113,7 +115,7 @@ def execute(subm, parallel, output):
+     if len(subm) == 0:
+         raise ValueError("You must specify at least one notebook to execute")
+ 
+-    stus = generate_student_impls(subm, parallel=parallel)
++    stus = generate_student_impls(subm, parallel=parallel, timeout=timeout)
+ 
+     if output is None:
+             output = "./"
+diff --git a/pybryt/execution/__init__.py b/pybryt/execution/__init__.py
+index 4ab61aa..1dbb26d 100644
+--- a/pybryt/execution/__init__.py
++++ b/pybryt/execution/__init__.py
+@@ -24,8 +24,8 @@ NBFORMAT_VERSION = 4
+ 
+ 
+ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: List[str] = [], 
+-        output: Optional[str] = None) -> Tuple[int, List[Tuple[Any, int]], List[Tuple[str, str]], \
+-        nbformat.NotebookNode]:
++        output: Optional[str] = None, timeout: Optional[int] = 1200) -> Tuple[int, List[Tuple[Any, \
++        int]], List[Tuple[str, str]], nbformat.NotebookNode]:
+     """
+     Executes a submission using ``nbconvert`` and returns the memory footprint.
+ 
+@@ -40,6 +40,8 @@ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: Li
+         nb_path (``str``): path to the notebook ``nb``
+         addl_filenames (``list[str]``, optional): a list of additional files to trace inside
+         output (``str``, optional): a file path at which to write the executed notebook
++        timeout (``int``, optional): number of seconds to allow for notebook execution; set to 
++            ``None`` for no time limit
+ 
+     Returns:
+         ``tuple[int, list[tuple[object, int]], list[tuple[str, str]], nbformat.NotebookNode]``: the 
+@@ -56,15 +58,16 @@ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: Li
+ 
+     first_cell = nbformat.v4.new_code_cell(dedent(f"""\
+         import sys
+-        from pybryt.execution import create_collector
++        from pybryt.execution import create_collector, tracing_on
+         cir_results_{secret}, cir = create_collector(addl_filenames={addl_filenames})
+-        sys.settrace(cir)
+         {TRACING_VARNAME} = True
++        tracing_on(tracing_func=cir)
+         %cd {nb_dir}
+     """))
+ 
+     last_cell = nbformat.v4.new_code_cell(dedent(f"""\
+-        sys.settrace(None)
++        from pybryt.execution import tracing_off
++        tracing_off()
+         import dill
+         from pybryt.utils import filter_picklable_list
+         filter_picklable_list(cir_results_{secret}[0])
+@@ -75,7 +78,7 @@ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: Li
+     nb['cells'].insert(0, first_cell)
+     nb['cells'].append(last_cell)
+ 
+-    ep = ExecutePreprocessor(timeout=1200, allow_errors=True)
++    ep = ExecutePreprocessor(timeout=timeout, allow_errors=True)
+ 
+     ep.preprocess(nb)
+ 
+diff --git a/pybryt/student.py b/pybryt/student.py
+index 456a839..4c5748d 100644
+--- a/pybryt/student.py
++++ b/pybryt/student.py
+@@ -38,6 +38,8 @@ class StudentImplementation(Serializable):
+         addl_filenames (``list[str]``, optional): additional filenames to trace inside during 
+             execution
+         output (``str``, optional): a path at which to write executed notebook
++        timeout (``int``, optional): number of seconds to allow for notebook execution; set to 
++            ``None`` for no time limit
+     """
+ 
+     nb: Optional[nbformat.NotebookNode]
+@@ -60,7 +62,7 @@ class StudentImplementation(Serializable):
+ 
+     def __init__(
+         self, path_or_nb: Optional[Union[str, nbformat.NotebookNode]], addl_filenames: List[str] = [],
+-        output: Optional[str] = None
++        output: Optional[str] = None, timeout: Optional[int] = 1200,
+     ):
+         self.executed_nb = None
+         if path_or_nb is None:
+@@ -76,19 +78,21 @@ class StudentImplementation(Serializable):
+         else:
+             raise TypeError(f"path_or_nb is of unsupported type {type(path_or_nb)}")
+ 
+-        self._execute(addl_filenames=addl_filenames, output=output)
++        self._execute(timeout, addl_filenames=addl_filenames, output=output)
+ 
+-    def _execute(self, addl_filenames: List[str] = [], output: Optional[str] = None) -> NoReturn:
++    def _execute(self, timeout: Optional[int], addl_filenames: List[str] = [], output: Optional[str] = None) -> NoReturn:
+         """
+         Executes the notebook ``self.nb``.
+ 
+         Args:
++            timeout (``int``): number of seconds to allow for notebook execution; set to 
++                ``None`` for no time limit
+             addl_filenames (``list[str]``, optional): additional filenames to trace inside during 
+                 execution
+             output (``str``, optional): a path at which to write executed notebook
+         """
+         self.steps, self.values, self.calls, self.executed_nb = execute_notebook(
+-            self.nb, self.nb_path, addl_filenames=addl_filenames, output=output
++            self.nb, self.nb_path, addl_filenames=addl_filenames, output=output, timeout=timeout,
+         )
+ 
+         if self.errors:
+

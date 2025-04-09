@@ -1,0 +1,86 @@
+diff --git a/pynubank/exception.py b/pynubank/exception.py
+index 4326696..c5bc410 100644
+--- a/pynubank/exception.py
++++ b/pynubank/exception.py
+@@ -7,6 +7,11 @@ class NuException(Exception):
+         super().__init__(message)
+ 
+ 
++class NuMissingCreditCard(NuException):
++    def __init__(self):
++        super().__init__(f'Couldn\'t fetch bills due to missing credit card.')
++
++
+ class NuRequestException(NuException):
+     def __init__(self, response: Response):
+         super().__init__(f'The request made failed with HTTP status code {response.status_code}')
+diff --git a/pynubank/nubank.py b/pynubank/nubank.py
+index 4ed2338..f83fd98 100644
+--- a/pynubank/nubank.py
++++ b/pynubank/nubank.py
+@@ -6,6 +6,7 @@ from qrcode import QRCode
+ from pynubank.utils.discovery import Discovery
+ from pynubank.utils.http import HttpClient
+ from pynubank.utils.graphql import prepare_request_body
++from pynubank.exception import NuMissingCreditCard
+ 
+ PAYMENT_EVENT_TYPES = (
+     'TransferOutEvent',
+@@ -43,11 +44,23 @@ class Nubank:
+         }
+         return self.client.post(self.discovery.get_url('login'), json=payload)
+ 
++    def _find_url(self, known_keys: set, links: dict) -> str:
++            intersection = known_keys.intersection(links)
++            iterator = iter(intersection)
++            key = next(iterator, None)
++            return links.get(key, {}).get('href', None)
++
+     def _save_auth_data(self, auth_data: dict) -> None:
+         self.client.set_header('Authorization', f'Bearer {auth_data["access_token"]}')
+-        self.feed_url = auth_data['_links']['events']['href']
+-        self.query_url = auth_data['_links']['ghostflame']['href']
+-        self.bills_url = auth_data['_links']['bills_summary']['href']
++
++        links = auth_data['_links']
++        self.query_url = links['ghostflame']['href']
++
++        feed_url_keys = {'magnitude', 'events'}
++        bills_url_keys = {'bills_summary'}
++
++        self.feed_url = self._find_url(feed_url_keys, links)
++        self.bills_url = self._find_url(bills_url_keys, links)
+ 
+     def get_qr_code(self) -> Tuple[str, QRCode]:
+         content = str(uuid.uuid4())
+@@ -108,8 +121,11 @@ class Nubank:
+         return list(filter(lambda x: x['category'] == 'transaction', feed['events']))
+ 
+     def get_bills(self):
+-        request = self.client.get(self.bills_url)
+-        return request['bills']
++        if self.bills_url is not None:
++            request = self.client.get(self.bills_url)
++            return request['bills']
++        else:
++            raise NuMissingCreditCard
+ 
+     def get_bill_details(self, bill: dict):
+         return self.client.get(bill['_links']['self']['href'])
+diff --git a/pynubank/utils/mock_http.py b/pynubank/utils/mock_http.py
+index 19c5f30..b4ae558 100644
+--- a/pynubank/utils/mock_http.py
++++ b/pynubank/utils/mock_http.py
+@@ -33,6 +33,12 @@ class MockHttpClient(HttpClient):
+         self._results[('https://mocked-proxy-url/api/proxy/ghostflame_123',
+                        str(prepare_request_body('create_money_request')))] = self._read_data('money')
+ 
++    def add_mock_url(self, url: str, graphql_object: str, response_json_name: str):
++        self._results[(url, graphql_object)] = self._read_data(response_json_name)
++
++    def remove_mock_url(self, route: tuple):
++        del self._results[route]
++
+     def get(self, url: str) -> dict:
+         result = self._find(url)
+         if result is None:

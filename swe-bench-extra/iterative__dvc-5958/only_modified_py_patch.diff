@@ -1,0 +1,98 @@
+diff --git a/dvc/fs/azure.py b/dvc/fs/azure.py
+--- a/dvc/fs/azure.py
++++ b/dvc/fs/azure.py
+@@ -1,6 +1,8 @@
++import asyncio
+ import logging
+ import os
+ import threading
++from contextlib import contextmanager
+ 
+ from funcy import cached_property, wrap_prop
+ 
+@@ -19,6 +21,34 @@
+ )
+ 
+ 
++@contextmanager
++def _temp_event_loop():
++    """When trying to initalize azure filesystem instances
++    with DefaultCredentials, the authentication process requires
++    to have an access to a separate event loop. The normal calls
++    are run in a separate loop managed by the fsspec, but the
++    DefaultCredentials assumes that the callee is managing their
++    own event loop. This function checks whether is there any
++    event loop set, and if not it creates a temporary event loop
++    and set it. After the context is finalized, it restores the
++    original event loop back (if there is any)."""
++
++    try:
++        original_loop = asyncio.get_event_loop()
++    except RuntimeError:
++        original_loop = None
++
++    loop = original_loop or asyncio.new_event_loop()
++
++    try:
++        asyncio.set_event_loop(loop)
++        yield
++    finally:
++        if original_loop is None:
++            loop.close()
++        asyncio.set_event_loop(original_loop)
++
++
+ class AzureAuthError(DvcException):
+     pass
+ 
+@@ -120,11 +150,12 @@ def fs(self):
+         from azure.core.exceptions import AzureError
+ 
+         try:
+-            file_system = AzureBlobFileSystem(**self.fs_args)
+-            if self.bucket not in [
+-                container.rstrip("/") for container in file_system.ls("/")
+-            ]:
+-                file_system.mkdir(self.bucket)
++            with _temp_event_loop():
++                file_system = AzureBlobFileSystem(**self.fs_args)
++                if self.bucket not in [
++                    container.rstrip("/") for container in file_system.ls("/")
++                ]:
++                    file_system.mkdir(self.bucket)
+         except (ValueError, AzureError) as e:
+             raise AzureAuthError(
+                 f"Authentication to Azure Blob Storage via {self.login_method}"
+@@ -133,3 +164,9 @@ def fs(self):
+             ) from e
+ 
+         return file_system
++
++    def open(
++        self, path_info, mode="r", **kwargs
++    ):  # pylint: disable=arguments-differ
++        with _temp_event_loop():
++            return self.fs.open(self._with_bucket(path_info), mode=mode)
+diff --git a/dvc/logger.py b/dvc/logger.py
+--- a/dvc/logger.py
++++ b/dvc/logger.py
+@@ -196,7 +196,17 @@ def disable_other_loggers():
+ 
+ def setup(level=logging.INFO):
+     colorama.init()
+-    logging.getLogger("asyncio").setLevel(logging.CRITICAL)
++
++    if level >= logging.DEBUG:
++        # Unclosed session errors for asyncio/aiohttp are only available
++        # on the tracing mode for extensive debug purposes. They are really
++        # noisy, and this is potentially somewhere in the client library
++        # not managing their own session. Even though it is the best practice
++        # for them to do so, we can be assured that these errors raised when
++        # the object is getting deallocated, so no need to take any extensive
++        # action.
++        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
++        logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
+ 
+     addLoggingLevel("TRACE", logging.DEBUG - 5)
+     logging.config.dictConfig(
+

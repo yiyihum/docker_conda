@@ -1,0 +1,210 @@
+diff --git a/src/streamlink/plugins/pcyourfreetv.py b/src/streamlink/plugins/pcyourfreetv.py
+index 15dde489..968ac7d3 100644
+--- a/src/streamlink/plugins/pcyourfreetv.py
++++ b/src/streamlink/plugins/pcyourfreetv.py
+@@ -1,16 +1,18 @@
+ import re
+ 
++from streamlink.compat import parse_qsl, unquote
+ from streamlink.plugin import Plugin, PluginOptions
+ from streamlink.plugin.api import http
+ from streamlink.stream import HLSStream
+ 
+ 
+ class PCYourFreeTV(Plugin):
+-    LIVE_TV_URL = 'http://pc-yourfreetv.com/index_livetv.php?page_id=1'
++    LIVE_TV_URL = 'http://pc-yourfreetv.com/indexlivetv.php?page_id=1'
+ 
+     _login_url = 'http://pc-yourfreetv.com/home.php'
+-    _url_re = re.compile(r'http://pc-yourfreetv\.com/index_player\.php\?channel=.+?&page_id=\d+')
+-    _token_re = re.compile(r'\b(?P<token_key>auth_[0-9a-f]+)=(?P<token_value>[0-9a-f]+)\b')
++    _url_re = re.compile(r'http://pc-yourfreetv\.com/indexplayer\.php\?channel=.+?&page_id=\d+')
++    _token_re = re.compile(r'\bsrc="indexplayer\.php\?channel=.+?&(?P<tokens>.+?)"')
++    _player_re = re.compile(r"<script language=JavaScript>m='(?P<player>.+?)'", re.DOTALL)
+     _video_url_re = re.compile(r"jwplayer\('.+?'\)\.setup\({.+?file: \"(?P<video_url>[^\"]+?)\".+?}\);", re.DOTALL)
+ 
+     options = PluginOptions({
+@@ -51,14 +53,21 @@ class PCYourFreeTV(Plugin):
+         match = self._token_re.search(res.text)
+         if match is None:
+             return
+-        token_key = match.group('token_key')
+-        token_value = match.group('token_value')
+ 
+         # Retrieve URL page and search for stream data
+-        res = http.get(self.url, params={token_key: token_value})
+-        match = self._video_url_re.search(res.text)
++        res = http.get(self.url, params=parse_qsl(match.group('tokens')))
++        match = self._player_re.search(res.text)
+         if match is None:
+             return
++
++        while match is not None:
++            player = unquote(match.group('player'))
++            match = self._player_re.search(player)
++
++        match = self._video_url_re.search(player)
++        if match is None:
++            return
++
+         video_url = match.group('video_url')
+         if '.m3u8' in video_url:
+             streams = HLSStream.parse_variant_playlist(self.session, video_url)
+diff --git a/src/streamlink/plugins/showroom.py b/src/streamlink/plugins/showroom.py
+index 4618f07b..289e0074 100644
+--- a/src/streamlink/plugins/showroom.py
++++ b/src/streamlink/plugins/showroom.py
+@@ -2,7 +2,7 @@
+ import re
+ 
+ from streamlink.plugin import Plugin
+-from streamlink.plugin.api import http, validate
++from streamlink.plugin.api import http, validate, useragents
+ from streamlink.stream import RTMPStream
+ 
+ _url_re = re.compile(r'''^https?://
+@@ -74,11 +74,6 @@ _info_pages = set((
+ 
+ 
+ class Showroom(Plugin):
+-    @staticmethod
+-    def _get_stream_info(room_id):
+-        res = http.get(_api_data_url.format(room_id=room_id))
+-        return http.json(res, schema=_api_data_schema)
+-
+     @classmethod
+     def can_handle_url(cls, url):
+         match = _url_re.match(url)
+@@ -95,6 +90,10 @@ class Showroom(Plugin):
+ 
+     def __init__(self, url):
+         Plugin.__init__(self, url)
++        self._headers = {
++            'Referer': self.url,
++            'User-Agent': useragents.FIREFOX
++        }
+         self._room_id = None
+         self._info = None
+         self._title = None
+@@ -112,6 +111,10 @@ class Showroom(Plugin):
+             self._room_id = self._get_room_id()
+         return self._room_id
+ 
++    def _get_stream_info(self, room_id):
++        res = http.get(_api_data_url.format(room_id=room_id), headers=self._headers)
++        return http.json(res, schema=_api_data_schema)
++
+     def _get_room_id(self):
+         """
+         Locates unique identifier ("room_id") for the room.
+@@ -123,7 +126,7 @@ class Showroom(Plugin):
+         if match_dict['room_id'] is not None:
+             return match_dict['room_id']
+         else:
+-            res = http.get(self.url)
++            res = http.get(self.url, headers=self._headers)
+             match = _room_id_re.search(res.text)
+             if not match:
+                 title = self.url.rsplit('/', 1)[-1]
+diff --git a/src/streamlink/plugins/tvplayer.py b/src/streamlink/plugins/tvplayer.py
+index a7feeda7..13464272 100644
+--- a/src/streamlink/plugins/tvplayer.py
++++ b/src/streamlink/plugins/tvplayer.py
+@@ -8,25 +8,32 @@ from streamlink.stream import HLSStream
+ 
+ 
+ class TVPlayer(Plugin):
++    context_url = "http://tvplayer.com/watch/context"
+     api_url = "http://api.tvplayer.com/api/v2/stream/live"
+     login_url = "https://tvplayer.com/account/login"
+     update_url = "https://tvplayer.com/account/update-detail"
+     dummy_postcode = "SE1 9LT"  # location of ITV HQ in London
+ 
+     url_re = re.compile(r"https?://(?:www.)?tvplayer.com/(:?watch/?|watch/(.+)?)")
+-    stream_attrs_re = re.compile(r'var\s+(validate|platform|resourceId|token)\s+=\s*(.*?);', re.S)
++    stream_attrs_re = re.compile(r'data-(resource|token)\s*=\s*"(.*?)"', re.S)
+     login_token_re = re.compile(r'input.*?name="token".*?value="(\w+)"')
+     stream_schema = validate.Schema({
+         "tvplayer": validate.Schema({
+             "status": u'200 OK',
+             "response": validate.Schema({
+-                    "stream": validate.url(scheme=validate.any("http")),
+-                    validate.optional("drmToken"): validate.any(None, validate.text)
+-                })
++                "stream": validate.url(scheme=validate.any("http")),
++                validate.optional("drmToken"): validate.any(None, validate.text)
+             })
+-        },
++        })
++    },
+         validate.get("tvplayer"),
+         validate.get("response"))
++    context_schema = validate.Schema({
++        "validate": validate.text,
++        "platform": {
++            "key": validate.text
++        }
++    })
+     options = PluginOptions({
+         "email": None,
+         "password": None
+@@ -50,6 +57,21 @@ class TVPlayer(Plugin):
+         # there is a 302 redirect on a successful login
+         return res2.status_code == 302
+ 
++    def _get_stream_data(self, resource, token, service=1):
++        # Get the context info (validation token and platform)
++        context_res = http.get(self.context_url, params={"resource": resource,
++                                                         "nonce": token})
++        context_data = http.json(context_res, schema=self.context_schema)
++
++        # get the stream urls
++        res = http.post(self.api_url, data=dict(
++            service=service,
++            id=resource,
++            validate=context_data["validate"],
++            platform=context_data["platform"]["key"]))
++
++        return http.json(res, schema=self.stream_schema)
++
+     def _get_streams(self):
+         if self.get_option("email") and self.get_option("password"):
+             self.authenticate(self.get_option("email"), self.get_option("password"))
+@@ -67,25 +89,19 @@ class TVPlayer(Plugin):
+ 
+         stream_attrs = dict((k, v.strip('"')) for k, v in self.stream_attrs_re.findall(res.text))
+ 
+-        if "resourceId" in stream_attrs and "validate" in stream_attrs and "platform" in stream_attrs:
+-            # get the stream urls
+-            res = http.post(self.api_url, data=dict(
+-                service=1,
+-                id=stream_attrs["resourceId"],
+-                validate=stream_attrs["validate"],
+-                platform=stream_attrs["platform"],
+-                token=stream_attrs.get("token")))
+-
+-            stream_data = http.json(res, schema=self.stream_schema)
+-
+-            if stream_data.get("drmToken"):
+-                self.logger.error("This stream is protected by DRM can cannot be played")
+-                return
+-            else:
+-                return HLSStream.parse_variant_playlist(self.session, stream_data["stream"])
++        if "resource" in stream_attrs and "token" in stream_attrs:
++            stream_data = self._get_stream_data(**stream_attrs)
++
++            if stream_data:
++                if stream_data.get("drmToken"):
++                    self.logger.error("This stream is protected by DRM can cannot be played")
++                    return
++                else:
++                    return HLSStream.parse_variant_playlist(self.session, stream_data["stream"])
+         else:
+             if "need to login" in res.text:
+-                self.logger.error("You need to login using --tvplayer-email/--tvplayer-password to view this stream")
++                self.logger.error(
++                    "You need to login using --tvplayer-email/--tvplayer-password to view this stream")
+ 
+ 
+ __plugin__ = TVPlayer
+

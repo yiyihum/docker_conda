@@ -1,0 +1,163 @@
+diff --git a/.coveragerc b/.coveragerc
+new file mode 100644
+index 0000000..2301243
+--- /dev/null
++++ b/.coveragerc
+@@ -0,0 +1,3 @@
++[report]
++omit =
++    */tests/*
+diff --git a/.travis.yml b/.travis.yml
+index a4c4ae5..8511f0b 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -4,8 +4,9 @@ dist: bionic
+ 
+ # https://devguide.python.org/#branchstatus
+ python:
+-  - "3.6"
+-  - "3.7"
++  - 3.6
++  - 3.7
++  - 3.8
+ 
+ addons:
+   apt:
+@@ -13,18 +14,18 @@ addons:
+       - libgnutls28-dev
+ 
+ install:
+-  - pip install flake8 coverage
++  - pip install flake8 coverage coveralls
+   - python setup.py install
+ 
+ script:
+   - flake8 sentinel5dl
+   - coverage run --source=sentinel5dl -m tests
+-  - coverage report
+ 
+ after_success:
+   - pip install sphinx sphinx-rtd-theme
+   - make -C docs clean html
+   - touch docs/build/html/.nojekyll # create this file to prevent Github's Jekyll processing
++  - coveralls
+ 
+ deploy:
+   provider: pages
+diff --git a/README.rst b/README.rst
+index a5aed3e..47748ce 100644
+--- a/README.rst
++++ b/README.rst
+@@ -3,6 +3,10 @@ Sentinel-5P Downloader
+ 
+ .. image:: https://travis-ci.com/emissions-api/sentinel5dl.svg?branch=master
+     :target: https://travis-ci.com/emissions-api/sentinel5dl
++    :alt: CI Builds
++.. image:: https://coveralls.io/repos/github/emissions-api/sentinel5dl/badge.svg?branch=master
++    :target: https://coveralls.io/github/emissions-api/sentinel5dl?branch=master
++    :alt: Test Coverage
+ .. image:: https://img.shields.io/github/issues-raw/emissions-api/sentinel5dl?color=blue
+     :target: https://github.com/emissions-api/sentinel5dl/issues
+     :alt: GitHub issues
+diff --git a/docs/Makefile b/docs/Makefile
+index d0c3cbf..a4de0bf 100644
+--- a/docs/Makefile
++++ b/docs/Makefile
+@@ -3,7 +3,7 @@
+ 
+ # You can set these variables from the command line, and also
+ # from the environment for the first two.
+-SPHINXOPTS    ?=
++SPHINXOPTS    ?= -W
+ SPHINXBUILD   ?= sphinx-build
+ SOURCEDIR     = source
+ BUILDDIR      = build
+diff --git a/docs/source/index.rst b/docs/source/index.rst
+index 7d41c3d..5ead6ed 100644
+--- a/docs/source/index.rst
++++ b/docs/source/index.rst
+@@ -1,4 +1,4 @@
+-.. include:: ../../readme.rst
++.. include:: ../../README.rst
+ 
+ 
+ .. toctree::
+diff --git a/sentinel5dl/__init__.py b/sentinel5dl/__init__.py
+index 278956d..0be61eb 100644
+--- a/sentinel5dl/__init__.py
++++ b/sentinel5dl/__init__.py
+@@ -38,6 +38,28 @@ def __md5(filename):
+     return hash_md5.hexdigest().upper()
+ 
+ 
++def __check_md5(filename, base_path):
++    '''Check the md5 sum of a given file against the ESA API.
++
++    :param filename: Path of local file to check
++    :param base_path: Base API path to for this product
++    :returns: If the local file matches the md5 checksum
++    :rtype: bool
++    '''
++    md5file = f'{filename}.md5sum'
++    try:
++        with open(md5file, 'r') as f:
++            md5sum = f.read()
++    except FileNotFoundError:
++        md5sum = __http_request(f'{base_path}/Checksum/Value/$value')
++        md5sum = md5sum.decode('ascii')
++        with open(md5file, 'w') as f:
++            f.write(md5sum)
++
++    # Compare md5 sum
++    return __md5(filename) == md5sum
++
++
+ def __http_request(path, filename=None):
+     '''Make an HTTP request to the API via HTTP, optionally downloading the
+     response.
+@@ -140,20 +162,15 @@ def download(products, output_dir='.'):
+         uuid = product['uuid']
+         filename = os.path.join(output_dir, product['identifier'] + '.nc')
+         logger.info(f'Downloading {uuid} to {filename}')
+-        path = f'/odata/v1/Products(\'{uuid}\')/$value'
++        base_path = f"/odata/v1/Products('{uuid}')"
+ 
+         # Check if file exist
+         if os.path.exists(filename):
+-            # Get md5 sum
+-            md5um_path = f"/odata/v1/Products('{uuid}')/Checksum/Value/$value"
+-            md5sum = __http_request(md5um_path)
+-            md5sum = md5sum.decode()
+-
+-            # Compare md5 sum
+-            if __md5(filename) == md5sum:
++            # Skip download if checksum matches
++            if __check_md5(filename, base_path):
+                 logger.info(f'Skipping {filename} since it already exist.')
+                 continue
+             logger.info(f'Overriding {filename} since md5 hash differs.')
+ 
+         # Download file
+-        __http_request(path, filename)
++        __http_request(f'{base_path}/$value', filename)
+diff --git a/setup.py b/setup.py
+index 9bfe958..1e7a6c5 100644
+--- a/setup.py
++++ b/setup.py
+@@ -11,7 +11,7 @@ def read(filename):
+ 
+ setup(
+     name='sentinel5dl',
+-    version='0.4',
++    version='0.5',
+     description='Sentinel-5p Downloader',
+     author='Emissions API Developers',
+     license='MIT',
+@@ -24,6 +24,7 @@ setup(
+         'Programming Language :: Python :: 3',
+         'Programming Language :: Python :: 3.6',
+         'Programming Language :: Python :: 3.7',
++        'Programming Language :: Python :: 3.8',
+         'Operating System :: OS Independent',
+         'Topic :: Scientific/Engineering :: GIS',
+     ],

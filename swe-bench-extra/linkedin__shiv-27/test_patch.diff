@@ -1,0 +1,112 @@
+diff --git a/test/conftest.py b/test/conftest.py
+index 9229abb..3454d5f 100644
+--- a/test/conftest.py
++++ b/test/conftest.py
+@@ -1,11 +1,23 @@
++import os
++
+ from pathlib import Path
+ 
+ import pytest
+ 
+ 
+-@pytest.fixture
+-def package_location():
+-    return Path(__file__).absolute().parent / 'package'
++@pytest.fixture(params=[True, False], ids=['.', 'absolute-path'])
++def package_location(request):
++    package_location = Path(__file__).absolute().parent / 'package'
++
++    if request.param is True:
++        # test building from the current directory
++        cwd = os.getcwd()
++        os.chdir(package_location)
++        yield Path('.')
++        os.chdir(cwd)
++    else:
++        # test building an absolute path
++        yield package_location
+ 
+ 
+ @pytest.fixture
+diff --git a/test/test_cli.py b/test/test_cli.py
+index ad2f6bb..a38017c 100644
+--- a/test/test_cli.py
++++ b/test/test_cli.py
+@@ -45,11 +45,20 @@ class TestCLI:
+         # assert we got the correct reason
+         assert strip_header(result.output) == DISALLOWED_PIP_ARGS.format(arg=arg, reason=reason)
+ 
+-    def test_hello_world(self, tmpdir, runner, package_location):
++    # /usr/local/bin/python3.6 is a test for https://github.com/linkedin/shiv/issues/16
++    @pytest.mark.parametrize('interpreter', [None, Path('/usr/local/bin/python3.6')])
++    def test_hello_world(self, tmpdir, runner, package_location, interpreter):
++        if interpreter is not None and not interpreter.exists():
++            pytest.skip(f'Interpreter "{interpreter}" does not exist')
++
+         with tempfile.TemporaryDirectory(dir=tmpdir) as tmpdir:
+             output_file = Path(tmpdir, 'test.pyz')
+ 
+-            result = runner(['-e', 'hello:main', '-o', output_file.as_posix(), package_location.as_posix()])
++            args = ['-e', 'hello:main', '-o', output_file.as_posix(), package_location.as_posix()]
++            if interpreter is not None:
++                args = ['-p', interpreter.as_posix()] + args
++
++            result = runner(args)
+ 
+             # check that the command successfully completed
+             assert result.exit_code == 0
+diff --git a/test/test_pip.py b/test/test_pip.py
+new file mode 100644
+index 0000000..aba1721
+--- /dev/null
++++ b/test/test_pip.py
+@@ -0,0 +1,48 @@
++import os
++
++from pathlib import Path
++
++import pytest
++
++from shiv.constants import PIP_REQUIRE_VIRTUALENV, DISTUTILS_CFG_NO_PREFIX
++from shiv.pip import clean_pip_env
++
++
++@pytest.mark.parametrize("pydistutils_path, os_name", [
++    ("pydistutils.cfg", "nt"),
++    (".pydistutils.cfg", "posix"),
++    (None, os.name),
++])
++def test_clean_pip_env(monkeypatch, tmpdir, pydistutils_path, os_name):
++    home = tmpdir.join("home").ensure(dir=True)
++    monkeypatch.setenv("HOME", home)
++
++    # patch os.name so distutils will use `pydistutils_path` for its config
++    monkeypatch.setattr(os, 'name', os.name)
++
++    if pydistutils_path:
++        pydistutils = Path.home() / pydistutils_path
++        pydistutils_contents = "foobar"
++        pydistutils.write_text(pydistutils_contents)
++    else:
++        pydistutils = Path.home() / ".pydistutils.cfg"
++        pydistutils_contents = None
++
++    before_env_var = "foo"
++    monkeypatch.setenv(PIP_REQUIRE_VIRTUALENV, before_env_var)
++
++    with clean_pip_env():
++        assert PIP_REQUIRE_VIRTUALENV not in os.environ
++
++        if not pydistutils_path:
++            # ~/.pydistutils.cfg was created
++            assert pydistutils.read_text() == DISTUTILS_CFG_NO_PREFIX
++        else:
++            # ~/.pydistutils.cfg was not modified
++            assert pydistutils.read_text() == pydistutils_contents
++
++    assert os.environ.get(PIP_REQUIRE_VIRTUALENV) == before_env_var
++
++    # If a temporary ~/.pydistutils.cfg was created, it was deleted. If
++    # ~/.pydistutils.cfg already existed, it still exists.
++    assert pydistutils.exists() == bool(pydistutils_path)

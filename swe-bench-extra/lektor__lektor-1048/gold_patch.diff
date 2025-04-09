@@ -1,0 +1,305 @@
+diff --git a/frontend/js/widgets/BooleanInputWidget.tsx b/frontend/js/widgets/BooleanInputWidget.tsx
+index be38b38..e27c388 100644
+--- a/frontend/js/widgets/BooleanInputWidget.tsx
++++ b/frontend/js/widgets/BooleanInputWidget.tsx
+@@ -1,38 +1,53 @@
+-import React from "react";
++import React, { KeyboardEvent } from "react";
+ import { WidgetProps } from "./types";
+-import { trans_obj } from "../i18n";
++import { trans, trans_obj } from "../i18n";
+ 
+-const isTrue = (value?: string) =>
++const isTrue = (value?: string | null) =>
+   value === "true" || value === "yes" || value === "1";
+ 
++const isDeleteOrBackspace = (event: KeyboardEvent<HTMLInputElement>) => {
++  if (event.altKey || event.metaKey || (event.shiftKey && !event.ctrlKey)) {
++    // If modifiers other than <ctrl>, <ctrl>-<shift>, or none are used, ignore
++    return false;
++  }
++  return event.key === "Delete" || event.key === "Backspace";
++};
++
+ export function BooleanInputWidget({
+   type,
+   value,
+   disabled,
+   placeholder,
+   onChange,
+-}: WidgetProps): JSX.Element {
++}: WidgetProps<string | null>): JSX.Element {
+   return (
+     <div className="form-check">
+       <label className="form-check-label">
+         <input
+           type="checkbox"
+-          className="form-check-input"
++          className={[
++            "form-check-input",
++            `form-check-input--default-${placeholder ? "true" : "false"}`,
++          ].join(" ")}
+           disabled={disabled}
+           ref={(checkbox) => {
+             if (checkbox) {
+-              if (!value && placeholder) {
+-                checkbox.indeterminate = true;
+-                checkbox.checked = isTrue(placeholder);
+-              } else {
+-                checkbox.indeterminate = false;
+-              }
++              // wierdly, `indeterminate` can not be set via HTML attribute
++              checkbox.indeterminate = !value;
+             }
+           }}
+-          checked={isTrue(value)}
++          checked={isTrue(value || placeholder)}
+           onChange={(ev) => {
+             onChange(ev.target.checked ? "yes" : "no");
+           }}
++          onKeyDown={(ev) => {
++            if (isDeleteOrBackspace(ev)) {
++              ev.preventDefault();
++              ev.stopPropagation();
++              onChange(null); // set value back to unset
++            }
++          }}
++          title={trans("TRISTATE_CHECKBOX_TOOLTIP")}
+         />
+         {type.checkbox_label_i18n ? trans_obj(type.checkbox_label_i18n) : null}
+       </label>
+diff --git a/frontend/scss/forms.scss b/frontend/scss/forms.scss
+index 5c8282e..e5de7bf 100644
+--- a/frontend/scss/forms.scss
++++ b/frontend/scss/forms.scss
+@@ -107,3 +107,28 @@ div.flow-block {
+ .spacing-widget {
+   height: 30px;
+ }
++
++// Visually distinguish between checked and unchecked indeterminate checkbox
++// (Checkboxes, as far as the browser is concerned only have three states.
++// Indeterminate checkboxes are not :checked, but we still set the default value
++// for the field in the checked attribute and would like to be able to tell
++// the difference between those that default to true vs false.)
++.form-check-input[type="checkbox"]:indeterminate {
++    border-color: rgba(#000, 0.25);
++    background-color: scale-color(
++        $form-check-input-checked-bg-color,
++        $alpha: -70%,
++        $saturation: -30%
++    );
++    // Slash, rather than bootstrap's horizontal bar, seems more intuitive indication
++    // of indeterminate state.
++    background-image:  escape-svg(url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path fill='none' stroke='#{$form-check-input-indeterminate-color}' stroke-linecap='round' stroke-width='3' d='M6 6 l8 8'/></svg>"));
++
++    &.form-check-input--default-true {
++        background-color: scale-color(
++            $form-check-input-checked-bg-color,
++            $alpha: -25%
++        );
++        border-color: $form-check-input-checked-border-color;
++    }
++}
+diff --git a/lektor/admin/modules/serve.py b/lektor/admin/modules/serve.py
+index 2ba9a1b..016862c 100644
+--- a/lektor/admin/modules/serve.py
++++ b/lektor/admin/modules/serve.py
+@@ -86,6 +86,14 @@ def _checked_send_file(filename: Filename, mimetype: Optional[str] = None) -> Re
+     return resp
+ 
+ 
++class HiddenRecordException(NotFound):
++    """Exception thrown when a request is made for a hidden page."""
++
++    def __init__(self, source: SourceObject) -> None:
++        super().__init__(description=f"Record is hidden: {source!r}")
++        self.source = source
++
++
+ class ArtifactServer:
+     """Resolve url_path to a Lektor source object, build it, serve the result.
+ 
+@@ -104,7 +112,7 @@ class ArtifactServer:
+ 
+         Raise NotFound if resolution fails.
+         """
+-        source = self.lektor_ctx.pad.resolve_url_path(url_path)
++        source = self.lektor_ctx.pad.resolve_url_path(url_path, include_invisible=True)
+         if source is None:
+             abort(404)
+         return source
+@@ -180,6 +188,9 @@ class ArtifactServer:
+         ):
+             return append_slash_redirect(request.environ)
+ 
++        if source.is_hidden:
++            raise HiddenRecordException(source)
++
+         if isinstance(source, Directory):
+             # Special case for asset directories: resolve to index.html
+             source = self.resolve_directory_index(source)
+@@ -230,6 +241,8 @@ def serve_file(path: str) -> Response:
+ def serve_artifact_or_file(path: str) -> Response:
+     try:
+         return serve_artifact(path)
++    except HiddenRecordException:
++        raise
+     except NotFound:
+         return serve_file(path)
+ 
+@@ -238,5 +251,5 @@ def serve_artifact_or_file(path: str) -> Response:
+ def serve_error_page(error: NotFound) -> ResponseReturnValue:
+     try:
+         return serve_artifact("404.html"), 404
+-    except NotFound as e:
+-        return e
++    except NotFound:
++        return error
+diff --git a/lektor/build_programs.py b/lektor/build_programs.py
+index cfffb74..63a8b01 100644
+--- a/lektor/build_programs.py
++++ b/lektor/build_programs.py
+@@ -108,7 +108,7 @@ class BuildProgram:
+             _build(artifact, build_func)
+ 
+         # If we failed anywhere we want to mark *all* artifacts as dirty.
+-        # This means that if a sub-artifact failes we also rebuild the
++        # This means that if a sub-artifact fails we also rebuild the
+         # parent next time around.
+         if failures:
+             for artifact in self.artifacts:
+@@ -217,6 +217,7 @@ class PageBuildProgram(BuildProgram):
+         # If pagination is disabled, all children and attachments are linked
+         # to this page.
+         all_children = self.source.children.include_undiscoverable(True)
++        all_children = all_children.include_hidden(True)
+         if pagination_enabled:
+             if self.source.page_num is None:
+                 child_sources.append(self._iter_paginated_children())
+diff --git a/lektor/builder.py b/lektor/builder.py
+index cf82d34..72aea0c 100644
+--- a/lektor/builder.py
++++ b/lektor/builder.py
+@@ -387,47 +387,60 @@ class BuildState:
+         finally:
+             con.close()
+ 
++    def iter_existing_artifacts(self):
++        """Scan output directory for artifacts.
++
++        Returns an iterable of the artifact_names for artifacts found.
++        """
++        is_ignored = self.env.is_ignored_artifact
++
++        def _unignored(filenames):
++            return filter(lambda fn: not is_ignored(fn), filenames)
++
++        dst = self.builder.destination_path
++        for dirpath, dirnames, filenames in os.walk(dst):
++            dirnames[:] = _unignored(dirnames)
++            for filename in _unignored(filenames):
++                full_path = os.path.join(dst, dirpath, filename)
++                yield self.artifact_name_from_destination_filename(full_path)
++
+     def iter_unreferenced_artifacts(self, all=False):
+         """Finds all unreferenced artifacts in the build folder and yields
+         them.
+         """
+-        dst = os.path.join(self.builder.destination_path)
++        if all:
++            return self.iter_existing_artifacts()
+ 
+         con = self.connect_to_database()
+         cur = con.cursor()
+ 
+-        try:
+-            for dirpath, dirnames, filenames in os.walk(dst):
+-                dirnames[:] = [
+-                    x for x in dirnames if not self.env.is_ignored_artifact(x)
+-                ]
+-                for filename in filenames:
+-                    if self.env.is_ignored_artifact(filename):
+-                        continue
+-                    full_path = os.path.join(dst, dirpath, filename)
+-                    artifact_name = self.artifact_name_from_destination_filename(
+-                        full_path
+-                    )
+-
+-                    if all:
+-                        yield artifact_name
+-                        continue
++        def _is_unreferenced(artifact_name):
++            # Check whether any of the primary sources for the artifact
++            # exist and — if the source can be resolved to a record —
++            # correspond to non-hidden records.
++            cur.execute(
++                """
++                SELECT DISTINCT source, path, alt
++                FROM artifacts LEFT JOIN source_info USING(source)
++                WHERE artifact = ?
++                    AND is_primary_source""",
++                [artifact_name],
++            )
++            for source, path, alt in cur.fetchall():
++                if self.get_file_info(source).exists:
++                    if path is None:
++                        return False  # no record to check
++                    record = self.pad.get(path, alt)
++                    if record is None:
++                        # I'm not sure this should happen, but be safe
++                        return False
++                    if record.is_visible:
++                        return False
++            # no sources exist, or those that do belong to hidden records
++            return True
+ 
+-                    cur.execute(
+-                        """
+-                        select source from artifacts
+-                         where artifact = ?
+-                           and is_primary_source""",
+-                        [artifact_name],
+-                    )
+-                    sources = set(x[0] for x in cur.fetchall())
+-
+-                    # It's a bad artifact if there are no primary sources
+-                    # or the primary sources do not exist.
+-                    if not sources or not any(
+-                        self.get_file_info(x).exists for x in sources
+-                    ):
+-                        yield artifact_name
++        try:
++            yield from filter(_is_unreferenced, self.iter_existing_artifacts())
+         finally:
+             con.close()
+ 
+diff --git a/lektor/db.py b/lektor/db.py
+index 6c55e53..6cfcea9 100644
+--- a/lektor/db.py
++++ b/lektor/db.py
+@@ -620,7 +620,11 @@ class Page(Record):
+         # When we resolve URLs we also want to be able to explicitly
+         # target undiscoverable pages.  Those who know the URL are
+         # rewarded.
+-        q = self.children.include_undiscoverable(True)
++
++        # We also want to resolve hidden children
++        # here. Pad.resolve_url_path() is where the check for hidden
++        # records is done.
++        q = self.children.include_undiscoverable(True).include_hidden(True)
+ 
+         for idx in range(len(url_path)):
+             piece = "/".join(url_path[: idx + 1])
+diff --git a/lektor/translations/en.json b/lektor/translations/en.json
+index c863fcf..9a860cc 100644
+--- a/lektor/translations/en.json
++++ b/lektor/translations/en.json
+@@ -124,5 +124,6 @@
+   "OPEN_OTHER_PROJECT": "Open other Project",
+   "OPEN_OTHER_PROJECT_QUESTION": "Opening this file requires opening another project (%s). The current project will be closed. Do you want to continue?",
+   "COLLAPSE": "Collapse",
+-  "EXPAND": "Expand"
++  "EXPAND": "Expand",
++   "TRISTATE_CHECKBOX_TOOLTIP": "Tri-state checkbox: use <del> or <backspace> to revert to unset"
+ }

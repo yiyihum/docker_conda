@@ -1,0 +1,111 @@
+diff --git a/setup.py b/setup.py
+index 7fc33f3..2b93690 100644
+--- a/setup.py
++++ b/setup.py
+@@ -82,7 +82,7 @@ arguments = dict(
+ 
+         [setuptools_scm.files_command]
+         .hg = setuptools_scm.hg:FILES_COMMAND
+-        .git = setuptools_scm.git:list_files_in_archive
++        .git = setuptools_scm.git_file_finder:find_files
+ 
+         [setuptools_scm.version_scheme]
+         guess-next-dev = setuptools_scm.version:guess_next_dev_version
+diff --git a/setuptools_scm/git.py b/setuptools_scm/git.py
+index 6f35e78..df31358 100644
+--- a/setuptools_scm/git.py
++++ b/setuptools_scm/git.py
+@@ -2,8 +2,6 @@ from .utils import do_ex, trace, has_command
+ from .version import meta
+ 
+ from os.path import isfile, join
+-import subprocess
+-import tarfile
+ import warnings
+ 
+ 
+@@ -128,13 +126,3 @@ def parse(root, describe_command=DEFAULT_DESCRIBE, pre_parse=warn_on_shallow):
+         return meta(tag, distance=number, node=node, dirty=dirty, branch=branch)
+     else:
+         return meta(tag, node=node, dirty=dirty, branch=branch)
+-
+-
+-def list_files_in_archive(path):
+-    """List the files that 'git archive' generates.
+-    """
+-    cmd = ['git', 'archive', 'HEAD']
+-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=path)
+-    tf = tarfile.open(fileobj=proc.stdout, mode='r|*')
+-    return [member.name for member in tf.getmembers()
+-            if member.type != tarfile.DIRTYPE]
+diff --git a/setuptools_scm/git_file_finder.py b/setuptools_scm/git_file_finder.py
+new file mode 100644
+index 0000000..2c978d3
+--- /dev/null
++++ b/setuptools_scm/git_file_finder.py
+@@ -0,0 +1,65 @@
++import os
++import subprocess
++import tarfile
++
++
++def _git_toplevel(path):
++    try:
++        out = subprocess.check_output([
++            'git', 'rev-parse', '--show-toplevel',
++        ], cwd=(path or '.'), universal_newlines=True)
++        return os.path.normcase(os.path.realpath(out.strip()))
++    except subprocess.CalledProcessError:
++        # git returned error, we are not in a git repo
++        return None
++    except OSError:
++        # git command not found, probably
++        return None
++
++
++def _git_ls_files_and_dirs(toplevel):
++    # use git archive instead of git ls-file to honor
++    # export-ignore git attribute
++    cmd = ['git', 'archive', '--prefix', toplevel + os.path.sep, 'HEAD']
++    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=toplevel)
++    tf = tarfile.open(fileobj=proc.stdout, mode='r|*')
++    git_files = set()
++    git_dirs = set([toplevel])
++    for member in tf.getmembers():
++        name = os.path.normcase(member.name).replace('/', os.path.sep)
++        if member.type == tarfile.DIRTYPE:
++            git_dirs.add(name)
++        else:
++            git_files.add(name)
++    return git_files, git_dirs
++
++
++def find_files(path=''):
++    """ setuptools compatible git file finder that follows symlinks
++
++    Spec here: http://setuptools.readthedocs.io/en/latest/setuptools.html#\
++        adding-support-for-revision-control-systems
++    """
++    toplevel = _git_toplevel(path)
++    if not toplevel:
++        return []
++    git_files, git_dirs = _git_ls_files_and_dirs(toplevel)
++    realpath = os.path.normcase(os.path.realpath(path))
++    assert realpath.startswith(toplevel)
++    assert realpath in git_dirs
++    seen = set()
++    res = []
++    for dirpath, dirnames, filenames in os.walk(realpath, followlinks=True):
++        # dirpath with symlinks resolved
++        realdirpath = os.path.normcase(os.path.realpath(dirpath))
++        if realdirpath not in git_dirs or realdirpath in seen:
++            dirnames[:] = []
++            continue
++        for filename in filenames:
++            # dirpath + filename with symlinks preserved
++            fullfilename = os.path.join(dirpath, filename)
++            if os.path.normcase(os.path.realpath(fullfilename)) in git_files:
++                res.append(
++                    os.path.join(path, os.path.relpath(fullfilename, path)))
++        seen.add(realdirpath)
++    return res

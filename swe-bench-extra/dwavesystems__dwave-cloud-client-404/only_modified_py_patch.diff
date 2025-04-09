@@ -1,0 +1,142 @@
+diff --git a/dwave/cloud/client.py b/dwave/cloud/client.py
+index 05bd128..2dd109b 100644
+--- a/dwave/cloud/client.py
++++ b/dwave/cloud/client.py
+@@ -697,10 +697,10 @@ class Client(object):
+                 Force refresh of cached list of solvers/properties.
+ 
+             order_by (callable/str/None, default='avg_load'):
+-                Solver sorting key function (or :class:`Solver` attribute/item
+-                dot-separated path). By default, solvers are sorted by average
+-                load. To explicitly not sort the solvers (and use the API-returned
+-                order), set ``order_by=None``.
++                Solver sorting key function (or :class:`~dwave.cloud.solver.Solver`
++                attribute/item dot-separated path). By default, solvers are sorted
++                by average load. To explicitly not sort the solvers (and use the
++                API-returned order), set ``order_by=None``.
+ 
+                 Signature of the `key` `callable` is::
+ 
+@@ -1035,7 +1035,7 @@ class Client(object):
+         warnings.warn("'solvers' is deprecated in favor of 'get_solvers'.", DeprecationWarning)
+         return self.get_solvers(refresh=refresh, **filters)
+ 
+-    def get_solver(self, name=None, refresh=False, **filters):
++    def get_solver(self, name=None, refresh=False, order_by='avg_load', **filters):
+         """Load the configuration for a single solver.
+ 
+         Makes a blocking web call to `{endpoint}/solvers/remote/{solver_name}/`, where `{endpoint}`
+@@ -1052,13 +1052,15 @@ class Client(object):
+                 Dictionary of filters over features this solver has to have. For a list of
+                 feature names and values, see: :meth:`~dwave.cloud.client.Client.get_solvers`.
+ 
+-            order_by (callable/str, default='id'):
+-                Solver sorting key function (or :class:`Solver` attribute name).
+-                By default, solvers are sorted by ID/name.
++            order_by (callable/str/None, default='avg_load'):
++                Solver sorting key function (or :class:`~dwave.cloud.solver.Solver`
++                attribute/item dot-separated path). By default, solvers are sorted by average
++                load. For details, see :meth:`~dwave.cloud.client.Client.get_solvers`.
+ 
+             refresh (bool):
+-                Return solver from cache (if cached with ``get_solvers()``),
+-                unless set to ``True``.
++                Return solver from cache (if cached with
++                :meth:`~dwave.cloud.client.Client.get_solvers`), unless set to
++                ``True``.
+ 
+         Returns:
+             :class:`.Solver`
+@@ -1096,7 +1098,7 @@ class Client(object):
+         # get the first solver that satisfies all filters
+         try:
+             logger.debug("Fetching solvers according to filters=%r", filters)
+-            return self.get_solvers(refresh=refresh, **filters)[0]
++            return self.get_solvers(refresh=refresh, order_by=order_by, **filters)[0]
+         except IndexError:
+             raise SolverNotFoundError("Solver with the requested features not available")
+ 
+@@ -1668,7 +1670,7 @@ class Client(object):
+ 
+     @staticmethod
+     @retried(_UPLOAD_PART_RETRIES, backoff=_UPLOAD_RETRIES_BACKOFF)
+-    def _upload_multipart_part(session, problem_id, part_id, part_stream,
++    def _upload_multipart_part(session, problem_id, part_id, part_generator,
+                                uploaded_part_checksum=None):
+         """Upload one problem part. Sync http request.
+ 
+@@ -1679,8 +1681,9 @@ class Client(object):
+                 Problem id.
+             part_id (int):
+                 Part number/id.
+-            part_stream (:class:`io.BufferedIOBase`/binary-stream-like):
+-                Problem part data container that supports `read` operation.
++            part_generator (generator of :class:`io.BufferedIOBase`/binary-stream-like):
++                Callable that produces problem part data container that supports
++                `read` and `seek` operations.
+             uploaded_part_checksum (str/None):
+                 Checksum of previously uploaded part. Optional, but if specified
+                 checksum is verified, and part is uploaded only if checksums
+@@ -1692,6 +1695,9 @@ class Client(object):
+ 
+         logger.debug("Uploading part_id=%r of problem_id=%r", part_id, problem_id)
+ 
++        # generate the mutable part stream from immutable stream generator
++        part_stream = part_generator()
++
+         # TODO: work-around to get a checksum of a binary stream (avoid 2x read)
+         data = part_stream.read()
+         digest = Client._digest(data)
+@@ -1808,12 +1814,12 @@ class Client(object):
+                 uploaded_parts[part_no] = checksum
+         return uploaded_parts
+ 
+-    def _upload_part_worker(self, problem_id, part_no, chunk_stream,
++    def _upload_part_worker(self, problem_id, part_no, chunk_generator,
+                             uploaded_part_checksum=None):
+ 
+         with self.create_session() as session:
+             part_checksum = self._upload_multipart_part(
+-                session, problem_id, part_id=part_no, part_stream=chunk_stream,
++                session, problem_id, part_id=part_no, part_generator=chunk_generator,
+                 uploaded_part_checksum=uploaded_part_checksum)
+ 
+             return part_no, part_checksum
+@@ -1859,12 +1865,11 @@ class Client(object):
+ 
+             # enqueue all parts, worker skips if checksum matches
+             parts = {}
+-            streams = collections.OrderedDict(enumerate(chunks))
+-            for chunk_no, chunk_stream in streams.items():
++            for chunk_no, chunk_generator in enumerate(chunks.generators()):
+                 part_no = chunk_no + 1
+                 part_future = self._upload_part_executor.submit(
+                     self._upload_part_worker,
+-                    problem_id, part_no, chunk_stream,
++                    problem_id, part_no, chunk_generator,
+                     uploaded_part_checksum=uploaded_parts.get(part_no))
+ 
+                 parts[part_no] = part_future
+diff --git a/dwave/cloud/upload.py b/dwave/cloud/upload.py
+index 2b48bb8..85d603b 100644
+--- a/dwave/cloud/upload.py
++++ b/dwave/cloud/upload.py
+@@ -22,6 +22,7 @@ import threading
+ 
+ from abc import abstractmethod
+ from collections.abc import Sized
++from functools import partial
+ 
+ __all__ = ['ChunkedData']
+ 
+@@ -400,3 +401,9 @@ class ChunkedData(object):
+     def __iter__(self):
+         for idx in range(len(self)):
+             yield self.chunk(idx)
++
++    def generators(self):
++        """Iterator of (immutable) chunk generators."""
++
++        for idx in range(len(self)):
++            yield partial(self.chunk, idx=idx)
+

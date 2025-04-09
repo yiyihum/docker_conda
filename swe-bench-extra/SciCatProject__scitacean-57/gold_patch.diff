@@ -1,0 +1,241 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 4a3c6fd..4d67bf3 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -9,12 +9,6 @@ repos:
+     - id: detect-private-key
+     - id: trailing-whitespace
+       args: [--markdown-linebreak-ext=md]
+-- repo: https://github.com/charliermarsh/ruff-pre-commit
+-  rev: 'v0.0.225'
+-  hooks:
+-    - id: ruff
+-      # Respect `exclude` and `extend-exclude` settings.
+-      args: ["--force-exclude", "--fix"]
+ - repo: https://github.com/psf/black
+   rev: 22.10.0
+   hooks:
+@@ -26,6 +20,12 @@ repos:
+       types: ["jupyter"]
+       args: ["--drop-empty-cells",
+              "--extra-keys 'metadata.language_info.version cell.metadata.jp-MarkdownHeadingCollapsed cell.metadata.pycharm'"]
++- repo: https://github.com/charliermarsh/ruff-pre-commit
++  rev: 'v0.0.225'
++  hooks:
++    - id: ruff
++      # Respect `exclude` and `extend-exclude` settings.
++      args: ["--force-exclude", "--fix"]
+ - repo: https://github.com/codespell-project/codespell
+   rev: v2.2.2
+   hooks:
+diff --git a/docs/release-notes.rst b/docs/release-notes.rst
+index fd2bb0e..c1b4b4b 100644
+--- a/docs/release-notes.rst
++++ b/docs/release-notes.rst
+@@ -30,6 +30,29 @@ Release notes
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+ 
++vYY.0M.MICRO (Unreleased)
++-------------------------
++
++Features
++~~~~~~~~
++
++* Files are no longer downloaded if an up-to-date version exists on local.
++
++Breaking changes
++~~~~~~~~~~~~~~~~
++
++Bugfixes
++~~~~~~~~
++
++Documentation
++~~~~~~~~~~~~~
++
++Deprecations
++~~~~~~~~~~~~
++
++Stability, Maintainability, and Testing
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
+ v23.01.1 (2023-01-20)
+ ---------------------
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index fd13655..2711e49 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -56,6 +56,8 @@ addopts = """
+ """
+ filterwarnings = [
+     "error",
++    # Many tests don't set a checksum, so File raises this warning.
++    "ignore:Cannot check if local file:UserWarning",
+ ]
+ 
+ [tool.mypy]
+diff --git a/src/scitacean/client.py b/src/scitacean/client.py
+index 5e15f40..d172965 100644
+--- a/src/scitacean/client.py
++++ b/src/scitacean/client.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ import datetime
+ import re
+ from contextlib import contextmanager
+@@ -33,7 +34,7 @@ class Client:
+     a client instead of the constructor directly.
+ 
+     See the user guide for typical usage patterns.
+-    In particular `Downloading Datasets <../../user-guide/downloading.ipynb>`_
++    In particular, `Downloading Datasets <../../user-guide/downloading.ipynb>`_
+     and `Uploading Datasets <../../user-guide/uploading.ipynb>`_.
+     """
+ 
+@@ -280,7 +281,12 @@ class Client:
+         return self._file_transfer
+ 
+     def download_files(
+-        self, dataset: Dataset, *, target: Union[str, Path], select: FileSelector = True
++        self,
++        dataset: Dataset,
++        *,
++        target: Union[str, Path],
++        select: FileSelector = True,
++        checksum_algorithm: Optional[str] = None,
+     ) -> Dataset:
+         r"""Download files of a dataset.
+ 
+@@ -304,6 +310,10 @@ class Client:
+             - An **re.Pattern** as returned by :func:`re.compile`:
+               if this pattern matches ``f.remote_path`` using :func:`re.search`
+             - A **Callable[File]**: if this callable returns ``True`` for ``f``
++        checksum_algorithm:
++            Select an algorithm for computing file checksums.
++            This argument will be removed when the next SciCat version
++            has been released.
+ 
+         Returns
+         -------
+@@ -348,19 +358,24 @@ class Client:
+         # TODO undo if later fails but only if no files were written
+         target.mkdir(parents=True, exist_ok=True)
+         files = _select_files(select, dataset)
+-        local_paths = [target / f.remote_path for f in files]
++        downloaded_files = [
++            f.downloaded(local_path=target / f.remote_path) for f in files
++        ]
++        downloaded_files = _remove_up_to_date_local_files(
++            downloaded_files, checksum_algorithm=checksum_algorithm
++        )
++        if not downloaded_files:
++            return dataset.replace()
++
+         with self._connect_for_file_download() as con:
+             con.download_files(
+                 remote=[
+                     p
+-                    for f in files
++                    for f in downloaded_files
+                     if (p := f.remote_access_path(dataset.source_folder)) is not None
+                 ],
+-                local=local_paths,
++                local=[f.local_path for f in downloaded_files],
+             )
+-        downloaded_files = tuple(
+-            f.downloaded(local_path=l) for f, l in zip(files, local_paths)
+-        )
+         for f in downloaded_files:
+             f.validate_after_download()
+         return dataset.replace_files(*downloaded_files)
+@@ -746,3 +761,18 @@ def _file_selector(select: FileSelector) -> Callable[[File], bool]:
+ def _select_files(select: FileSelector, dataset: Dataset) -> List[File]:
+     selector = _file_selector(select)
+     return [f for f in dataset.files if selector(f)]
++
++
++def _remove_up_to_date_local_files(
++    files: List[File], checksum_algorithm: Optional[str]
++) -> List[File]:
++    return [
++        file
++        for file in files
++        if not (
++            file.local_path.exists()
++            and dataclasses.replace(
++                file, checksum_algorithm=checksum_algorithm
++            ).local_is_up_to_date()
++        )
++    ]
+diff --git a/src/scitacean/file.py b/src/scitacean/file.py
+index 9820164..d923936 100644
+--- a/src/scitacean/file.py
++++ b/src/scitacean/file.py
+@@ -6,6 +6,7 @@ from __future__ import annotations
+ 
+ import dataclasses
+ import os
++import warnings
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import NoReturn, Optional, Union, cast
+@@ -195,14 +196,14 @@ class File:
+         :
+             The checksum of the file.
+         """
+-        if self.is_on_local:
+-            if self.checksum_algorithm is None:
+-                return None
+-            return self._checksum_cache.get(  # type: ignore[union-attr]
+-                path=self.local_path,  # type: ignore[arg-type]
+-                algorithm=self.checksum_algorithm,
+-            )
+-        return self._remote_checksum
++        if not self.is_on_local:
++            return self._remote_checksum
++        if self.checksum_algorithm is None:
++            return None
++        return self._checksum_cache.get(  # type: ignore[union-attr]
++            path=self.local_path,  # type: ignore[arg-type]
++            algorithm=self.checksum_algorithm,
++        )
+ 
+     def remote_access_path(
+         self, source_folder: Union[RemotePath, str]
+@@ -220,6 +221,32 @@ class File:
+         """True if the file is on local."""
+         return self.local_path is not None
+ 
++    def local_is_up_to_date(self) -> bool:
++        """Check if the file on local is up-to-date.
++
++        Returns
++        -------
++        :
++            True if the file exists on local and its checksum
++            matches the stored checksum for the remote file.
++        """
++        if not self.is_on_remote:
++            return True
++        if not self.is_on_local:
++            return False
++        if self.checksum_algorithm is None:
++            warnings.warn(
++                f"Cannot check if local file {self.local_path} is up to date because "
++                "the checksum algorithm is not set. "
++                "Assuming the file needs to be updated."
++            )
++            return False
++        local_checksum = self._checksum_cache.get(  # type: ignore[union-attr]
++            path=self.local_path,  # type: ignore[arg-type]
++            algorithm=self.checksum_algorithm,
++        )
++        return self._remote_checksum == local_checksum
++
+     def make_model(self, *, for_archive: bool = False) -> DataFile:
+         """Build a pydantic model for this file.
+ 

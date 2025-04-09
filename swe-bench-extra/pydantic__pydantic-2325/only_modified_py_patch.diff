@@ -1,0 +1,161 @@
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -1,9 +1,10 @@
+ import warnings
+-from collections import deque
++from collections import defaultdict, deque
+ from collections.abc import Iterable as CollectionsIterable
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    DefaultDict,
+     Deque,
+     Dict,
+     FrozenSet,
+@@ -249,6 +250,8 @@ def Schema(default: Any, **kwargs: Any) -> Any:
+ SHAPE_ITERABLE = 9
+ SHAPE_GENERIC = 10
+ SHAPE_DEQUE = 11
++SHAPE_DICT = 12
++SHAPE_DEFAULTDICT = 13
+ SHAPE_NAME_LOOKUP = {
+     SHAPE_LIST: 'List[{}]',
+     SHAPE_SET: 'Set[{}]',
+@@ -257,8 +260,12 @@ def Schema(default: Any, **kwargs: Any) -> Any:
+     SHAPE_FROZENSET: 'FrozenSet[{}]',
+     SHAPE_ITERABLE: 'Iterable[{}]',
+     SHAPE_DEQUE: 'Deque[{}]',
++    SHAPE_DICT: 'Dict[{}]',
++    SHAPE_DEFAULTDICT: 'DefaultDict[{}]',
+ }
+ 
++MAPPING_LIKE_SHAPES: Set[int] = {SHAPE_DEFAULTDICT, SHAPE_DICT, SHAPE_MAPPING}
++
+ 
+ class ModelField(Representation):
+     __slots__ = (
+@@ -572,6 +579,14 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+         elif issubclass(origin, Sequence):
+             self.type_ = get_args(self.type_)[0]
+             self.shape = SHAPE_SEQUENCE
++        elif issubclass(origin, DefaultDict):
++            self.key_field = self._create_sub_type(get_args(self.type_)[0], 'key_' + self.name, for_keys=True)
++            self.type_ = get_args(self.type_)[1]
++            self.shape = SHAPE_DEFAULTDICT
++        elif issubclass(origin, Dict):
++            self.key_field = self._create_sub_type(get_args(self.type_)[0], 'key_' + self.name, for_keys=True)
++            self.type_ = get_args(self.type_)[1]
++            self.shape = SHAPE_DICT
+         elif issubclass(origin, Mapping):
+             self.key_field = self._create_sub_type(get_args(self.type_)[0], 'key_' + self.name, for_keys=True)
+             self.type_ = get_args(self.type_)[1]
+@@ -688,8 +703,8 @@ def validate(
+ 
+         if self.shape == SHAPE_SINGLETON:
+             v, errors = self._validate_singleton(v, values, loc, cls)
+-        elif self.shape == SHAPE_MAPPING:
+-            v, errors = self._validate_mapping(v, values, loc, cls)
++        elif self.shape in MAPPING_LIKE_SHAPES:
++            v, errors = self._validate_mapping_like(v, values, loc, cls)
+         elif self.shape == SHAPE_TUPLE:
+             v, errors = self._validate_tuple(v, values, loc, cls)
+         elif self.shape == SHAPE_ITERABLE:
+@@ -806,7 +821,7 @@ def _validate_tuple(
+         else:
+             return tuple(result), None
+ 
+-    def _validate_mapping(
++    def _validate_mapping_like(
+         self, v: Any, values: Dict[str, Any], loc: 'LocStr', cls: Optional['ModelOrDc']
+     ) -> 'ValidateReturn':
+         try:
+@@ -832,8 +847,30 @@ def _validate_mapping(
+             result[key_result] = value_result
+         if errors:
+             return v, errors
+-        else:
++        elif self.shape == SHAPE_DICT:
+             return result, None
++        elif self.shape == SHAPE_DEFAULTDICT:
++            return defaultdict(self.type_, result), None
++        else:
++            return self._get_mapping_value(v, result), None
++
++    def _get_mapping_value(self, original: T, converted: Dict[Any, Any]) -> Union[T, Dict[Any, Any]]:
++        """
++        When type is `Mapping[KT, KV]` (or another unsupported mapping), we try to avoid
++        coercing to `dict` unwillingly.
++        """
++        original_cls = original.__class__
++
++        if original_cls == dict or original_cls == Dict:
++            return converted
++        elif original_cls in {defaultdict, DefaultDict}:
++            return defaultdict(self.type_, converted)
++        else:
++            try:
++                # Counter, OrderedDict, UserDict, ...
++                return original_cls(converted)  # type: ignore
++            except TypeError:
++                raise RuntimeError(f'Could not convert dictionary to {original_cls.__name__!r}') from None
+ 
+     def _validate_singleton(
+         self, v: Any, values: Dict[str, Any], loc: 'LocStr', cls: Optional['ModelOrDc']
+@@ -876,7 +913,7 @@ def _type_display(self) -> PyObjectStr:
+         t = display_as_type(self.type_)
+ 
+         # have to do this since display_as_type(self.outer_type_) is different (and wrong) on python 3.6
+-        if self.shape == SHAPE_MAPPING:
++        if self.shape in MAPPING_LIKE_SHAPES:
+             t = f'Mapping[{display_as_type(self.key_field.type_)}, {t}]'  # type: ignore
+         elif self.shape == SHAPE_TUPLE:
+             t = 'Tuple[{}]'.format(', '.join(display_as_type(f.type_) for f in self.sub_fields))  # type: ignore
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -28,7 +28,7 @@
+ from .class_validators import ValidatorGroup, extract_root_validators, extract_validators, inherit_validators
+ from .error_wrappers import ErrorWrapper, ValidationError
+ from .errors import ConfigError, DictError, ExtraError, MissingError
+-from .fields import SHAPE_MAPPING, ModelField, ModelPrivateAttr, PrivateAttr, Undefined
++from .fields import MAPPING_LIKE_SHAPES, ModelField, ModelPrivateAttr, PrivateAttr, Undefined
+ from .json import custom_pydantic_encoder, pydantic_encoder
+ from .parse import Protocol, load_file, load_str_bytes
+ from .schema import default_ref_template, model_schema
+@@ -559,7 +559,8 @@ def json(
+     @classmethod
+     def _enforce_dict_if_root(cls, obj: Any) -> Any:
+         if cls.__custom_root_type__ and (
+-            not (isinstance(obj, dict) and obj.keys() == {ROOT_KEY}) or cls.__fields__[ROOT_KEY].shape == SHAPE_MAPPING
++            not (isinstance(obj, dict) and obj.keys() == {ROOT_KEY})
++            or cls.__fields__[ROOT_KEY].shape in MAPPING_LIKE_SHAPES
+         ):
+             return {ROOT_KEY: obj}
+         else:
+diff --git a/pydantic/schema.py b/pydantic/schema.py
+--- a/pydantic/schema.py
++++ b/pydantic/schema.py
+@@ -29,11 +29,11 @@
+ from typing_extensions import Annotated, Literal
+ 
+ from .fields import (
++    MAPPING_LIKE_SHAPES,
+     SHAPE_FROZENSET,
+     SHAPE_GENERIC,
+     SHAPE_ITERABLE,
+     SHAPE_LIST,
+-    SHAPE_MAPPING,
+     SHAPE_SEQUENCE,
+     SHAPE_SET,
+     SHAPE_SINGLETON,
+@@ -450,7 +450,7 @@ def field_type_schema(
+         if field.shape in {SHAPE_SET, SHAPE_FROZENSET}:
+             f_schema['uniqueItems'] = True
+ 
+-    elif field.shape == SHAPE_MAPPING:
++    elif field.shape in MAPPING_LIKE_SHAPES:
+         f_schema = {'type': 'object'}
+         key_field = cast(ModelField, field.key_field)
+         regex = getattr(key_field.type_, 'regex', None)
+

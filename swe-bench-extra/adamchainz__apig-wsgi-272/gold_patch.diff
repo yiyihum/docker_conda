@@ -1,0 +1,222 @@
+diff --git a/HISTORY.rst b/HISTORY.rst
+index 6b356b4..cd7d803 100644
+--- a/HISTORY.rst
++++ b/HISTORY.rst
+@@ -2,6 +2,8 @@
+ History
+ =======
+ 
++* Fix handling of query string encoding in ALB deployments.
++
+ 2.11.0 (2021-05-10)
+ -------------------
+ 
+diff --git a/example/README.rst b/example/README.rst
+index b0d17a3..c00ff7b 100644
+--- a/example/README.rst
++++ b/example/README.rst
+@@ -47,7 +47,13 @@ other requirements into it, and run the deployment playbook:
+    source venv/bin/activate
+    python -m pip install -U pip wheel
+    python -m pip install -r requirements.txt
+-   ansible-playbook playbook.yml
++
++To run the playbook, you'll need to specify a VPC ID and two subnet IDs in order
++to create an ALB.
++
++.. code-block:: sh
++
++   ansible-playbook playbook.yml -e "vpc_id=vpc-12345678" -e "subnet_id_1=subnet-12345678" -e "subnet_id_2=subnet-12345678"
+ 
+ Ansible should complete with a ``PLAY RECAP`` at the end like:
+ 
+diff --git a/example/deployment/files/cloudformation_site.yml b/example/deployment/files/cloudformation_site.yml
+index ac2fcfa..72f4716 100644
+--- a/example/deployment/files/cloudformation_site.yml
++++ b/example/deployment/files/cloudformation_site.yml
+@@ -16,6 +16,15 @@ Parameters:
+   LambdaIAMRoleArn:
+     Type: String
+ 
++  VpcId:
++      Type: String
++
++  SubnetId1:
++    Type: String
++
++  SubnetId2:
++    Type: String
++
+ Resources:
+ 
+   # Lambda
+@@ -33,13 +42,20 @@ Resources:
+       Runtime: python3.8
+       Timeout: 20
+ 
+-  LambdaPermission:
++  LambdaPermissionAPIGW:
+     Type: AWS::Lambda::Permission
+     Properties:
+       Action: lambda:InvokeFunction
+       FunctionName: !GetAtt LambdaFunction.Arn
+       Principal: apigateway.amazonaws.com
+ 
++  LambdaPermissionALB:
++    Type: AWS::Lambda::Permission
++    Properties:
++      Action: lambda:InvokeFunction
++      FunctionName: !GetAtt LambdaFunction.Arn
++      Principal: elasticloadbalancing.amazonaws.com
++
+   # new style HTTP API
+ 
+   HttpApi:
+@@ -110,6 +126,49 @@ Resources:
+       DeploymentId: !Ref Deployment
+       StageName: prod
+ 
++  # ALB
++
++  LoadBalancer:
++    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
++    Properties:
++      Scheme: internet-facing
++      Subnets:
++        - !Ref SubnetId1
++        - !Ref SubnetId2
++      SecurityGroups: [!Ref SecurityGroup]
++
++  TargetGroup:
++    Type: AWS::ElasticLoadBalancingV2::TargetGroup
++    DependsOn: LambdaPermissionALB
++    Properties:
++      TargetType: lambda
++      Targets:
++        - Id: !GetAtt LambdaFunction.Arn
++      TargetGroupAttributes:
++        - Key: lambda.multi_value_headers.enabled
++          Value: True
++
++  HttpListener:
++    Type: AWS::ElasticLoadBalancingV2::Listener
++    Properties:
++      LoadBalancerArn: !Ref LoadBalancer
++      Port: 80
++      Protocol: HTTP
++      DefaultActions:
++        - TargetGroupArn: !Ref TargetGroup
++          Type: forward
++
++  SecurityGroup:
++    Type: AWS::EC2::SecurityGroup
++    Properties:
++      GroupDescription: Allow http on port 80
++      VpcId: !Ref VpcId
++      SecurityGroupIngress:
++        - IpProtocol: tcp
++          FromPort: 80
++          ToPort: 80
++          CidrIp: 0.0.0.0/0
++
+ Outputs:
+ 
+   HttpApiUrl:
+@@ -117,3 +176,6 @@ Outputs:
+ 
+   RestApiUrl:
+     Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageApi}/
++
++  AlbUrl:
++    Value: !GetAtt LoadBalancer.DNSName
+diff --git a/example/deployment/playbook.yml b/example/deployment/playbook.yml
+index 1eae34c..728919a 100755
+--- a/example/deployment/playbook.yml
++++ b/example/deployment/playbook.yml
+@@ -95,6 +95,9 @@
+         PackageS3Key: '{{ zip_name }}'
+         PackageS3ObjectVersion: '{{ (s3_result.stdout|from_json).VersionId }}'
+         LambdaIAMRoleArn: '{{ base_stack_result.stack_outputs.LambdaIAMRoleArn }}'
++        VpcId: '{{ vpc_id }}'
++        SubnetId1: '{{ subnet_id_1 }}'
++        SubnetId2: '{{ subnet_id_2 }}'
+     register: site_stack_result
+ 
+   - name: debug
+@@ -102,3 +105,4 @@
+       msg: |
+         New style "HTTP API" using v2 events at {{ site_stack_result.stack_outputs.HttpApiUrl }}
+         Old style REST API using v1 events at {{ site_stack_result.stack_outputs.RestApiUrl }}
++        ALB at {{ site_stack_result.stack_outputs.AlbUrl }}
+diff --git a/src/apig_wsgi.py b/src/apig_wsgi.py
+index a8f41b5..814cab3 100644
+--- a/src/apig_wsgi.py
++++ b/src/apig_wsgi.py
+@@ -13,6 +13,8 @@ DEFAULT_NON_BINARY_CONTENT_TYPE_PREFIXES = (
+     "application/vnd.api+json",
+ )
+ 
++RESERVED_URI_CHARACTERS = r"!#$&'()*+,/:;=?@[]%"
++
+ 
+ def make_lambda_handler(
+     wsgi_app, binary_support=None, non_binary_content_type_prefixes=None
+@@ -37,13 +39,19 @@ def make_lambda_handler(
+     non_binary_content_type_prefixes = tuple(non_binary_content_type_prefixes)
+ 
+     def handler(event, context):
+-        # Assume version 1 since ALB isn't documented as sending a version.
+-        version = event.get("version", "1.0")
+-        if version == "1.0":
++        # ALB doesn't send a version, but requestContext will contain a key named 'elb'.
++        if "requestContext" in event and "elb" in event["requestContext"]:
++            version = "alb"
++        else:
++            version = event.get("version", "1.0")
++
++        if version in ("1.0", "alb"):
+             # Binary support deafults 'off' on version 1
+             event_binary_support = binary_support or False
+             environ = get_environ_v1(
+-                event, context, binary_support=event_binary_support
++                event,
++                context,
++                encode_query_params=(version == "1.0"),
+             )
+             response = V1Response(
+                 binary_support=event_binary_support,
+@@ -65,7 +73,7 @@ def make_lambda_handler(
+     return handler
+ 
+ 
+-def get_environ_v1(event, context, binary_support):
++def get_environ_v1(event, context, encode_query_params):
+     body = get_body(event)
+     environ = {
+         "CONTENT_LENGTH": str(len(body)),
+@@ -87,15 +95,24 @@ def get_environ_v1(event, context, binary_support):
+         "apig_wsgi.multi_value_headers": False,
+     }
+ 
++    if encode_query_params:
++        safe_chars = ""
++    else:
++        safe_chars = RESERVED_URI_CHARACTERS
++
+     # Multi-value query strings need explicit activation on ALB
+     if "multiValueQueryStringParameters" in event:
+         environ["QUERY_STRING"] = urlencode(
+             # may be None when testing on console
+             event["multiValueQueryStringParameters"] or (),
+             doseq=True,
++            safe=safe_chars,
+         )
+     else:
+-        environ["QUERY_STRING"] = urlencode(event.get("queryStringParameters") or ())
++        environ["QUERY_STRING"] = urlencode(
++            event.get("queryStringParameters") or (),
++            safe=safe_chars,
++        )
+ 
+     # Multi-value headers need explicit activation on ALB
+     if "multiValueHeaders" in event:

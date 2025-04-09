@@ -1,0 +1,117 @@
+diff --git a/ocfl-validate.py b/ocfl-validate.py
+index 30e1d9c..f5653ec 100755
+--- a/ocfl-validate.py
++++ b/ocfl-validate.py
+@@ -61,7 +61,8 @@ for path in args.path:
+         obj = ocfl.Object(lax_digests=args.lax_digests)
+         if obj.validate_inventory(path,
+                                   show_warnings=show_warnings,
+-                                  show_errors=not args.very_quiet):
++                                  show_errors=not args.very_quiet,
++                                  extract_spec_version=True):
+             num_good += 1
+     else:
+         log.error("Bad path %s (%s)", path, path_type)
+diff --git a/ocfl/inventory_validator.py b/ocfl/inventory_validator.py
+index cb702db..6684155 100644
+--- a/ocfl/inventory_validator.py
++++ b/ocfl/inventory_validator.py
+@@ -48,6 +48,8 @@ class InventoryValidator():
+         self.head = 'UNKNOWN'
+         # Validation control
+         self.lax_digests = lax_digests
++        # Configuration
++        self.spec_versions_supported = ('1.0', '1.1')
+ 
+     def error(self, code, **args):
+         """Error with added context."""
+@@ -57,8 +59,13 @@ class InventoryValidator():
+         """Warning with added context."""
+         self.log.warning(code, where=self.where, **args)
+ 
+-    def validate(self, inventory):
+-        """Validate a given inventory."""
++    def validate(self, inventory, extract_spec_version=False):
++        """Validate a given inventory.
++
++        If extract_spec_version is True then will look at the type value to determine
++        the specification version. In the case that there is no type value or it isn't
++        valid, then other tests will be based on the version given in self.spec_version.
++        """
+         # Basic structure
+         self.inventory = inventory
+         if 'id' in inventory:
+@@ -75,8 +82,18 @@ class InventoryValidator():
+             self.error("E036a")
+         if 'type' not in inventory:
+             self.error("E036b")
++        elif not isinstance(inventory['type'], str):
++            self.error("E999")
++        elif extract_spec_version:
++            m = re.match(r'''https://ocfl.io/(\d+.\d)/spec/#inventory''', inventory['type'])
++            if not m:
++                self.error('E038b', got=inventory['type'], assumed_spec_version=self.spec_version)
++            elif m.group(1) in self.spec_versions_supported:
++                self.spec_version = m.group(1)
++            else:
++                self.error("E038c", got=m.group(1), assumed_spec_version=self.spec_version)
+         elif inventory['type'] != 'https://ocfl.io/' + self.spec_version + '/spec/#inventory':
+-            self.error("E038", expected='https://ocfl.io/' + self.spec_version + '/spec/#inventory', got=inventory['type'])
++            self.error("E038a", expected='https://ocfl.io/' + self.spec_version + '/spec/#inventory', got=inventory['type'])
+         if 'digestAlgorithm' not in inventory:
+             self.error("E036c")
+         elif inventory['digestAlgorithm'] == 'sha512':
+diff --git a/ocfl/object.py b/ocfl/object.py
+index 83b3e74..e8fb726 100755
+--- a/ocfl/object.py
++++ b/ocfl/object.py
+@@ -532,14 +532,14 @@ class Object():
+             self.log.info("OCFL object at %s is INVALID", objdir)
+         return passed
+ 
+-    def validate_inventory(self, path, show_warnings=True, show_errors=True):
++    def validate_inventory(self, path, show_warnings=True, show_errors=True, extract_spec_version=False):
+         """Validate just an OCFL Object inventory at path."""
+         validator = Validator(show_warnings=show_warnings,
+                               show_errors=show_errors)
+         try:
+             (inv_dir, inv_file) = fs.path.split(path)
+             validator.obj_fs = open_fs(inv_dir, create=False)
+-            validator.validate_inventory(inv_file, where='standalone')
++            validator.validate_inventory(inv_file, where='standalone', extract_spec_version=extract_spec_version)
+         except fs.errors.ResourceNotFound:
+             validator.log.error('E033', where='standalone', explanation='failed to open directory')
+         except ValidatorAbortException:
+diff --git a/ocfl/validator.py b/ocfl/validator.py
+index 060c1dc..6fc3dc1 100644
+--- a/ocfl/validator.py
++++ b/ocfl/validator.py
+@@ -132,12 +132,17 @@ class Validator():
+             pass
+         return self.log.num_errors == 0
+ 
+-    def validate_inventory(self, inv_file, where='root'):
++    def validate_inventory(self, inv_file, where='root', extract_spec_version=False):
+         """Validate a given inventory file, record errors with self.log.error().
+ 
+         Returns inventory object for use in later validation
+         of object content. Does not look at anything else in the
+         object itself.
++
++        where - used for reporting messages of where inventory is in object
++
++        extract_spec_version - if set True will attempt to take spec_version from the
++            inventory itself instead of using the spec_version provided
+         """
+         try:
+             with self.obj_fs.openbin(inv_file, 'r') as fh:
+@@ -148,7 +153,7 @@ class Validator():
+         inv_validator = InventoryValidator(log=self.log, where=where,
+                                            lax_digests=self.lax_digests,
+                                            spec_version=self.spec_version)
+-        inv_validator.validate(inventory)
++        inv_validator.validate(inventory, extract_spec_version=extract_spec_version)
+         return inventory, inv_validator
+ 
+     def validate_inventory_digest(self, inv_file, digest_algorithm, where="root"):
+

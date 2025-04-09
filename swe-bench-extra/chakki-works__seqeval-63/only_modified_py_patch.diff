@@ -1,0 +1,142 @@
+diff --git a/seqeval/metrics/v1.py b/seqeval/metrics/v1.py
+index 2197293..0dbb392 100644
+--- a/seqeval/metrics/v1.py
++++ b/seqeval/metrics/v1.py
+@@ -207,7 +207,8 @@ def precision_recall_fscore_support(y_true: List[List[str]],
+                                     sample_weight: Optional[List[int]] = None,
+                                     zero_division: str = 'warn',
+                                     scheme: Optional[Type[Token]] = None,
+-                                    suffix: bool = False) -> SCORES:
++                                    suffix: bool = False,
++                                    **kwargs) -> SCORES:
+     """Compute precision, recall, F-measure and support for each class.
+ 
+     Args:
+@@ -288,9 +289,11 @@ def precision_recall_fscore_support(y_true: List[List[str]],
+         modified with ``zero_division``.
+     """
+     def extract_tp_actual_correct(y_true, y_pred, suffix, scheme):
+-        target_names = unique_labels(y_true, y_pred, scheme, suffix)
+-        entities_true = Entities(y_true, scheme, suffix)
+-        entities_pred = Entities(y_pred, scheme, suffix)
++        # If this function is called from classification_report,
++        # try to reuse entities to optimize the function.
++        entities_true = kwargs.get('entities_true') or Entities(y_true, scheme, suffix)
++        entities_pred = kwargs.get('entities_pred') or Entities(y_pred, scheme, suffix)
++        target_names = sorted(entities_true.unique_tags | entities_pred.unique_tags)
+ 
+         tp_sum = np.array([], dtype=np.int32)
+         pred_sum = np.array([], dtype=np.int32)
+@@ -376,7 +379,10 @@ def classification_report(y_true: List[List[str]],
+ 
+     if scheme is None or not issubclass(scheme, Token):
+         scheme = auto_detect(y_true, suffix)
+-    target_names = unique_labels(y_true, y_pred, scheme, suffix)
++
++    entities_true = Entities(y_true, scheme, suffix)
++    entities_pred = Entities(y_pred, scheme, suffix)
++    target_names = sorted(entities_true.unique_tags | entities_pred.unique_tags)
+ 
+     if output_dict:
+         reporter = DictReporter()
+@@ -393,7 +399,9 @@ def classification_report(y_true: List[List[str]],
+         sample_weight=sample_weight,
+         zero_division=zero_division,
+         scheme=scheme,
+-        suffix=suffix
++        suffix=suffix,
++        entities_true=entities_true,
++        entities_pred=entities_pred
+     )
+     for row in zip(target_names, p, r, f1, s):
+         reporter.write(*row)
+@@ -408,7 +416,9 @@ def classification_report(y_true: List[List[str]],
+             sample_weight=sample_weight,
+             zero_division=zero_division,
+             scheme=scheme,
+-            suffix=suffix
++            suffix=suffix,
++            entities_true=entities_true,
++            entities_pred=entities_pred
+         )
+         reporter.write('{} avg'.format(average), avg_p, avg_r, avg_f1, support)
+     reporter.write_blank()
+diff --git a/seqeval/scheme.py b/seqeval/scheme.py
+index 013be37..f60abfa 100644
+--- a/seqeval/scheme.py
++++ b/seqeval/scheme.py
+@@ -35,6 +35,9 @@ class Prefix(enum.Flag):
+     ANY = I | O | B | E | S | U | L
+ 
+ 
++Prefixes = dict(Prefix.__members__)
++
++
+ class Tag(enum.Flag):
+     SAME = enum.auto()
+     DIFF = enum.auto()
+@@ -49,25 +52,13 @@ class Token:
+ 
+     def __init__(self, token: str, suffix: bool = False, delimiter: str = '-'):
+         self.token = token
+-        self.suffix = suffix
+-        self.delimiter = delimiter
++        self.prefix = Prefixes[token[-1]] if suffix else Prefixes[token[0]]
++        tag = token[:-1] if suffix else token[1:]
++        self.tag = tag.strip(delimiter) or '_'
+ 
+     def __repr__(self):
+         return self.token
+ 
+-    @property
+-    def prefix(self):
+-        """Extracts a prefix from the token."""
+-        prefix = self.token[-1] if self.suffix else self.token[0]
+-        return Prefix[prefix]
+-
+-    @property
+-    def tag(self):
+-        """Extracts a tag from the token."""
+-        tag = self.token[:-1] if self.suffix else self.token[1:]
+-        tag = tag.strip(self.delimiter) or '_'
+-        return tag
+-
+     def is_valid(self):
+         """Check whether the prefix is allowed or not."""
+         if self.prefix not in self.allowed_prefix:
+@@ -229,9 +220,9 @@ class Tokens:
+ 
+     def __init__(self, tokens: List[str], scheme: Type[Token],
+                  suffix: bool = False, delimiter: str = '-', sent_id: int = None):
+-        self.tokens = [scheme(token, suffix=suffix, delimiter=delimiter) for token in tokens]
+-        self.scheme = scheme
+         self.outside_token = scheme('O', suffix=suffix, delimiter=delimiter)
++        self.tokens = [scheme(token, suffix=suffix, delimiter=delimiter) for token in tokens]
++        self.extended_tokens = self.tokens + [self.outside_token]
+         self.sent_id = sent_id
+ 
+     @property
+@@ -276,12 +267,6 @@ class Tokens:
+         prev = self.extended_tokens[i - 1]
+         return token.is_end(prev)
+ 
+-    @property
+-    def extended_tokens(self):
+-        # append a sentinel.
+-        tokens = self.tokens + [self.outside_token]
+-        return tokens
+-
+ 
+ class Entities:
+ 
+@@ -315,8 +300,8 @@ def auto_detect(sequences: List[List[str]], suffix: bool = False, delimiter: str
+     error_message = 'This scheme is not supported: {}'
+     for tokens in sequences:
+         for token in tokens:
+-            token = Token(token, suffix=suffix, delimiter=delimiter)
+             try:
++                token = Token(token, suffix=suffix, delimiter=delimiter)
+                 prefixes.add(token.prefix)
+             except KeyError:
+                 raise ValueError(error_message.format(token))
+

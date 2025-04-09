@@ -1,0 +1,178 @@
+diff --git a/dabl/models.py b/dabl/models.py
+index 7dd1c39..e3a42f7 100644
+--- a/dabl/models.py
++++ b/dabl/models.py
+@@ -1,3 +1,4 @@
++from importlib.metadata import version
+ import warnings
+ import numpy as np
+ import pandas as pd
+@@ -17,7 +18,7 @@ except ImportError:
+     from sklearn.metrics.scorer import _check_multimetric_scoring
+ from sklearn.model_selection._validation import _fit_and_score
+ from sklearn.utils.validation import check_is_fitted
+-from sklearn.utils.metaestimators import if_delegate_has_method
++from dabl._available_if import available_if
+ try:
+     from sklearn.utils._testing import set_random_state
+ except ImportError:
+@@ -33,6 +34,8 @@ from .pipelines import (get_fast_classifiers, get_fast_regressors,
+                         get_any_classifiers)
+ from .utils import _validate_Xyt
+ 
++_SKLEARN_VERSION = version('scikit-learn')
++
+ 
+ def _format_scores(scores):
+     return " ".join(('{}: {:.3f}'.format(name, score)
+@@ -41,11 +44,14 @@ def _format_scores(scores):
+ 
+ class _DablBaseEstimator(BaseEstimator):
+ 
+-    @if_delegate_has_method(delegate='est_')
++    def _estimator_has(attr: str) -> bool:
++        return lambda self: hasattr(self, 'est_') and hasattr(self.est_, attr)
++
++    @available_if(_estimator_has('predict_proba'))
+     def predict_proba(self, X):
+         return self.est_.predict_proba(X)
+ 
+-    @if_delegate_has_method(delegate='est_')
++    @available_if(_estimator_has('decision_function'))
+     def decision_function(self, X):
+         return self.est_.decision_function(X)
+ 
+@@ -76,10 +82,11 @@ class _BaseSimpleEstimator(_DablBaseEstimator):
+             with warnings.catch_warnings():
+                 warnings.filterwarnings('ignore',
+                                         category=UndefinedMetricWarning)
++                _fit_and_score_args = {'score_params': {}} if _SKLEARN_VERSION >= '1.4' else {}
+                 scores = _fit_and_score(estimator, X, y, scorer=scorers,
+                                         train=train, test=test,
+                                         parameters={}, fit_params={},
+-                                        verbose=self.verbose)
++                                        verbose=self.verbose, **_fit_and_score_args)
+             res.append(scores['test_scores'])
+ 
+         res_mean = pd.DataFrame(res).mean(axis=0)
+diff --git a/dabl/plot/utils.py b/dabl/plot/utils.py
+index b49f2b6..07b264b 100644
+--- a/dabl/plot/utils.py
++++ b/dabl/plot/utils.py
+@@ -6,6 +6,7 @@ import itertools
+ import numpy as np
+ import pandas as pd
+ import matplotlib.pyplot as plt
++from matplotlib.axes import Axes
+ from matplotlib.patches import Rectangle, Patch
+ from matplotlib.ticker import EngFormatter
+ from seaborn.utils import despine
+@@ -369,7 +370,7 @@ def _check_X_target_col(X, target_col, types=None, type_hints=None, task=None):
+     return types
+ 
+ 
+-def _short_tick_names(ax, label_length=20, ticklabel_length=10):
++def _short_tick_names(ax: Axes, label_length=20, ticklabel_length=10):
+     """Shorten axes labels and tick labels.
+ 
+     Uses _shortname to change labels as a side effect.
+@@ -384,8 +385,19 @@ def _short_tick_names(ax, label_length=20, ticklabel_length=10):
+         Length of each label in xticklabels and yticklabels
+ 
+     """
+-    ax.set_yticks(ax.get_yticks().tolist())
+-    ax.set_xticks(ax.get_xticks().tolist())
++    # Handle differences in return types between matplotlib 3.7 and 3.8
++    yticks = ax.get_yticks()
++    if isinstance(yticks, np.ndarray):
++        yticks = yticks.tolist()
++    assert isinstance(yticks, list)
++    ax.set_yticks(yticks)
++
++    xticks = ax.get_xticks()
++    if isinstance(xticks, np.ndarray):
++        xticks = xticks.tolist()
++    assert isinstance(xticks, list)
++    ax.set_xticks(xticks)
++
+     ax.set_xticklabels(
+         [_shortname(t.get_text(), maxlen=ticklabel_length)
+          for t in ax.get_xticklabels()]
+@@ -578,7 +590,7 @@ def class_hists(data, column, target, bins="auto", ax=None, legend=True,
+     >>> from dabl.datasets import load_adult
+     >>> data = load_adult()
+     >>> class_hists(data, "age", "gender", legend=True)
+-    <AxesSubplot:xlabel='age'>
++    <Axes: xlabel='age'>
+     """
+     col_data = data[column].dropna()
+ 
+diff --git a/dabl/preprocessing.py b/dabl/preprocessing.py
+index 67c43d8..055d67a 100644
+--- a/dabl/preprocessing.py
++++ b/dabl/preprocessing.py
+@@ -1,3 +1,4 @@
++from importlib.metadata import version
+ from joblib import hash
+ import warnings
+ from warnings import warn
+@@ -11,10 +12,13 @@ from sklearn.pipeline import make_pipeline
+ from sklearn.preprocessing import OneHotEncoder, StandardScaler
+ from sklearn.utils.validation import check_is_fitted
+ 
++
+ _FLOAT_REGEX = r"^[-+]?(?:(?:\d*\.\d+)|(?:\d+\.?))$"
+ _FLOAT_MATCHING_CACHE = {}
+ _MIXED_TYPE_WARNINGS = {}
+ 
++_SKLEARN_VERSION = version('scikit-learn')
++
+ 
+ def _float_matching(X_col, return_safe_col=False):
+     try:
+@@ -86,7 +90,8 @@ class DirtyFloatCleaner(BaseEstimator, TransformerMixin):
+             floats, X_col = _float_matching_fetch(X, col, return_safe_col=True)
+             # FIXME sparse
+             if (~floats).any():
+-                ohe = OneHotEncoder(sparse=False, handle_unknown='ignore')
++                ohe_args = {'sparse_output': False} if _SKLEARN_VERSION >= '1.2' else {'sparse': False}
++                ohe = OneHotEncoder(handle_unknown='ignore', **ohe_args)
+                 encoders[col] = ohe.fit(pd.DataFrame(X_col[~floats]))
+             else:
+                 encoders[col] = None
+@@ -601,9 +606,10 @@ class EasyPreprocessor(BaseEstimator, TransformerMixin):
+             steps_categorical.append(
+                 SimpleImputer(strategy='most_frequent', add_indicator=True)
+                 )
++            ohe_args = {'sparse_output': False} if _SKLEARN_VERSION >= '1.2' else {'sparse': False}
+             ohe = OneHotEncoder(
+                 categories='auto', handle_unknown='ignore',
+-                sparse=False, drop="if_binary")
++                drop="if_binary", **ohe_args)
+             steps_categorical.append(ohe)
+ 
+         pipe_categorical = make_pipeline(*steps_categorical)
+diff --git a/setup.py b/setup.py
+index 6eca18d..b0141ec 100644
+--- a/setup.py
++++ b/setup.py
+@@ -13,8 +13,16 @@ setup(name='dabl',
+       long_description=readme,
+       long_description_content_type='text/markdown; charset=UTF-8',
+       packages=find_packages(),
+-      install_requires=["numpy", "scipy", "scikit-learn>=1.1", "pandas",
+-                        "matplotlib>=3.5", "seaborn"],
++      install_requires=[
++          "numpy",
++          "scipy",
++          "scikit-learn>=1.1",
++          "pandas",
++          "matplotlib < 3.8;python_version<'3.9'",
++          "matplotlib >= 3.8;python_version>='3.9'",
++          "seaborn",
++      ],
++      python_requires=">=3.8",
+       author_email='t3kcit+githubspam@gmail.com',
+       package_data={'': ['datasets/titanic.csv',
+                          'datasets/ames_housing.pkl.bz2',
+

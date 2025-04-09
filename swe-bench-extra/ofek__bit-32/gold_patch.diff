@@ -1,0 +1,105 @@
+diff --git a/.gitignore b/.gitignore
+index 9367500..ba62003 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ *.log
+ *.pyc
++*.orig
+ /.cache
+ /.idea
+ /.coverage
+diff --git a/bit/network/fees.py b/bit/network/fees.py
+index 58a783a..4204400 100644
+--- a/bit/network/fees.py
++++ b/bit/network/fees.py
+@@ -1,3 +1,4 @@
++import logging
+ from functools import wraps
+ from time import time
+ 
+@@ -54,7 +55,12 @@ def get_fee_local_cache(f):
+                     cached_fee_fast = request.json()['fastestFee']
+                     fast_last_update = now
+                 except (ConnectionError, HTTPError, Timeout):  # pragma: no cover
+-                    return cached_fee_fast or DEFAULT_FEE_FAST
++                    if cached_fee_fast is None:
++                        logging.warning('Connection to fee API failed, returning default fee (fast) of {}'.format(DEFAULT_FEE_FAST))
++                        return DEFAULT_FEE_FAST
++                    else:
++                        logging.warning('Connection to fee API failed, returning cached fee (fast).')
++                        return cached_fee_fast
+ 
+             return cached_fee_fast
+ 
+@@ -71,7 +77,12 @@ def get_fee_local_cache(f):
+                     cached_fee_hour = request.json()['hourFee']
+                     hour_last_update = now
+                 except (ConnectionError, HTTPError, Timeout):  # pragma: no cover
+-                    return cached_fee_hour or DEFAULT_FEE_HOUR
++                    if cached_fee_hour is None:
++                        logging.warning('Connection to fee API failed, returning default fee (hour) of {}'.format(DEFAULT_FEE_HOUR))
++                        return DEFAULT_FEE_HOUR
++                    else:
++                        logging.warning('Connection to fee API failed, returning cached fee (hour).')
++                        return cached_fee_hour
+ 
+             return cached_fee_hour
+ 
+diff --git a/bit/transaction.py b/bit/transaction.py
+index 7ef723c..4f38bdd 100644
+--- a/bit/transaction.py
++++ b/bit/transaction.py
+@@ -1,3 +1,4 @@
++import logging
+ from collections import namedtuple
+ from itertools import islice
+ 
+@@ -70,10 +71,19 @@ def estimate_tx_fee(n_in, n_out, satoshis, compressed):
+         + 8
+     )
+ 
+-    return estimated_size * satoshis
++    estimated_fee = estimated_size * satoshis
++
++    logging.debug('Estimated fee: {} satoshis for {} bytes'.format(estimated_fee, estimated_size))
++
++    return estimated_fee
+ 
+ 
+ def sanitize_tx_data(unspents, outputs, fee, leftover, combine=True, message=None, compressed=True):
++    """
++    sanitize_tx_data()
++
++    fee is in satoshis per byte.
++    """
+ 
+     outputs = outputs.copy()
+ 
+@@ -94,12 +104,15 @@ def sanitize_tx_data(unspents, outputs, fee, leftover, combine=True, message=Non
+             messages.append((message, 0))
+ 
+     # Include return address in fee estimate.
+-    fee = estimate_tx_fee(len(unspents), len(outputs) + len(messages) + 1, fee, compressed)
+-    total_out = sum(out[1] for out in outputs) + fee
+ 
+     total_in = 0
++    num_outputs = len(outputs) + len(messages) + 1
++    sum_outputs = sum(out[1] for out in outputs)
+ 
+     if combine:
++        # calculated_fee is in total satoshis.
++        calculated_fee = estimate_tx_fee(len(unspents), num_outputs, fee, compressed)
++        total_out = sum_outputs + calculated_fee
+         unspents = unspents.copy()
+         total_in += sum(unspent.amount for unspent in unspents)
+ 
+@@ -110,6 +123,8 @@ def sanitize_tx_data(unspents, outputs, fee, leftover, combine=True, message=Non
+ 
+         for index, unspent in enumerate(unspents):
+             total_in += unspent.amount
++            calculated_fee = estimate_tx_fee(len(unspents[:index + 1]), num_outputs, fee, compressed)
++            total_out = sum_outputs + calculated_fee
+ 
+             if total_in >= total_out:
+                 break

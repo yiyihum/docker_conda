@@ -1,0 +1,162 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e44f4266..cc8553aa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## Version _next_
+ 
++- Add support for _password_
++- Add support for _binary_
+ - Add support for _byte_
+ - Add support for _date_
+ - Move SQLAlchemy relationship construction behind facade
+diff --git a/README.md b/README.md
+index 4684c692..87a5c8c1 100644
+--- a/README.md
++++ b/README.md
+@@ -100,7 +100,9 @@ An example API has been defined using connexion and Flask here:
+ - `number` (float only),
+ - `boolean`,
+ - `string`,
++- `password`,
+ - `byte`,
++- `binary`,
+ - `date`,
+ - `date-time`,
+ - `$ref` references for columns and models,
+diff --git a/docs/source/technical_details/type_mapping.rst b/docs/source/technical_details/type_mapping.rst
+index 077313ac..bf7406ba 100644
+--- a/docs/source/technical_details/type_mapping.rst
++++ b/docs/source/technical_details/type_mapping.rst
+@@ -19,8 +19,12 @@ following mappings:
+ +--------------+----------------+-----------------+
+ | string       | *undefined*    | String          |
+ +--------------+----------------+-----------------+
++|              | password       | String          |
+++--------------+----------------+-----------------+
+ |              | byte           | String          |
+ +--------------+----------------+-----------------+
++|              | binary         | LargeBinary     |
+++--------------+----------------+-----------------+
+ |              | date           | Date            |
+ +--------------+----------------+-----------------+
+ |              | date-time      | DateTime        |
+@@ -35,6 +39,26 @@ String
+ translated to the *length* argument for the *SQLAlchemy* *String*, which is set
+ to *None* if *maxLength* is *undefined*.
+ 
++Password
++--------
++
++The same *maxLength* information as for *String* also applies.
++
++.. note:: The *password* format under the hood is the same as *String*. No
++    special protection (such as encryption) is added.
++
++Byte
++------
++
++This format is for *base64* encoded binary data. The same *maxLength*
++information as for *String* also applies.
++
++Binary
++------
++
++The same *maxLength* information as for *String* also applies. The codec is
++assumed to be *utf-8*.
++
+ DateTime
+ --------
+ 
+diff --git a/open_alchemy/column_factory/column.py b/open_alchemy/column_factory/column.py
+index 7a2874aa..395e470a 100644
+--- a/open_alchemy/column_factory/column.py
++++ b/open_alchemy/column_factory/column.py
+@@ -272,10 +272,14 @@ def _handle_string(*, artifacts: types.ColumnArtifacts) -> sqlalchemy.String:
+         raise exceptions.MalformedSchemaError(
+             "The string type does not support autoincrement."
+         )
+-    if artifacts.format in {None, "byte"}:
++    if artifacts.format in {None, "byte", "password"}:
+         if artifacts.max_length is None:
+             return sqlalchemy.String
+         return sqlalchemy.String(length=artifacts.max_length)
++    if artifacts.format == "binary":
++        if artifacts.max_length is None:
++            return sqlalchemy.LargeBinary
++        return sqlalchemy.LargeBinary(length=artifacts.max_length)
+     if artifacts.format == "date":
+         return sqlalchemy.Date
+     if artifacts.format == "date-time":
+diff --git a/open_alchemy/utility_base.py b/open_alchemy/utility_base.py
+index dcdff3cc..042d8c20 100644
+--- a/open_alchemy/utility_base.py
++++ b/open_alchemy/utility_base.py
+@@ -99,12 +99,23 @@ class UtilityBase:
+         return ref_model
+ 
+     @staticmethod
+-    def _from_dict(
++    def _model_from_dict(
+         kwargs: typing.Dict[str, typing.Any], *, model: typing.Type[TUtilityBase]
+     ) -> TUtilityBase:
+         """Construct model from dictionary."""
+         return model.from_dict(**kwargs)
+ 
++    @staticmethod
++    def _simple_type_from_dict(format_: str, value: typing.Any) -> typing.Any:
++        """Construct dictionary key for simple types."""
++        if format_ == "date":
++            return datetime.date.fromisoformat(value)
++        if format_ == "date-time":
++            return datetime.datetime.fromisoformat(value)
++        if format_ == "binary":
++            return value.encode()
++        return value
++
+     @classmethod
+     def from_dict(cls: typing.Type[TUtilityBase], **kwargs: typing.Any) -> TUtilityBase:
+         """
+@@ -168,7 +179,7 @@ class UtilityBase:
+             ref_model: typing.Type[TUtilityBase]
+             if type_ == "object":
+                 ref_model = cls._get_model(spec=spec, name=name, schema=schema)
+-                ref_model_instance = cls._from_dict(value, model=ref_model)
++                ref_model_instance = cls._model_from_dict(value, model=ref_model)
+                 model_dict[name] = ref_model_instance
+                 continue
+ 
+@@ -183,19 +194,15 @@ class UtilityBase:
+                         f"The model schema is {json.dumps(schema)}."
+                     )
+                 ref_model = cls._get_model(spec=item_spec, name=name, schema=schema)
+-                model_from_dict = functools.partial(cls._from_dict, model=ref_model)
++                model_from_dict = functools.partial(
++                    cls._model_from_dict, model=ref_model
++                )
+                 ref_model_instances = map(model_from_dict, value)
+                 model_dict[name] = list(ref_model_instances)
+                 continue
+ 
+             # Handle other types
+-            if format_ == "date":
+-                model_dict[name] = datetime.date.fromisoformat(value)
+-                continue
+-            if format_ == "date-time":
+-                model_dict[name] = datetime.datetime.fromisoformat(value)
+-                continue
+-            model_dict[name] = value
++            model_dict[name] = cls._simple_type_from_dict(format_=format_, value=value)
+ 
+         return cls(**model_dict)
+ 
+@@ -265,6 +272,8 @@ class UtilityBase:
+             return value.isoformat()
+         if format_ == "date-time":
+             return value.isoformat()
++        if format_ == "binary":
++            return value.decode()
+         return value
+ 
+     @classmethod

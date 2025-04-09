@@ -1,0 +1,189 @@
+diff --git a/mobly/base_test.py b/mobly/base_test.py
+index e85551a..b3ccf43 100644
+--- a/mobly/base_test.py
++++ b/mobly/base_test.py
+@@ -553,6 +553,7 @@ class BaseTestClass(object):
+             # Skip all tests peacefully.
+             e.details = 'setup_class aborted due to: %s' % e.details
+             self._skip_remaining_tests(e)
++            self._safe_exec_func(self.teardown_class)
+             return self.results
+         except Exception as e:
+             # Setup class failed for unknown reasons.
+@@ -564,9 +565,8 @@ class BaseTestClass(object):
+             self._exec_procedure_func(self._on_fail, class_record)
+             self.results.add_class_error(class_record)
+             self._skip_remaining_tests(e)
+-            return self.results
+-        finally:
+             self._safe_exec_func(self.teardown_class)
++            return self.results
+         # Run tests in order.
+         try:
+             for test_name, test_method in tests:
+diff --git a/tests/mobly/base_test_test.py b/tests/mobly/base_test_test.py
+index 725dcda..db615dd 100755
+--- a/tests/mobly/base_test_test.py
++++ b/tests/mobly/base_test_test.py
+@@ -38,7 +38,6 @@ class SomeError(Exception):
+ 
+ 
+ class BaseTestTest(unittest.TestCase):
+-
+     def setUp(self):
+         self.mock_test_cls_configs = config_parser.TestRunConfig()
+         self.mock_test_cls_configs.log_path = '/tmp'
+@@ -566,6 +565,25 @@ class BaseTestTest(unittest.TestCase):
+                          ("Error 0, Executed 0, Failed 0, Passed 0, "
+                           "Requested 3, Skipped 3"))
+ 
++    def test_setup_and_teardown_execution_count(self):
++        class MockBaseTest(base_test.BaseTestClass):
++            def test_func(self):
++                pass
++
++            def test_func2(self):
++                pass
++
++        bt_cls = MockBaseTest(self.mock_test_cls_configs)
++        bt_cls.setup_class = mock.Mock()
++        bt_cls.teardown_class = mock.Mock()
++        bt_cls.setup_test = mock.Mock()
++        bt_cls.teardown_test = mock.Mock()
++        bt_cls.run()
++        self.assertEqual(bt_cls.setup_class.call_count, 1)
++        self.assertEqual(bt_cls.teardown_class.call_count, 1)
++        self.assertEqual(bt_cls.setup_test.call_count, 2)
++        self.assertEqual(bt_cls.teardown_test.call_count, 2)
++
+     def test_abort_class_in_test(self):
+         class MockBaseTest(base_test.BaseTestClass):
+             def test_1(self):
+diff --git a/tests/mobly/controllers/android_device_lib/callback_handler_test.py b/tests/mobly/controllers/android_device_lib/callback_handler_test.py
+index a701d51..f288ef3 100755
+--- a/tests/mobly/controllers/android_device_lib/callback_handler_test.py
++++ b/tests/mobly/controllers/android_device_lib/callback_handler_test.py
+@@ -34,6 +34,7 @@ MOCK_RAW_EVENT = {
+ class CallbackHandlerTest(unittest.TestCase):
+     """Unit tests for mobly.controllers.android_device_lib.callback_handler.
+     """
++
+     def test_timeout_value(self):
+         self.assertGreaterEqual(jsonrpc_client_base._SOCKET_READ_TIMEOUT,
+                                 callback_handler.MAX_TIMEOUT)
+@@ -64,9 +65,9 @@ class CallbackHandlerTest(unittest.TestCase):
+             event_client=mock_event_client,
+             ret_value=None,
+             method_name=None)
+-        expected_msg = 'Timeout waiting for event "ha" .*'
++        expected_msg = 'Timed out after waiting .*s for event "ha" .*'
+         with self.assertRaisesRegex(callback_handler.TimeoutError,
+-                                     expected_msg):
++                                    expected_msg):
+             handler.waitAndGet('ha')
+ 
+     def test_wait_for_event(self):
+@@ -101,7 +102,7 @@ class CallbackHandlerTest(unittest.TestCase):
+             return False
+ 
+         with self.assertRaisesRegex(callback_handler.TimeoutError,
+-                                     expected_msg):
++                                    expected_msg):
+             handler.waitForEvent('AsyncTaskResult', some_condition, 0.01)
+ 
+ 
+diff --git a/tests/mobly/controllers/android_device_lib/snippet_client_test.py b/tests/mobly/controllers/android_device_lib/snippet_client_test.py
+index 010064c..beb9262 100755
+--- a/tests/mobly/controllers/android_device_lib/snippet_client_test.py
++++ b/tests/mobly/controllers/android_device_lib/snippet_client_test.py
+@@ -18,6 +18,7 @@ from builtins import bytes
+ import mock
+ from future.tests.base import unittest
+ 
++from mobly.controllers.android_device_lib import adb
+ from mobly.controllers.android_device_lib import jsonrpc_client_base
+ from mobly.controllers.android_device_lib import snippet_client
+ from tests.lib import jsonrpc_client_test_base
+@@ -51,6 +52,8 @@ class MockAdbProxy(object):
+             return bytes('instrumentation:{p}/{r} (target={p})'.format(
+                 p=MOCK_PACKAGE_NAME,
+                 r=snippet_client._INSTRUMENTATION_RUNNER_PACKAGE), 'utf-8')
++        elif 'which' in params:
++            return ''
+ 
+     def __getattr__(self, name):
+         """All calls to the none-existent functions in adb proxy would
+@@ -175,6 +178,73 @@ class SnippetClientTest(jsonrpc_client_test_base.JsonRpcClientTestBase):
+         client.start_app_and_connect()
+         self.assertEqual(123, client.device_port)
+ 
++    @mock.patch('mobly.controllers.android_device_lib.snippet_client.'
++                'SnippetClient._do_start_app')
++    @mock.patch('mobly.controllers.android_device_lib.snippet_client.'
++                'SnippetClient._check_app_installed')
++    @mock.patch('mobly.controllers.android_device_lib.snippet_client.'
++                'SnippetClient._read_protocol_line')
++    @mock.patch('mobly.controllers.android_device_lib.snippet_client.'
++                'SnippetClient._connect_to_v1')
++    @mock.patch('mobly.controllers.android_device_lib.snippet_client.'
++                'utils.get_available_host_port')
++    def test_snippet_start_app_and_connect_v1_persistent_session(
++            self, mock_get_port, mock_connect_to_v1, mock_read_protocol_line,
++            mock_check_app_installed, mock_do_start_app):
++
++        def _mocked_shell(arg):
++            if 'setsid' in arg:
++                raise adb.AdbError('cmd', 'stdout', 'stderr', 'ret_code')
++            else:
++                return 'nohup'
++
++        mock_get_port.return_value = 123
++        mock_read_protocol_line.side_effect = [
++            'SNIPPET START, PROTOCOL 1 234',
++            'SNIPPET SERVING, PORT 1234',
++            'SNIPPET START, PROTOCOL 1 234',
++            'SNIPPET SERVING, PORT 1234',
++            'SNIPPET START, PROTOCOL 1 234',
++            'SNIPPET SERVING, PORT 1234',
++        ]
++
++        # Test 'setsid' exists
++        client = self._make_client()
++        client._adb.shell = mock.Mock(return_value='setsid')
++        client.start_app_and_connect()
++        cmd_setsid = '%s am instrument -w -e action start %s/%s' % (
++            snippet_client._SETSID_COMMAND,
++            MOCK_PACKAGE_NAME,
++            snippet_client._INSTRUMENTATION_RUNNER_PACKAGE)
++        mock_do_start_app.assert_has_calls(mock.call(cmd_setsid))
++
++        # Test 'setsid' does not exist, but 'nohup' exsits
++        client = self._make_client()
++        client._adb.shell = _mocked_shell
++        client.start_app_and_connect()
++        cmd_nohup = '%s am instrument -w -e action start %s/%s' % (
++            snippet_client._NOHUP_COMMAND,
++            MOCK_PACKAGE_NAME,
++            snippet_client._INSTRUMENTATION_RUNNER_PACKAGE)
++        mock_do_start_app.assert_has_calls([
++            mock.call(cmd_setsid),
++            mock.call(cmd_nohup)
++        ])
++
++        # Test both 'setsid' and 'nohup' do not exist
++        client._adb.shell = mock.Mock(
++            side_effect=adb.AdbError('cmd', 'stdout', 'stderr', 'ret_code'))
++        client = self._make_client()
++        client.start_app_and_connect()
++        cmd_not_persist = ' am instrument -w -e action start %s/%s' % (
++            MOCK_PACKAGE_NAME,
++            snippet_client._INSTRUMENTATION_RUNNER_PACKAGE)
++        mock_do_start_app.assert_has_calls([
++            mock.call(cmd_setsid),
++            mock.call(cmd_nohup),
++            mock.call(cmd_not_persist)
++        ])
++
+     @mock.patch('socket.create_connection')
+     @mock.patch('mobly.controllers.android_device_lib.snippet_client.'
+                 'utils.start_standing_subprocess')

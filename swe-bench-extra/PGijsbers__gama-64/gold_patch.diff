@@ -1,0 +1,235 @@
+diff --git a/docs/source/releases.rst b/docs/source/releases.rst
+index abed928..b311f77 100644
+--- a/docs/source/releases.rst
++++ b/docs/source/releases.rst
+@@ -1,6 +1,21 @@
+ Release Notes
+ =============
+ 
++Version 19.11.0
++---------------
++Features:
++ - `gama.__version__` can now be used to retrieve gama's version.
++ - `fit_arff`, `score_arff` and `predict_arff` now accept a `target_column` parameter to specify the target.
++   If left unset, the last column of the ARFF file is assumed to be the target column.
++
++Bugfixes:
++ - fit(x, y) may now be called with y as (N,1) array.
++ - ensemble post-processing is now compatible with non-zero indexed class labels
++
++Maintenance:
++ - `__version__.py` is now the only place with hard-coded version.
++
++
+ Version 19.08.0
+ ---------------
+ - Prototype dash app for visualizing GAMA logs.
+diff --git a/gama/__init__.py b/gama/__init__.py
+index fa98f03..fb18dad 100644
+--- a/gama/__init__.py
++++ b/gama/__init__.py
+@@ -1,5 +1,6 @@
+ from .GamaClassifier import GamaClassifier
+ from .GamaRegressor import GamaRegressor
++from .__version__ import __version__
+ 
+ name = "gama"
+ 
+diff --git a/gama/__version__.py b/gama/__version__.py
+new file mode 100644
+index 0000000..e934ba5
+--- /dev/null
++++ b/gama/__version__.py
+@@ -0,0 +1,2 @@
++# We employ YY.0M.micro scheme in 2019. In 2020 we move to YY.minor.micro.
++__version__ = '19.11.0'
+diff --git a/gama/data.py b/gama/data.py
+index 13e192a..f4694eb 100644
+--- a/gama/data.py
++++ b/gama/data.py
+@@ -1,5 +1,5 @@
+ """ This module contains functions for loading data. """
+-from typing import Tuple
++from typing import Tuple, Optional
+ 
+ import arff
+ import pandas as pd
+@@ -19,6 +19,9 @@ def arff_to_pandas(file_path: str) -> pd.DataFrame:
+         A dataframe of the data in the ARFF file,
+         with categorical columns having category dtype.
+     """
++    if not isinstance(file_path, str):
++        raise TypeError(f"`file_path` must be of type `str` but is of type {type(file_path)}")
++
+     with open(file_path, 'r') as arff_file:
+         arff_dict = arff.load(arff_file)
+ 
+@@ -31,17 +34,17 @@ def arff_to_pandas(file_path: str) -> pd.DataFrame:
+     return data
+ 
+ 
+-def X_y_from_arff(file_path: str, split_column: str = 'last') -> Tuple[pd.DataFrame, pd.Series]:
++def X_y_from_arff(file_path: str, split_column: Optional[str] = None) -> Tuple[pd.DataFrame, pd.Series]:
+     """ Load data from the ARFF file into pandas DataFrame and specified column to pd.Series. "
+ 
+     Parameters
+     ----------
+     file_path: str
+         path to the ARFF file.
+-    split_column: str (default='last')
++    split_column: str, optional (default=None)
+         Column to split and return separately (e.g. target column).
+-        Value should either match a column name or 'last'.
+-        If 'last' is specified, the last column is returned separately.
++        Value should either match a column name or None.
++        If None is specified, the last column is returned separately.
+ 
+     Returns
+     -------
+@@ -50,7 +53,7 @@ def X_y_from_arff(file_path: str, split_column: str = 'last') -> Tuple[pd.DataFr
+     """
+     data = arff_to_pandas(file_path)
+ 
+-    if split_column == 'last':
++    if split_column is None:
+         return data.iloc[:, :-1], data.iloc[:, -1]
+     elif split_column in data.columns:
+         return data.loc[:, data.columns != split_column], data.loc[:, split_column]
+diff --git a/gama/gama.py b/gama/gama.py
+index 03e45c1..cd61d85 100644
+--- a/gama/gama.py
++++ b/gama/gama.py
+@@ -21,6 +21,7 @@ from gama.search_methods.base_search import BaseSearch
+ from gama.utilities.metrics import scoring_to_metric
+ from .utilities.observer import Observer
+ 
++from gama.__version__ import __version__
+ from gama.data import X_y_from_arff
+ from gama.search_methods.async_ea import AsyncEA
+ from gama.utilities.generic.timekeeper import TimeKeeper
+@@ -42,7 +43,6 @@ log = logging.getLogger(__name__)
+ STR_NO_OPTIMAL_PIPELINE = """Gama did not yet establish an optimal pipeline.
+                           This can be because `fit` was not yet called, or
+                           did not terminate successfully."""
+-__version__ = '19.01.0'
+ 
+ for module_to_ignore in ["sklearn", "numpy"]:
+     warnings.filterwarnings("ignore", module=module_to_ignore)
+@@ -202,23 +202,24 @@ class Gama(ABC):
+                 x[col] = x[col].astype(self._X[col].dtype)
+         return self._predict(x)
+ 
+-    def predict_arff(self, arff_file_path: str):
++    def predict_arff(self, arff_file_path: str, target_column: Optional[str] = None) -> np.ndarray:
+         """ Predict the target for input found in the ARFF file.
+ 
+         Parameters
+         ----------
+         arff_file_path: str
+             An ARFF file with the same columns as the one that used in fit.
+-            The target column is ignored (but must be present).
++            Target column must be present in file, but its values are ignored (can be '?').
++        target_column: str, optional (default=None)
++            Specifies which column the model should predict.
++            If left None, the last column is taken to be the target.
+ 
+         Returns
+         -------
+         numpy.ndarray
+             array with predictions for each row in the ARFF file.
+         """
+-        if not isinstance(arff_file_path, str):
+-            raise TypeError(f"`arff_file_path` must be of type `str` but is of type {type(arff_file_path)}")
+-        X, _ = X_y_from_arff(arff_file_path)
++        X, _ = X_y_from_arff(arff_file_path, split_column=target_column)
+         return self._predict(X)
+ 
+     def score(self, x: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray]) -> float:
+@@ -239,32 +240,38 @@ class Gama(ABC):
+         predictions = self.predict_proba(x) if self._metrics[0].requires_probabilities else self.predict(x)
+         return self._metrics[0].score(y, predictions)
+ 
+-    def score_arff(self, arff_file_path: str) -> float:
++    def score_arff(self, arff_file_path: str, target_column: Optional[str] = None) -> float:
+         """ Calculate the score of the model according to the `scoring` metric and input in the ARFF file.
+ 
+         Parameters
+         ----------
+-        arff_file_path: string
++        arff_file_path: str
+             An ARFF file with which to calculate the score.
++        target_column: str, optional (default=None)
++            Specifies which column the model should predict.
++            If left None, the last column is taken to be the target.
+ 
+         Returns
+         -------
+         float
+             The score obtained on the given test data according to the `scoring` metric.
+         """
+-        X, y = X_y_from_arff(arff_file_path)
++        X, y = X_y_from_arff(arff_file_path, split_column=target_column)
+         return self.score(X, y)
+ 
+-    def fit_arff(self, arff_file_path: str, *args, **kwargs):
++    def fit_arff(self, arff_file_path: str, target_column: Optional[str] = None, *args, **kwargs):
+         """ Find and fit a model to predict the target column (last) from other columns.
+ 
+         Parameters
+         ----------
+-        arff_file_path: string
++        arff_file_path: str
+             Path to an ARFF file containing the training data.
+-            The last column is always taken to be the target.
++        target_column: str, optional (default=None)
++            Specifies which column the model should predict.
++            If left None, the last column is taken to be the target.
++
+         """
+-        X, y = X_y_from_arff(arff_file_path)
++        X, y = X_y_from_arff(arff_file_path, split_column=target_column)
+         self.fit(X, y, *args, **kwargs)
+ 
+     def fit(self,
+diff --git a/gama/utilities/preprocessing.py b/gama/utilities/preprocessing.py
+index 476db87..bc99e8d 100644
+--- a/gama/utilities/preprocessing.py
++++ b/gama/utilities/preprocessing.py
+@@ -86,8 +86,12 @@ def format_x_y(x: Union[pd.DataFrame, np.ndarray], y: Union[pd.DataFrame, pd.Ser
+ 
+     if isinstance(x, np.ndarray):
+         x = heuristic_numpy_to_dataframe(x)
+-    if isinstance(y, np.ndarray) and y.ndim == 2 and y.shape[1] > 1:
+-        y = np.argmax(y, axis=1)
++    if isinstance(y, np.ndarray) and y.ndim == 2:
++        # Either indicator matrix or should be a vector.
++        if y.shape[1] > 1:
++            y = np.argmax(y, axis=1)
++        else:
++            y = y.squeeze()
+ 
+     if y_type == pd.Series:
+         if isinstance(y, pd.DataFrame):
+diff --git a/setup.py b/setup.py
+index 511a393..358d9ce 100644
+--- a/setup.py
++++ b/setup.py
+@@ -3,6 +3,9 @@ import os
+ 
+ from setuptools import setup, find_packages
+ 
++with open("gama/__version__.py", 'r') as fh:
++    version = fh.readlines()[-1].split()[-1].strip("\"'")
++
+ requirements = [
+     'numpy>=1.14.0',
+     'scipy>=1.0.0',
+@@ -37,7 +40,7 @@ with open(os.path.join("README.md")) as fid:
+ 
+ setup(
+     name='gama',
+-    version='19.08.0',
++    version=version,
+     description='A package for automated machine learning based on scikit-learn.',
+     long_description=README,
+     long_description_content_type='text/markdown',

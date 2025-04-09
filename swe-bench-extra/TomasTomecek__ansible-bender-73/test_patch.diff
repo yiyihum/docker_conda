@@ -1,0 +1,153 @@
+diff --git a/tests/data/multiplay.yaml b/tests/data/multiplay.yaml
+new file mode 100644
+index 0000000..4297bb5
+--- /dev/null
++++ b/tests/data/multiplay.yaml
+@@ -0,0 +1,17 @@
++---
++- hosts: all
++  vars:
++    ansible_bender: {}
++  tasks:
++  - name: Run a sample command
++    command: 'ls -lha /'
++- hosts: localhost
++  vars:
++    ansible_bender:
++      target_image:
++        name: nope
++  tasks:
++  - name: create a file
++    copy:
++      content: "killer"
++      dest: /queen
+diff --git a/tests/functional/test_buildah.py b/tests/functional/test_buildah.py
+index 5b62642..517c7b7 100644
+--- a/tests/functional/test_buildah.py
++++ b/tests/functional/test_buildah.py
+@@ -135,13 +135,15 @@ def test_build_basic_image_with_all_params(tmpdir, target_image):
+ 
+ 
+ def test_build_failure(tmpdir):
+-    target_image = "registry.example.com/ab-test-" + random_word(12) + ":oldest"
++    target_image_name = "registry.example.com/ab-test-" + random_word(12)
++    target_image_tag = "oldest"
++    target_image = f"{target_image_name}:{target_image_tag}"
+     target_failed_image = target_image + "-failed"
+     cmd = ["build", bad_playbook_path, base_image, target_image]
+     with pytest.raises(subprocess.CalledProcessError):
+         ab(cmd, str(tmpdir))
+-    out = ab(["get-logs"], str(tmpdir), return_output=True)
+-    assert "PLAY [all]" in out
++    out = ab(["get-logs"], str(tmpdir), return_output=True).lstrip()
++    assert out.startswith("PLAY [registry")
+ 
+     p_inspect_data = json.loads(subprocess.check_output(["podman", "inspect", "-t", "image", target_failed_image]))[0]
+     image_id = p_inspect_data["Id"]
+diff --git a/tests/functional/test_cli.py b/tests/functional/test_cli.py
+index 331cefe..58d1a09 100644
+--- a/tests/functional/test_cli.py
++++ b/tests/functional/test_cli.py
+@@ -61,8 +61,8 @@ metadata:
+ def test_get_logs(target_image, tmpdir):
+     cmd = ["build", basic_playbook_path, base_image, target_image]
+     ab(cmd, str(tmpdir))
+-    out = ab(["get-logs"], str(tmpdir), return_output=True)
+-    assert "PLAY [all]" in out
++    out = ab(["get-logs"], str(tmpdir), return_output=True).lstrip()
++    assert out.startswith("PLAY [registry")
+     assert "TASK [Gathering Facts]" in out
+     assert "failed=0" in out
+     assert "TASK [print local env vars]" in out
+diff --git a/tests/integration/test_api.py b/tests/integration/test_api.py
+index 6705c5c..8247527 100644
+--- a/tests/integration/test_api.py
++++ b/tests/integration/test_api.py
+@@ -5,13 +5,14 @@ import os
+ import shutil
+ 
+ import yaml
++from ansible_bender.builders.buildah_builder import podman_run_cmd
+ from flexmock import flexmock
+ 
+ from ansible_bender.api import Application
+ from ansible_bender.conf import Build
+ from ansible_bender.utils import random_str, run_cmd
+ from tests.spellbook import (dont_cache_playbook_path, change_layering_playbook, data_dir,
+-                             dont_cache_playbook_path_pre, non_ex_pb)
++                             dont_cache_playbook_path_pre, non_ex_pb, multiplay_path)
+ from ..spellbook import small_basic_playbook_path
+ 
+ 
+@@ -22,8 +23,8 @@ def test_build_db_metadata(target_image, application, build):
+     assert build.build_finished_time is not None
+     assert build.build_start_time is not None
+     assert build.log_lines is not None
+-    logs = "\n".join(build.log_lines)
+-    assert "PLAY [all]" in logs
++    logs = "\n".join([l for l in build.log_lines if l])
++    assert logs.startswith("PLAY [registry")
+     assert "TASK [Gathering Facts]" in logs
+     assert "failed=0" in logs
+ 
+@@ -229,3 +230,16 @@ def test_caching_non_ex_image_w_mocking(tmpdir, build):
+         assert not build.layers[-1].cached
+     finally:
+         application.clean()
++
++
++def test_multiplay(build, application):
++    im = "multiplay"
++    build.playbook_path = multiplay_path
++    build.target_image = im
++    application.build(build)
++    try:
++        build = application.db.get_build(build.build_id)
++        podman_run_cmd(im, ["ls", "/queen"])  # the file has to be in there
++        assert len(build.layers) == 3
++    finally:
++        run_cmd(["buildah", "rmi", im], ignore_status=True, print_output=True)
+diff --git a/tests/integration/test_conf.py b/tests/integration/test_conf.py
+index 07a6f51..8519436 100644
+--- a/tests/integration/test_conf.py
++++ b/tests/integration/test_conf.py
+@@ -2,11 +2,12 @@ import os
+ 
+ import jsonschema
+ import pytest
++from ansible_bender.utils import set_logging
+ 
+ from ansible_bender.conf import ImageMetadata, Build
+ from ansible_bender.core import PbVarsParser
+ 
+-from tests.spellbook import b_p_w_vars_path, basic_playbook_path, full_conf_pb_path
++from tests.spellbook import b_p_w_vars_path, basic_playbook_path, full_conf_pb_path, multiplay_path
+ 
+ 
+ def test_expand_pb_vars():
+@@ -78,3 +79,13 @@ def test_validation_err_ux():
+ 
+     assert "is not of type" in s
+     assert "Failed validating 'type' in schema" in s
++
++
++def test_multiplay(caplog):
++    set_logging()
++    p = PbVarsParser(multiplay_path)
++    b, m = p.get_build_and_metadata()
++
++    assert b.target_image != "nope"
++    assert "Variables are loaded only from the first play." == caplog.records[0].msg
++    assert "no bender data found in the playbook" == caplog.records[1].msg
+diff --git a/tests/spellbook.py b/tests/spellbook.py
+index 347a5a0..723f4fe 100644
+--- a/tests/spellbook.py
++++ b/tests/spellbook.py
+@@ -18,6 +18,7 @@ project_dir = os.path.dirname(tests_dir)
+ data_dir = os.path.abspath(os.path.join(tests_dir, "data"))
+ buildah_inspect_data_path = os.path.join(data_dir, "buildah_inspect.json")
+ basic_playbook_path = os.path.join(data_dir, "basic_playbook.yaml")
++multiplay_path = os.path.join(data_dir, "multiplay.yaml")
+ non_ex_pb = os.path.join(data_dir, "non_ex_pb.yaml")
+ b_p_w_vars_path = os.path.join(data_dir, "b_p_w_vars.yaml")
+ p_w_vars_files_path = os.path.join(data_dir, "p_w_vars_files.yaml")

@@ -1,0 +1,131 @@
+diff --git a/sqlglot/dialects/postgres.py b/sqlglot/dialects/postgres.py
+index 891596a6..880a6c2d 100644
+--- a/sqlglot/dialects/postgres.py
++++ b/sqlglot/dialects/postgres.py
+@@ -284,6 +284,7 @@ class Postgres(Dialect):
+             "TEMP": TokenType.TEMPORARY,
+             "CSTRING": TokenType.PSEUDO_TYPE,
+             "OID": TokenType.OBJECT_IDENTIFIER,
++            "OPERATOR": TokenType.OPERATOR,
+             "REGCLASS": TokenType.OBJECT_IDENTIFIER,
+             "REGCOLLATION": TokenType.OBJECT_IDENTIFIER,
+             "REGCONFIG": TokenType.OBJECT_IDENTIFIER,
+@@ -333,12 +334,13 @@ class Postgres(Dialect):
+ 
+         RANGE_PARSERS = {
+             **parser.Parser.RANGE_PARSERS,
++            TokenType.AT_GT: binary_range_parser(exp.ArrayContains),
+             TokenType.DAMP: binary_range_parser(exp.ArrayOverlaps),
+             TokenType.DAT: lambda self, this: self.expression(
+                 exp.MatchAgainst, this=self._parse_bitwise(), expressions=[this]
+             ),
+-            TokenType.AT_GT: binary_range_parser(exp.ArrayContains),
+             TokenType.LT_AT: binary_range_parser(exp.ArrayContained),
++            TokenType.OPERATOR: lambda self, this: self._parse_operator(this),
+         }
+ 
+         STATEMENT_PARSERS = {
+@@ -346,6 +348,29 @@ class Postgres(Dialect):
+             TokenType.END: lambda self: self._parse_commit_or_rollback(),
+         }
+ 
++        def _parse_operator(self, this: t.Optional[exp.Expression]) -> t.Optional[exp.Expression]:
++            while True:
++                if not self._match(TokenType.L_PAREN):
++                    break
++
++                op = ""
++                while self._curr and not self._match(TokenType.R_PAREN):
++                    op += self._curr.text
++                    self._advance()
++
++                this = self.expression(
++                    exp.Operator,
++                    comments=self._prev_comments,
++                    this=this,
++                    operator=op,
++                    expression=self._parse_bitwise(),
++                )
++
++                if not self._match(TokenType.OPERATOR):
++                    break
++
++            return this
++
+         def _parse_date_part(self) -> exp.Expression:
+             part = self._parse_type()
+             self._match(TokenType.COMMA)
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index aad679d0..5c276be8 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -4036,6 +4036,11 @@ class NEQ(Binary, Predicate):
+     pass
+ 
+ 
++# https://www.postgresql.org/docs/current/ddl-schemas.html#DDL-SCHEMAS-PATH
++class Operator(Binary):
++    arg_types = {"this": True, "operator": True, "expression": True}
++
++
+ class SimilarTo(Binary, Predicate):
+     pass
+ 
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 9e432716..14125733 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -3050,6 +3050,9 @@ class Generator:
+         table = "" if isinstance(expression.this, exp.Literal) else "TABLE "
+         return f"REFRESH {table}{this}"
+ 
++    def operator_sql(self, expression: exp.Operator) -> str:
++        return self.binary(expression, f"OPERATOR({self.sql(expression, 'operator')})")
++
+     def _simplify_unless_literal(self, expression: E) -> E:
+         if not isinstance(expression, exp.Literal):
+             from sqlglot.optimizer.simplify import simplify
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 1689c43f..60bd1a7b 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -293,6 +293,7 @@ class Parser(metaclass=_Parser):
+         TokenType.NATURAL,
+         TokenType.NEXT,
+         TokenType.OFFSET,
++        TokenType.OPERATOR,
+         TokenType.ORDINALITY,
+         TokenType.OVERLAPS,
+         TokenType.OVERWRITE,
+@@ -3336,7 +3337,7 @@ class Parser(metaclass=_Parser):
+ 
+         return this
+ 
+-    def _parse_between(self, this: exp.Expression) -> exp.Between:
++    def _parse_between(self, this: t.Optional[exp.Expression]) -> exp.Between:
+         low = self._parse_bitwise()
+         self._match(TokenType.AND)
+         high = self._parse_bitwise()
+@@ -5362,7 +5363,9 @@ class Parser(metaclass=_Parser):
+         self._match_r_paren()
+         return self.expression(exp.DictRange, this=this, min=min, max=max)
+ 
+-    def _parse_comprehension(self, this: exp.Expression) -> t.Optional[exp.Comprehension]:
++    def _parse_comprehension(
++        self, this: t.Optional[exp.Expression]
++    ) -> t.Optional[exp.Comprehension]:
+         index = self._index
+         expression = self._parse_column()
+         if not self._match(TokenType.IN):
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index e933929e..a8c7dfc4 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -276,6 +276,7 @@ class TokenType(AutoName):
+     OBJECT_IDENTIFIER = auto()
+     OFFSET = auto()
+     ON = auto()
++    OPERATOR = auto()
+     ORDER_BY = auto()
+     ORDERED = auto()
+     ORDINALITY = auto()

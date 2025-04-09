@@ -1,0 +1,96 @@
+diff --git a/kopf/engines/peering.py b/kopf/engines/peering.py
+index 257af61..4787c1d 100644
+--- a/kopf/engines/peering.py
++++ b/kopf/engines/peering.py
+@@ -265,13 +265,13 @@ def detect_own_id(*, manual: bool) -> Identity:
+     return Identity(f'{user}@{host}' if manual else f'{user}@{host}/{now}/{rnd}')
+ 
+ 
+-def guess_selector(settings: configuration.OperatorSettings) -> Optional[references.Selector]:
++def guess_selectors(settings: configuration.OperatorSettings) -> Iterable[references.Selector]:
+     if settings.peering.standalone:
+-        return None
++        return []
+     elif settings.peering.clusterwide:
+-        return references.CLUSTER_PEERINGS
++        return [references.CLUSTER_PEERINGS_K, references.CLUSTER_PEERINGS_Z]
+     elif settings.peering.namespaced:
+-        return references.NAMESPACED_PEERINGS
++        return [references.NAMESPACED_PEERINGS_K, references.NAMESPACED_PEERINGS_Z]
+     else:
+         raise TypeError("Unidentified peering mode (none of standalone/cluster/namespaced).")
+ 
+@@ -289,10 +289,10 @@ async def touch_command(
+         insights.ready_resources.wait(),
+     })
+ 
+-    selector = guess_selector(settings=settings)
+-    resource = insights.backbone.get(selector) if selector else None
+-    if resource is None:
+-        raise RuntimeError(f"Cannot find the peering resource {selector}.")
++    selectors = guess_selectors(settings=settings)
++    resources = [insights.backbone[s] for s in selectors if s in insights.backbone]
++    if not resources:
++        raise RuntimeError(f"Cannot find the peering resource for {selectors}.")
+ 
+     await aiotasks.wait({
+         aiotasks.create_guarded_task(
+@@ -305,4 +305,5 @@ async def touch_command(
+                 lifetime=lifetime),
+         )
+         for namespace in insights.namespaces
++        for resource in resources
+     })
+diff --git a/kopf/reactor/orchestration.py b/kopf/reactor/orchestration.py
+index 6b624fa..9906400 100644
+--- a/kopf/reactor/orchestration.py
++++ b/kopf/reactor/orchestration.py
+@@ -127,9 +127,8 @@ async def adjust_tasks(
+         identity: peering.Identity,
+         ensemble: Ensemble,
+ ) -> None:
+-    peering_selector = peering.guess_selector(settings=settings)
+-    peering_resource = insights.backbone.get(peering_selector) if peering_selector else None
+-    peering_resources = {peering_resource} if peering_resource is not None else set()
++    peering_selectors = peering.guess_selectors(settings=settings)
++    peering_resources = {insights.backbone[s] for s in peering_selectors if s in insights.backbone}
+ 
+     # Pause or resume all streams if the peering CRDs are absent but required.
+     # Ignore the CRD absence in auto-detection mode: pause only when (and if) the CRDs are added.
+diff --git a/kopf/structs/references.py b/kopf/structs/references.py
+index bbf3c74..26534e2 100644
+--- a/kopf/structs/references.py
++++ b/kopf/structs/references.py
+@@ -389,14 +389,16 @@ class Selector:
+ # Some predefined API endpoints that we use in the framework itself (not exposed to the operators).
+ # Note: the CRDs are versionless: we do not look into its ``spec`` stanza, we only watch for
+ # the fact of changes, so the schema does not matter, any cluster-preferred API version would work.
+-# Note: the peering resources are either zalando.org/v1 or kopf.dev/v1; both cannot co-exist because
+-# they would share the names, so K8s will not let this. It is done for domain name transitioning.
++# Note: the peering resources are usually either zalando.org/v1 or kopf.dev/v1; if both co-exist,
++# then both will be served (for keepalives and pausing). It is done for domain name transitioning.
+ CRDS = Selector('apiextensions.k8s.io', 'customresourcedefinitions')
+ EVENTS = Selector('v1', 'events')
+ EVENTS_K8S = Selector('events.k8s.io', 'events')  # only for exclusion from EVERYTHING
+ NAMESPACES = Selector('v1', 'namespaces')
+-CLUSTER_PEERINGS = Selector('clusterkopfpeerings')
+-NAMESPACED_PEERINGS = Selector('kopfpeerings')
++CLUSTER_PEERINGS_K = Selector('kopf.dev/v1', 'clusterkopfpeerings')
++CLUSTER_PEERINGS_Z = Selector('zalando.org/v1', 'clusterkopfpeerings')
++NAMESPACED_PEERINGS_K = Selector('kopf.dev/v1', 'kopfpeerings')
++NAMESPACED_PEERINGS_Z = Selector('zalando.org/v1', 'kopfpeerings')
+ MUTATING_WEBHOOK = Selector('admissionregistration.k8s.io', 'mutatingwebhookconfigurations')
+ VALIDATING_WEBHOOK = Selector('admissionregistration.k8s.io', 'validatingwebhookconfigurations')
+ 
+@@ -426,8 +428,9 @@ class Backbone(Mapping[Selector, Resource]):
+         self._revised = asyncio.Condition()
+         self.selectors = [
+             NAMESPACES, EVENTS, CRDS,
+-            CLUSTER_PEERINGS, NAMESPACED_PEERINGS,
+             MUTATING_WEBHOOK, VALIDATING_WEBHOOK,
++            CLUSTER_PEERINGS_K, NAMESPACED_PEERINGS_K,
++            CLUSTER_PEERINGS_Z, NAMESPACED_PEERINGS_Z,
+         ]
+ 
+     def __len__(self) -> int:
+

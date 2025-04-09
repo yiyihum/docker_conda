@@ -1,0 +1,216 @@
+diff --git a/tests/test_accessory.py b/tests/test_accessory.py
+index c4eebe0..7989eeb 100644
+--- a/tests/test_accessory.py
++++ b/tests/test_accessory.py
+@@ -1,4 +1,5 @@
+ """Tests for pyhap.accessory."""
++import asyncio
+ from io import StringIO
+ from unittest.mock import patch
+ 
+@@ -6,6 +7,7 @@ import pytest
+ 
+ from pyhap import accessory
+ from pyhap.accessory import Accessory, Bridge
++from pyhap.accessory_driver import AccessoryDriver
+ from pyhap.const import (
+     CATEGORY_CAMERA,
+     CATEGORY_TARGET_CONTROLLER,
+@@ -22,6 +24,21 @@ from . import AsyncMock
+ # #####################
+ 
+ 
++class TestAccessory(Accessory):
++    """An accessory that keeps track of if its stopped."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._stopped = False
++
++    async def stop(self):
++        self._stopped = True
++
++    @property
++    def stopped(self):
++        return self._stopped
++
++
+ def test_acc_init(mock_driver):
+     Accessory(mock_driver, "Test Accessory")
+ 
+@@ -383,15 +400,27 @@ def test_to_hap(mock_driver):
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_bridge_run_stop(mock_driver):
+-    mock_driver.async_add_job = AsyncMock()
+-    bridge = Bridge(mock_driver, "Test Bridge")
+-    acc = Accessory(mock_driver, "Test Accessory", aid=2)
+-    assert acc.available is True
+-    bridge.add_accessory(acc)
+-    acc2 = Accessory(mock_driver, "Test Accessory 2")
+-    bridge.add_accessory(acc2)
++async def test_bridge_run_stop():
++    with patch(
++        "pyhap.accessory_driver.HAPServer.async_stop", new_callable=AsyncMock
++    ), patch(
++        "pyhap.accessory_driver.HAPServer.async_start", new_callable=AsyncMock
++    ), patch(
++        "pyhap.accessory_driver.Zeroconf"
++    ), patch(
++        "pyhap.accessory_driver.AccessoryDriver.persist"
++    ), patch(
++        "pyhap.accessory_driver.AccessoryDriver.load"
++    ):
++        driver = AccessoryDriver(loop=asyncio.get_event_loop())
++        bridge = Bridge(driver, "Test Bridge")
++        acc = TestAccessory(driver, "Test Accessory", aid=2)
++        assert acc.available is True
++        bridge.add_accessory(acc)
++        acc2 = TestAccessory(driver, "Test Accessory 2")
++        bridge.add_accessory(acc2)
+ 
+-    await bridge.run()
+-    assert mock_driver.async_add_job.called
+-    await bridge.stop()
++        await bridge.run()
++        await bridge.stop()
++    assert acc.stopped is True
++    assert acc2.stopped is True
+diff --git a/tests/test_accessory_driver.py b/tests/test_accessory_driver.py
+index 39f163a..34dd942 100644
+--- a/tests/test_accessory_driver.py
++++ b/tests/test_accessory_driver.py
+@@ -39,6 +39,38 @@ CHAR_PROPS = {
+ }
+ 
+ 
++class AsyncIntervalAccessory(Accessory):
++    """An accessory increments a counter at interval."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._counter = 0
++
++    @Accessory.run_at_interval(0.001)  # Run this method every 0.001 seconds
++    async def run(self):
++        self._counter += 1
++
++    @property
++    def counter(self):
++        return self._counter
++
++
++class SyncIntervalAccessory(Accessory):
++    """An accessory increments a counter at interval."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._counter = 0
++
++    @Accessory.run_at_interval(0.001)  # Run this method every 0.001 seconds
++    def run(self):  # pylint: disable=invalid-overridden-method
++        self._counter += 1
++
++    @property
++    def counter(self):
++        return self._counter
++
++
+ class UnavailableAccessory(Accessory):
+     """An accessory that is not available."""
+ 
+@@ -670,3 +702,67 @@ async def test_call_async_add_job_with_callback(driver):
+         await asyncio.sleep(0)
+         await asyncio.sleep(0)
+         assert called is True
++
++
++@pytest.mark.asyncio
++async def test_bridge_with_multiple_async_run_at_interval_accessories():
++    with patch(
++        "pyhap.accessory_driver.HAPServer.async_stop", new_callable=AsyncMock
++    ), patch(
++        "pyhap.accessory_driver.HAPServer.async_start", new_callable=AsyncMock
++    ), patch(
++        "pyhap.accessory_driver.Zeroconf"
++    ), patch(
++        "pyhap.accessory_driver.AccessoryDriver.persist"
++    ), patch(
++        "pyhap.accessory_driver.AccessoryDriver.load"
++    ):
++        driver = AccessoryDriver(loop=asyncio.get_event_loop())
++        bridge = Bridge(driver, "mybridge")
++        acc = AsyncIntervalAccessory(driver, "TestAcc", aid=2)
++        acc2 = AsyncIntervalAccessory(driver, "TestAcc2", aid=3)
++        acc3 = AsyncIntervalAccessory(driver, "TestAcc3", aid=4)
++        bridge.add_accessory(acc)
++        bridge.add_accessory(acc2)
++        bridge.add_accessory(acc3)
++        driver.add_accessory(bridge)
++        driver.start_service()
++        await asyncio.sleep(0.5)
++        assert not driver.loop.is_closed()
++        await driver.async_stop()
++
++    assert acc.counter > 2
++    assert acc2.counter > 2
++    assert acc3.counter > 2
++
++
++@pytest.mark.asyncio
++async def test_bridge_with_multiple_sync_run_at_interval_accessories():
++    with patch(
++        "pyhap.accessory_driver.HAPServer.async_stop", new_callable=AsyncMock
++    ), patch(
++        "pyhap.accessory_driver.HAPServer.async_start", new_callable=AsyncMock
++    ), patch(
++        "pyhap.accessory_driver.Zeroconf"
++    ), patch(
++        "pyhap.accessory_driver.AccessoryDriver.persist"
++    ), patch(
++        "pyhap.accessory_driver.AccessoryDriver.load"
++    ):
++        driver = AccessoryDriver(loop=asyncio.get_event_loop())
++        bridge = Bridge(driver, "mybridge")
++        acc = SyncIntervalAccessory(driver, "TestAcc", aid=2)
++        acc2 = SyncIntervalAccessory(driver, "TestAcc2", aid=3)
++        acc3 = SyncIntervalAccessory(driver, "TestAcc3", aid=4)
++        bridge.add_accessory(acc)
++        bridge.add_accessory(acc2)
++        bridge.add_accessory(acc3)
++        driver.add_accessory(bridge)
++        driver.start_service()
++        await asyncio.sleep(0.5)
++        assert not driver.loop.is_closed()
++        await driver.async_stop()
++
++    assert acc.counter > 2
++    assert acc2.counter > 2
++    assert acc3.counter > 2
+diff --git a/tests/test_hap_server.py b/tests/test_hap_server.py
+index 8941878..062042c 100644
+--- a/tests/test_hap_server.py
++++ b/tests/test_hap_server.py
+@@ -43,6 +43,9 @@ async def test_we_can_connect():
+     assert server.connections == {}
+     _, port = sock.getsockname()
+     _, writer = await asyncio.open_connection("127.0.0.1", port)
++    # flush out any call_soon
++    for _ in range(3):
++        await asyncio.sleep(0)
+     assert server.connections != {}
+     server.async_stop()
+     writer.close()
+diff --git a/tests/test_tlv.py b/tests/test_tlv.py
+index 28260c6..8e9f300 100644
+--- a/tests/test_tlv.py
++++ b/tests/test_tlv.py
+@@ -1,6 +1,7 @@
+ """Tests for pyhap.tlv."""
+ 
+ import pytest
++
+ from pyhap import tlv
+ 
+ 

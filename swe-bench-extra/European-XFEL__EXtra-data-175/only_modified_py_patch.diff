@@ -1,0 +1,204 @@
+diff --git a/extra_data/components.py b/extra_data/components.py
+index a00930a..3f7a8b2 100644
+--- a/extra_data/components.py
++++ b/extra_data/components.py
+@@ -372,24 +372,31 @@ class XtdfDetectorBase(MultimodDetectorBase):
+ 
+                 inner_ids = get_inner_ids(f, data_slice, inner_index)
+ 
++                trainids = np.repeat(
++                    np.arange(first_tid, last_tid + 1, dtype=np.uint64),
++                    chunk_counts.astype(np.intp),
++                )
++                index = self._make_image_index(
++                    trainids, inner_ids, inner_index[:-2]
++                )
++
+                 if isinstance(pulses, by_id):
++                    # Get the pulse ID values out of the MultiIndex rather than
++                    # using inner_ids, because LPD1M in parallel_gain mode
++                    # makes the MultiIndex differently, repeating pulse IDs.
+                     if inner_index == 'pulseId':
+-                        pulse_id = inner_ids
++                        pulse_id = index.get_level_values('pulse')
+                     else:
+-                        pulse_id = get_inner_ids(f, data_slice, 'pulseId')
++                        pulse_id = self._make_image_index(
++                            trainids, get_inner_ids(f, data_slice, 'pulseId'),
++                        ).get_level_values('pulse')
+                     positions = self._select_pulse_ids(pulses, pulse_id)
+                 else:  # by_index
+                     positions = self._select_pulse_indices(
+                         pulses, chunk_firsts - data_slice.start, chunk_counts
+                     )
+ 
+-                trainids = np.repeat(
+-                    np.arange(first_tid, last_tid + 1, dtype=np.uint64),
+-                    chunk_counts.astype(np.intp),
+-                )
+-                index = self._make_image_index(
+-                    trainids, inner_ids, inner_index[:-2]
+-                )[positions]
++                index = index[positions]
+ 
+                 if isinstance(positions, slice):
+                     data_positions = slice(
+@@ -398,12 +405,7 @@ class XtdfDetectorBase(MultimodDetectorBase):
+                         positions.step
+                     )
+                 else:  # ndarray
+-                    # h5py fancy indexing needs a list, not an ndarray
+-                    data_positions = list(data_slice.start + positions)
+-                    if data_positions == []:
+-                        # Work around a limitation of h5py
+-                        # https://github.com/h5py/h5py/issues/1169
+-                        data_positions = slice(0, 0)
++                    data_positions = data_slice.start + positions
+ 
+                 dset = f.file[data_path]
+                 if dset.ndim >= 2 and dset.shape[1] == 1:
+@@ -765,8 +767,7 @@ class MPxDetectorTrainIterator:
+                 positions.step
+             )
+         else:  # ndarray
+-            # h5py fancy indexing needs a list, not an ndarray
+-            data_positions = list(first + positions)
++            data_positions = first + positions
+ 
+         return self.data._guess_axes(ds[data_positions], train_pulse_ids, unstack_pulses=True)
+ 
+@@ -931,6 +932,30 @@ class LPD1M(XtdfDetectorBase):
+                     "parallel_gain=True needs the frames in each train to be divisible by 3"
+                 )
+ 
++    def _select_pulse_indices(self, pulses, firsts, counts):
++        if not self.parallel_gain:
++            return super()._select_pulse_indices(pulses, firsts, counts)
++
++        if isinstance(pulses.value, slice):
++            if pulses.value == slice(0, MAX_PULSES, 1):
++                # All pulses included
++                return slice(0, counts.sum())
++            else:
++                s = pulses.value
++                desired = np.arange(s.start, s.stop, step=s.step, dtype=np.uint64)
++        else:
++            desired = pulses.value
++
++        positions = []
++        for ix, frames in zip(firsts, counts):
++            n_per_gain_stage = int(frames // 3)
++            train_desired = desired[desired < n_per_gain_stage]
++            for stage in range(3):
++                start = ix + np.uint64(stage * n_per_gain_stage)
++                positions.append(start + train_desired)
++
++        return np.concatenate(positions)
++
+     def _make_image_index(self, tids, inner_ids, inner_name='pulse'):
+         if not self.parallel_gain:
+             return super()._make_image_index(tids, inner_ids, inner_name)
+diff --git a/extra_data/file_access.py b/extra_data/file_access.py
+index f70edb8..6ef8bea 100644
+--- a/extra_data/file_access.py
++++ b/extra_data/file_access.py
+@@ -292,6 +292,25 @@ class FileAccess:
+             counts = np.uint64((ix_group['last'][:ntrains] - firsts + 1) * status)
+         return firsts, counts
+ 
++    def metadata(self) -> dict:
++        """Get the contents of the METADATA group as a dict
++
++        Not including the lists of data sources
++        """
++        if self.format_version == '0.5':
++            # Pretend this is actually there, like format version 1.0
++            return {'dataFormatVersion': '0.5'}
++
++        r = {}
++        for k, ds in self.file['METADATA'].items():
++            if not isinstance(ds, h5py.Dataset):
++                continue
++            v = ds[0]
++            if isinstance(v, bytes):
++                v = v.decode('utf-8', 'surrogateescape')
++            r[k] = v
++        return r
++
+     def get_keys(self, source):
+         """Get keys for a given source name
+ 
+diff --git a/extra_data/reader.py b/extra_data/reader.py
+index e92934e..075d04b 100644
+--- a/extra_data/reader.py
++++ b/extra_data/reader.py
+@@ -1220,6 +1220,18 @@ class DataCollection:
+             return pd.Series(arr, index=self.train_ids)
+         return arr
+ 
++    def run_metadata(self) -> dict:
++        """Get a dictionary of metadata about the run
++
++        From file format version 1.0, the files capture: creationDate,
++        daqLibrary, dataFormatVersion, karaboFramework, proposalNumber,
++        runNumber, sequenceNumber, updateDate.
++        """
++        if not self.is_single_run:
++            raise MultiRunError()
++
++        return self.files[0].metadata()
++
+     def write(self, filename):
+         """Write the selected data to a new HDF5 file
+ 
+@@ -1473,8 +1485,9 @@ def open_run(
+     run: str, int
+         A run number such as 243, '243' or 'r0243'.
+     data: str
+-        'raw' or 'proc' (processed) to access data from one of those folders.
+-        The default is 'raw'.
++        'raw', 'proc' (processed) or 'all' (both 'raw' and 'proc') to access
++        data from either or both of those folders. If 'all' is used, sources
++        present in 'proc' overwrite those in 'raw'. The default is 'raw'.
+     include: str
+         Wildcard string to filter data files.
+     file_filter: callable
+@@ -1486,6 +1499,24 @@ def open_run(
+         files which don't have this flag, out-of-sequence train IDs are suspect.
+         If True, it tries to include these trains.
+     """
++    if data == 'all':
++        common_args = dict(
++            proposal=proposal, run=run, include=include,
++            file_filter=file_filter, inc_suspect_trains=inc_suspect_trains)
++
++        # Create separate data collections for raw and proc.
++        raw_dc = open_run(**common_args, data='raw')
++        proc_dc = open_run(**common_args, data='proc')
++
++        # Deselect to those raw sources not present in proc.
++        raw_extra = raw_dc.deselect(
++            [(src, '*') for src in raw_dc.all_sources & proc_dc.all_sources])
++
++        # Merge extra raw sources into proc sources and re-enable is_single_run.
++        dc = proc_dc.union(raw_extra)
++        dc.is_single_run = True
++        return dc
++
+     if isinstance(proposal, str):
+         if ('/' not in proposal) and not proposal.startswith('p'):
+             proposal = 'p' + proposal.rjust(6, '0')
+diff --git a/setup.py b/setup.py
+index a4bb1b7..3f31ec5 100755
+--- a/setup.py
++++ b/setup.py
+@@ -46,7 +46,7 @@ setup(name="EXtra-data",
+       },
+       install_requires=[
+           'fabio',
+-          'h5py>=2.7.1',
++          'h5py>=2.10',
+           'karabo-bridge >=0.6',
+           'matplotlib',
+           'numpy',
+

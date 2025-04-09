@@ -1,0 +1,82 @@
+diff --git a/xhistogram/core.py b/xhistogram/core.py
+index c14f977..9f992c2 100644
+--- a/xhistogram/core.py
++++ b/xhistogram/core.py
+@@ -88,7 +88,6 @@ def _histogram_2d_vectorized(*args, bins=None, weights=None, density=False,
+     """Calculate the histogram independently on each row of a 2D array"""
+ 
+     N_inputs = len(args)
+-    bins = _ensure_bins_is_a_list_of_arrays(bins, N_inputs)
+     a0 = args[0]
+ 
+     # consistency checks for inputa
+@@ -128,7 +127,9 @@ def _histogram_2d_vectorized(*args, bins=None, weights=None, density=False,
+     # just throw out everything outside of the bins, as np.histogram does
+     # TODO: make this optional?
+     slices = (slice(None),) + (N_inputs * (slice(1, -1),))
+-    return bin_counts[slices]
++    bin_counts = bin_counts[slices]
++
++    return bin_counts
+ 
+ 
+ def histogram(*args, bins=None, axis=None, weights=None, density=False,
+@@ -242,9 +243,29 @@ def histogram(*args, bins=None, axis=None, weights=None, density=False,
+     else:
+         weights_reshaped = None
+ 
+-    h = _histogram_2d_vectorized(*all_args_reshaped, bins=bins,
+-                                 weights=weights_reshaped,
+-                                 density=density, block_size=block_size)
++    n_inputs = len(all_args_reshaped)
++    bins = _ensure_bins_is_a_list_of_arrays(bins, n_inputs)
++
++    bin_counts = _histogram_2d_vectorized(*all_args_reshaped, bins=bins,
++                                          weights=weights_reshaped,
++                                          density=density,
++                                          block_size=block_size)
++
++    if density:
++        # Normalise by dividing by bin counts and areas such that all the
++        # histogram data integrated over all dimensions = 1
++        bin_widths = [np.diff(b) for b in bins]
++        if n_inputs == 1:
++            bin_areas = bin_widths[0]
++        elif n_inputs == 2:
++            bin_areas = np.outer(*bin_widths)
++        else:
++            # Slower, but N-dimensional logic
++            bin_areas = np.prod(np.ix_(*bin_widths))
++
++        h = bin_counts / bin_areas / bin_counts.sum()
++    else:
++        h = bin_counts
+ 
+     if h.shape[0] == 1:
+         assert do_full_array
+diff --git a/xhistogram/xarray.py b/xhistogram/xarray.py
+index c4d41d8..8b9af1f 100644
+--- a/xhistogram/xarray.py
++++ b/xhistogram/xarray.py
+@@ -126,7 +126,7 @@ def histogram(*args, bins=None, dim=None, weights=None, density=False,
+         axis = None
+ 
+     h_data = _histogram(*args_data, weights=weights_data, bins=bins, axis=axis,
+-                        block_size=block_size)
++                        density=density, block_size=block_size)
+ 
+     # create output dims
+     new_dims = [a.name + bin_dim_suffix for a in args[:N_args]]
+@@ -155,6 +155,12 @@ def histogram(*args, bins=None, dim=None, weights=None, density=False,
+ 
+     da_out = xr.DataArray(h_data, dims=output_dims, coords=all_coords,
+                           name=output_name)
++
++    if density:
++        # correct for overcounting the bins which weren't histogrammed along
++        n_bins_bystander_dims = da_out.isel(**{bd: 0 for bd in new_dims}).size
++        da_out = da_out * n_bins_bystander_dims
++
+     return da_out
+ 
+     # we need weights to be passed through apply_func's alignment algorithm,

@@ -1,0 +1,193 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index a08ccca..30fd0f6 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -9,6 +9,7 @@
+ # @Last Modified time: 2019-08-07 12:30:00
+ 
+ from __future__ import print_function, division, absolute_import
++import glob
+ import gzip
+ import os
+ import pytest
+@@ -134,6 +135,7 @@ def radd(rsync, expdata):
+     ''' fixture to add a path to an rsync object '''
+     rsync.add(expdata['name'], **expdata['params'])
+     yield rsync
++    rsync.reset()
+ 
+ 
+ @pytest.fixture(scope='session')
+@@ -141,6 +143,7 @@ def rstream(radd):
+     ''' fixture to set the stream for an parametrized rsync object '''
+     radd.set_stream()
+     yield radd
++    radd.reset()
+ 
+ 
+ @pytest.fixture(scope='session')
+@@ -195,7 +198,6 @@ def monkeysas(tmpdir, monkeypatch, path):
+     path.replant_tree()
+ 
+ 
+-
+ @pytest.fixture()
+ def copydata(tmpdir, request):
+     ''' fixture to copy a file into a temporary directory '''
+@@ -210,6 +212,21 @@ def copydata(tmpdir, request):
+     yield destpath
+ 
+ 
++@pytest.fixture()
++def copymulti(tmpdir, request):
++    ''' Fixture to copy multiple files into a temporary directory '''
++    srcpath = os.path.join(os.getenv("SAS_BASE_DIR"), request.param)
++    files = glob.glob(srcpath)
++    if not files:
++        pytest.skip('Files do not exist, cannot copy')
++    for item in files:
++        loc = item.split(os.getenv("SAS_BASE_DIR") + '/')[-1]
++        sasdir = tmpdir / 'sas'
++        destpath = sasdir / loc
++        os.makedirs(os.path.dirname(destpath), exist_ok=True)
++        shutil.copy(item, destpath)
++
++
+ @contextlib.contextmanager
+ def gzuncompress(filename):
+     ''' Context manager than gunzips a file temporarily. '''
+diff --git a/tests/data/paths.yaml b/tests/data/paths.yaml
+index bfda7d5..dcd9e95 100644
+--- a/tests/data/paths.yaml
++++ b/tests/data/paths.yaml
+@@ -8,4 +8,7 @@ paths:
+     work: mangawork
+     params: {drpver: v2_4_3, plate: 8485, ifu: 1901, wave: LOG}
+     location: manga/spectro/redux/v2_4_3/8485/stack/manga-8485-1901-LOGCUBE.fits.gz
+-
++  - name: spec-lite
++    work: ebosswork
++    params: {run2d: v5_10_0, plateid: 3606, mjd: 55182, fiberid: 537}
++    location: eboss/spectro/redux/v5_10_0/spectra/lite/3606/spec-3606-55182-0537.fits
+diff --git a/tests/path/test_path.py b/tests/path/test_path.py
+index 91036d2..2852b53 100644
+--- a/tests/path/test_path.py
++++ b/tests/path/test_path.py
+@@ -152,9 +152,11 @@ class TestPath(object):
+     def test_uncompress(self, copydata, monkeysas, path):
+         ''' test to find unzipped files with zipped path templates '''
+         assert path.templates['mangacube'].endswith('.gz')
++        assert path.templates['mangacube'].count('.gz') == 1
+         with gzuncompress(copydata) as f:
+             full = path.full('mangacube', drpver='v2_4_3', plate=8485, ifu=1901, wave='LOG')
+             assert not full.endswith('.gz')
++            assert full.count('.gz') == 0
+             assert full.endswith('.fits')
+ 
+     @pytest.mark.parametrize('copydata',
+@@ -163,16 +165,31 @@ class TestPath(object):
+     def test_compress(self, copydata, monkeysas, path):
+         ''' test to find zipped files with non-zipped path templates '''
+         assert not path.templates['mangaimage'].endswith('.gz')
++        assert path.templates['mangaimage'].count('.gz') == 0
+         with gzcompress(copydata) as f:
+             full = path.full('mangaimage', drpver='v2_5_3', plate=8485, ifu=1901)
+             assert not full.endswith('.png')
+             assert full.endswith('.gz')
++            assert full.count('.gz') == 1
+ 
+     def test_uncompress_nofileexists(self, monkeysas, path):
+         ''' test if no file exists, full returns original template path '''
+         assert path.templates['mangacube'].endswith('.gz')
+-        full = path.full('mangacube', drpver='v2_4_3', plate=8485, ifu=1901, wave='LOG')
++        full = path.full('mangacube', drpver='v2_4_3', plate=8888, ifu=12345, wave='LOG')
+         assert full.endswith('.gz')
++        assert full.count('.gz') == 1
++
++    @pytest.mark.parametrize('copymulti',
++                             [('mangawork/manga/spectro/redux/v2_4_3/8485/stack/manga-8485-*-LOGCUBE.fits.gz')],
++                             indirect=True, ids=['data'])
++    @pytest.mark.parametrize('plate, ifu', [(8888, '*'), (8888, 12345),
++                                            (8485, 1901), (8485, '*')],
++                             ids=['nodata-wild', 'nodata', 'glob', 'glob-wild'])
++    def test_compression_wildcards(self, copymulti, monkeysas, path, plate, ifu):
++        assert path.templates['mangacube'].endswith('.gz')
++        full = path.full('mangacube', drpver='v2_4_3', plate=plate, ifu=ifu, wave='LOG')
++        assert full.endswith('.gz')
++        assert full.count('.gz') == 1
+ 
+     @pytest.mark.parametrize('mirror', [(True), (False)])
+     def test_netloc(self, mirror):
+@@ -247,6 +264,24 @@ class TestPath(object):
+         ff = path.full('mangapreimg', designid=8405, designgrp='D0084XX', mangaid='1-42007', force_module=True)
+         assert 'mangapreim/trunk/data' in ff
+ 
++    @pytest.mark.parametrize('tree_ver', [('sdsswork'), ('dr15'), ('sdss5'), ('mpl8')])
++    def test_release_from_module(self, monkeypatch, tree_ver):
++        monkeypatch.setenv('TREE_VER', tree_ver)
++        path = Path()
++        assert path.release == tree_ver
++
++    def test_sdss5_paths(self, monkeypatch):
++        path = Path(release='sdss5')
++        assert 'rsFields' in path.templates
++        f1 = path.full('rsFields', plan='001', observatory='APO')
++
++        monkeypatch.setenv('TREE_VER', 'sdss5')
++        path = Path()
++        assert 'rsFields' in path.templates
++        f2 = path.full('rsFields', plan='001', observatory='APO')
++
++        assert f1 == f2
++
+ 
+ @pytest.fixture()
+ def monkeyoos(monkeypatch):
+diff --git a/tests/sync/test_http.py b/tests/sync/test_http.py
+index 7818048..bf267ef 100644
+--- a/tests/sync/test_http.py
++++ b/tests/sync/test_http.py
+@@ -72,3 +72,13 @@ class TestHttp(object):
+         assert http.public is True
+         assert http.auth.username is None
+         assert http.auth.ready() is None
++
++    @pytest.mark.parametrize('tree_ver, exp', [('sdsswork', 'work'), ('dr15', 'dr15'),
++                                               ('dr13', 'dr13'), ('mpl8', 'work')])
++    def test_release_from_module(self, monkeypatch, tree_ver, exp, datapath):
++        monkeypatch.setenv('TREE_VER', tree_ver)
++        http = HttpAccess()
++        full = http.full(datapath['name'], **datapath['params'])
++        assert http.release == tree_ver
++        assert exp in full
++
+diff --git a/tests/sync/test_rsync.py b/tests/sync/test_rsync.py
+index eda53d9..d41afd4 100644
+--- a/tests/sync/test_rsync.py
++++ b/tests/sync/test_rsync.py
+@@ -12,6 +12,7 @@ from __future__ import print_function, division, absolute_import
+ import os
+ import pytest
+ from sdss_access import Access, AccessError
++from sdss_access.sync import RsyncAccess
+ 
+ 
+ class TestRsync(object):
+@@ -44,6 +45,17 @@ class TestRsync(object):
+         assert os.path.exists(path) is True
+         assert os.path.isfile(path) is True
+ 
++    @pytest.mark.parametrize('tree_ver, exp', [('sdsswork', 'work'), ('dr15', 'dr15'),
++                                               ('dr13', 'dr13'), ('mpl8', 'work')])
++    def test_release_from_module(self, monkeypatch, tree_ver, exp, datapath):
++        monkeypatch.setenv('TREE_VER', tree_ver)
++        rsync = RsyncAccess()
++        rsync.remote()
++        rsync.add(datapath['name'], **datapath['params'])
++        loc = rsync.initial_stream.task[0]['location']
++        assert rsync.release == tree_ver
++        assert exp in loc
++
+ 
+ class TestRsyncFails(object):
+ 

@@ -1,0 +1,238 @@
+diff --git a/docker/Dockerfile.py b/docker/Dockerfile.py
+index dbb20af4..454ab9b5 100644
+--- a/docker/Dockerfile.py
++++ b/docker/Dockerfile.py
+@@ -32,7 +32,6 @@ dependencies = ' '.join(['libffi-dev',  # For client side encryption for extras
+                          'python3.9-distutils' if python == 'python3.9' else '',
+                          # 'python3.9-venv' if python == 'python3.9' else '',
+                          'python3-pip',
+-                         'libcurl4-openssl-dev',
+                          'libssl-dev',
+                          'wget',
+                          'curl',
+@@ -40,7 +39,6 @@ dependencies = ' '.join(['libffi-dev',  # For client side encryption for extras
+                          "nodejs",  # CWL support for javascript expressions
+                          'rsync',
+                          'screen',
+-                         'build-essential',  # We need a build environment to build Singularity 3.
+                          'libarchive13',
+                          'libc6',
+                          'libseccomp2',
+@@ -53,7 +51,13 @@ dependencies = ' '.join(['libffi-dev',  # For client side encryption for extras
+                          'cryptsetup',
+                          'less',
+                          'vim',
+-                         'git'])
++                         'git',
++                         # Dependencies for Mesos which the deb doesn't actually list
++                         'libsvn1',
++                         'libcurl4-nss-dev',
++                         'libapr1',
++                         # Dependencies for singularity
++                         'containernetworking-plugins'])
+ 
+ 
+ def heredoc(s):
+@@ -67,7 +71,7 @@ motd = heredoc('''
+     Run toil <workflow>.py --help to see all options for running your workflow.
+     For more information see http://toil.readthedocs.io/en/latest/
+ 
+-    Copyright (C) 2015-2020 Regents of the University of California
++    Copyright (C) 2015-2022 Regents of the University of California
+ 
+     Version: {applianceSelf}
+ 
+@@ -77,8 +81,7 @@ motd = heredoc('''
+ motd = ''.join(l + '\\n\\\n' for l in motd.splitlines())
+ 
+ print(heredoc('''
+-    # We can't use a newer Ubuntu until we no longer need Mesos
+-    FROM ubuntu:16.04
++    FROM ubuntu:20.04
+ 
+     ARG TARGETARCH
+ 
+@@ -87,30 +90,27 @@ print(heredoc('''
+ 
+     RUN apt-get -y update --fix-missing && apt-get -y upgrade && apt-get -y install apt-transport-https ca-certificates software-properties-common && apt-get clean && rm -rf /var/lib/apt/lists/*
+ 
+-    RUN echo "deb http://repos.mesosphere.io/ubuntu/ xenial main" \
+-        > /etc/apt/sources.list.d/mesosphere.list \
+-        && apt-key adv --keyserver keyserver.ubuntu.com --recv E56151BF \
+-        && echo "deb http://deb.nodesource.com/node_6.x xenial main" \
+-        > /etc/apt/sources.list.d/nodesource.list \
+-        && apt-key adv --keyserver keyserver.ubuntu.com --recv 68576280
+-
+     RUN add-apt-repository -y ppa:deadsnakes/ppa
+ 
+     RUN apt-get -y update --fix-missing && \
+         DEBIAN_FRONTEND=noninteractive apt-get -y upgrade && \
+         DEBIAN_FRONTEND=noninteractive apt-get -y install {dependencies} && \
+-        if [ $TARGETARCH = amd64 ] ; then DEBIAN_FRONTEND=noninteractive apt-get -y install mesos=1.0.1-2.0.94.ubuntu1604 ; fi && \
+         apt-get clean && \
+         rm -rf /var/lib/apt/lists/*
+-
++    
++    # Install a Mesos build from somewhere and test it.
++    # This is /ipfs/QmRCNmVVrWPPQiEw2PrFLmb8ps6oETQvtKv8dLVN8ZRwFz/mesos-1.11.x.deb
++    RUN if [ $TARGETARCH = amd64 ] ; then \
++        wget -q https://rpm.aventer.biz/Ubuntu/dists/focal/binary-amd64/mesos-1.11.x.deb && \
++        dpkg -i mesos-1.11.x.deb && \
++        rm mesos-1.11.x.deb && \
++        mesos-agent --help >/dev/null ; \
++        fi
++    
+     # Install a particular old Debian Sid Singularity from somewhere.
+-    # The dependencies it thinks it needs aren't really needed and aren't
+-    # available here.
+     ADD singularity-sources.tsv /etc/singularity/singularity-sources.tsv
+-    RUN wget "$(cat /etc/singularity/singularity-sources.tsv | grep "^$TARGETARCH" | cut -f3)" && \
+-        (dpkg -i singularity-container_3*.deb || true) && \
+-        dpkg --force-depends --configure -a && \
+-        sed -i 's/containernetworking-plugins, //' /var/lib/dpkg/status && \
++    RUN wget -q "$(cat /etc/singularity/singularity-sources.tsv | grep "^$TARGETARCH" | cut -f3)" && \
++        dpkg -i singularity-container_3*.deb && \
+         sed -i 's!bind path = /etc/localtime!#bind path = /etc/localtime!g' /etc/singularity/singularity.conf && \
+         mkdir -p /usr/local/libexec/toil && \
+         mv /usr/bin/singularity /usr/local/libexec/toil/singularity-real \
+@@ -127,9 +127,6 @@ print(heredoc('''
+ 
+     RUN chmod 777 /usr/bin/waitForKey.sh && chmod 777 /usr/bin/customDockerInit.sh && chmod 777 /usr/local/bin/singularity
+ 
+-    # fixes an incompatibility updating pip on Ubuntu 16 w/ python3.8
+-    RUN sed -i "s/platform.linux_distribution()/('Ubuntu', '16.04', 'xenial')/g" /usr/lib/python3/dist-packages/pip/download.py
+-
+     # The stock pip is too old and can't install from sdist with extras
+     RUN {pip} install --upgrade pip==21.3.1
+ 
+@@ -150,9 +147,6 @@ print(heredoc('''
+         && chmod u+x /usr/local/bin/docker \
+         && /usr/local/bin/docker -v
+ 
+-    # Fix for Mesos interface dependency missing on ubuntu
+-    RUN {pip} install protobuf==3.0.0
+-
+     # Fix for https://issues.apache.org/jira/browse/MESOS-3793
+     ENV MESOS_LAUNCHER=posix
+ 
+@@ -174,7 +168,7 @@ print(heredoc('''
+     env PATH /opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ 
+     # We want to pick the right Python when the user runs it
+-    RUN rm /usr/bin/python3 && rm /usr/bin/python && \
++    RUN rm -f /usr/bin/python3 && rm -f /usr/bin/python && \
+         ln -s /usr/bin/{python} /usr/bin/python3 && \
+         ln -s /usr/bin/python3 /usr/bin/python
+ 
+diff --git a/src/toil/batchSystems/kubernetes.py b/src/toil/batchSystems/kubernetes.py
+index 0e00e3c5..9be3d4ba 100644
+--- a/src/toil/batchSystems/kubernetes.py
++++ b/src/toil/batchSystems/kubernetes.py
+@@ -21,7 +21,6 @@ cannot yet be launched. That functionality will need to wait for user-mode
+ Docker
+ """
+ import datetime
+-import getpass
+ import logging
+ import os
+ import string
+@@ -47,7 +46,7 @@ from toil.batchSystems.contained_executor import pack_job
+ from toil.common import Toil
+ from toil.job import JobDescription
+ from toil.lib.conversions import human2bytes
+-from toil.lib.misc import slow_down, utc_now
++from toil.lib.misc import slow_down, utc_now, get_user_name
+ from toil.lib.retry import ErrorCondition, retry
+ from toil.resource import Resource
+ from toil.statsAndLogging import configure_root_logger, set_log_level
+@@ -1246,7 +1245,7 @@ class KubernetesBatchSystem(BatchSystemCleanupSupport):
+         # and all lowercase letters, numbers, or - or .
+         acceptable_chars = set(string.ascii_lowercase + string.digits + '-.')
+ 
+-        return ''.join([c for c in getpass.getuser().lower() if c in acceptable_chars])[:100]
++        return ''.join([c for c in get_user_name().lower() if c in acceptable_chars])[:100]
+ 
+     @classmethod
+     def add_options(cls, parser: Union[ArgumentParser, _ArgumentGroup]) -> None:
+diff --git a/src/toil/batchSystems/mesos/batchSystem.py b/src/toil/batchSystems/mesos/batchSystem.py
+index bca66b2e..aed82c27 100644
+--- a/src/toil/batchSystems/mesos/batchSystem.py
++++ b/src/toil/batchSystems/mesos/batchSystem.py
+@@ -12,7 +12,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ import ast
+-import getpass
+ import json
+ import logging
+ import os
+@@ -43,7 +42,7 @@ from toil.batchSystems.mesos import JobQueue, MesosShape, TaskData, ToilJob
+ from toil.job import JobDescription
+ from toil.lib.conversions import b_to_mib, mib_to_b
+ from toil.lib.memoize import strict_bool
+-from toil.lib.misc import get_public_ip
++from toil.lib.misc import get_public_ip, get_user_name
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -319,7 +318,7 @@ class MesosBatchSystem(BatchSystemLocalSupport,
+         The Mesos driver thread which handles the scheduler's communication with the Mesos master
+         """
+         framework = addict.Dict()
+-        framework.user = getpass.getuser()  # We must determine the user name ourselves with pymesos
++        framework.user = get_user_name()  # We must determine the user name ourselves with pymesos
+         framework.name = "toil"
+         framework.principal = framework.name
+         # Make the driver which implements most of the scheduler logic and calls back to us for the user-defined parts.
+diff --git a/src/toil/lib/misc.py b/src/toil/lib/misc.py
+index d62133b0..879606f9 100644
+--- a/src/toil/lib/misc.py
++++ b/src/toil/lib/misc.py
+@@ -1,4 +1,5 @@
+ import datetime
++import getpass
+ import logging
+ import os
+ import random
+@@ -36,6 +37,23 @@ def get_public_ip() -> str:
+         # to provide a default argument
+         return '127.0.0.1'
+ 
++def get_user_name() -> str:
++    """
++    Get the current user name, or a suitable substitute string if the user name
++    is not available.
++    """
++    try:
++        try:
++            return getpass.getuser()
++        except KeyError:
++            # This is expected if the user isn't in /etc/passwd, such as in a
++            # Docker container when running as a weird UID. Make something up.
++            return 'UnknownUser' + str(os.getuid())
++    except Exception as e:
++        # We can't get the UID, or something weird has gone wrong.
++        logger.error('Unexpected error getting user name: %s', e)
++        return 'UnknownUser'
++
+ def utc_now() -> datetime.datetime:
+     """Return a datetime in the UTC timezone corresponding to right now."""
+     return datetime.datetime.utcnow().replace(tzinfo=pytz.UTC)
+diff --git a/src/toil/provisioners/abstractProvisioner.py b/src/toil/provisioners/abstractProvisioner.py
+index 7712cb31..c039c8b9 100644
+--- a/src/toil/provisioners/abstractProvisioner.py
++++ b/src/toil/provisioners/abstractProvisioner.py
+@@ -731,10 +731,10 @@ class AbstractProvisioner(ABC):
+         # mesos-agent. If there are multiple keys to be transferred, then the last one to be transferred must be
+         # set to keyPath.
+         MESOS_LOG_DIR = '--log_dir=/var/lib/mesos '
+-        LEADER_DOCKER_ARGS = '--registry=in_memory --cluster={name}'
++        LEADER_DOCKER_ARGS = '--webui_dir=/share/mesos/webui --registry=in_memory --cluster={name}'
+         # --no-systemd_enable_support is necessary in Ubuntu 16.04 (otherwise,
+         # Mesos attempts to contact systemd but can't find its run file)
+-        WORKER_DOCKER_ARGS = '--work_dir=/var/lib/mesos --master={ip}:5050 --attributes=preemptable:{preemptable} --no-hostname_lookup --no-systemd_enable_support'
++        WORKER_DOCKER_ARGS = '--launcher_dir=/libexec/mesos --work_dir=/var/lib/mesos --master={ip}:5050 --attributes=preemptable:{preemptable} --no-hostname_lookup --no-systemd_enable_support'
+ 
+         if self.clusterType == 'mesos':
+             if role == 'leader':
+

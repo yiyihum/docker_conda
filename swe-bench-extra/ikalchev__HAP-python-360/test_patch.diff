@@ -1,0 +1,268 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 957924d..20476b5 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -49,7 +49,7 @@ class MockDriver:
+     def __init__(self):
+         self.loader = Loader()
+ 
+-    def publish(self, data, client_addr=None):
++    def publish(self, data, client_addr=None, immediate=False):
+         pass
+ 
+     def add_job(self, target, *args):  # pylint: disable=no-self-use
+diff --git a/tests/test_accessory.py b/tests/test_accessory.py
+index 23a032d..2c20d06 100644
+--- a/tests/test_accessory.py
++++ b/tests/test_accessory.py
+@@ -12,6 +12,7 @@ from pyhap.const import (
+     CATEGORY_CAMERA,
+     CATEGORY_TARGET_CONTROLLER,
+     CATEGORY_TELEVISION,
++    HAP_REPR_VALUE,
+     STANDALONE_AID,
+ )
+ from pyhap.service import Service
+@@ -460,3 +461,18 @@ async def test_bridge_run_stop():
+         await bridge.stop()
+     assert acc.stopped is True
+     assert acc2.stopped is True
++
++
++def test_acc_with_(mock_driver):
++    """Test ProgrammableSwitchEvent is always None."""
++    acc = Accessory(mock_driver, "Test Accessory")
++    serv_stateless_switch = acc.add_preload_service("StatelessProgrammableSwitch")
++    char_doorbell_detected_switch = serv_stateless_switch.configure_char(
++        "ProgrammableSwitchEvent",
++        value=0,
++        valid_values={"SinglePress": 0},
++    )
++    char_doorbell_detected_switch.client_update_value(0)
++    assert char_doorbell_detected_switch.to_HAP()[HAP_REPR_VALUE] is None
++    char_doorbell_detected_switch.client_update_value(None)
++    assert char_doorbell_detected_switch.to_HAP()[HAP_REPR_VALUE] is None
+diff --git a/tests/test_accessory_driver.py b/tests/test_accessory_driver.py
+index dc1db1d..a07281f 100644
+--- a/tests/test_accessory_driver.py
++++ b/tests/test_accessory_driver.py
+@@ -555,7 +555,7 @@ def test_send_events(driver):
+     class HapServerMock:
+         pushed_events = set()
+ 
+-        def push_event(self, bytedata, client_addr):
++        def push_event(self, bytedata, client_addr, immediate):
+             self.pushed_events.add((bytedata, client_addr))
+             if client_addr == "client2":
+                 return False
+@@ -567,7 +567,7 @@ def test_send_events(driver):
+     driver.http_server = HapServerMock()
+     driver.loop = LoopMock()
+     driver.topics = {"mocktopic": {"client1", "client2", "client3"}}
+-    driver.async_send_event("mocktopic", "bytedata", "client1")
++    driver.async_send_event("mocktopic", "bytedata", "client1", True)
+ 
+     # Only client2 and client3 get the event when client1 sent it
+     assert driver.http_server.get_pushed_events() == {
+diff --git a/tests/test_characteristic.py b/tests/test_characteristic.py
+index 2d6e871..4882de8 100644
+--- a/tests/test_characteristic.py
++++ b/tests/test_characteristic.py
+@@ -1,5 +1,5 @@
+ """Tests for pyhap.characteristic."""
+-from unittest.mock import ANY, Mock, patch
++from unittest.mock import ANY, MagicMock, Mock, patch
+ from uuid import uuid1
+ 
+ import pytest
+@@ -8,6 +8,7 @@ from pyhap.characteristic import (
+     HAP_FORMAT_DEFAULTS,
+     HAP_FORMAT_INT,
+     HAP_PERMISSION_READ,
++    CHAR_PROGRAMMABLE_SWITCH_EVENT,
+     Characteristic,
+ )
+ 
+@@ -123,6 +124,62 @@ def test_set_value():
+         assert char.value == 3
+         assert mock_notify.call_count == 1
+ 
++        # No change should not generate another notify
++        char.set_value(3)
++        assert char.value == 3
++        assert mock_notify.call_count == 1
++
++
++def test_set_value_immediate():
++    """Test setting the value of a characteristic generates immediate notify."""
++    char = Characteristic(
++        display_name="Switch Event",
++        type_id=CHAR_PROGRAMMABLE_SWITCH_EVENT,
++        properties=PROPERTIES.copy(),
++    )
++    assert char.value is None
++
++    publish_mock = Mock()
++    char.broker = Mock(publish=publish_mock)
++
++    char.set_value(0)
++    assert char.value is None
++    publish_mock.assert_called_with(0, char, None, True)
++
++    char.set_value(1)
++    assert char.value is None
++    publish_mock.assert_called_with(1, char, None, True)
++
++
++def test_switch_event_always_serializes_to_null_via_set_value():
++    """Test that the switch event char is always null."""
++    char = Characteristic(
++        display_name="Switch Event",
++        type_id=CHAR_PROGRAMMABLE_SWITCH_EVENT,
++        properties=PROPERTIES.copy(),
++    )
++    assert char.value is None
++    char.broker = MagicMock()
++
++    assert char.to_HAP()["value"] is None
++    char.set_value(1)
++    assert char.to_HAP()["value"] is None
++
++
++def test_switch_event_always_serializes_to_null_via_client_update_value():
++    """Test that the switch event char is always null."""
++    char = Characteristic(
++        display_name="Switch Event",
++        type_id=CHAR_PROGRAMMABLE_SWITCH_EVENT,
++        properties=PROPERTIES.copy(),
++    )
++    assert char.value is None
++    char.broker = MagicMock()
++
++    assert char.to_HAP()["value"] is None
++    char.client_update_value(1)
++    assert char.to_HAP()["value"] is None
++
+ 
+ def test_client_update_value():
+     """Test updating the characteristic value with call from the driver."""
+@@ -143,6 +200,27 @@ def test_client_update_value():
+         char.client_update_value(9, "mock_client_addr")
+         assert char.value == 9
+         mock_notify.assert_called_once_with("mock_client_addr")
++        assert len(mock_notify.mock_calls) == 1
++
++        # Same value, do not call again
++        char.client_update_value(9, "mock_client_addr")
++        assert char.value == 9
++        assert len(mock_notify.mock_calls) == 1
++
++        # New value, should notify
++        char.client_update_value(12, "mock_client_addr")
++        assert char.value == 12
++        assert len(mock_notify.mock_calls) == 2
++
++        # Same value, do not call again
++        char.client_update_value(12, "mock_client_addr")
++        assert char.value == 12
++        assert len(mock_notify.mock_calls) == 2
++
++        # New value, should notify
++        char.client_update_value(9, "mock_client_addr")
++        assert char.value == 9
++        assert len(mock_notify.mock_calls) == 3
+ 
+ 
+ def test_notify():
+@@ -155,11 +233,11 @@ def test_notify():
+ 
+     with patch.object(char, "broker") as mock_broker:
+         char.notify()
+-    mock_broker.publish.assert_called_with(2, char, None)
++    mock_broker.publish.assert_called_with(2, char, None, False)
+ 
+     with patch.object(char, "broker") as mock_broker:
+         char.notify("mock_client_addr")
+-    mock_broker.publish.assert_called_with(2, char, "mock_client_addr")
++    mock_broker.publish.assert_called_with(2, char, "mock_client_addr", False)
+ 
+ 
+ def test_to_HAP_numberic():
+diff --git a/tests/test_hap_server.py b/tests/test_hap_server.py
+index 58b3457..e13a836 100644
+--- a/tests/test_hap_server.py
++++ b/tests/test_hap_server.py
+@@ -83,7 +83,7 @@ async def test_idle_connection_cleanup():
+ async def test_push_event(driver):
+     """Test we can create and send an event."""
+     addr_info = ("1.2.3.4", 1234)
+-    server = hap_server.HAPServer(addr_info, driver)
++    server = hap_server.HAPServer(("127.0.01", 5555), driver)
+     server.loop = asyncio.get_event_loop()
+     hap_events = []
+ 
+@@ -94,17 +94,58 @@ async def test_push_event(driver):
+         server.loop, server.connections, server.accessory_handler
+     )
+     hap_server_protocol.write = _save_event
++    hap_server_protocol.peername = addr_info
++    server.accessory_handler.topics["1.33"] = {addr_info}
++    server.accessory_handler.topics["2.33"] = {addr_info}
++    server.accessory_handler.topics["3.33"] = {addr_info}
+ 
+-    assert server.push_event({"aid": 1}, addr_info) is False
++    assert server.push_event({"aid": 1, "iid": 33, "value": False}, addr_info) is False
+     await asyncio.sleep(0)
+     server.connections[addr_info] = hap_server_protocol
+ 
+-    assert server.push_event({"aid": 1}, addr_info) is True
+-    assert server.push_event({"aid": 2}, addr_info) is True
+-    assert server.push_event({"aid": 3}, addr_info) is True
++    assert (
++        server.push_event({"aid": 1, "iid": 33, "value": False}, addr_info, True)
++        is True
++    )
++    assert (
++        server.push_event({"aid": 2, "iid": 33, "value": False}, addr_info, True)
++        is True
++    )
++    assert (
++        server.push_event({"aid": 3, "iid": 33, "value": False}, addr_info, True)
++        is True
++    )
+ 
+     await asyncio.sleep(0)
+     assert hap_events == [
+-        b"EVENT/1.0 200 OK\r\nContent-Type: application/hap+json\r\nContent-Length: 51\r\n\r\n"
+-        b'{"characteristics":[{"aid":1},{"aid":2},{"aid":3}]}'
++        b"EVENT/1.0 200 OK\r\nContent-Type: application/hap+json\r\nContent-Length: 120\r\n\r\n"
++        b'{"characteristics":[{"aid":1,"iid":33,"value":false},'
++        b'{"aid":2,"iid":33,"value":false},{"aid":3,"iid":33,"value":false}]}'
++    ]
++
++    hap_events = []
++    assert (
++        server.push_event({"aid": 1, "iid": 33, "value": False}, addr_info, False)
++        is True
++    )
++    assert (
++        server.push_event({"aid": 2, "iid": 33, "value": False}, addr_info, False)
++        is True
++    )
++    assert (
++        server.push_event({"aid": 3, "iid": 33, "value": False}, addr_info, False)
++        is True
++    )
++
++    await asyncio.sleep(0)
++    assert hap_events == []
++
++    # Ensure that a the event is not sent if its unsubscribed during
++    # the coalesce delay
++    server.accessory_handler.topics["1.33"].remove(addr_info)
++
++    await asyncio.sleep(0.55)
++    assert hap_events == [
++        b"EVENT/1.0 200 OK\r\nContent-Type: application/hap+json\r\nContent-Length: 87\r\n\r\n"
++        b'{"characteristics":[{"aid":2,"iid":33,"value":false},{"aid":3,"iid":33,"value":false}]}'
+     ]

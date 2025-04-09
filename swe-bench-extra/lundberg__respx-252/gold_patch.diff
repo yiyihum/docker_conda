@@ -1,0 +1,131 @@
+diff --git a/docs/api.md b/docs/api.md
+index 7432767..ae54c7c 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -309,9 +309,9 @@ respx.post("https://example.org/", content__contains="bar")
+ ```
+ 
+ ### Data
+-Matches request *form data*, using [eq](#eq) as default lookup.
++Matches request *form data*, excluding files, using [eq](#eq) as default lookup.
+ > Key: `data`  
+-> Lookups: [eq](#eq)
++> Lookups: [eq](#eq), [contains](#contains)
+ ``` python
+ respx.post("https://example.org/", data={"foo": "bar"})
+ ```
+diff --git a/respx/patterns.py b/respx/patterns.py
+index 3bf8d9b..75cb815 100644
+--- a/respx/patterns.py
++++ b/respx/patterns.py
+@@ -25,6 +25,8 @@ from urllib.parse import urljoin
+ 
+ import httpx
+ 
++from respx.utils import MultiItems, decode_data
++
+ from .types import (
+     URL as RawURL,
+     CookieTypes,
+@@ -536,14 +538,16 @@ class JSON(ContentMixin, PathPattern):
+         return jsonlib.dumps(value, sort_keys=True)
+ 
+ 
+-class Data(ContentMixin, Pattern):
+-    lookups = (Lookup.EQUAL,)
++class Data(MultiItemsMixin, Pattern):
++    lookups = (Lookup.EQUAL, Lookup.CONTAINS)
+     key = "data"
+-    value: bytes
++    value: MultiItems
++
++    def clean(self, value: Dict) -> MultiItems:
++        return MultiItems(value)
+ 
+-    def clean(self, value: Dict) -> bytes:
+-        request = httpx.Request("POST", "/", data=value)
+-        data = request.read()
++    def parse(self, request: httpx.Request) -> Any:
++        data, _ = decode_data(request)
+         return data
+ 
+ 
+diff --git a/respx/utils.py b/respx/utils.py
+new file mode 100644
+index 0000000..434c30d
+--- /dev/null
++++ b/respx/utils.py
+@@ -0,0 +1,73 @@
++import email
++from email.message import Message
++from typing import List, Tuple, cast
++from urllib.parse import parse_qsl
++
++import httpx
++
++
++class MultiItems(dict):
++    def get_list(self, key: str) -> List[str]:
++        try:
++            return [self[key]]
++        except KeyError:  # pragma: no cover
++            return []
++
++    def multi_items(self) -> List[Tuple[str, str]]:
++        return list(self.items())
++
++
++def _parse_multipart_form_data(
++    content: bytes, *, content_type: str, encoding: str
++) -> Tuple[MultiItems, MultiItems]:
++    form_data = b"\r\n".join(
++        (
++            b"MIME-Version: 1.0",
++            b"Content-Type: " + content_type.encode(encoding),
++            b"\r\n" + content,
++        )
++    )
++    data = MultiItems()
++    files = MultiItems()
++    for payload in email.message_from_bytes(form_data).get_payload():
++        payload = cast(Message, payload)
++        name = payload.get_param("name", header="Content-Disposition")
++        filename = payload.get_filename()
++        content_type = payload.get_content_type()
++        value = payload.get_payload(decode=True)
++        assert isinstance(value, bytes)
++        if content_type.startswith("text/") and filename is None:
++            # Text field
++            data[name] = value.decode(payload.get_content_charset() or "utf-8")
++        else:
++            # File field
++            files[name] = filename, value
++
++    return data, files
++
++
++def _parse_urlencoded_data(content: bytes, *, encoding: str) -> MultiItems:
++    return MultiItems(
++        (key, value)
++        for key, value in parse_qsl(content.decode(encoding), keep_blank_values=True)
++    )
++
++
++def decode_data(request: httpx.Request) -> Tuple[MultiItems, MultiItems]:
++    content = request.read()
++    content_type = request.headers.get("Content-Type", "")
++
++    if content_type.startswith("multipart/form-data"):
++        data, files = _parse_multipart_form_data(
++            content,
++            content_type=content_type,
++            encoding=request.headers.encoding,
++        )
++    else:
++        data = _parse_urlencoded_data(
++            content,
++            encoding=request.headers.encoding,
++        )
++        files = MultiItems()
++
++    return data, files

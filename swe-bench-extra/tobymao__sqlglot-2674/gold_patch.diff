@@ -1,0 +1,180 @@
+diff --git a/sqlglot/dialects/snowflake.py b/sqlglot/dialects/snowflake.py
+index 42e8c661..fca42d48 100644
+--- a/sqlglot/dialects/snowflake.py
++++ b/sqlglot/dialects/snowflake.py
+@@ -369,12 +369,35 @@ class Snowflake(Dialect):
+ 
+             return lateral
+ 
++        def _parse_at_before(self, table: exp.Table) -> exp.Table:
++            # https://docs.snowflake.com/en/sql-reference/constructs/at-before
++            index = self._index
++            if self._match_texts(("AT", "BEFORE")):
++                this = self._prev.text.upper()
++                kind = (
++                    self._match(TokenType.L_PAREN)
++                    and self._match_texts(self.HISTORICAL_DATA_KIND)
++                    and self._prev.text.upper()
++                )
++                expression = self._match(TokenType.FARROW) and self._parse_bitwise()
++
++                if expression:
++                    self._match_r_paren()
++                    when = self.expression(
++                        exp.HistoricalData, this=this, kind=kind, expression=expression
++                    )
++                    table.set("when", when)
++                else:
++                    self._retreat(index)
++
++            return table
++
+         def _parse_table_parts(self, schema: bool = False) -> exp.Table:
+             # https://docs.snowflake.com/en/user-guide/querying-stage
+-            if self._match_text_seq("@", advance=False):
+-                table: t.Optional[exp.Expression] = self._parse_location_path()
+-            elif self._match(TokenType.STRING, advance=False):
++            if self._match(TokenType.STRING, advance=False):
+                 table = self._parse_string()
++            elif self._match_text_seq("@", advance=False):
++                table = self._parse_location_path()
+             else:
+                 table = None
+ 
+@@ -393,9 +416,11 @@ class Snowflake(Dialect):
+ 
+                     self._match(TokenType.COMMA)
+ 
+-                return self.expression(exp.Table, this=table, format=file_format, pattern=pattern)
++                table = self.expression(exp.Table, this=table, format=file_format, pattern=pattern)
++            else:
++                table = super()._parse_table_parts(schema=schema)
+ 
+-            return super()._parse_table_parts(schema=schema)
++            return self._parse_at_before(table)
+ 
+         def _parse_id_var(
+             self,
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 19a96df2..6990344e 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1105,14 +1105,7 @@ class Create(DDL):
+ # https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#create_table_clone_statement
+ # https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language#create_table_copy
+ class Clone(Expression):
+-    arg_types = {
+-        "this": True,
+-        "when": False,
+-        "kind": False,
+-        "shallow": False,
+-        "expression": False,
+-        "copy": False,
+-    }
++    arg_types = {"this": True, "shallow": False, "copy": False}
+ 
+ 
+ class Describe(Expression):
+@@ -2522,6 +2515,11 @@ class IndexTableHint(Expression):
+     arg_types = {"this": True, "expressions": False, "target": False}
+ 
+ 
++# https://docs.snowflake.com/en/sql-reference/constructs/at-before
++class HistoricalData(Expression):
++    arg_types = {"this": True, "kind": True, "expression": True}
++
++
+ class Table(Expression):
+     arg_types = {
+         "this": True,
+@@ -2538,6 +2536,7 @@ class Table(Expression):
+         "pattern": False,
+         "index": False,
+         "ordinality": False,
++        "when": False,
+     }
+ 
+     @property
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index f3f90601..e03462d1 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -862,15 +862,7 @@ class Generator:
+         this = self.sql(expression, "this")
+         shallow = "SHALLOW " if expression.args.get("shallow") else ""
+         keyword = "COPY" if expression.args.get("copy") and self.SUPPORTS_TABLE_COPY else "CLONE"
+-        this = f"{shallow}{keyword} {this}"
+-        when = self.sql(expression, "when")
+-
+-        if when:
+-            kind = self.sql(expression, "kind")
+-            expr = self.sql(expression, "expression")
+-            return f"{this} {when} ({kind} => {expr})"
+-
+-        return this
++        return f"{shallow}{keyword} {this}"
+ 
+     def describe_sql(self, expression: exp.Describe) -> str:
+         return f"DESCRIBE {self.sql(expression, 'this')}"
+@@ -1400,6 +1392,12 @@ class Generator:
+         target = f" FOR {target}" if target else ""
+         return f"{this}{target} ({self.expressions(expression, flat=True)})"
+ 
++    def historicaldata_sql(self, expression: exp.HistoricalData) -> str:
++        this = self.sql(expression, "this")
++        kind = self.sql(expression, "kind")
++        expr = self.sql(expression, "expression")
++        return f"{this} ({kind} => {expr})"
++
+     def table_sql(self, expression: exp.Table, sep: str = " AS ") -> str:
+         table = ".".join(
+             self.sql(part)
+@@ -1436,6 +1434,10 @@ class Generator:
+             ordinality = f" WITH ORDINALITY{alias}"
+             alias = ""
+ 
++        when = self.sql(expression, "when")
++        if when:
++            table = f"{table} {when}"
++
+         return f"{table}{version}{file_format}{alias}{index}{hints}{pivots}{joins}{laterals}{ordinality}"
+ 
+     def tablesample_sql(
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 1fae5959..5399b293 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -907,7 +907,7 @@ class Parser(metaclass=_Parser):
+     INSERT_ALTERNATIVES = {"ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"}
+ 
+     CLONE_KEYWORDS = {"CLONE", "COPY"}
+-    CLONE_KINDS = {"TIMESTAMP", "OFFSET", "STATEMENT"}
++    HISTORICAL_DATA_KIND = {"TIMESTAMP", "OFFSET", "STATEMENT", "STREAM"}
+ 
+     OPCLASS_FOLLOW_KEYWORDS = {"ASC", "DESC", "NULLS"}
+     OPTYPE_FOLLOW_TOKENS = {TokenType.COMMA, TokenType.R_PAREN}
+@@ -1411,23 +1411,8 @@ class Parser(metaclass=_Parser):
+ 
+             if self._match_texts(self.CLONE_KEYWORDS):
+                 copy = self._prev.text.lower() == "copy"
+-                clone = self._parse_table(schema=True)
+-                when = self._match_texts(("AT", "BEFORE")) and self._prev.text.upper()
+-                clone_kind = (
+-                    self._match(TokenType.L_PAREN)
+-                    and self._match_texts(self.CLONE_KINDS)
+-                    and self._prev.text.upper()
+-                )
+-                clone_expression = self._match(TokenType.FARROW) and self._parse_bitwise()
+-                self._match(TokenType.R_PAREN)
+                 clone = self.expression(
+-                    exp.Clone,
+-                    this=clone,
+-                    when=when,
+-                    kind=clone_kind,
+-                    shallow=shallow,
+-                    expression=clone_expression,
+-                    copy=copy,
++                    exp.Clone, this=self._parse_table(schema=True), shallow=shallow, copy=copy
+                 )
+ 
+         return self.expression(

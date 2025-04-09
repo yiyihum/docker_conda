@@ -1,0 +1,241 @@
+diff --git a/jsonargparse/actions.py b/jsonargparse/actions.py
+index 3b9fea8..cd64248 100644
+--- a/jsonargparse/actions.py
++++ b/jsonargparse/actions.py
+@@ -8,7 +8,7 @@ import argparse
+ from typing import Callable, Tuple, Type, Union
+ from argparse import Namespace, Action, SUPPRESS, _HelpAction, _SubParsersAction
+ 
+-from .optionals import get_config_read_mode, FilesCompleterMethod
++from .optionals import FilesCompleterMethod, get_config_read_mode, ruyaml_support
+ from .typing import path_type
+ from .util import (
+     yamlParserError,
+@@ -177,15 +177,19 @@ class _ActionPrintConfig(Action):
+                          dest=dest,
+                          default=default,
+                          nargs='?',
+-                         metavar='skip_null',
++                         metavar='comments,skip_null',
+                          help='Print configuration and exit.')
+ 
+     def __call__(self, parser, namespace, value, option_string=None):
+         kwargs = {'subparser': parser, 'key': None, 'skip_none': False, 'skip_check': True}
++        valid_flags = {'': None, 'comments': 'yaml_comments', 'skip_null': 'skip_none'}
+         if value is not None:
+-            if value not in {'skip_null', ''}:
+-                raise ParserError('Invalid option "'+str(value)+'" for '+option_string)
+-            kwargs['skip_none'] = True
++            flags = value.split(',')
++            invalid_flags = [f for f in flags if f not in valid_flags]
++            if len(invalid_flags) > 0:
++                raise ParserError('Invalid option "'+str(invalid_flags[0])+'" for '+option_string)
++            for flag in [f for f in flags if f != '']:
++                kwargs[valid_flags[flag]] = True
+         while hasattr(parser, 'parent_parser'):
+             kwargs['key'] = parser.subcommand if kwargs['key'] is None else parser.subcommand+'.'+kwargs['key']
+             parser = parser.parent_parser
+diff --git a/jsonargparse/core.py b/jsonargparse/core.py
+index 7455908..2441425 100644
+--- a/jsonargparse/core.py
++++ b/jsonargparse/core.py
+@@ -708,6 +708,7 @@ class ArgumentParser(_ActionsContainer, argparse.ArgumentParser, LoggerProperty)
+         format: str = 'parser_mode',
+         skip_none: bool = True,
+         skip_check: bool = False,
++        yaml_comments: bool = False,
+     ) -> str:
+         """Generates a yaml or json string for the given configuration object.
+ 
+@@ -716,6 +717,7 @@ class ArgumentParser(_ActionsContainer, argparse.ArgumentParser, LoggerProperty)
+             format: The output format: "yaml", "json", "json_indented" or "parser_mode".
+             skip_none: Whether to exclude entries whose value is None.
+             skip_check: Whether to skip parser checking.
++            yaml_comments: Whether to add help content as comments.
+ 
+         Returns:
+             The configuration in yaml or json format.
+@@ -756,7 +758,11 @@ class ArgumentParser(_ActionsContainer, argparse.ArgumentParser, LoggerProperty)
+         if format == 'parser_mode':
+             format = 'yaml' if self.parser_mode == 'yaml' else 'json_indented'
+         if format == 'yaml':
+-            return yaml.safe_dump(cfg, **self.dump_yaml_kwargs)  # type: ignore
++            dump = yaml.safe_dump(cfg, **self.dump_yaml_kwargs)  # type: ignore
++            if yaml_comments:
++                formatter = self.formatter_class(self.prog)
++                dump = formatter.add_yaml_comments(dump)  # type: ignore
++            return dump
+         elif format == 'json_indented':
+             return json.dumps(cfg, indent=2, **self.dump_json_kwargs)+'\n'  # type: ignore
+         elif format == 'json':
+diff --git a/jsonargparse/formatters.py b/jsonargparse/formatters.py
+index 6d50412..2c686a8 100644
+--- a/jsonargparse/formatters.py
++++ b/jsonargparse/formatters.py
+@@ -1,9 +1,20 @@
+ """Formatter classes."""
+ 
++import re
+ from argparse import _HelpAction, HelpFormatter, OPTIONAL, SUPPRESS, ZERO_OR_MORE
+ from enum import Enum
+-
+-from .actions import ActionConfigFile, ActionYesNo, _ActionLink
++from io import StringIO
++
++from .actions import (
++    ActionConfigFile,
++    ActionYesNo,
++    _ActionConfigLoad,
++    _ActionLink,
++    _ActionSubCommands,
++    _find_action,
++    filter_default_actions,
++)
++from .optionals import import_ruyaml
+ from .typehints import ActionTypeHint, type_to_str
+ from .util import _get_env_var, _get_key_value
+ 
+@@ -94,3 +105,108 @@ class DefaultHelpFormatter(HelpFormatter):
+     def add_usage(self, usage, actions, groups, prefix=None):
+         actions = [a for a in actions if not isinstance(a, _ActionLink)]
+         super().add_usage(usage, actions, groups, prefix=prefix)
++
++
++    def add_yaml_comments(self, cfg: str) -> str:
++        """Adds help text as yaml comments."""
++        ruyaml = import_ruyaml('add_yaml_comments')
++        yaml = ruyaml.YAML()
++        cfg = yaml.load(cfg)
++
++        def get_subparsers(parser, prefix=''):
++            subparsers = {}
++            if parser._subparsers is not None:
++                for key, subparser in parser._subparsers._group_actions[0].choices.items():
++                    full_key = (prefix+'.' if prefix else '')+key
++                    subparsers[full_key] = subparser
++                    subparsers.update(get_subparsers(subparser, prefix=full_key))
++            return subparsers
++
++        parsers = get_subparsers(self._parser)  # type: ignore
++        parsers[None] = self._parser  # type: ignore
++
++        group_titles = {}
++        for prefix, parser in parsers.items():
++            for group in parser._action_groups:
++                actions = filter_default_actions(group._group_actions)
++                actions = [a for a in actions if not isinstance(a, (_ActionConfigLoad, ActionConfigFile, _ActionSubCommands))]
++                keys = set(re.sub(r'\.?[^.]+$', '', a.dest) for a in actions)
++                if len(keys) == 1:
++                    key = keys.pop()
++                    full_key = (prefix+('.' if key else '') if prefix else '')+key
++                    group_titles[full_key] = group.title
++
++        def set_comments(cfg, prefix='', depth=0):
++            for key in cfg.keys():
++                full_key = (prefix+'.' if prefix else '')+key
++                action = _find_action(self._parser, full_key, within_subcommands=True)
++                if isinstance(action, tuple):
++                    action = action[0]
++                text = None
++                if full_key in group_titles and isinstance(cfg[key], dict):
++                    text = group_titles[full_key]
++                elif action is not None and action.help not in {None, SUPPRESS}:
++                    text = self._expand_help(action)
++                if isinstance(cfg[key], dict):
++                    if text:
++                        self.set_yaml_group_comment(text, cfg, key, depth)
++                    set_comments(cfg[key], full_key, depth+1)
++                elif text:
++                    self.set_yaml_argument_comment(text, cfg, key, depth)
++
++        if self._parser.description is not None:  # type: ignore
++            self.set_yaml_start_comment(self._parser.description, cfg)  # type: ignore
++        set_comments(cfg)
++        out = StringIO()
++        yaml.dump(cfg, out)
++        return out.getvalue()
++
++
++    def set_yaml_start_comment(
++        self,
++        text: str,
++        cfg: 'ruyaml.comments.CommentedMap',  # type: ignore
++    ):
++        """Sets the start comment to a ruyaml object.
++
++        Args:
++            text: The content to use for the comment.
++            cfg: The ruyaml object.
++        """
++        cfg.yaml_set_start_comment(text)
++
++
++    def set_yaml_group_comment(
++        self,
++        text: str,
++        cfg: 'ruyaml.comments.CommentedMap',  # type: ignore
++        key: str,
++        depth: int,
++    ):
++        """Sets the comment for a group to a ruyaml object.
++
++        Args:
++            text: The content to use for the comment.
++            cfg: The parent ruyaml object.
++            key: The key of the group.
++            depth: The nested level of the group.
++        """
++        cfg.yaml_set_comment_before_after_key(key, before='\n'+text, indent=2*depth)
++
++
++    def set_yaml_argument_comment(
++        self,
++        text: str,
++        cfg: 'ruyaml.comments.CommentedMap',  # type: ignore
++        key: str,
++        depth: int,
++    ):
++        """Sets the comment for an argument to a ruyaml object.
++
++        Args:
++            text: The content to use for the comment.
++            cfg: The parent ruyaml object.
++            key: The key of the argument.
++            depth: The nested level of the argument.
++        """
++        cfg.yaml_set_comment_before_after_key(key, before='\n'+text, indent=2*depth)
+diff --git a/jsonargparse/optionals.py b/jsonargparse/optionals.py
+index 2859428..2088b15 100644
+--- a/jsonargparse/optionals.py
++++ b/jsonargparse/optionals.py
+@@ -21,6 +21,7 @@ _docstring_parser = find_spec('docstring_parser')
+ _argcomplete = find_spec('argcomplete')
+ _dataclasses = find_spec('dataclasses')
+ _fsspec = find_spec('fsspec')
++_ruyaml = find_spec('ruyaml')
+ 
+ jsonschema_support = False if _jsonschema is None else True
+ jsonnet_support = False if _jsonnet is None else True
+@@ -29,6 +30,7 @@ docstring_parser_support = False if _docstring_parser is None else True
+ argcomplete_support = False if _argcomplete is None else True
+ dataclasses_support = False if _dataclasses is None else True
+ fsspec_support = False if _fsspec is None else True
++ruyaml_support = False if _ruyaml is None else True
+ 
+ _config_read_mode = 'fr'
+ 
+@@ -116,6 +118,14 @@ def import_fsspec(importer):
+         raise ImportError('fsspec package is required by '+importer+' :: '+str(ex)) from ex
+ 
+ 
++def import_ruyaml(importer):
++    try:
++        import ruyaml
++        return ruyaml
++    except (ImportError, ModuleNotFound) as ex:
++        raise ImportError('ruyaml package is required by '+importer+' :: '+str(ex)) from ex
++
++
+ def set_config_read_mode(
+     urls_enabled: bool = False,
+     fsspec_enabled: bool = False,

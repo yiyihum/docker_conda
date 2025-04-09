@@ -1,0 +1,211 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index e46cddc..cb3f951 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -11,6 +11,12 @@ Version 1.20
+ 
+ Unreleased
+ 
++* Added public property :attr:`~Reader.after_entry_update_hooks` to
++  :class:`Reader`, which contains list of hooks to run for each new/modified
++  entry after :meth:`~Reader.update_feeds()` call. Hooks will receive
++  :class:`Reader` instance, :class:`~types.Entry`-like object instance and
++  :class:`~types.EntryUpdateStatus` value
++
+ 
+ Version 1.19
+ ------------
+diff --git a/docs/api.rst b/docs/api.rst
+index 8393dcb..7d757f9 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -61,6 +61,9 @@ Data objects
+ .. autoclass:: UpdatedFeed
+     :members:
+ 
++.. autoclass:: EntryUpdateStatus
++    :members:
++
+ 
+ Exceptions
+ ----------
+diff --git a/src/reader/__init__.py b/src/reader/__init__.py
+index 3f8fdaf..690acde 100644
+--- a/src/reader/__init__.py
++++ b/src/reader/__init__.py
+@@ -54,6 +54,7 @@ from .types import (
+     EntrySearchCounts,
+     UpdateResult,
+     UpdatedFeed,
++    EntryUpdateStatus,
+ )
+ 
+ from .exceptions import (
+diff --git a/src/reader/core.py b/src/reader/core.py
+index cf4bb34..da0e64d 100644
+--- a/src/reader/core.py
++++ b/src/reader/core.py
+@@ -52,6 +52,7 @@ from .types import EntryInput
+ from .types import EntrySearchCounts
+ from .types import EntrySearchResult
+ from .types import EntrySortOrder
++from .types import EntryUpdateStatus
+ from .types import Feed
+ from .types import FeedCounts
+ from .types import FeedInput
+@@ -73,7 +74,12 @@ _U = TypeVar('_U')
+ 
+ ReaderPluginType = Callable[['Reader'], None]
+ _PostFeedUpdatePluginType = Callable[['Reader', str], None]
+-_PostEntryAddPluginType = Callable[['Reader', EntryData[datetime]], None]
++#: Function that will be called for each new/modified entry
++#:
++#: ..versionadded:: 1.20
++AfterEntryUpdateHook = Callable[
++    ['Reader', EntryData[datetime], EntryUpdateStatus], None
++]
+ 
+ 
+ def make_reader(
+@@ -265,6 +271,9 @@ class Reader:
+     .. versionadded:: 1.13
+         JSON Feed support.
+ 
++    .. versionadded:: 1.20
++        after_entry_update_hooks public attribute
++
+     """
+ 
+     def __init__(
+@@ -286,7 +295,22 @@ class Reader:
+ 
+         self._updater = reader._updater
+         self._post_feed_update_plugins: Collection[_PostFeedUpdatePluginType] = []
+-        self._post_entry_add_plugins: Collection[_PostEntryAddPluginType] = []
++
++        #: List of functions that will be called for each new/modified entry after
++        #: feed was updated. Each function should take three arguments and return None.
++        #:
++        #: * ``reader`` - a :class:`Reader` instance
++        #: * ``entry`` - an :class:`~types.Entry`-like object
++        #:
++        #:   .. warning::
++        #:
++        #:     The only attributes that are guaranteed to be present are ``feed_url``, ``id``
++        #:     and ``object_id``; all other attributes may appear or disappear between minor
++        #:     versions, or may be None.
++        #: * ``status`` - an :class:`~types.EntryUpdateStatus` value
++        #:
++        #: ..versionadded:: 1.20
++        self.after_entry_update_hooks: Collection[AfterEntryUpdateHook] = []
+ 
+         if _called_directly:
+             warnings.warn(
+@@ -919,12 +943,12 @@ class Reader:
+         for entry in entries_to_update:
+             if entry.new:
+                 new_count += 1
++                entry_status = EntryUpdateStatus.NEW
+             else:
+                 updated_count += 1
+-            if not entry.new:
+-                continue
+-            for entry_plugin in self._post_entry_add_plugins:
+-                entry_plugin(self, entry.entry)
++                entry_status = EntryUpdateStatus.MODIFIED
++            for entry_hook in self.after_entry_update_hooks:
++                entry_hook(self, entry.entry, entry_status)
+ 
+         return new_count, updated_count
+ 
+diff --git a/src/reader/plugins/entry_dedupe.py b/src/reader/plugins/entry_dedupe.py
+index 972401b..91eddb5 100644
+--- a/src/reader/plugins/entry_dedupe.py
++++ b/src/reader/plugins/entry_dedupe.py
+@@ -74,6 +74,8 @@ Entry user attributes are set as follows:
+ import logging
+ import re
+ 
++from reader.types import EntryUpdateStatus
++
+ log = logging.getLogger('reader._plugins.feed_entry_dedupe')
+ 
+ 
+@@ -111,7 +113,10 @@ def _is_duplicate(one, two):
+     return same_title and same_text
+ 
+ 
+-def _entry_dedupe_plugin(reader, entry):
++def _entry_dedupe_plugin(reader, entry, status):
++    if status is EntryUpdateStatus.MODIFIED:
++        return
++
+     duplicates = [
+         e
+         for e in reader.get_entries(feed=entry.feed_url)
+@@ -150,4 +155,4 @@ def _entry_dedupe_plugin(reader, entry):
+ 
+ 
+ def init_reader(reader):
+-    reader._post_entry_add_plugins.append(_entry_dedupe_plugin)
++    reader.after_entry_update_hooks.append(_entry_dedupe_plugin)
+diff --git a/src/reader/plugins/mark_as_read.py b/src/reader/plugins/mark_as_read.py
+index 8f696a7..3b30bf7 100644
+--- a/src/reader/plugins/mark_as_read.py
++++ b/src/reader/plugins/mark_as_read.py
+@@ -29,6 +29,7 @@ import logging
+ import re
+ 
+ from reader.exceptions import MetadataNotFoundError
++from reader.types import EntryUpdateStatus
+ 
+ # avoid circular imports
+ 
+@@ -52,7 +53,10 @@ def _get_config(reader, feed_url, metadata_key, patterns_key):
+     return []
+ 
+ 
+-def _mark_as_read(reader, entry):
++def _mark_as_read(reader, entry, status):
++    if status is EntryUpdateStatus.MODIFIED:
++        return
++
+     metadata_name = reader.make_reader_reserved_name('mark_as_read')
+     patterns = _get_config(reader, entry.feed_url, metadata_name, 'title')
+ 
+@@ -63,4 +67,4 @@ def _mark_as_read(reader, entry):
+ 
+ 
+ def init_reader(reader):
+-    reader._post_entry_add_plugins.append(_mark_as_read)
++    reader.after_entry_update_hooks.append(_mark_as_read)
+diff --git a/src/reader/types.py b/src/reader/types.py
+index c3a1f5a..d5c90d5 100644
+--- a/src/reader/types.py
++++ b/src/reader/types.py
+@@ -1,4 +1,5 @@
+ import dataclasses
++import enum
+ import re
+ import traceback
+ import warnings
+@@ -480,6 +481,19 @@ class EntrySearchResult(_namedtuple_compat):
+         return self.feed_url, self.id
+ 
+ 
++class EntryUpdateStatus(enum.Enum):
++
++    """Data type representing status of entry.
++    Used by :py:attr:`~Reader.after_entry_update_hooks`.
++
++    .. versionadded:: 1.20
++
++    """
++
++    NEW = 'new'
++    MODIFIED = 'modified'
++
++
+ # Semi-public API (typing support)
+ 
+ 

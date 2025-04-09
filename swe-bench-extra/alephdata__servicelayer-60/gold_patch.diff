@@ -1,0 +1,87 @@
+diff --git a/servicelayer/worker.py b/servicelayer/worker.py
+index 939a3a3..f2a45b3 100644
+--- a/servicelayer/worker.py
++++ b/servicelayer/worker.py
+@@ -1,5 +1,6 @@
+ import signal
+ import logging
++import sys
+ from threading import Thread
+ from banal import ensure_list
+ from abc import ABC, abstractmethod
+@@ -10,7 +11,13 @@ from servicelayer.cache import get_redis
+ from servicelayer.util import unpack_int
+ 
+ log = logging.getLogger(__name__)
++
++# When a worker thread is not blocking, it has to exit if no task is available.
++# `TASK_FETCH_RETRY`` determines how many times the worker thread will try to fetch
++# a task before quitting.
++# `INTERVAL`` determines the interval in seconds between each retry.
+ INTERVAL = 2
++TASK_FETCH_RETRY = 60 / INTERVAL
+ 
+ 
+ class Worker(ABC):
+@@ -23,8 +30,10 @@ class Worker(ABC):
+         self.exit_code = 0
+ 
+     def _handle_signal(self, signal, frame):
+-        log.warning("Shutting down worker (signal %s)", signal)
++        log.warning(f"Shutting down worker (signal {signal})")
+         self.exit_code = int(signal)
++        # Exit eagerly without waiting for current task to finish running
++        sys.exit(self.exit_code)
+ 
+     def handle_safe(self, task):
+         try:
+@@ -56,16 +65,25 @@ class Worker(ABC):
+             task.stage.queue(task.payload, task.context)
+ 
+     def process(self, blocking=True, interval=INTERVAL):
+-        while True:
++        retries = 0
++        while retries <= TASK_FETCH_RETRY:
+             if self.exit_code > 0:
++                log.info("Worker thread is exiting")
+                 return self.exit_code
+             self.periodic()
+             stages = self.get_stages()
+             task = Stage.get_task(self.conn, stages, timeout=interval)
+             if task is None:
+                 if not blocking:
+-                    return self.exit_code
++                    # If we get a null task, retry to fetch a task a bunch of times before quitting
++                    if retries >= TASK_FETCH_RETRY:
++                        log.info("Worker thread is exiting")
++                        return self.exit_code
++                    else:
++                        retries += 1
+                 continue
++            # when we get a good task, reset retry count
++            retries = 0
+             self.handle_safe(task)
+ 
+     def sync(self):
+diff --git a/setup.py b/setup.py
+index 88a915d..79b586f 100644
+--- a/setup.py
++++ b/setup.py
+@@ -30,7 +30,7 @@ setup(
+     install_requires=[
+         "banal >= 1.0.1, <2.0.0",
+         "normality >= 2.1.1, <3.0.0",
+-        "fakeredis == 1.7.0",
++        "fakeredis == 1.7.1",
+         "sqlalchemy >= 1.3",
+         "structlog >= 20.2.0, < 22.0.0",
+         "colorama >= 0.4.4, < 1.0.0",
+@@ -39,7 +39,7 @@ setup(
+         "amazon": ["boto3 >= 1.11.9, <2.0.0"],
+         "google": [
+             "grpcio >= 1.32.0, <2.0.0",
+-            "google-cloud-storage >= 1.31.0, <2.0.0",
++            "google-cloud-storage >= 1.31.0, < 3.0.0",
+         ],
+         "dev": [
+             "twine",

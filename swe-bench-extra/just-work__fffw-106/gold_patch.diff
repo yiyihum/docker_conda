@@ -1,0 +1,100 @@
+diff --git a/fffw/encoding/filters.py b/fffw/encoding/filters.py
+index 1f49262..70c8d93 100644
+--- a/fffw/encoding/filters.py
++++ b/fffw/encoding/filters.py
+@@ -269,16 +269,20 @@ class Trim(AutoFilter):
+                 streams.append(scene.stream)
+ 
+             # intersect scene with trim interval
+-            start = cast(TS, max(self.start, scene.start))
+-            end = cast(TS, min(self.end, scene.end))
++            start = cast(TS, max(self.start, scene.position))
++            end = cast(TS, min(self.end, scene.position + scene.duration))
+ 
+             if start < end:
+                 # If intersection is not empty, add intersection to resulting
+                 # scenes list.
+                 # This will allow to detect buffering when multiple scenes are
+                 # reordered in same file: input[3:4] + input[1:2]
+-                scenes.append(Scene(stream=scene.stream, start=start,
+-                                    duration=end - start))
++                offset = start - scene.position
++                scenes.append(Scene(
++                    stream=scene.stream,
++                    start=scene.start + offset,
++                    position=scene.position + offset,
++                    duration=end - start))
+ 
+         kwargs = {
+             'start': start,
+@@ -367,8 +371,14 @@ class Concat(Filter):
+         streams: List[str] = []
+         frames: int = 0
+         for meta in metadata:
++            for scene in meta.scenes:
++                scenes.append(Scene(
++                    stream=scene.stream,
++                    duration=scene.duration,
++                    start=scene.start,
++                    position=scene.position + duration,
++                ))
+             duration += meta.duration
+-            scenes.extend(meta.scenes)
+             for stream in meta.streams:
+                 if not streams or streams[-1] != stream:
+                     # Add all streams for each concatenated metadata and remove
+@@ -422,6 +432,12 @@ class Upload(VideoFilter):
+     extra_hw_frames: int = param(default=64, init=False)
+     device: Device = param(skip=True)
+ 
++    def __post_init__(self) -> None:
++        if isinstance(self.device, dict):
++            # deserialize back after filter cloning
++            self.device = Device(**self.device)
++        super().__post_init__()
++
+     def transform(self, *metadata: Meta) -> VideoMeta:
+         """ Marks a stream as uploaded to a device."""
+         meta = ensure_video(*metadata)
+diff --git a/fffw/graph/meta.py b/fffw/graph/meta.py
+index 29beac6..5ed0f15 100644
+--- a/fffw/graph/meta.py
++++ b/fffw/graph/meta.py
+@@ -143,6 +143,7 @@ class TS(float):
+             value = seconds + fractional
+         return super().__new__(cls, value)  # type: ignore
+ 
++    __hash__ = float.__hash__
+     __add__ = ts(float.__add__)
+     __radd__ = ts(float.__radd__)
+     __sub__ = ts(float.__sub__)
+@@ -264,7 +265,9 @@ class Scene:
+     duration: TS
+     """ Stream duration."""
+     start: TS
+-    """ First frame/sample timestamp for stream."""
++    """ First frame/sample timestamp in source stream."""
++    position: TS
++    """ Position of scene in current stream."""
+ 
+     @property
+     def end(self) -> TS:
+@@ -386,6 +389,7 @@ def audio_meta_data(**kwargs: Any) -> AudioMeta:
+         stream=stream,
+         duration=duration,
+         start=start,
++        position=start,
+     )
+ 
+     return AudioMeta(
+@@ -425,8 +429,9 @@ def video_meta_data(**kwargs: Any) -> VideoMeta:
+     start = TS(kwargs.get('start', 0))
+     scene = Scene(
+         stream=stream,
+-        start=start,
+         duration=duration,
++        start=start,
++        position=start,
+     )
+     return VideoMeta(
+         scenes=[scene],

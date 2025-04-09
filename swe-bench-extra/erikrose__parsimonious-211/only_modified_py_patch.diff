@@ -1,0 +1,69 @@
+diff --git a/parsimonious/exceptions.py b/parsimonious/exceptions.py
+index d0f9375..a03a549 100644
+--- a/parsimonious/exceptions.py
++++ b/parsimonious/exceptions.py
+@@ -1,3 +1,4 @@
++from textwrap import dedent
+ 
+ from parsimonious.utils import StrAndRepr
+ 
+@@ -44,6 +45,20 @@ class ParseError(StrAndRepr, Exception):
+             return self.pos + 1
+ 
+ 
++class LeftRecursionError(ParseError):
++    def __str__(self):
++        rule_name = self.expr.name if self.expr.name else str(self.expr)
++        window = self.text[self.pos:self.pos + 20]
++        return dedent(f"""
++            Left recursion in rule {rule_name!r} at {window!r} (line {self.line()}, column {self.column()}).
++
++            Parsimonious is a packrat parser, so it can't handle left recursion.
++            See https://en.wikipedia.org/wiki/Parsing_expression_grammar#Indirect_left_recursion
++            for how to rewrite your grammar into a rule that does not use left-recursion.
++            """
++        ).strip()
++
++
+ class IncompleteParseError(ParseError):
+     """A call to ``parse()`` matched a whole Expression but did not consume the
+     entire text."""
+diff --git a/parsimonious/expressions.py b/parsimonious/expressions.py
+index 9200365..f93f2c6 100644
+--- a/parsimonious/expressions.py
++++ b/parsimonious/expressions.py
+@@ -10,7 +10,7 @@ from collections import defaultdict
+ from inspect import getfullargspec, isfunction, ismethod, ismethoddescriptor
+ import regex as re
+ 
+-from parsimonious.exceptions import ParseError, IncompleteParseError
++from parsimonious.exceptions import ParseError, IncompleteParseError, LeftRecursionError
+ from parsimonious.nodes import Node, RegexNode
+ from parsimonious.utils import StrAndRepr
+ 
+@@ -96,6 +96,9 @@ def expression(callable, rule_name, grammar):
+     return AdHocExpression(name=rule_name)
+ 
+ 
++IN_PROGRESS = object()
++
++
+ class Expression(StrAndRepr):
+     """A thing that can be matched against a piece of text"""
+ 
+@@ -186,10 +189,10 @@ class Expression(StrAndRepr):
+             node = expr_cache[pos]
+         else:
+             # TODO: Set default value to prevent infinite recursion in left-recursive rules.
+-            node = expr_cache[pos] = self._uncached_match(text,
+-                                                          pos,
+-                                                          cache,
+-                                                          error)
++            expr_cache[pos] = IN_PROGRESS  # Mark as in progress
++            node = expr_cache[pos] = self._uncached_match(text, pos, cache, error)
++        if node is IN_PROGRESS:
++            raise LeftRecursionError(text, pos=-1, expr=self)
+ 
+         # Record progress for error reporting:
+         if node is None and pos >= error.pos and (
+

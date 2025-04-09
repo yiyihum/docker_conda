@@ -1,0 +1,219 @@
+diff --git a/wagtail/contrib/forms/tests/test_models.py b/wagtail/contrib/forms/tests/test_models.py
+index 4b2ad1bef7..d9567ca1b3 100644
+--- a/wagtail/contrib/forms/tests/test_models.py
++++ b/wagtail/contrib/forms/tests/test_models.py
+@@ -4,7 +4,6 @@ import unittest
+ 
+ from django import VERSION as DJANGO_VERSION
+ from django.core import mail
+-from django.core.checks import Info
+ from django.test import TestCase, override_settings
+ 
+ from wagtail.contrib.forms.models import FormSubmission
+@@ -19,7 +18,6 @@ from wagtail.test.testapp.models import (
+     CustomFormPageSubmission,
+     ExtendedFormField,
+     FormField,
+-    FormFieldWithCustomSubmission,
+     FormPageWithCustomFormBuilder,
+     JadeFormPage,
+ )
+@@ -809,75 +807,3 @@ class TestNonHtmlExtension(TestCase):
+         self.assertEqual(
+             form_page.landing_page_template, "tests/form_page_landing.jade"
+         )
+-
+-
+-class TestLegacyFormFieldCleanNameChecks(TestCase, WagtailTestUtils):
+-    fixtures = ["test.json"]
+-
+-    def setUp(self):
+-        self.login(username="siteeditor", password="password")
+-        self.form_page = Page.objects.get(
+-            url_path="/home/contact-us-one-more-time/"
+-        ).specific
+-
+-    def test_form_field_clean_name_update_on_checks(self):
+-        fields_before_checks = [
+-            (
+-                field.label,
+-                field.clean_name,
+-            )
+-            for field in FormFieldWithCustomSubmission.objects.all()
+-        ]
+-
+-        self.assertEqual(
+-            fields_before_checks,
+-            [
+-                ("Your email", ""),
+-                ("Your message", ""),
+-                ("Your choices", ""),
+-            ],
+-        )
+-
+-        # running checks should show an info message AND update blank clean_name values
+-
+-        messages = FormFieldWithCustomSubmission.check()
+-
+-        self.assertEqual(
+-            messages,
+-            [
+-                Info(
+-                    "Added `clean_name` on 3 form field(s)",
+-                    obj=FormFieldWithCustomSubmission,
+-                )
+-            ],
+-        )
+-
+-        fields_after_checks = [
+-            (
+-                field.label,
+-                field.clean_name,
+-            )
+-            for field in FormFieldWithCustomSubmission.objects.all()
+-        ]
+-
+-        self.assertEqual(
+-            fields_after_checks,
+-            [
+-                ("Your email", "your-email"),  # kebab case, legacy format
+-                ("Your message", "your-message"),
+-                ("Your choices", "your-choices"),
+-            ],
+-        )
+-
+-        # running checks again should return no messages as fields no longer need changing
+-        self.assertEqual(FormFieldWithCustomSubmission.check(), [])
+-
+-        # creating a new field should use the non-legacy clean_name format
+-
+-        field = FormFieldWithCustomSubmission.objects.create(
+-            page=self.form_page,
+-            label="Your FAVOURITE #number",
+-            field_type="number",
+-        )
+-
+-        self.assertEqual(field.clean_name, "your_favourite_number")
+diff --git a/wagtail/contrib/forms/tests/test_views.py b/wagtail/contrib/forms/tests/test_views.py
+index 4491015781..9b06dfb062 100644
+--- a/wagtail/contrib/forms/tests/test_views.py
++++ b/wagtail/contrib/forms/tests/test_views.py
+@@ -5,7 +5,6 @@ from io import BytesIO
+ 
+ from django.conf import settings
+ from django.contrib.auth.models import AnonymousUser
+-from django.core.checks import Info
+ from django.test import RequestFactory, TestCase, override_settings
+ from django.urls import reverse
+ from openpyxl import load_workbook
+@@ -522,49 +521,6 @@ class TestFormsSubmissionsList(TestCase, WagtailTestUtils):
+         self.assertIn("this is a really old message", first_row_values)
+ 
+ 
+-class TestFormsSubmissionsListLegacyFieldName(TestCase, WagtailTestUtils):
+-    fixtures = ["test.json"]
+-
+-    def setUp(self):
+-        self.login(username="siteeditor", password="password")
+-        self.form_page = Page.objects.get(
+-            url_path="/home/contact-us-one-more-time/"
+-        ).specific
+-
+-        # running checks should show an info message AND update blank clean_name values
+-
+-        messages = FormFieldWithCustomSubmission.check()
+-
+-        self.assertEqual(
+-            messages,
+-            [
+-                Info(
+-                    "Added `clean_name` on 3 form field(s)",
+-                    obj=FormFieldWithCustomSubmission,
+-                )
+-            ],
+-        )
+-
+-        # check clean_name has been updated
+-        self.assertEqual(
+-            FormFieldWithCustomSubmission.objects.all()[0].clean_name, "your-email"
+-        )
+-
+-    def test_list_submissions(self):
+-        response = self.client.get(
+-            reverse("wagtailforms:list_submissions", args=(self.form_page.id,))
+-        )
+-
+-        # Check response
+-        self.assertEqual(response.status_code, 200)
+-        self.assertTemplateUsed(response, "wagtailforms/index_submissions.html")
+-        self.assertEqual(len(response.context["data_rows"]), 2)
+-
+-        # check display of list values within form submissions
+-        self.assertContains(response, "old@example.com")
+-        self.assertContains(response, "new@example.com")
+-
+-
+ class TestFormsSubmissionsExport(TestCase, WagtailTestUtils):
+     def setUp(self):
+         # Create a form page
+diff --git a/wagtail/embeds/tests/test_embeds.py b/wagtail/embeds/tests/test_embeds.py
+index 40255d5602..5257dba19f 100644
+--- a/wagtail/embeds/tests/test_embeds.py
++++ b/wagtail/embeds/tests/test_embeds.py
+@@ -634,6 +634,16 @@ class TestInstagramOEmbed(TestCase):
+                 "https://www.instagram.com/p/CHeRxmnDSYe/?utm_source=ig_embed"
+             )
+         )
++        self.assertTrue(
++            finder.accept(
++                "https://www.instagram.com/tv/CZMkxGaIXk3/?utm_source=ig_embed"
++            )
++        )
++        self.assertTrue(
++            finder.accept(
++                "https://www.instagram.com/reel/CZMs3O_I22w/?utm_source=ig_embed"
++            )
++        )
+         self.assertFalse(
+             finder.accept("https://instagr.am/p/CHeRxmnDSYe/?utm_source=ig_embed")
+         )
+@@ -659,8 +669,6 @@ class TestInstagramOEmbed(TestCase):
+         )
+         # check that a request was made with the expected URL / authentication
+         request = urlopen.call_args[0][0]
+-        # check that a request was made with the expected URL / authentication
+-        request = urlopen.call_args[0][0]
+         self.assertEqual(
+             request.get_full_url(),
+             "https://graph.facebook.com/v11.0/instagram_oembed?url=https%3A%2F%2Finstagr.am%2Fp%2FCHeRxmnDSYe%2F&format=json",
+diff --git a/wagtail/test/testapp/fixtures/test.json b/wagtail/test/testapp/fixtures/test.json
+index 074a0b696f..65fb8028f4 100644
+--- a/wagtail/test/testapp/fixtures/test.json
++++ b/wagtail/test/testapp/fixtures/test.json
+@@ -487,7 +487,7 @@
+     "pk": 1,
+     "model": "tests.formfieldwithcustomsubmission",
+     "fields": {
+-      "clean_name": "",
++      "clean_name": "your_email",
+       "sort_order": 1,
+       "label": "Your email",
+       "field_type": "email",
+@@ -502,7 +502,7 @@
+     "pk": 2,
+     "model": "tests.formfieldwithcustomsubmission",
+     "fields": {
+-      "clean_name": "",
++      "clean_name": "your_message",
+       "sort_order": 2,
+       "label": "Your message",
+       "field_type": "multiline",
+@@ -517,7 +517,7 @@
+     "pk": 3,
+     "model": "tests.formfieldwithcustomsubmission",
+     "fields": {
+-      "clean_name": "",
++      "clean_name": "your_choices",
+       "sort_order": 3,
+       "label": "Your choices",
+       "field_type": "checkboxes",

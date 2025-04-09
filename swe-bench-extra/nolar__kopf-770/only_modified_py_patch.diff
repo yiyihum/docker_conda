@@ -1,0 +1,105 @@
+diff --git a/kopf/_cogs/clients/auth.py b/kopf/_cogs/clients/auth.py
+index 632984d..4b4af34 100644
+--- a/kopf/_cogs/clients/auth.py
++++ b/kopf/_cogs/clients/auth.py
+@@ -44,7 +44,12 @@ def reauthenticated_request(fn: _F) -> _F:
+                 return await fn(*args, **kwargs, context=context)
+             except errors.APIUnauthorizedError as e:
+                 await vault.invalidate(key, exc=e)
+-        raise credentials.LoginError("Ran out of connection credentials.")
++
++        # Normally, either `vault.extended()` or `vault.invalidate()` raise the login errors.
++        # The for-cycle can only end if the yielded credentials are not invalidated before trying
++        # the next ones -- but this case exits by `return` or by other (non-401) errors.
++        raise RuntimeError("Reached an impossible state: the end of the authentication cycle.")
++
+     return cast(_F, wrapper)
+ 
+ 
+@@ -76,7 +81,12 @@ def reauthenticated_stream(fn: _F) -> _F:
+                 return
+             except errors.APIUnauthorizedError as e:
+                 await vault.invalidate(key, exc=e)
+-        raise credentials.LoginError("Ran out of connection credentials.")
++
++        # Normally, either `vault.extended()` or `vault.invalidate()` raise the login errors.
++        # The for-cycle can only end if the yielded credentials are not invalidated before trying
++        # the next ones -- but this case exits by `return` or by other (non-401) errors.
++        raise RuntimeError("Reached an impossible state: the end of the authentication cycle.")
++
+     return cast(_F, wrapper)
+ 
+ 
+diff --git a/kopf/_cogs/structs/credentials.py b/kopf/_cogs/structs/credentials.py
+index e9bca12..3d9cae6 100644
+--- a/kopf/_cogs/structs/credentials.py
++++ b/kopf/_cogs/structs/credentials.py
+@@ -205,7 +205,9 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
+             it can lead to improper items returned.
+         """
+         if not self._current:
+-            raise LoginError("No valid credentials are available.")
++            raise LoginError("Ran out of valid credentials. Consider installing "
++                             "an API client library or adding a login handler. See more: "
++                             "https://kopf.readthedocs.io/en/stable/authentication/")
+         prioritised: Dict[int, List[Tuple[VaultKey, VaultItem]]]
+         prioritised = collections.defaultdict(list)
+         for key, item in self._current.items():
+@@ -252,11 +254,14 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
+ 
+         # If the re-auth has failed, re-raise the original exception in the current stack.
+         # If the original exception is unknown, raise normally on the next iteration's yield.
++        # The error here is optional -- for better stack traces of the original exception `exc`.
+         # Keep in mind, this routine is called in parallel from many tasks for the same keys.
+         async with self._lock:
+             if not self._current:
+                 if exc is not None:
+-                    raise exc
++                    raise LoginError("Ran out of valid credentials. Consider installing "
++                                     "an API client library or adding a login handler. See more: "
++                                     "https://kopf.readthedocs.io/en/stable/authentication/") from exc
+ 
+     async def populate(
+             self,
+diff --git a/kopf/_core/intents/piggybacking.py b/kopf/_core/intents/piggybacking.py
+index e05714d..df57ba1 100644
+--- a/kopf/_core/intents/piggybacking.py
++++ b/kopf/_core/intents/piggybacking.py
+@@ -46,6 +46,7 @@ def login_via_client(
+         **kwargs: Any,
+ ) -> Optional[credentials.ConnectionInfo]:
+ 
++    # Keep imports in the function, as module imports are mocked in some tests.
+     try:
+         import kubernetes.config
+     except ImportError:
+@@ -59,7 +60,8 @@ def login_via_client(
+             kubernetes.config.load_kube_config()  # developer's config files
+             logger.debug("Client is configured via kubeconfig file.")
+         except kubernetes.config.ConfigException as e2:
+-            raise credentials.LoginError(f"Cannot authenticate client neither in-cluster, nor via kubeconfig.")
++            raise credentials.LoginError("Cannot authenticate the client library "
++                                         "neither in-cluster, nor via kubeconfig.")
+ 
+     # We do not even try to understand how it works and why. Just load it, and extract the results.
+     # For kubernetes client >= 12.0.0 use the new 'get_default_copy' method
+@@ -100,6 +102,7 @@ def login_via_pykube(
+         **kwargs: Any,
+ ) -> Optional[credentials.ConnectionInfo]:
+ 
++    # Keep imports in the function, as module imports are mocked in some tests.
+     try:
+         import pykube
+     except ImportError:
+@@ -115,8 +118,8 @@ def login_via_pykube(
+             config = pykube.KubeConfig.from_file()
+             logger.debug("Pykube is configured via kubeconfig file.")
+         except (pykube.PyKubeError, FileNotFoundError):
+-            raise credentials.LoginError(f"Cannot authenticate pykube "
+-                                         f"neither in-cluster, nor via kubeconfig.")
++            raise credentials.LoginError("Cannot authenticate pykube "
++                                         "neither in-cluster, nor via kubeconfig.")
+ 
+     # We don't know how this token will be retrieved, we just get it afterwards.
+     provider_token = None
+

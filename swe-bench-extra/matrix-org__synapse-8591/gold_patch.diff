@@ -1,0 +1,106 @@
+diff --git a/changelog.d/8569.misc b/changelog.d/8569.misc
+new file mode 100644
+index 000000000..3b6e0625e
+--- /dev/null
++++ b/changelog.d/8569.misc
+@@ -0,0 +1,1 @@
++Fix mypy not properly checking across the codebase, additionally, fix a typing assertion error in `handlers/auth.py`.
+\ No newline at end of file
+diff --git a/changelog.d/8589.removal b/changelog.d/8589.removal
+new file mode 100644
+index 000000000..b80f29d6b
+--- /dev/null
++++ b/changelog.d/8589.removal
+@@ -0,0 +1,1 @@
++Drop unused `device_max_stream_id` table.
+diff --git a/changelog.d/8591.misc b/changelog.d/8591.misc
+new file mode 100644
+index 000000000..8f16bc3e7
+--- /dev/null
++++ b/changelog.d/8591.misc
+@@ -0,0 +1,1 @@
++ Move metric registration code down into `LruCache`.
+diff --git a/synapse/handlers/auth.py b/synapse/handlers/auth.py
+index 1d1ddc224..8619fbb98 100644
+--- a/synapse/handlers/auth.py
++++ b/synapse/handlers/auth.py
+@@ -1122,20 +1122,22 @@ class AuthHandler(BaseHandler):
+             Whether self.hash(password) == stored_hash.
+         """
+ 
+-        def _do_validate_hash():
++        def _do_validate_hash(checked_hash: bytes):
+             # Normalise the Unicode in the password
+             pw = unicodedata.normalize("NFKC", password)
+ 
+             return bcrypt.checkpw(
+                 pw.encode("utf8") + self.hs.config.password_pepper.encode("utf8"),
+-                stored_hash,
++                checked_hash,
+             )
+ 
+         if stored_hash:
+             if not isinstance(stored_hash, bytes):
+                 stored_hash = stored_hash.encode("ascii")
+ 
+-            return await defer_to_thread(self.hs.get_reactor(), _do_validate_hash)
++            return await defer_to_thread(
++                self.hs.get_reactor(), _do_validate_hash, stored_hash
++            )
+         else:
+             return False
+ 
+diff --git a/synapse/storage/databases/main/schema/delta/58/21drop_device_max_stream_id.sql b/synapse/storage/databases/main/schema/delta/58/21drop_device_max_stream_id.sql
+new file mode 100644
+index 000000000..01ea6eddc
+--- /dev/null
++++ b/synapse/storage/databases/main/schema/delta/58/21drop_device_max_stream_id.sql
+@@ -0,0 +1,1 @@
++DROP TABLE device_max_stream_id;
+diff --git a/synapse/util/caches/lrucache.py b/synapse/util/caches/lrucache.py
+index 3b471d8fd..60bb6ff64 100644
+--- a/synapse/util/caches/lrucache.py
++++ b/synapse/util/caches/lrucache.py
+@@ -124,6 +124,10 @@ class LruCache(Generic[KT, VT]):
+         else:
+             self.max_size = int(max_size)
+ 
++        # register_cache might call our "set_cache_factor" callback; there's nothing to
++        # do yet when we get resized.
++        self._on_resize = None  # type: Optional[Callable[[],None]]
++
+         if cache_name is not None:
+             metrics = register_cache(
+                 "lru_cache",
+@@ -332,7 +336,10 @@ class LruCache(Generic[KT, VT]):
+             return key in cache
+ 
+         self.sentinel = object()
++
++        # make sure that we clear out any excess entries after we get resized.
+         self._on_resize = evict
++
+         self.get = cache_get
+         self.set = cache_set
+         self.setdefault = cache_set_default
+@@ -383,6 +390,7 @@ class LruCache(Generic[KT, VT]):
+         new_size = int(self._original_max_size * factor)
+         if new_size != self.max_size:
+             self.max_size = new_size
+-            self._on_resize()
++            if self._on_resize:
++                self._on_resize()
+             return True
+         return False
+diff --git a/tox.ini b/tox.ini
+index 4d132eff4..6d0815378 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -158,7 +158,6 @@ commands=
+     coverage html
+ 
+ [testenv:mypy]
+-skip_install = True
+ deps =
+     {[base]deps}
+     mypy==0.782

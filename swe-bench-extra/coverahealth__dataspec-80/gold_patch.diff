@@ -1,0 +1,299 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9f6fb1e..b2e117f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - Added `Spec.compose_conformer` to allow composition of new conformers with existing
+   conformers (#65)
+ - Added `s.merge` to allow seamless merging of mapping Specs (#70)
++- Added `ErrorDetails.as_map` to convert `ErrorDetails` instances to simple dicts (#79)
+ 
+ ### Changed
+ - **Breaking** `Spec.with_conformer` will now replace the default conformer applied
+diff --git a/docs/api.rst b/docs/api.rst
+index fd112fd..93c074e 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -1,3 +1,5 @@
++.. py:currentmodule:: dataspec
++
+ .. _api:
+ 
+ Dataspec API
+@@ -27,20 +29,52 @@ For more information, see :py:meth:`dataspec.SpecAPI.__call__`.
+ Types
+ -----
+ 
+-.. automodule:: dataspec
+-   :members: Spec, SpecPredicate, Tag, Conformer, PredicateFn, ValidatorFn
+-   :noindex:
++.. autoclass:: Spec
++   :members:
++
++.. data:: SpecPredicate
++
++   SpecPredicates are values that can be coerced into Specs by :py:func:`dataspec.s`.
++
++.. data:: Tag
++
++   Tags are string names given to :py:class:`dataspec.Spec` instances which are emitted
++   in :py:class:`dataspec.ErrorDetails` instances to indicate which Spec or Specs were
++   evaluated to produce the error.
++
++.. data:: Conformer
++
++   Conformers are functions of one argument which return either a conformed value or
++   an instance of :py:class:`dataspec.Invalid` (such as :py:obj:`dataspec.INVALID`).
++
++.. data:: PredicateFn
++
++   Predicate functions are functions of one argument which return :py:class:`bool`
++   indicating whether or not the argument is valid or not.
++
++.. data:: ValidatorFn
++
++   Validator functions are functions of one argument which yield successive
++   :py:class:`dataspec.ErrorDetails` instances indicating exactly why input values
++   do not meet the Spec.
+ 
+ .. _spec_errors:
+ 
+ Spec Errors
+ -----------
+ 
+-.. automodule:: dataspec
+-   :members: ErrorDetails, Invalid, ValidationError
+-   :noindex:
++.. autoclass:: ErrorDetails
++   :members:
++
++.. autoclass:: Invalid
++
++.. autoclass:: ValidationError
++   :members:
++
++.. data:: dataspec.INVALID
+ 
+-.. autodata:: dataspec.INVALID
++   ``INVALID`` is a singleton instance of :py:class:`dataspec.Invalid` emitted by
++   builtin conformers which can be used for a quick ``is`` identity check.
+ 
+ .. _utilities:
+ 
+diff --git a/docs/usage.rst b/docs/usage.rst
+index 8ac9279..18dcb2c 100644
+--- a/docs/usage.rst
++++ b/docs/usage.rst
+@@ -4,7 +4,7 @@ Usage
+ =====
+ 
+ .. contents::
+-   :depth: 3
++   :depth: 4
+ 
+ .. _constructing_specs:
+ 
+@@ -34,6 +34,84 @@ provided in :py:class:`dataspec.ErrorDetails` objects emitted by Spec instance
+ provided as the first positional argument. Specs are required to have tags and all
+ builtin Spec factories will supply a default tag if one is not given.
+ 
++.. _validation:
++
++Validation
++----------
++
++Once you've :ref:`constructed <constructing_specs>` your Spec, you'll most likely want
++to begin validating data with that Spec. The :py:class:`dataspec.Spec` interface
++provides several different ways to check that your data is valid given your use case.
++
++The simplest way to validate your data is by calling :py:meth:`dataspec.Spec.is_valid`
++which returns a simple boolean :py:obj:`True` if your data is valid and :py:obj:`False`
++otherwise. Of course, that kind of simple yes or no answer may be sufficient in some
++cases, but in other cases you may be more interested in knowing *exactly* why the data
++you provided is invalid. For more complex cases, you can turn to the generator
++:py:meth:`dataspec.Spec.validate` which will emit successive
++:py:class:`dataspec.ErrorDetails` instances describing the errors in your input value.
++
++:py:class:`dataspec.ErrorDetails` instances include comprehensive details about why
++your input data did not meet the Spec, including an error message, the predicate that
++validated it, and the value itself. :py:class:`via <dataspec.ErrorDetails>` is a list
++of all Spec tags that validated your data up to (and including) the error. For nested
++values, the :py:class:`path <dataspec.ErrorDetails>` attribute indicates the indices
++and keys that lead from the input value to the failing value. This detail can be used
++to programmatically emit useful error messages to clients.
++
++.. note::
++
++   For convenience, you can fetch all of the errors at once as a list using
++   :py:meth:`dataspec.Spec.validate_all` or raise an exception with all of the errors
++   using :py:meth:`dataspec.Spec.validate_ex`.
++
++.. warning::
++
++   ``dataspec`` will emit an exhaustive list of every instance where your input data
++   fails to meet the Spec, so if you do not require a full list of errors, you may
++   want to consider using :py:meth:`dataspec.Spec.is_valid` or using the generator
++   method :py:meth:`dataspec.Spec.validate` to fetch errors as needed.
++
++.. _conformation:
++
++Conformation
++------------
++
++Data validation is only one half of the value proposition for using ``dataspec``. After
++you've validated that data is valid, the next step is to normalize it into a canonical
++format. Conformers are functions of one argument that can accept a validated value and
++emit a canonical representation of that value. Conformation is the component of
++``dataspec`` that helps you normalize data.
++
++Every Spec value comes with a default conformer. For most Specs, that conformer simply
++returns the value it was passed, though a few builtin Specs do provide a richer,
++canonicalized version of the input data. For example, :py:meth:`dataspec.SpecAPI.date`
++conforms a date (possibly from a ``strptime`` format string) into a ``date`` object.
++Note that **none** of the builtin Spec conformers ever modify the data they are passed.
++``dataspec`` conformers always create new data structures and return the conformed
++values. Custom conformers can modify their data in-flight, but that is not recommended
++since it will be harder reason about failures (in particular, if a mutating conformer
++appeared in the middle of ``s.all(...)`` Spec and a later Spec produced an error).
++
++Most common Spec workflows will involve validating that your data is, in fact, valid
++using :py:meth:`dataspec.Spec.is_valid` or :py:meth:`dataspec.Spec.validate` for richer
++error details and then calling :py:meth:`dataspec.Spec.conform_valid` if it is valid
++or dealing with the error if not.
++
++.. _user_provided_conformers:
++
++User Provided Conformers
++^^^^^^^^^^^^^^^^^^^^^^^^
++
++When you create Specs, you can always provide a conformer using the ``conformer``
++keyword argument. This function will be called any time you call
++:py:meth:`dataspec.Spec.conform` on your Spec or any Spec your Spec is a part of. The
++``conformer`` keyword argument for :py:func:`dataspec.s` and other builtin factories
++will always apply your conformer as by :py:meth:`dataspec.Spec.compose_conformer` ,
++rather than replacing the default conformer. To have your conformer *completely*
++replace the default conformer (if one is provided), you can use the
++:py:meth:`dataspec.Spec.with_conformer` method on the returned Spec.
++
+ .. _predicates_and_validators:
+ 
+ Predicate and Validators
+@@ -506,40 +584,4 @@ Occasionally, it may be useful to allow any value to pass validation. For these
+    You may want to combine ``s.every(...)`` with ``s.all(...)`` to perform a pre-
+    conformation step prior to later steps. In this case, it may still be useful to
+    provide a slightly more strict validation to ensure your conformer does not throw
+-   an exception.
+-
+-Conformation
+-------------
+-
+-Data validation is only one half of the value proposition for using ``dataspec``. After
+-you've validated that data is valid, the next step is to normalize it into a canonical
+-format. Conformers are functions of one argument that can accept a validated value and
+-emit a canonical representation of that value. Conformation is the component of
+-``dataspec`` that helps you normalize data.
+-
+-Every Spec value comes with a default conformer. For most Specs, that conformer simply
+-returns the value it was passed, though a few builtin Specs do provide a richer,
+-canonicalized version of the input data. For example, :py:meth:`dataspec.SpecAPI.date`
+-conforms a date (possibly from a ``strptime`` format string) into a ``date`` object.
+-Note that **none** of the builtin Spec conformers ever modify the data they are passed.
+-``dataspec`` conformers always create new data structures and return the conformed
+-values. Custom conformers can modify their data in-flight, but that is not recommended
+-since it will be harder reason about failures (in particular, if a mutating conformer
+-appeared in the middle of ``s.all(...)`` Spec and a later Spec produced an error).
+-
+-Most common Spec workflows will involve validating that your data is, in fact, valid
+-using :py:meth:`dataspec.Spec.is_valid` or :py:meth:`dataspec.Spec.validate` for richer
+-error details and then calling :py:meth:`dataspec.Spec.conform_valid` if it is valid
+-or dealing with the error if not.
+-
+-User Provided Conformers
+-^^^^^^^^^^^^^^^^^^^^^^^^
+-
+-When you create Specs, you can always provide a conformer using the ``conformer``
+-keyword argument. This function will be called any time you call
+-:py:meth:`dataspec.Spec.conform` on your Spec or any Spec your Spec is a part of. The
+-``conformer`` keyword argument for :py:func:`dataspec.s` and other builtin factories
+-will always apply your conformer as by :py:meth:`dataspec.Spec.compose_conformer` ,
+-rather than replacing the default conformer. To have your conformer *completely*
+-replace the default conformer (if one is provided), you can use the
+-:py:meth:`dataspec.Spec.with_conformer` method on the returned Spec.
+\ No newline at end of file
++   an exception.
+\ No newline at end of file
+diff --git a/src/dataspec/base.py b/src/dataspec/base.py
+index efe4154..9653ae0 100644
+--- a/src/dataspec/base.py
++++ b/src/dataspec/base.py
+@@ -125,6 +125,40 @@ class ErrorDetails:
+             self.path.insert(0, loc)
+         return self
+ 
++    def as_map(self) -> Mapping[str, Union[str, List[str]]]:
++        """
++        Return a map of the fields of this instance converted to strings or a list of
++        strings, suitable for being converted into JSON.
++
++        The :py:attr:`dataspec.ErrorDetails.pred` attribute will be stringified in one
++        of three ways. If ``pred`` is a :py:class:`dataspec.Spec` instance, ``pred``
++        will be converted to the :py:attr:`dataspec.Spec.tag` of that instance. If
++        ``pred`` is a callable (as by :py:func:`callable`) , it will be converted to
++        the ``__name__`` of the callable. Otherwise, ``pred`` will be passed directly
++        to :py:func:`str`.
++
++        ``message`` will remain a string. ``value`` will be passed to :py:func:`str`
++        directly. ``via`` and ``path`` will be returned as a list of strings.
++
++        :return: a mapping of string keys to strings or lists of strings
++        """
++        if isinstance(self.pred, Spec):
++            pred = self.pred.tag
++        elif callable(self.pred):
++            # Lambdas just have the name '<lambda>', but there's not much
++            # we can do about that
++            pred = self.pred.__name__
++        else:
++            pred = str(self.pred)
++
++        return {
++            "message": self.message,
++            "pred": pred,
++            "value": str(self.value),
++            "via": list(self.via),
++            "path": [str(e) for e in self.path],
++        }
++
+ 
+ @attr.s(auto_attribs=True, slots=True)
+ class ValidationError(Exception):
+@@ -172,6 +206,20 @@ class Spec(ABC):
+         """
+         raise NotImplementedError
+ 
++    def validate_all(self, v: Any) -> List[ErrorDetails]:  # pragma: no cover
++        """
++        Validate the value ``v`` against the Spec, returning a :py:class:`list` of all
++        Spec failures of ``v`` as :py:class:`dataspec.ErrorDetails` instances.
++
++        This method is equivalent to ``list(spec.validate(v))``. If an empty list is
++        returned ``v`` is valid according to the Spec.
++
++        :param v: a value to validate
++        :return: a list of Spec failures as :py:class:`dataspec.ErrorDetails`
++            instances, if any
++        """
++        return list(self.validate(v))
++
+     def validate_ex(self, v: Any) -> None:
+         """
+         Validate the value ``v`` against the Spec, throwing a
+@@ -181,7 +229,7 @@ class Spec(ABC):
+         :param v: a value to validate
+         :return: :py:obj:`None`
+         """
+-        errors = list(self.validate(v))
++        errors = self.validate_all(v)
+         if errors:
+             raise ValidationError(errors)
+ 

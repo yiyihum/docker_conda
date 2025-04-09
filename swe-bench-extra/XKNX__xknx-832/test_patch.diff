@@ -1,0 +1,202 @@
+diff --git a/test/io_tests/tunnel_test.py b/test/io_tests/tunnel_test.py
+index 3615b9cd..d9d8aa48 100644
+--- a/test/io_tests/tunnel_test.py
++++ b/test/io_tests/tunnel_test.py
+@@ -1,14 +1,24 @@
+ """Unit test for KNX/IP Tunnelling Request/Response."""
+ import asyncio
+-from unittest.mock import Mock, patch
++from unittest.mock import AsyncMock, Mock, patch
+ 
+ import pytest
+ from xknx import XKNX
+ from xknx.dpt import DPTArray
+ from xknx.io import Tunnel
+-from xknx.knxip import HPAI, CEMIFrame, KNXIPFrame, TunnellingAck, TunnellingRequest
++from xknx.knxip import (
++    HPAI,
++    CEMIFrame,
++    ConnectRequest,
++    ConnectResponse,
++    DisconnectRequest,
++    DisconnectResponse,
++    KNXIPFrame,
++    TunnellingAck,
++    TunnellingRequest,
++)
+ from xknx.knxip.knxip_enum import CEMIMessageCode
+-from xknx.telegram import Telegram, TelegramDirection
++from xknx.telegram import IndividualAddress, Telegram, TelegramDirection
+ from xknx.telegram.apci import GroupValueWrite
+ 
+ 
+@@ -103,3 +113,88 @@ class TestTunnel:
+         # one call for the outgoing request and one for the ACK for the confirmation
+         assert self.tunnel.udp_client.send.call_count == 2
+         await task
++
++    async def test_tunnel_connect_send_disconnect(self, time_travel):
++        """Test initiating a tunnelling connection."""
++        local_addr = ("192.168.1.1", 12345)
++        gateway_control_addr = ("192.168.1.2", 3671)
++        gateway_data_addr = ("192.168.1.2", 56789)
++        self.tunnel.udp_client.connect = AsyncMock()
++        self.tunnel.udp_client.getsockname = Mock(return_value=local_addr)
++        self.tunnel.udp_client.send = Mock()
++        self.tunnel.udp_client.stop = AsyncMock()
++
++        # Connect
++        connect_request = ConnectRequest(
++            self.xknx,
++            control_endpoint=HPAI(*local_addr),
++            data_endpoint=HPAI(*local_addr),
++        )
++        connect_frame = KNXIPFrame.init_from_body(connect_request)
++
++        connection_task = asyncio.create_task(self.tunnel.connect())
++        await time_travel(0)
++        self.tunnel.udp_client.connect.assert_called_once()
++        self.tunnel.udp_client.send.assert_called_once_with(connect_frame)
++
++        connect_response_frame = KNXIPFrame.init_from_body(
++            ConnectResponse(
++                self.xknx,
++                communication_channel=23,
++                data_endpoint=HPAI(*gateway_data_addr),
++                identifier=7,
++            )
++        )
++        self.tunnel.udp_client.handle_knxipframe(
++            connect_response_frame, gateway_control_addr
++        )
++        await connection_task
++        assert self.tunnel._data_endpoint_addr == gateway_data_addr
++        assert self.tunnel._src_address == IndividualAddress(7)
++
++        # Send - use data endpoint
++        self.tunnel.udp_client.send.reset_mock()
++        test_telegram = Telegram(payload=GroupValueWrite(DPTArray((1,))))
++        test_telegram_frame = KNXIPFrame.init_from_body(
++            TunnellingRequest(
++                self.xknx,
++                communication_channel_id=23,
++                sequence_counter=0,
++                cemi=CEMIFrame.init_from_telegram(
++                    self.xknx,
++                    test_telegram,
++                    code=CEMIMessageCode.L_DATA_REQ,
++                    src_addr=IndividualAddress(7),
++                ),
++            )
++        )
++        asyncio.create_task(self.tunnel.send_telegram(test_telegram))
++        await time_travel(0)
++        self.tunnel.udp_client.send.assert_called_once_with(
++            test_telegram_frame, addr=gateway_data_addr
++        )
++        # skip ack and confirmation
++
++        # Disconnect
++        self.tunnel.udp_client.send.reset_mock()
++        disconnect_request = DisconnectRequest(
++            self.xknx, communication_channel_id=23, control_endpoint=HPAI(*local_addr)
++        )
++        disconnect_frame = KNXIPFrame.init_from_body(disconnect_request)
++
++        disconnection_task = asyncio.create_task(self.tunnel.disconnect())
++        await time_travel(0)
++        self.tunnel.udp_client.send.assert_called_once_with(disconnect_frame)
++
++        disconnect_response_frame = KNXIPFrame.init_from_body(
++            DisconnectResponse(
++                self.xknx,
++                communication_channel_id=23,
++            )
++        )
++        self.tunnel.udp_client.handle_knxipframe(
++            disconnect_response_frame, gateway_control_addr
++        )
++        await disconnection_task
++        assert self.tunnel._data_endpoint_addr is None
++        self.tunnel.udp_client.stop.assert_called_once()
+diff --git a/test/io_tests/tunnelling_test.py b/test/io_tests/tunnelling_test.py
+index bfb4142c..b893e3cc 100644
+--- a/test/io_tests/tunnelling_test.py
++++ b/test/io_tests/tunnelling_test.py
+@@ -26,6 +26,7 @@ class TestTunnelling:
+         """Test tunnelling from KNX bus."""
+         xknx = XKNX()
+         communication_channel_id = 23
++        data_endpoint = ("192.168.1.2", 4567)
+         udp_client = UDPClient(xknx, ("192.168.1.1", 0), ("192.168.1.2", 1234))
+         telegram = Telegram(
+             destination_address=GroupAddress("1/2/3"),
+@@ -36,6 +37,7 @@ class TestTunnelling:
+         tunnelling = Tunnelling(
+             xknx,
+             udp_client,
++            data_endpoint,
+             telegram,
+             src_address,
+             sequence_counter,
+@@ -60,7 +62,7 @@ class TestTunnelling:
+         ) as mock_udp_getsockname:
+             mock_udp_getsockname.return_value = ("192.168.1.3", 4321)
+             await tunnelling.start()
+-            mock_udp_send.assert_called_with(exp_knxipframe)
++            mock_udp_send.assert_called_with(exp_knxipframe, addr=data_endpoint)
+ 
+         # Response KNX/IP-Frame with wrong type
+         wrong_knxipframe = KNXIPFrame(xknx)
+diff --git a/test/knxip_tests/connect_response_test.py b/test/knxip_tests/connect_response_test.py
+index 71f61a4c..3bd85054 100644
+--- a/test/knxip_tests/connect_response_test.py
++++ b/test/knxip_tests/connect_response_test.py
+@@ -38,9 +38,7 @@ class TestKNXIPConnectResponse:
+         assert isinstance(knxipframe.body, ConnectResponse)
+         assert knxipframe.body.communication_channel == 1
+         assert knxipframe.body.status_code == ErrorCode.E_NO_ERROR
+-        assert knxipframe.body.control_endpoint == HPAI(
+-            ip_addr="192.168.42.10", port=3671
+-        )
++        assert knxipframe.body.data_endpoint == HPAI(ip_addr="192.168.42.10", port=3671)
+         assert knxipframe.body.request_type == ConnectRequestType.TUNNEL_CONNECTION
+         assert knxipframe.body.identifier == 4607
+ 
+@@ -49,7 +47,7 @@ class TestKNXIPConnectResponse:
+             communication_channel=1,
+             status_code=ErrorCode.E_NO_ERROR,
+             request_type=ConnectRequestType.TUNNEL_CONNECTION,
+-            control_endpoint=HPAI(ip_addr="192.168.42.10", port=3671),
++            data_endpoint=HPAI(ip_addr="192.168.42.10", port=3671),
+             identifier=4607,
+         )
+         knxipframe2 = KNXIPFrame.init_from_body(connect_response)
+@@ -151,7 +149,7 @@ class TestKNXIPConnectResponse:
+             communication_channel=192,
+             status_code=ErrorCode.E_NO_MORE_CONNECTIONS,
+             request_type=ConnectRequestType.TUNNEL_CONNECTION,
+-            control_endpoint=HPAI(ip_addr="10.1.0.41", port=3671),
++            data_endpoint=HPAI(ip_addr="10.1.0.41", port=3671),
+             identifier=0,
+         )
+         knxipframe2 = KNXIPFrame.init_from_body(connect_response)
+diff --git a/test/str_test.py b/test/str_test.py
+index 72c9ef56..3d34719f 100644
+--- a/test/str_test.py
++++ b/test/str_test.py
+@@ -526,12 +526,12 @@ class TestStringRepresentations:
+         connect_response = ConnectResponse(xknx)
+         connect_response.communication_channel = 13
+         connect_response.request_type = ConnectRequestType.TUNNEL_CONNECTION
+-        connect_response.control_endpoint = HPAI(ip_addr="192.168.42.1", port=33941)
++        connect_response.data_endpoint = HPAI(ip_addr="192.168.42.1", port=33941)
+         connect_response.identifier = 42
+         assert (
+             str(connect_response)
+             == '<ConnectResponse communication_channel="13" status_code="ErrorCode.E_NO_ERROR" '
+-            'control_endpoint="192.168.42.1:33941" '
++            'data_endpoint="192.168.42.1:33941" '
+             'request_type="ConnectRequestType.TUNNEL_CONNECTION" identifier="42" />'
+         )
+ 

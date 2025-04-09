@@ -1,0 +1,170 @@
+diff --git a/pytuber/cli.py b/pytuber/cli.py
+index f432978..2c7d6e6 100644
+--- a/pytuber/cli.py
++++ b/pytuber/cli.py
+@@ -68,6 +68,8 @@ def add():
+     """Add playlist."""
+ 
+ 
++add.add_command(core.add_from_editor)
++add.add_command(core.add_from_file)
+ add.add_command(lastfm.add)
+ 
+ 
+diff --git a/pytuber/core/commands/__init__.py b/pytuber/core/commands/__init__.py
+index 27fbf7e..888f16e 100644
+--- a/pytuber/core/commands/__init__.py
++++ b/pytuber/core/commands/__init__.py
+@@ -7,6 +7,7 @@ from pytuber.core.commands.cmd_show import show
+ from pytuber.core.commands.cmd_autocomplete import autocomplete
+ from pytuber.core.commands.cmd_clean import clean
+ from pytuber.core.commands.cmd_quota import quota
++from pytuber.core.commands.cmd_add import add_from_editor, add_from_file
+ 
+ __all__ = [
+     "setup",
+@@ -18,4 +19,6 @@ __all__ = [
+     "autocomplete",
+     "clean",
+     "quota",
++    "add_from_editor",
++    "add_from_file",
+ ]
+diff --git a/pytuber/core/commands/cmd_add.py b/pytuber/core/commands/cmd_add.py
+new file mode 100644
+index 0000000..e0af66b
+--- /dev/null
++++ b/pytuber/core/commands/cmd_add.py
+@@ -0,0 +1,97 @@
++from typing import List
++
++import click
++from tabulate import tabulate
++
++from pytuber.core.models import (
++    PlaylistManager,
++    PlaylistType,
++    Provider,
++    TrackManager,
++)
++from pytuber.lastfm.commands.cmd_add import option_title
++from pytuber.utils import magenta
++
++
++@click.command("editor")
++@option_title()
++def add_from_editor(title: str) -> None:
++    """Create playlist in a text editor."""
++    marker = (
++        "\n\n# Copy/Paste your track list and hit save!\n"
++        "# One line per track, make sure it doesn't start with a #\n"
++        "# Separate the track artist and title with a single dash `-`\n"
++    )
++    message = click.edit(marker)
++    create_playlist(title, parse_tracklist(message or ""))
++
++
++@click.command("file")
++@click.argument("file", type=click.Path(), required=True)
++@option_title()
++def add_from_file(file: str, title: str) -> None:
++    """Import a playlist from a text file."""
++
++    with open(file, "r") as fp:
++        text = fp.read()
++
++    create_playlist(title, parse_tracklist(text or ""))
++
++
++def parse_tracklist(text):
++    tracks: List[tuple] = []
++    for line in text.split("\n"):
++        line = line.strip()
++        if not line or line.startswith("#"):
++            continue
++
++        parts = line.split("-", 1)
++        if len(parts) != 2:
++            continue
++
++        artist, track = list(map(str.strip, parts))
++        if not artist or not track or (artist, track) in tracks:
++            continue
++
++        tracks.append((artist, track))
++
++    return tracks
++
++
++def create_playlist(title, tracks):
++    if not tracks:
++        return click.secho("Tracklist is empty, aborting...")
++
++    click.clear()
++    click.secho(
++        "{}\n\n{}\n".format(
++            tabulate(  # type: ignore
++                [
++                    (magenta("Title:"), title),
++                    (magenta("Tracks:"), len(tracks)),
++                ],
++                tablefmt="plain",
++                colalign=("right", "left"),
++            ),
++            tabulate(  # type: ignore
++                [
++                    (i + 1, track[0], track[1])
++                    for i, track in enumerate(tracks)
++                ],
++                headers=("No", "Artist", "Track Name"),
++            ),
++        )
++    )
++    click.confirm("Are you sure you want to save this playlist?", abort=True)
++    playlist = PlaylistManager.set(
++        dict(
++            type=PlaylistType.EDITOR,
++            provider=Provider.user,
++            title=title.strip(),
++            tracks=[
++                TrackManager.set(dict(artist=artist, name=name)).id
++                for artist, name in tracks
++            ],
++        )
++    )
++    click.secho("Added playlist: {}!".format(playlist.id))
+diff --git a/pytuber/core/commands/s b/pytuber/core/commands/s
+new file mode 100644
+index 0000000..e69de29
+diff --git a/pytuber/core/models.py b/pytuber/core/models.py
+index 861373d..53f12c0 100644
+--- a/pytuber/core/models.py
++++ b/pytuber/core/models.py
+@@ -16,6 +16,14 @@ from pytuber.utils import timestamp
+ class Provider(enum.Enum):
+     lastfm = "last.fm"
+     youtube = "youtube"
++    user = "user"
++
++    def __str__(self):
++        return self.value
++
++
++class PlaylistType(enum.Enum):
++    EDITOR = "editor"
+ 
+     def __str__(self):
+         return self.value
+diff --git a/pytuber/lastfm/commands/cmd_add.py b/pytuber/lastfm/commands/cmd_add.py
+index 1fd87a3..1f451b1 100644
+--- a/pytuber/lastfm/commands/cmd_add.py
++++ b/pytuber/lastfm/commands/cmd_add.py
+@@ -16,7 +16,7 @@ from .cmd_fetch import fetch_tracks
+ 
+ @click.group("lastfm")
+ def add():
+-    """Last.fm is a music service that learns what you love."""
++    """Create playlists from Last.fm api."""
+ 
+ 
+ option_limit = partial(

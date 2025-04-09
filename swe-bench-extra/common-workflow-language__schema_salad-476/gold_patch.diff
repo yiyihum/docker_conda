@@ -1,0 +1,171 @@
+diff --git a/schema_salad/codegen.py b/schema_salad/codegen.py
+index f735919..3c4144e 100644
+--- a/schema_salad/codegen.py
++++ b/schema_salad/codegen.py
+@@ -11,6 +11,7 @@ from typing import (
+     TextIO,
+     Union,
+ )
++from urllib.parse import urlsplit
+ 
+ from . import schema
+ from .codegen_base import CodeGenBase
+@@ -33,12 +34,23 @@ def codegen(
+     examples: Optional[str] = None,
+     package: Optional[str] = None,
+     copyright: Optional[str] = None,
++    parser_info: Optional[str] = None,
+ ) -> None:
+     """Generate classes with loaders for the given Schema Salad description."""
+ 
+     j = schema.extend_and_specialize(i, loader)
+ 
+     gen = None  # type: Optional[CodeGenBase]
++    base = schema_metadata.get("$base", schema_metadata.get("id"))
++    sp = urlsplit(base)
++    pkg = (
++        package
++        if package
++        else ".".join(
++            list(reversed(sp.netloc.split("."))) + sp.path.strip("/").split("/")
++        )
++    )
++    info = parser_info or pkg
+     if lang == "python":
+         if target:
+             dest: Union[TextIOWrapper, TextIO] = open(
+@@ -46,13 +58,14 @@ def codegen(
+             )
+         else:
+             dest = sys.stdout
+-        gen = PythonCodeGen(dest, copyright=copyright)
++
++        gen = PythonCodeGen(dest, copyright=copyright, parser_info=info)
+     elif lang == "java":
+         gen = JavaCodeGen(
+-            schema_metadata.get("$base", schema_metadata.get("id")),
++            base,
+             target=target,
+             examples=examples,
+-            package=package,
++            package=pkg,
+             copyright=copyright,
+         )
+     else:
+diff --git a/schema_salad/java_codegen.py b/schema_salad/java_codegen.py
+index ff3e8ec..36c7641 100644
+--- a/schema_salad/java_codegen.py
++++ b/schema_salad/java_codegen.py
+@@ -14,7 +14,6 @@ from typing import (
+     Set,
+     Union,
+ )
+-from urllib.parse import urlsplit
+ 
+ import pkg_resources
+ 
+@@ -129,20 +128,13 @@ class JavaCodeGen(CodeGenBase):
+         base: str,
+         target: Optional[str],
+         examples: Optional[str],
+-        package: Optional[str],
++        package: str,
+         copyright: Optional[str],
+     ) -> None:
+         super().__init__()
+         self.base_uri = base
+-        sp = urlsplit(base)
+         self.examples = examples
+-        self.package = (
+-            package
+-            if package
+-            else ".".join(
+-                list(reversed(sp.netloc.split("."))) + sp.path.strip("/").split("/")
+-            )
+-        )
++        self.package = package
+         self.artifact = self.package.split(".")[-1]
+         self.copyright = copyright
+         self.target_dir = Path(target or ".").resolve()
+diff --git a/schema_salad/main.py b/schema_salad/main.py
+index 04b972e..4dca459 100644
+--- a/schema_salad/main.py
++++ b/schema_salad/main.py
+@@ -129,6 +129,14 @@ def arg_parser() -> argparse.ArgumentParser:
+         help="Optional copyright of the input schema.",
+     ),
+ 
++    parser.add_argument(
++        "--codegen-parser-info",
++        metavar="parser_info",
++        type=str,
++        default=None,
++        help="Optional parser name which is accessible via resulted parser API (Python only)",
++    )
++
+     exgroup.add_argument(
+         "--print-oneline",
+         action="store_true",
+@@ -323,6 +331,7 @@ def main(argsl: Optional[List[str]] = None) -> int:
+             examples=args.codegen_examples,
+             package=args.codegen_package,
+             copyright=args.codegen_copyright,
++            parser_info=args.codegen_parser_info,
+         )
+         return 0
+ 
+diff --git a/schema_salad/metaschema.py b/schema_salad/metaschema.py
+index 8be526d..0d39020 100644
+--- a/schema_salad/metaschema.py
++++ b/schema_salad/metaschema.py
+@@ -674,6 +674,10 @@ def save_relative_uri(
+         return save(uri, top=False, base_url=base_url)
+ 
+ 
++def parser_info() -> str:
++    return "org.w3id.cwl.salad"
++
++
+ class Documented(Savable):
+     pass
+ 
+diff --git a/schema_salad/python_codegen.py b/schema_salad/python_codegen.py
+index 984a93d..458806e 100644
+--- a/schema_salad/python_codegen.py
++++ b/schema_salad/python_codegen.py
+@@ -68,13 +68,19 @@ def fmt(text: str, indent: int) -> str:
+ class PythonCodeGen(CodeGenBase):
+     """Generation of Python code for a given Schema Salad definition."""
+ 
+-    def __init__(self, out: IO[str], copyright: Optional[str]) -> None:
++    def __init__(
++        self,
++        out: IO[str],
++        copyright: Optional[str],
++        parser_info: str,
++    ) -> None:
+         super().__init__()
+         self.out = out
+         self.current_class_is_abstract = False
+         self.serializer = StringIO()
+         self.idfield = ""
+         self.copyright = copyright
++        self.parser_info = parser_info
+ 
+     @staticmethod
+     def safe_name(name: str) -> str:
+@@ -112,6 +118,14 @@ class PythonCodeGen(CodeGenBase):
+         stream.close()
+         self.out.write("\n\n")
+ 
++        self.out.write(
++            f"""def parser_info() -> str:
++    return "{self.parser_info}"
++
++
++"""
++        )
++
+         for primative in prims.values():
+             self.declare_type(primative)
+ 

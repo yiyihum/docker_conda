@@ -1,0 +1,394 @@
+diff --git a/IPython/core/excolors.py b/IPython/core/excolors.py
+index d979a7197..487bde18c 100644
+--- a/IPython/core/excolors.py
++++ b/IPython/core/excolors.py
+@@ -3,6 +3,7 @@
+ Color schemes for exception handling code in IPython.
+ """
+ 
++import os
+ import warnings
+ 
+ #*****************************************************************************
+@@ -155,6 +156,12 @@ def exception_colors():
+         Normal = C.Normal,
+         ))
+ 
++    # Hack: the 'neutral' colours are not very visible on a dark background on
++    # Windows. Since Windows command prompts have a dark background by default, and
++    # relatively few users are likely to alter that, we will use the 'Linux' colours,
++    # designed for a dark background, as the default on Windows.
++    if os.name == "nt":
++        ex_colors.add_scheme(ex_colors['Linux'].copy('Neutral'))
+ 
+     return ex_colors
+ 
+diff --git a/IPython/core/inputsplitter.py b/IPython/core/inputsplitter.py
+index 2d0ca2dcf..267b73add 100644
+--- a/IPython/core/inputsplitter.py
++++ b/IPython/core/inputsplitter.py
+@@ -18,8 +18,10 @@
+ # Distributed under the terms of the Modified BSD License.
+ import ast
+ import codeop
++import io
+ import re
+ import sys
++import tokenize
+ import warnings
+ 
+ from IPython.utils.py3compat import cast_unicode
+@@ -87,6 +89,113 @@ def num_ini_spaces(s):
+     else:
+         return 0
+ 
++# Fake token types for partial_tokenize:
++INCOMPLETE_STRING = tokenize.N_TOKENS
++IN_MULTILINE_STATEMENT = tokenize.N_TOKENS + 1
++
++# The 2 classes below have the same API as TokenInfo, but don't try to look up
++# a token type name that they won't find.
++class IncompleteString:
++    type = exact_type = INCOMPLETE_STRING
++    def __init__(self, s, start, end, line):
++        self.s = s
++        self.start = start
++        self.end = end
++        self.line = line
++
++class InMultilineStatement:
++    type = exact_type = IN_MULTILINE_STATEMENT
++    def __init__(self, pos, line):
++        self.s = ''
++        self.start = self.end = pos
++        self.line = line
++
++def partial_tokens(s):
++    """Iterate over tokens from a possibly-incomplete string of code.
++
++    This adds two special token types: INCOMPLETE_STRING and
++    IN_MULTILINE_STATEMENT. These can only occur as the last token yielded, and
++    represent the two main ways for code to be incomplete.
++    """
++    readline = io.StringIO(s).readline
++    token = tokenize.TokenInfo(tokenize.NEWLINE, '', (1, 0), (1, 0), '')
++    try:
++        for token in tokenize.generate_tokens(readline):
++            yield token
++    except tokenize.TokenError as e:
++        # catch EOF error
++        lines = s.splitlines(keepends=True)
++        end = len(lines), len(lines[-1])
++        if 'multi-line string' in e.args[0]:
++            l, c = start = token.end
++            s = lines[l-1][c:] + ''.join(lines[l:])
++            yield IncompleteString(s, start, end, lines[-1])
++        elif 'multi-line statement' in e.args[0]:
++            yield InMultilineStatement(end, lines[-1])
++        else:
++            raise
++
++def find_next_indent(code):
++    """Find the number of spaces for the next line of indentation"""
++    tokens = list(partial_tokens(code))
++    if tokens[-1].type == tokenize.ENDMARKER:
++        tokens.pop()
++    if not tokens:
++        return 0
++    while (tokens[-1].type in {tokenize.DEDENT, tokenize.NEWLINE, tokenize.COMMENT}):
++        tokens.pop()
++
++    if tokens[-1].type == INCOMPLETE_STRING:
++        # Inside a multiline string
++        return 0
++
++    # Find the indents used before
++    prev_indents = [0]
++    def _add_indent(n):
++        if n != prev_indents[-1]:
++            prev_indents.append(n)
++
++    tokiter = iter(tokens)
++    for tok in tokiter:
++        if tok.type in {tokenize.INDENT, tokenize.DEDENT}:
++            _add_indent(tok.end[1])
++        elif (tok.type == tokenize.NL):
++            try:
++                _add_indent(next(tokiter).start[1])
++            except StopIteration:
++                break
++
++    last_indent = prev_indents.pop()
++
++    # If we've just opened a multiline statement (e.g. 'a = ['), indent more
++    if tokens[-1].type == IN_MULTILINE_STATEMENT:
++        if tokens[-2].exact_type in {tokenize.LPAR, tokenize.LSQB, tokenize.LBRACE}:
++            return last_indent + 4
++        return last_indent
++
++    if tokens[-1].exact_type == tokenize.COLON:
++        # Line ends with colon - indent
++        return last_indent + 4
++
++    if last_indent:
++        # Examine the last line for dedent cues - statements like return or
++        # raise which normally end a block of code.
++        last_line_starts = 0
++        for i, tok in enumerate(tokens):
++            if tok.type == tokenize.NEWLINE:
++                last_line_starts = i + 1
++
++        last_line_tokens = tokens[last_line_starts:]
++        names = [t.string for t in last_line_tokens if t.type == tokenize.NAME]
++        if names and names[0] in {'raise', 'return', 'pass', 'break', 'continue'}:
++            # Find the most recent indentation less than the current level
++            for indent in reversed(prev_indents):
++                if indent < last_indent:
++                    return indent
++
++    return last_indent
++
++
+ def last_blank(src):
+     """Determine if the input source ends in a blank.
+ 
+@@ -306,7 +415,7 @@ def push(self, lines):
+         if source.endswith('\\\n'):
+             return False
+ 
+-        self._update_indent(lines)
++        self._update_indent()
+         try:
+             with warnings.catch_warnings():
+                 warnings.simplefilter('error', SyntaxWarning)
+@@ -382,55 +491,10 @@ def push_accepts_more(self):
+         # General fallback - accept more code
+         return True
+ 
+-    #------------------------------------------------------------------------
+-    # Private interface
+-    #------------------------------------------------------------------------
+-
+-    def _find_indent(self, line):
+-        """Compute the new indentation level for a single line.
+-
+-        Parameters
+-        ----------
+-        line : str
+-          A single new line of non-whitespace, non-comment Python input.
+-
+-        Returns
+-        -------
+-        indent_spaces : int
+-          New value for the indent level (it may be equal to self.indent_spaces
+-        if indentation doesn't change.
+-
+-        full_dedent : boolean
+-          Whether the new line causes a full flush-left dedent.
+-        """
+-        indent_spaces = self.indent_spaces
+-        full_dedent = self._full_dedent
+-
+-        inisp = num_ini_spaces(line)
+-        if inisp < indent_spaces:
+-            indent_spaces = inisp
+-            if indent_spaces <= 0:
+-                #print 'Full dedent in text',self.source # dbg
+-                full_dedent = True
+-
+-        if line.rstrip()[-1] == ':':
+-            indent_spaces += 4
+-        elif dedent_re.match(line):
+-            indent_spaces -= 4
+-            if indent_spaces <= 0:
+-                full_dedent = True
+-
+-        # Safety
+-        if indent_spaces < 0:
+-            indent_spaces = 0
+-            #print 'safety' # dbg
+-
+-        return indent_spaces, full_dedent
+-
+-    def _update_indent(self, lines):
+-        for line in remove_comments(lines).splitlines():
+-            if line and not line.isspace():
+-                self.indent_spaces, self._full_dedent = self._find_indent(line)
++    def _update_indent(self):
++        # self.source always has a trailing newline
++        self.indent_spaces = find_next_indent(self.source[:-1])
++        self._full_dedent = (self.indent_spaces == 0)
+ 
+     def _store(self, lines, buffer=None, store='source'):
+         """Store one or more lines of input.
+diff --git a/IPython/terminal/debugger.py b/IPython/terminal/debugger.py
+index bad6c3e7a..68db885b5 100644
+--- a/IPython/terminal/debugger.py
++++ b/IPython/terminal/debugger.py
+@@ -1,13 +1,19 @@
++import signal
++import sys
++
+ from IPython.core.debugger import Pdb
+ 
+ from IPython.core.completer import IPCompleter
+ from .ptutils import IPythonPTCompleter
++from .shortcuts import suspend_to_bg
+ 
++from prompt_toolkit.filters import Condition
++from prompt_toolkit.keys import Keys
++from prompt_toolkit.key_binding.manager import KeyBindingManager
+ from prompt_toolkit.token import Token
+ from prompt_toolkit.shortcuts import create_prompt_application
+ from prompt_toolkit.interface import CommandLineInterface
+ from prompt_toolkit.enums import EditingMode
+-import sys
+ 
+ 
+ class TerminalPdb(Pdb):
+@@ -31,8 +37,14 @@ def patch_stdout(**kwargs):
+                                        )
+             self._ptcomp = IPythonPTCompleter(compl, patch_stdout=patch_stdout)
+ 
++        kbmanager = KeyBindingManager.for_prompt()
++        supports_suspend = Condition(lambda cli: hasattr(signal, 'SIGTSTP'))
++        kbmanager.registry.add_binding(Keys.ControlZ, filter=supports_suspend
++                                      )(suspend_to_bg)
++
+         self._pt_app = create_prompt_application(
+                             editing_mode=getattr(EditingMode, self.shell.editing_mode.upper()),
++                            key_bindings_registry=kbmanager.registry,
+                             history=self.shell.debugger_history,
+                             completer= self._ptcomp,
+                             enable_history_search=True,
+diff --git a/IPython/terminal/interactiveshell.py b/IPython/terminal/interactiveshell.py
+index 96f33cb97..97fabdba7 100644
+--- a/IPython/terminal/interactiveshell.py
++++ b/IPython/terminal/interactiveshell.py
+@@ -286,6 +286,16 @@ def _make_style_from_name_or_cls(self, name_or_cls):
+                     Token.OutPrompt: '#990000',
+                     Token.OutPromptNum: '#ff0000 bold',
+                 })
++
++                # Hack: Due to limited color support on the Windows console
++                # the prompt colors will be wrong without this
++                if os.name == 'nt':
++                    style_overrides.update({
++                        Token.Prompt: '#ansidarkgreen',
++                        Token.PromptNum: '#ansigreen bold',
++                        Token.OutPrompt: '#ansidarkred',
++                        Token.OutPromptNum: '#ansired bold',
++                    })
+             elif legacy =='nocolor':
+                 style_cls=_NoStyle
+                 style_overrides = {}
+diff --git a/IPython/terminal/shortcuts.py b/IPython/terminal/shortcuts.py
+index 0201fc848..e37038a0f 100644
+--- a/IPython/terminal/shortcuts.py
++++ b/IPython/terminal/shortcuts.py
+@@ -1,5 +1,16 @@
++"""
++Module to define and register Terminal IPython shortcuts with
++:any:`prompt_toolkit`
++"""
++
++# Copyright (c) IPython Development Team.
++# Distributed under the terms of the Modified BSD License.
++
++import warnings
+ import signal
+ import sys
++from typing import Callable
++
+ 
+ from prompt_toolkit.enums import DEFAULT_BUFFER, SEARCH_BUFFER
+ from prompt_toolkit.filters import (HasFocus, HasSelection, Condition,
+@@ -60,7 +71,7 @@ def register_ipython_shortcuts(registry, shell):
+ 
+     registry.add_binding(Keys.ControlO,
+                          filter=(HasFocus(DEFAULT_BUFFER)
+-                                & EmacsInsertMode()))(newline_with_copy_margin)
++                                & EmacsInsertMode()))(newline_autoindent_outer(shell.input_splitter))
+ 
+     registry.add_binding(Keys.F2,
+                          filter=HasFocus(DEFAULT_BUFFER)
+@@ -166,11 +177,20 @@ def force_exit(event):
+ def indent_buffer(event):
+     event.current_buffer.insert_text(' ' * 4)
+ 
++@undoc
+ def newline_with_copy_margin(event):
+     """
++    DEPRECATED since IPython 6.0
++
++    See :any:`newline_autoindent_outer` for a replacement.
++
+     Preserve margin and cursor position when using
+     Control-O to insert a newline in EMACS mode
+     """
++    warnings.warn("`newline_with_copy_margin(event)` is deprecated since IPython 6.0. "
++      "see `newline_autoindent_outer(shell)(event)` for a replacement.",
++                  DeprecationWarning, stacklevel=2)
++
+     b = event.current_buffer
+     cursor_start_pos = b.document.cursor_position_col
+     b.newline(copy_margin=True)
+@@ -180,6 +200,30 @@ def newline_with_copy_margin(event):
+         pos_diff = cursor_start_pos - cursor_end_pos
+         b.cursor_right(count=pos_diff)
+ 
++def newline_autoindent_outer(inputsplitter) -> Callable[..., None]:
++    """
++    Return a function suitable for inserting a indented newline after the cursor.
++
++    Fancier version of deprecated ``newline_with_copy_margin`` which should
++    compute the correct indentation of the inserted line. That is to say, indent
++    by 4 extra space after a function definition, class definition, context
++    manager... And dedent by 4 space after ``pass``, ``return``, ``raise ...``.
++    """
++
++    def newline_autoindent(event):
++        """insert a newline after the cursor indented appropriately."""
++        b = event.current_buffer
++        d = b.document
++
++        if b.complete_state:
++            b.cancel_completion()
++        text = d.text[:d.cursor_position] + '\n'
++        _, indent = inputsplitter.check_complete(text)
++        b.insert_text('\n' + (' ' * (indent or 0)), move_cursor=False)
++
++    return newline_autoindent
++
++
+ def open_input_in_editor(event):
+     event.cli.current_buffer.tempfile_suffix = ".py"
+     event.cli.current_buffer.open_in_editor(event.cli)
+diff --git a/docs/source/whatsnew/pr/debugger-ctrl-z.rst b/docs/source/whatsnew/pr/debugger-ctrl-z.rst
+new file mode 100644
+index 000000000..fce7a764f
+--- /dev/null
++++ b/docs/source/whatsnew/pr/debugger-ctrl-z.rst
+@@ -0,0 +1,2 @@
++Pressing Ctrl-Z in the terminal debugger now suspends IPython, as it already
++does in the main terminal prompt.
+diff --git a/setup.py b/setup.py
+index b3b4b395a..642b2a489 100755
+--- a/setup.py
++++ b/setup.py
+@@ -202,7 +202,6 @@ def run(self):
+ install_requires = [
+     'setuptools>=18.5',
+     'jedi>=0.10',
+-    'typing',
+     'decorator',
+     'pickleshare',
+     'simplegeneric>0.8',
+@@ -218,6 +217,7 @@ def run(self):
+ extras_require.update({
+     'test:python_version >= "3.4"': ['numpy'],
+     ':python_version == "3.3"': ['pathlib2'],
++    ':python_version <= "3.4"': ['typing'],
+     ':sys_platform != "win32"': ['pexpect'],
+     ':sys_platform == "darwin"': ['appnope'],
+     ':sys_platform == "win32"': ['colorama'],

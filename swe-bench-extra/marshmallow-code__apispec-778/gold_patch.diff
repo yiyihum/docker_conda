@@ -1,0 +1,195 @@
+diff --git a/docs/conf.py b/docs/conf.py
+index 368fd52..c0fd839 100755
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -18,8 +18,9 @@ primary_domain = "py"
+ default_role = "py:obj"
+ 
+ intersphinx_mapping = {
+-    "python": ("http://python.readthedocs.io/en/latest/", None),
+-    "marshmallow": ("http://marshmallow.readthedocs.io/en/latest/", None),
++    "python": ("https://python.readthedocs.io/en/latest/", None),
++    "marshmallow": ("https://marshmallow.readthedocs.io/en/latest/", None),
++    "webargs": ("https://webargs.readthedocs.io/en/latest/", None),
+ }
+ 
+ issues_github_path = "marshmallow-code/apispec"
+diff --git a/docs/using_plugins.rst b/docs/using_plugins.rst
+index 2c794b8..0f02be9 100644
+--- a/docs/using_plugins.rst
++++ b/docs/using_plugins.rst
+@@ -295,6 +295,32 @@ method. Continuing from the example above:
+ The function passed to `add_attribute_function` will be bound to the converter.
+ It must accept the converter instance as first positional argument.
+ 
++In some rare cases, typically with container fields such as fields derived from
++:class:`List <marshmallow.fields.List>`, documenting the parameters using this
++field require some more customization.
++This can be achieved using the `add_parameter_attribute_function
++<apispec.ext.marshmallow.openapi.OpenAPIConverter.add_parameter_attribute_function>`
++method.
++
++For instance, when documenting webargs's
++:class:`DelimitedList <webargs.fields.DelimitedList>` field, one may register
++this function:
++
++.. code-block:: python
++
++    def delimited_list2param(self, field, **kwargs):
++        ret: dict = {}
++        if isinstance(field, DelimitedList):
++            if self.openapi_version.major < 3:
++                ret["collectionFormat"] = "csv"
++            else:
++                ret["explode"] = False
++                ret["style"] = "form"
++        return ret
++
++
++    ma_plugin.converter.add_parameter_attribute_function(delimited_list2param)
++
+ Next Steps
+ ----------
+ 
+diff --git a/setup.py b/setup.py
+index 49bf24c..70b9b56 100644
+--- a/setup.py
++++ b/setup.py
+@@ -7,15 +7,15 @@ EXTRAS_REQUIRE = {
+     "validation": ["prance[osv]>=0.11", "openapi_spec_validator<0.5"],
+     "lint": [
+         "flake8==5.0.4",
+-        "flake8-bugbear==22.9.11",
++        "flake8-bugbear==22.9.23",
+         "pre-commit~=2.4",
+-        "mypy==0.971",
++        "mypy==0.982",
+         "types-PyYAML",
+     ],
+     "docs": [
+         "marshmallow>=3.13.0",
+         "pyyaml==6.0",
+-        "sphinx==5.1.1",
++        "sphinx==5.2.3",
+         "sphinx-issues==3.0.1",
+         "sphinx-rtd-theme==1.0.0",
+     ],
+diff --git a/src/apispec/ext/marshmallow/openapi.py b/src/apispec/ext/marshmallow/openapi.py
+index ea76955..94da0b2 100644
+--- a/src/apispec/ext/marshmallow/openapi.py
++++ b/src/apispec/ext/marshmallow/openapi.py
+@@ -8,6 +8,7 @@ marshmallow :class:`Schemas <marshmallow.Schema>` and :class:`Fields <marshmallo
+ """
+ 
+ from __future__ import annotations
++import typing
+ 
+ import marshmallow
+ from marshmallow.utils import is_collection
+@@ -59,9 +60,37 @@ class OpenAPIConverter(FieldConverterMixin):
+         self.schema_name_resolver = schema_name_resolver
+         self.spec = spec
+         self.init_attribute_functions()
++        self.init_parameter_attribute_functions()
+         # Schema references
+         self.refs: dict = {}
+ 
++    def init_parameter_attribute_functions(self) -> None:
++        self.parameter_attribute_functions = [
++            self.field2required,
++            self.list2param,
++        ]
++
++    def add_parameter_attribute_function(self, func) -> None:
++        """Method to add a field parameter function to the list of field
++        parameter functions that will be called on a field to convert it to a
++        field parameter.
++
++        :param func func: the field parameter function to add
++            The attribute function will be bound to the
++            `OpenAPIConverter <apispec.ext.marshmallow.openapi.OpenAPIConverter>`
++            instance.
++            It will be called for each field in a schema with
++            `self <apispec.ext.marshmallow.openapi.OpenAPIConverter>` and a
++            `field <marshmallow.fields.Field>` instance
++            positional arguments and `ret <dict>` keyword argument.
++            May mutate `ret`.
++            User added field parameter functions will be called after all built-in
++            field parameter functions in the order they were added.
++        """
++        bound_func = func.__get__(self)
++        setattr(self, func.__name__, bound_func)
++        self.parameter_attribute_functions.append(bound_func)
++
+     def resolve_nested_schema(self, schema):
+         """Return the OpenAPI representation of a marshmallow Schema.
+ 
+@@ -150,7 +179,7 @@ class OpenAPIConverter(FieldConverterMixin):
+ 
+     def _field2parameter(
+         self, field: marshmallow.fields.Field, *, name: str, location: str
+-    ):
++    ) -> dict:
+         """Return an OpenAPI parameter as a `dict`, given a marshmallow
+         :class:`Field <marshmallow.Field>`.
+ 
+@@ -158,26 +187,49 @@ class OpenAPIConverter(FieldConverterMixin):
+         """
+         ret: dict = {"in": location, "name": name}
+ 
++        prop = self.field2property(field)
++        if self.openapi_version.major < 3:
++            ret.update(prop)
++        else:
++            if "description" in prop:
++                ret["description"] = prop.pop("description")
++            ret["schema"] = prop
++
++        for param_attr_func in self.parameter_attribute_functions:
++            ret.update(param_attr_func(field, ret=ret))
++
++        return ret
++
++    def field2required(
++        self, field: marshmallow.fields.Field, **kwargs: typing.Any
++    ) -> dict:
++        """Return the dictionary of OpenAPI parameter attributes for a required field.
++
++        :param Field field: A marshmallow field.
++        :rtype: dict
++        """
++        ret = {}
+         partial = getattr(field.parent, "partial", False)
+         ret["required"] = field.required and (
+             not partial
+             or (is_collection(partial) and field.name not in partial)  # type:ignore
+         )
++        return ret
+ 
+-        prop = self.field2property(field)
+-        multiple = isinstance(field, marshmallow.fields.List)
++    def list2param(self, field: marshmallow.fields.Field, **kwargs: typing.Any) -> dict:
++        """Return a dictionary of parameter properties from
++        :class:`List <marshmallow.fields.List` fields.
+ 
+-        if self.openapi_version.major < 3:
+-            if multiple:
++        :param Field field: A marshmallow field.
++        :rtype: dict
++        """
++        ret: dict = {}
++        if isinstance(field, marshmallow.fields.List):
++            if self.openapi_version.major < 3:
+                 ret["collectionFormat"] = "multi"
+-            ret.update(prop)
+-        else:
+-            if multiple:
++            else:
+                 ret["explode"] = True
+                 ret["style"] = "form"
+-            if prop.get("description", None):
+-                ret["description"] = prop.pop("description")
+-            ret["schema"] = prop
+         return ret
+ 
+     def schema2jsonschema(self, schema):

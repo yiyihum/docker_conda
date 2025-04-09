@@ -1,0 +1,105 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a99b266..1c24dc9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,10 @@
+ Changelog
+ =========
+ 
++`0.9.1` (2020-1-2)
++* Ack messages when data not json serializable (#141)
++* Use ThreadScheduler instead of ThreadPoolExecutor (#145)
++
+ `0.9.0` (2019-12-20)
+ * Flask support via middleware (#127)
+ * Add message attributes to metrics log (#128)
+diff --git a/docs/api/settings.rst b/docs/api/settings.rst
+index 31c8d75..73b8f64 100644
+--- a/docs/api/settings.rst
++++ b/docs/api/settings.rst
+@@ -123,6 +123,8 @@ Ack deadline for all subscribers in seconds.
+     passes, the message is no longer considered outstanding, and Cloud Pub/Sub will attempt
+     to redeliver the message.*
+ 
++.. _settings_publisher_timeout:
++
+ ``PUBLISHER_TIMEOUT``
+ ---------------------
+ 
+@@ -136,7 +138,7 @@ Timeout that the publishing result will wait on the future to publish successful
+ <https://googleapis.dev/python/pubsub/1.1.0/publisher/api/futures.html?highlight=result#google.cloud.pubsub_v1.publisher.futures.Future.result>`_
+ 
+ ``THREADS_PER_SUBSCRIPTION``
+-------------------
++----------------------------
+ 
+ **Optional**
+ 
+diff --git a/rele/__init__.py b/rele/__init__.py
+index 9f2820e..71852af 100644
+--- a/rele/__init__.py
++++ b/rele/__init__.py
+@@ -1,4 +1,4 @@
+-__version__ = "0.9.0"
++__version__ = "0.9.1"
+ default_app_config = "rele.apps.ReleConfig"
+ 
+ from .client import Publisher, Subscriber  # noqa
+diff --git a/rele/client.py b/rele/client.py
+index 53a02d1..062a82e 100644
+--- a/rele/client.py
++++ b/rele/client.py
+@@ -67,11 +67,14 @@ class Subscriber:
+         topic_path = self._client.topic_path(self._gc_project_id, topic)
+ 
+         with suppress(exceptions.AlreadyExists):
+-            self._client.create_subscription(
+-                name=subscription_path,
+-                topic=topic_path,
+-                ack_deadline_seconds=self._ack_deadline,
+-            )
++            try:
++                self._client.create_subscription(
++                    name=subscription_path,
++                    topic=topic_path,
++                    ack_deadline_seconds=self._ack_deadline,
++                )
++            except exceptions.NotFound:
++                logger.error("Cannot subscribe to a topic that does not exist.")
+ 
+     def consume(self, subscription_name, callback, scheduler):
+         """Begin listening to topic from the SubscriberClient.
+@@ -104,7 +107,7 @@ class Publisher:
+     :param gc_project_id: string Google Cloud Project ID.
+     :param credentials: string Google Cloud Credentials.
+     :param encoder: A valid `json.encoder.JSONEncoder subclass <https://docs.python.org/3/library/json.html#json.JSONEncoder>`_  # noqa
+-    :param timeout: float
++    :param timeout: float, default :ref:`settings_publisher_timeout`
+     """
+ 
+     def __init__(self, gc_project_id, credentials, encoder, timeout):
+@@ -116,7 +119,7 @@ class Publisher:
+         else:
+             self._client = pubsub_v1.PublisherClient(credentials=credentials)
+ 
+-    def publish(self, topic, data, blocking=False, **attrs):
++    def publish(self, topic, data, blocking=False, timeout=None, **attrs):
+         """Publishes message to Google PubSub topic.
+ 
+         Usage::
+@@ -145,6 +148,7 @@ class Publisher:
+         :param topic: string topic to publish the data.
+         :param data: dict with the content of the message.
+         :param blocking: boolean
++        :param timeout: float, default None fallsback to :ref:`settings_publisher_timeout`
+         :param attrs: Extra parameters to be published.
+         :return: `Future <https://googleapis.github.io/google-cloud-python/latest/pubsub/subscriber/api/futures.html>`_  # noqa
+         """
+@@ -157,6 +161,6 @@ class Publisher:
+         if not blocking:
+             return future
+ 
+-        future.result(timeout=self._timeout)
++        future.result(timeout=timeout or self._timeout)
+         run_middleware_hook("post_publish", topic)
+         return future

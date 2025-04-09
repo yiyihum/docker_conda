@@ -1,0 +1,171 @@
+diff --git a/tests/aws/conftest.py b/tests/aws/conftest.py
+index 0594830..5a97b58 100644
+--- a/tests/aws/conftest.py
++++ b/tests/aws/conftest.py
+@@ -65,6 +65,14 @@ def ec2_resource():
+             for instance in self.instances:
+                 yield MockEC2Instance(instance)
+ 
++        def filter(self, Filters=None):
++            if Filters is None:
++                self.all()
++            if Filters[0]['Name'] == 'instance-state-name':
++                for instance in self.instances:
++                    if instance['state']['Name'] in Filters[0]['Values']:
++                        yield MockEC2Instance(instance)
++
+     class MockEC2Resource(object):
+         def __init__(self, responses):
+             self.responses = responses
+@@ -94,7 +102,19 @@ def ec2_client():
+         def describe_instances(self):
+             return self.instances
+ 
+-        def describe_reserved_instances(self):
++        def describe_reserved_instances(self, Filters=None):
++            final_reserved = {'ReservedInstances': []}
++            if Filters is None:
++                final_reserved = self.reserved
++            else:
++                filter = Filters[0]
++                if filter['Name'] == 'state':
++                    final_reserved['ReservedInstances'] = [
++                        reserved_instance
++                        for reserved_instance
++                        in self.reserved['ReservedInstances']
++                        if reserved_instance['State'] not in filter['Values']
++                    ]
+             return self.reserved
+ 
+     class MockEC2ClientCall(object):
+diff --git a/tests/aws/report_running_expected.txt b/tests/aws/report_running_expected.txt
+new file mode 100644
+index 0000000..befecd0
+--- /dev/null
++++ b/tests/aws/report_running_expected.txt
+@@ -0,0 +1,8 @@
++Id          Name       Type        AZ          OS                        State    Launch time          Reserved      Current hourly price    Renewed hourly price
++----------  ---------  ----------  ----------  ------------------------  -------  -------------------  ----------  ----------------------  ----------------------
++i-912a4392  web1       c3.8xlarge  us-east-1c  Windows                   running  2015-10-22 14:15:10  Yes                         0.5121                  0.3894
++i-1840273e  app1       r2.8xlarge  us-east-1b  Red Hat Enterprise Linux  running  2015-10-22 14:15:10  Yes                         0.3894                  0.3794
++i-9840273d  app2       r2.8xlarge  us-east-1c  SUSE Linux                running  2015-10-22 14:15:10  Yes                         0.5225                  0.389
++i-1840273c  database2  r2.8xlarge  us-east-1c  Linux/UNIX                running  2015-10-22 14:15:10  Yes                         0.611                   0.379
++i-1840273b  database3  r2.8xlarge  us-east-1c  Linux/UNIX                running  2015-10-22 14:15:10  Yes                         0.611                   0.379
++i-912a4393  test       t1.micro    us-east-1c  Linux/UNIX                running  2015-10-22 14:15:10  No                          0.767                   0.3892
+diff --git a/tests/aws/test_reports.py b/tests/aws/test_reports.py
+index 35fd236..d0f6793 100644
+--- a/tests/aws/test_reports.py
++++ b/tests/aws/test_reports.py
+@@ -17,6 +17,10 @@ from dateutil.tz import tzutc
+ import accloudtant.aws.reports
+ 
+ 
++def get_future_date(years=1):
++    return datetime.datetime.now() + datetime.timedelta(years)
++
++
+ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+     instances = {
+         'instances': [{
+@@ -232,16 +236,7 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+                     tzinfo=tzutc()
+                 ),
+             'RecurringCharges': [],
+-            'End': datetime.datetime(
+-                    2016,
+-                    6,
+-                    5,
+-                    6,
+-                    20,
+-                    10,
+-                    494000,
+-                    tzinfo=tzutc()
+-                ),
++            'End': get_future_date(),
+             'CurrencyCode': 'USD',
+             'OfferingType': 'Medium Utilization',
+             'ReservedInstancesId': '46a408c7-c33d-422d-af59-28df12233320',
+@@ -266,16 +261,7 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+                     tzinfo=tzutc()
+                 ),
+             'RecurringCharges': [],
+-            'End': datetime.datetime(
+-                    2016,
+-                    6,
+-                    5,
+-                    6,
+-                    20,
+-                    10,
+-                    494000,
+-                    tzinfo=tzutc()
+-                ),
++            'End': get_future_date(),
+             'CurrencyCode': 'USD',
+             'OfferingType': 'Medium Utilization',
+             'ReservedInstancesId': '46a408c7-c33d-422d-af59-28df12233321',
+@@ -300,15 +286,7 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+                     tzinfo=tzutc()
+                 ),
+             'RecurringCharges': [],
+-            'End': datetime.datetime(
+-                    2016,
+-                    6,
+-                    5,
+-                    6,
+-                    20,
+-                    10,
+-                    tzinfo=tzutc()
+-                ),
++            'End': get_future_date(),
+             'CurrencyCode': 'USD',
+             'OfferingType': 'Medium Utilization',
+             'ReservedInstancesId': '46a408c7-c33d-422d-af59-28df12233322',
+@@ -333,15 +311,7 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+                     tzinfo=tzutc()
+                 ),
+             'RecurringCharges': [],
+-            'End': datetime.datetime(
+-                    2016,
+-                    6,
+-                    5,
+-                    6,
+-                    20,
+-                    10,
+-                    tzinfo=tzutc()
+-                ),
++            'End': get_future_date(),
+             'CurrencyCode': 'USD',
+             'OfferingType': 'Medium Utilization',
+             'ReservedInstancesId': '46a408c7-c33d-422d-af59-28df12233320',
+@@ -421,7 +391,7 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+                             },
+                         },
+                     },
+-                    'od': '0.767',
++                    'od': '0.867',
+                     'memoryGiB': '15',
+                     'vCPU': '8',
+                 },
+@@ -618,7 +588,7 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+             'best': 0.3892,
+         },
+     }
+-    expected = open('tests/aws/report_expected.txt', 'r').read()
++    expected = open('tests/aws/report_running_expected.txt', 'r').read()
+ 
+     monkeypatch.setattr('boto3.resource', ec2_resource)
+     ec2_resource.set_responses(instances)
+@@ -634,6 +604,7 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+     print(reports)
+     out, err = capsys.readouterr()
+ 
++    assert(len(reports.instances) == 6)
+     for mock in instances['instances']:
+         mock['current'] = instances_prices[mock['id']]['current']
+         mock['best'] = instances_prices[mock['id']]['best']
+@@ -641,5 +612,4 @@ def test_reports(capsys, monkeypatch, ec2_resource, ec2_client, process_ec2):
+             if instance.id == mock['id']:
+                 assert(instance.current == mock['current'])
+                 assert(instance.best == mock['best'])
+-    print(out)
+     assert(out == expected)

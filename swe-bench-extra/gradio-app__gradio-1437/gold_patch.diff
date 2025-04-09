@@ -1,0 +1,437 @@
+diff --git a/gradio/blocks.py b/gradio/blocks.py
+index 6cb19350f..0b0a434e2 100644
+--- a/gradio/blocks.py
++++ b/gradio/blocks.py
+@@ -1,11 +1,13 @@
+ from __future__ import annotations
+ 
++import copy
+ import getpass
+ import inspect
+ import os
+ import random
+ import sys
+ import time
++import warnings
+ import webbrowser
+ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+ 
+@@ -310,8 +312,91 @@ class Blocks(BlockContext):
+                     event_method = getattr(original_mapping[target], trigger)
+                     event_method(fn=fn, **dependency)
+ 
++            # Allows some use of Interface-specific methods with loaded Spaces
++            blocks.predict = [fns[0]]
++            dependency = blocks.dependencies[0]
++            blocks.input_components = [blocks.blocks[i] for i in dependency["inputs"]]
++            blocks.output_components = [blocks.blocks[o] for o in dependency["outputs"]]
++
++        blocks.api_mode = True
+         return blocks
+ 
++    def __call__(self, *params, fn_index=0):
++        """
++        Allows Blocks objects to be called as functions
++        Parameters:
++        *params: the parameters to pass to the function
++        fn_index: the index of the function to call (defaults to 0, which for Interfaces, is the default prediction function)
++        """
++        dependency = self.dependencies[fn_index]
++        block_fn = self.fns[fn_index]
++
++        if self.api_mode:
++            serialized_params = []
++            for i, input_id in enumerate(dependency["inputs"]):
++                block = self.blocks[input_id]
++                if getattr(block, "stateful", False):
++                    raise ValueError(
++                        "Cannot call Blocks object as a function if any of"
++                        " the inputs are stateful."
++                    )
++                else:
++                    serialized_input = block.serialize(params[i], True)
++                    serialized_params.append(serialized_input)
++        else:
++            serialized_params = params
++
++        processed_input = self.preprocess_data(fn_index, serialized_params, None)
++
++        if inspect.iscoroutinefunction(block_fn.fn):
++            raise ValueError(
++                "Cannot call Blocks object as a function if the function is a coroutine"
++            )
++        else:
++            predictions = block_fn.fn(*processed_input)
++
++        output = self.postprocess_data(fn_index, predictions, None)
++
++        if self.api_mode:
++            output_copy = copy.deepcopy(output)
++            deserialized_output = []
++            for o, output_id in enumerate(dependency["outputs"]):
++                block = self.blocks[output_id]
++                if getattr(block, "stateful", False):
++                    raise ValueError(
++                        "Cannot call Blocks object as a function if any of"
++                        " the outputs are stateful."
++                    )
++                else:
++                    deserialized = block.deserialize(output_copy[o])
++                    deserialized_output.append(deserialized)
++        else:
++            deserialized_output = output
++
++        if len(deserialized_output) == 1:
++            return deserialized_output[0]
++        return deserialized_output
++
++    def __str__(self):
++        return self.__repr__()
++
++    def __repr__(self):
++        num_backend_fns = len([d for d in self.dependencies if d["backend_fn"]])
++        repr = f"Gradio Blocks instance: {num_backend_fns} backend functions"
++        repr += "\n" + "-" * len(repr)
++        for d, dependency in enumerate(self.dependencies):
++            if dependency["backend_fn"]:
++                repr += f"\nfn_index={d}"
++                repr += "\n inputs:"
++                for input_id in dependency["inputs"]:
++                    block = self.blocks[input_id]
++                    repr += "\n |-{}".format(str(block))
++                repr += "\n outputs:"
++                for output_id in dependency["outputs"]:
++                    block = self.blocks[output_id]
++                    repr += "\n |-{}".format(str(block))
++        return repr
++
+     def render(self):
+         if Context.root_block is not None:
+             Context.root_block.blocks.update(self.blocks)
+@@ -320,22 +405,7 @@ class Blocks(BlockContext):
+         if Context.block is not None:
+             Context.block.children.extend(self.children)
+ 
+-    async def process_api(
+-        self,
+-        data: PredictBody,
+-        username: str = None,
+-        state: Optional[Dict[int, any]] = None,
+-    ) -> Dict[str, Any]:
+-        """
+-        Processes API calls from the frontend.
+-        Parameters:
+-            data: data recieved from the frontend
+-            username: name of user if authentication is set up
+-            state: data stored from stateful components for session
+-        Returns: None
+-        """
+-        raw_input = data.data
+-        fn_index = data.fn_index
++    def preprocess_data(self, fn_index, raw_input, state):
+         block_fn = self.fns[fn_index]
+         dependency = self.dependencies[fn_index]
+ 
+@@ -349,14 +419,24 @@ class Blocks(BlockContext):
+                     processed_input.append(block.preprocess(raw_input[i]))
+         else:
+             processed_input = raw_input
++        return processed_input
++
++    async def call_function(self, fn_index, processed_input):
++        """Calls and times function with given index and preprocessed input."""
++        block_fn = self.fns[fn_index]
++
+         start = time.time()
+         if inspect.iscoroutinefunction(block_fn.fn):
+-            predictions = await block_fn.fn(*processed_input)
++            prediction = await block_fn.fn(*processed_input)
+         else:
+-            predictions = await run_in_threadpool(block_fn.fn, *processed_input)
++            prediction = await run_in_threadpool(block_fn.fn, *processed_input)
+         duration = time.time() - start
+-        block_fn.total_runtime += duration
+-        block_fn.total_runs += 1
++        return prediction, duration
++
++    def postprocess_data(self, fn_index, predictions, state):
++        block_fn = self.fns[fn_index]
++        dependency = self.dependencies[fn_index]
++
+         if type(predictions) is dict and len(predictions) > 0:
+             keys_are_blocks = [isinstance(key, Block) for key in predictions.keys()]
+             if all(keys_are_blocks):
+@@ -375,6 +455,7 @@ class Blocks(BlockContext):
+                 )
+         if len(dependency["outputs"]) == 1:
+             predictions = (predictions,)
++
+         if block_fn.postprocess:
+             output = []
+             for i, output_id in enumerate(dependency["outputs"]):
+@@ -410,6 +491,34 @@ class Blocks(BlockContext):
+ 
+         else:
+             output = predictions
++        return output
++
++    async def process_api(
++        self,
++        fn_index: int,
++        raw_input: List[Any],
++        username: str = None,
++        state: Optional[Dict[int, any]] = None,
++    ) -> Dict[str, Any]:
++        """
++        Processes API calls from the frontend. First preprocesses the data,
++        then runs the relevant function, then postprocesses the output.
++        Parameters:
++            data: data recieved from the frontend
++            username: name of user if authentication is set up
++            state: data stored from stateful components for session
++        Returns: None
++        """
++        block_fn = self.fns[fn_index]
++
++        processed_input = self.preprocess_data(fn_index, raw_input, state)
++
++        predictions, duration = await self.call_function(fn_index, processed_input)
++        block_fn.total_runtime += duration
++        block_fn.total_runs += 1
++
++        output = self.postprocess_data(fn_index, predictions, state)
++
+         return {
+             "data": output,
+             "duration": duration,
+diff --git a/gradio/components.py b/gradio/components.py
+index 982378836..8bff6374c 100644
+--- a/gradio/components.py
++++ b/gradio/components.py
+@@ -11,12 +11,11 @@ import numbers
+ import operator
+ import os
+ import shutil
+-import sys
+ import tempfile
+ import warnings
+ from copy import deepcopy
+ from types import ModuleType
+-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
++from typing import Any, Callable, Dict, List, Optional, Tuple
+ 
+ import matplotlib.figure
+ import numpy as np
+@@ -26,7 +25,7 @@ from ffmpy import FFmpeg
+ from markdown_it import MarkdownIt
+ 
+ from gradio import media_data, processing_utils
+-from gradio.blocks import Block, BlockContext
++from gradio.blocks import Block
+ from gradio.events import (
+     Changeable,
+     Clearable,
+@@ -889,7 +888,7 @@ class CheckboxGroup(Changeable, IOComponent):
+ 
+     def __init__(
+         self,
+-        choices: List[str],
++        choices: List[str] = None,
+         *,
+         value: List[str] = None,
+         type: str = "value",
+@@ -909,7 +908,7 @@ class CheckboxGroup(Changeable, IOComponent):
+         show_label (bool): if True, will display label.
+         visible (bool): If False, component will be hidden.
+         """
+-        self.choices = choices
++        self.choices = choices or []
+         self.cleared_value = []
+         self.type = type
+         self.value = self.postprocess(value)
+@@ -1052,7 +1051,7 @@ class Radio(Changeable, IOComponent):
+ 
+     def __init__(
+         self,
+-        choices: List[str],
++        choices: List[str] = None,
+         *,
+         value: Optional[str] = None,
+         type: str = "value",
+@@ -1072,7 +1071,7 @@ class Radio(Changeable, IOComponent):
+         show_label (bool): if True, will display label.
+         visible (bool): If False, component will be hidden.
+         """
+-        self.choices = choices
++        self.choices = choices or []
+         self.type = type
+         self.test_input = self.choices[0] if len(self.choices) else None
+         self.value = self.postprocess(value)
+@@ -1197,7 +1196,7 @@ class Dropdown(Radio):
+ 
+     def __init__(
+         self,
+-        choices: List[str],
++        choices: List[str] = None,
+         *,
+         value: Optional[str] = None,
+         type: str = "value",
+@@ -1678,7 +1677,8 @@ class Video(Changeable, Clearable, Playable, IOComponent):
+             return file_name
+ 
+     def serialize(self, x, called_directly):
+-        raise NotImplementedError()
++        data = processing_utils.encode_url_or_file_to_base64(x)
++        return {"name": x, "data": data, "is_example": False}
+ 
+     def save_flagged(self, dir, label, data, encryption_key):
+         """
+@@ -1712,7 +1712,8 @@ class Video(Changeable, Clearable, Playable, IOComponent):
+         }
+ 
+     def deserialize(self, x):
+-        return processing_utils.decode_base64_to_file(x).name
++        file = processing_utils.decode_base64_to_file(x["data"])
++        return file.name
+ 
+     def style(
+         self,
+@@ -2001,7 +2002,8 @@ class Audio(Changeable, Clearable, Playable, Streamable, IOComponent):
+         return processing_utils.encode_url_or_file_to_base64(y)
+ 
+     def deserialize(self, x):
+-        return processing_utils.decode_base64_to_file(x).name
++        file = processing_utils.decode_base64_to_file(x["data"])
++        return file.name
+ 
+     def stream(
+         self,
+@@ -2209,7 +2211,8 @@ class File(Changeable, Clearable, IOComponent):
+             }
+ 
+     def deserialize(self, x):
+-        return processing_utils.decode_base64_to_file(x).name
++        file = processing_utils.decode_base64_to_file(x["data"])
++        return file.name
+ 
+     def restore_flagged(self, dir, data, encryption_key):
+         return self.restore_flagged_file(dir, data, encryption_key)
+diff --git a/gradio/external.py b/gradio/external.py
+index b545cf216..618d0f285 100644
+--- a/gradio/external.py
++++ b/gradio/external.py
+@@ -323,12 +323,12 @@ def get_spaces_blocks(model_name, config):
+     headers = {"Content-Type": "application/json"}
+ 
+     fns = []
+-    for _dependency in config["dependencies"]:
+-        if _dependency["backend_fn"]:
++    for d, dependency in enumerate(config["dependencies"]):
++        if dependency["backend_fn"]:
+ 
+-            def get_fn(dependency):
++            def get_fn(outputs, fn_index):
+                 def fn(*data):
+-                    data = json.dumps({"data": data})
++                    data = json.dumps({"data": data, "fn_index": fn_index})
+                     response = requests.post(api_url, headers=headers, data=data)
+                     result = json.loads(response.content.decode("utf-8"))
+                     try:
+@@ -337,13 +337,14 @@ def get_spaces_blocks(model_name, config):
+                         raise KeyError(
+                             f"Could not find 'data' key in response from external Space. Response received: {result}"
+                         )
+-                    if len(dependency["outputs"]) == 1:
++                    if len(outputs) == 1:
+                         output = output[0]
+                     return output
+ 
+                 return fn
+ 
+-            fns.append(get_fn(deepcopy(_dependency)))
++            fn = get_fn(deepcopy(dependency["outputs"]), d)
++            fns.append(fn)
+         else:
+             fns.append(None)
+     return gradio.Blocks.from_config(config, fns)
+diff --git a/gradio/mix.py b/gradio/mix.py
+index 81f5cebbc..9eb6e9bf7 100644
+--- a/gradio/mix.py
++++ b/gradio/mix.py
+@@ -1,6 +1,8 @@
+ """
+ Ways to transform interfaces to produce new interfaces
+ """
++import warnings
++
+ import gradio
+ 
+ 
+@@ -22,6 +24,10 @@ class Parallel(gradio.Interface):
+         outputs = []
+ 
+         for io in interfaces:
++            if not (isinstance(io, gradio.Interface)):
++                warnings.warn(
++                    "Parallel may not work properly with non-Interface objects."
++                )
+             fns.extend(io.predict)
+             outputs.extend(io.output_components)
+ 
+@@ -52,7 +58,13 @@ class Series(gradio.Interface):
+         Returns:
+         (Interface): an Interface object connecting the given models
+         """
+-        fns = [io.predict for io in interfaces]
++        fns = []
++        for io in interfaces:
++            if not (isinstance(io, gradio.Interface)):
++                warnings.warn(
++                    "Series may not work properly with non-Interface objects."
++                )
++            fns.append(io.predict)
+ 
+         def connected_fn(
+             *data,
+diff --git a/gradio/routes.py b/gradio/routes.py
+index ebee2c8a2..32ca616b6 100644
+--- a/gradio/routes.py
++++ b/gradio/routes.py
+@@ -278,7 +278,11 @@ class App(FastAPI):
+             else:
+                 session_state = {}
+             try:
+-                output = await app.blocks.process_api(body, username, session_state)
++                raw_input = body.data
++                fn_index = body.fn_index
++                output = await app.blocks.process_api(
++                    fn_index, raw_input, username, session_state
++                )
+             except BaseException as error:
+                 if app.blocks.show_error:
+                     traceback.print_exc()
+diff --git a/ui/packages/upload/src/Upload.svelte b/ui/packages/upload/src/Upload.svelte
+index 5281171a9..708154f1d 100644
+--- a/ui/packages/upload/src/Upload.svelte
++++ b/ui/packages/upload/src/Upload.svelte
+@@ -10,7 +10,7 @@
+ 	export let click: boolean = true;
+ 	export let center: boolean = true;
+ 	export let flex: boolean = true;
+-	export let file_count: string;
++	export let file_count: string = "single";
+ 
+ 	let hidden_upload: HTMLInputElement;
+ 
+@@ -46,7 +46,10 @@
+ 					  }
+ 					: (this.result as string);
+ 				if (all_file_data.length === files.length) {
+-					dispatch("load", all_file_data);
++					dispatch(
++						"load",
++						file_count == "single" ? all_file_data[0] : all_file_data
++					);
+ 				}
+ 			};
+ 		});

@@ -1,0 +1,393 @@
+diff --git a/networkx/algorithms/bridges.py b/networkx/algorithms/bridges.py
+index 959a67fec..eda4a4f6d 100644
+--- a/networkx/algorithms/bridges.py
++++ b/networkx/algorithms/bridges.py
+@@ -35,6 +35,9 @@ def bridges(G, root=None):
+     NodeNotFound
+        If `root` is not in the graph `G`.
+ 
++    NetworkXNotImplemented
++        If `G` is a directed graph.
++
+     Examples
+     --------
+     The barbell graph with parameter zero has a single bridge:
+@@ -99,6 +102,9 @@ def has_bridges(G, root=None):
+     NodeNotFound
+        If `root` is not in the graph `G`.
+ 
++    NetworkXNotImplemented
++        If `G` is a directed graph.
++
+     Examples
+     --------
+     The barbell graph with parameter zero has a single bridge::
+@@ -158,6 +164,11 @@ def local_bridges(G, with_span=True, weight=None):
+         The local bridges as an edge 2-tuple of nodes `(u, v)` or
+         as a 3-tuple `(u, v, span)` when `with_span is True`.
+ 
++    Raises
++    ------
++    NetworkXNotImplemented
++        If `G` is a directed graph or multigraph.
++
+     Examples
+     --------
+     A cycle graph has every edge a local bridge with span N-1.
+diff --git a/networkx/algorithms/community/modularity_max.py b/networkx/algorithms/community/modularity_max.py
+index 264a0dc07..ca1cfb9e2 100644
+--- a/networkx/algorithms/community/modularity_max.py
++++ b/networkx/algorithms/community/modularity_max.py
+@@ -326,6 +326,8 @@ def greedy_modularity_communities(
+             raise ValueError(f"best_n must be between 1 and {len(G)}. Got {best_n}.")
+         if best_n < cutoff:
+             raise ValueError(f"Must have best_n >= cutoff. Got {best_n} < {cutoff}")
++        if best_n == 1:
++            return [set(G)]
+     else:
+         best_n = G.number_of_nodes()
+     if n_communities is not None:
+@@ -351,7 +353,19 @@ def greedy_modularity_communities(
+ 
+     # continue merging communities until one of the breaking criteria is satisfied
+     while len(communities) > cutoff:
+-        dq = next(community_gen)
++        try:
++            dq = next(community_gen)
++        # StopIteration occurs when communities are the connected components
++        except StopIteration:
++            communities = sorted(communities, key=len, reverse=True)
++            # if best_n requires more merging, merge big sets for highest modularity
++            while len(communities) > best_n:
++                comm1, comm2, *rest = communities
++                communities = [comm1 ^ comm2]
++                communities.extend(rest)
++            return communities
++
++        # keep going unless max_mod is reached or best_n says to merge more
+         if dq < 0 and len(communities) <= best_n:
+             break
+         communities = next(community_gen)
+diff --git a/networkx/algorithms/covering.py b/networkx/algorithms/covering.py
+index 174044270..b2aeb82b5 100644
+--- a/networkx/algorithms/covering.py
++++ b/networkx/algorithms/covering.py
+@@ -12,36 +12,42 @@ __all__ = ["min_edge_cover", "is_edge_cover"]
+ @not_implemented_for("directed")
+ @not_implemented_for("multigraph")
+ def min_edge_cover(G, matching_algorithm=None):
+-    """Returns a set of edges which constitutes
+-    the minimum edge cover of the graph.
++    """Returns the min cardinality edge cover of the graph as a set of edges.
+ 
+     A smallest edge cover can be found in polynomial time by finding
+     a maximum matching and extending it greedily so that all nodes
+-    are covered.
++    are covered. This function follows that process. A maximum matching
++    algorithm can be specified for the first step of the algorithm.
++    The resulting set may return a set with one 2-tuple for each edge,
++    (the usual case) or with both 2-tuples `(u, v)` and `(v, u)` for
++    each edge. The latter is only done when a bipartite matching algorithm
++    is specified as `matching_algorithm`.
+ 
+     Parameters
+     ----------
+     G : NetworkX graph
+-        An undirected bipartite graph.
++        An undirected graph.
+ 
+     matching_algorithm : function
+-        A function that returns a maximum cardinality matching in a
+-        given bipartite graph. The function must take one input, the
+-        graph ``G``, and return a dictionary mapping each node to its
+-        mate. If not specified,
++        A function that returns a maximum cardinality matching for `G`.
++        The function must take one input, the graph `G`, and return
++        either a set of edges (with only one direction for the pair of nodes)
++        or a dictionary mapping each node to its mate. If not specified,
++        :func:`~networkx.algorithms.matching.max_weight_matching` is used.
++        Common bipartite matching functions include
+         :func:`~networkx.algorithms.bipartite.matching.hopcroft_karp_matching`
+-        will be used. Other possibilities include
+-        :func:`~networkx.algorithms.bipartite.matching.eppstein_matching`,
+-        or matching algorithms in the
+-        :mod:`networkx.algorithms.matching` module.
++        or
++        :func:`~networkx.algorithms.bipartite.matching.eppstein_matching`.
+ 
+     Returns
+     -------
+     min_cover : set
+ 
+-        It contains all the edges of minimum edge cover
+-        in form of tuples. It contains both the edges `(u, v)` and `(v, u)`
+-        for given nodes `u` and `v` among the edges of minimum edge cover.
++        A set of the edges in a minimum edge cover in the form of tuples.
++        It contains only one of the equivalent 2-tuples `(u, v)` and `(v, u)`
++        for each edge. If a bipartite method is used to compute the matching,
++        the returned set contains both the 2-tuples `(u, v)` and `(v, u)`
++        for each edge of a minimum edge cover.
+ 
+     Notes
+     -----
+@@ -53,9 +59,13 @@ def min_edge_cover(G, matching_algorithm=None):
+     is bounded by the worst-case running time of the function
+     ``matching_algorithm``.
+ 
+-    Minimum edge cover for bipartite graph can also be found using the
+-    function present in :mod:`networkx.algorithms.bipartite.covering`
++    Minimum edge cover for `G` can also be found using the `min_edge_covering`
++    function in :mod:`networkx.algorithms.bipartite.covering` which is
++    simply this function with a default matching algorithm of
++    :func:`~networkx.algorithms.bipartite.matching.hopcraft_karp_matching`
+     """
++    if len(G) == 0:
++        return set()
+     if nx.number_of_isolates(G) > 0:
+         # ``min_cover`` does not exist as there is an isolated node
+         raise nx.NetworkXException(
+@@ -66,11 +76,12 @@ def min_edge_cover(G, matching_algorithm=None):
+     maximum_matching = matching_algorithm(G)
+     # ``min_cover`` is superset of ``maximum_matching``
+     try:
+-        min_cover = set(
+-            maximum_matching.items()
+-        )  # bipartite matching case returns dict
++        # bipartite matching algs return dict so convert if needed
++        min_cover = set(maximum_matching.items())
++        bipartite_cover = True
+     except AttributeError:
+         min_cover = maximum_matching
++        bipartite_cover = False
+     # iterate for uncovered nodes
+     uncovered_nodes = set(G) - {v for u, v in min_cover} - {u for u, v in min_cover}
+     for v in uncovered_nodes:
+@@ -82,7 +93,8 @@ def min_edge_cover(G, matching_algorithm=None):
+         # multigraph.)
+         u = arbitrary_element(G[v])
+         min_cover.add((u, v))
+-        min_cover.add((v, u))
++        if bipartite_cover:
++            min_cover.add((v, u))
+     return min_cover
+ 
+ 
+diff --git a/networkx/algorithms/planarity.py b/networkx/algorithms/planarity.py
+index 4d1441efc..bc6ff2f0f 100644
+--- a/networkx/algorithms/planarity.py
++++ b/networkx/algorithms/planarity.py
+@@ -1,7 +1,39 @@
+ from collections import defaultdict
+ import networkx as nx
+ 
+-__all__ = ["check_planarity", "PlanarEmbedding"]
++__all__ = ["check_planarity", "is_planar", "PlanarEmbedding"]
++
++
++def is_planar(G):
++    """Returns True if and only if `G` is planar.
++
++    A graph is *planar* iff it can be drawn in a plane without
++    any edge intersections.
++
++    Parameters
++    ----------
++    G : NetworkX graph
++
++    Returns
++    -------
++    bool
++       Whether the graph is planar.
++
++    Examples
++    --------
++    >>> G = nx.Graph([(0, 1), (0, 2)])
++    >>> nx.is_planar(G)
++    True
++    >>> nx.is_planar(nx.complete_graph(5))
++    False
++
++    See Also
++    --------
++    check_planarity :
++        Check if graph is planar *and* return a `PlanarEmbedding` instance if True.
++    """
++
++    return check_planarity(G, counterexample=False)[0]
+ 
+ 
+ def check_planarity(G, counterexample=False):
+@@ -24,6 +56,18 @@ def check_planarity(G, counterexample=False):
+         If the graph is planar `certificate` is a PlanarEmbedding
+         otherwise it is a Kuratowski subgraph.
+ 
++    Examples
++    --------
++    >>> G = nx.Graph([(0, 1), (0, 2)])
++    >>> is_planar, P = nx.check_planarity(G)
++    >>> print(is_planar)
++    True
++
++    When `G` is planar, a `PlanarEmbedding` instance is returned:
++
++    >>> P.get_data()
++    {0: [1, 2], 1: [0], 2: [0]}
++
+     Notes
+     -----
+     A (combinatorial) embedding consists of cyclic orderings of the incident
+@@ -37,6 +81,11 @@ def check_planarity(G, counterexample=False):
+     A counterexample is only generated if the corresponding parameter is set,
+     because the complexity of the counterexample generation is higher.
+ 
++    See also
++    --------
++    is_planar :
++        Check for planarity without creating a `PlanarEmbedding` or counterexample.
++
+     References
+     ----------
+     .. [1] Ulrik Brandes:
+@@ -716,6 +765,8 @@ class PlanarEmbedding(nx.DiGraph):
+     The planar embedding is given by a `combinatorial embedding
+     <https://en.wikipedia.org/wiki/Graph_embedding#Combinatorial_embedding>`_.
+ 
++    .. note:: `check_planarity` is the preferred way to check if a graph is planar.
++
+     **Neighbor ordering:**
+ 
+     In comparison to a usual graph structure, the embedding also stores the
+@@ -761,6 +812,15 @@ class PlanarEmbedding(nx.DiGraph):
+     For a half-edge (u, v) that is orientated such that u is below v then the
+     face that belongs to (u, v) is to the right of this half-edge.
+ 
++    See Also
++    --------
++    is_planar :
++        Preferred way to check if an existing graph is planar.
++
++    check_planarity :
++        A convenient way to create a `PlanarEmbedding`. If not planar,
++        it returns a subgraph that shows this.
++
+     Examples
+     --------
+ 
+diff --git a/networkx/algorithms/tournament.py b/networkx/algorithms/tournament.py
+index bace64bae..a002e022e 100644
+--- a/networkx/algorithms/tournament.py
++++ b/networkx/algorithms/tournament.py
+@@ -82,6 +82,13 @@ def is_tournament(G):
+     bool
+         Whether the given graph is a tournament graph.
+ 
++    Examples
++    --------
++    >>> from networkx.algorithms import tournament
++    >>> G = nx.DiGraph([(0, 1), (1, 2), (2, 0)])
++    >>> tournament.is_tournament(G)
++    True
++
+     Notes
+     -----
+     Some definitions require a self-loop on each node, but that is not
+@@ -114,6 +121,13 @@ def hamiltonian_path(G):
+     path : list
+         A list of nodes which form a Hamiltonian path in `G`.
+ 
++    Examples
++    --------
++    >>> from networkx.algorithms import tournament
++    >>> G = nx.DiGraph([(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
++    >>> tournament.hamiltonian_path(G)
++    [0, 1, 2, 3]
++
+     Notes
+     -----
+     This is a recursive implementation with an asymptotic running time
+@@ -185,6 +199,13 @@ def score_sequence(G):
+     list
+         A sorted list of the out-degrees of the nodes of `G`.
+ 
++    Examples
++    --------
++    >>> from networkx.algorithms import tournament
++    >>> G = nx.DiGraph([(1, 0), (1, 3), (0, 2), (0, 3), (2, 1), (3, 2)])
++    >>> tournament.score_sequence(G)
++    [1, 1, 2, 2]
++
+     """
+     return sorted(d for v, d in G.out_degree())
+ 
+@@ -260,6 +281,15 @@ def is_reachable(G, s, t):
+     bool
+         Whether there is a path from `s` to `t` in `G`.
+ 
++    Examples
++    --------
++    >>> from networkx.algorithms import tournament
++    >>> G = nx.DiGraph([(1, 0), (1, 3), (1, 2), (2, 3), (2, 0), (3, 0)])
++    >>> tournament.is_reachable(G, 1, 3)
++    True
++    >>> tournament.is_reachable(G, 3, 2)
++    False
++
+     Notes
+     -----
+     Although this function is more theoretically efficient than the
+@@ -331,6 +361,16 @@ def is_strongly_connected(G):
+     bool
+         Whether the tournament is strongly connected.
+ 
++    Examples
++    --------
++    >>> from networkx.algorithms import tournament
++    >>> G = nx.DiGraph([(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3), (3, 0)])
++    >>> tournament.is_strongly_connected(G)
++    True
++    >>> G.remove_edge(1, 3)
++    >>> tournament.is_strongly_connected(G)
++    False
++
+     Notes
+     -----
+     Although this function is more theoretically efficient than the
+diff --git a/networkx/algorithms/tree/recognition.py b/networkx/algorithms/tree/recognition.py
+index 52da959b6..88b2abe8b 100644
+--- a/networkx/algorithms/tree/recognition.py
++++ b/networkx/algorithms/tree/recognition.py
+@@ -96,6 +96,16 @@ def is_arborescence(G):
+     b : bool
+         A boolean that is True if `G` is an arborescence.
+ 
++    Examples
++    --------
++    >>> G = nx.DiGraph([(0, 1), (0, 2), (2, 3), (3, 4)])
++    >>> nx.is_arborescence(G)
++    True
++    >>> G.remove_edge(0, 1)
++    >>> G.add_edge(1, 2)  # maximum in-degree is 2
++    >>> nx.is_arborescence(G)
++    False
++
+     Notes
+     -----
+     In another convention, an arborescence is known as a *tree*.
+@@ -125,6 +135,16 @@ def is_branching(G):
+     b : bool
+         A boolean that is True if `G` is a branching.
+ 
++    Examples
++    --------
++    >>> G = nx.DiGraph([(0, 1), (1, 2), (2, 3), (3, 4)])
++    >>> nx.is_branching(G)
++    True
++    >>> G.remove_edge(2, 3)
++    >>> G.add_edge(3, 1)  # maximum in-degree is 2
++    >>> nx.is_branching(G)
++    False
++
+     Notes
+     -----
+     In another convention, a branching is also known as a *forest*.
+

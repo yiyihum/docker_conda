@@ -1,0 +1,102 @@
+diff --git a/news/fix_aliases_infinite_loop.rst b/news/fix_aliases_infinite_loop.rst
+new file mode 100644
+index 00000000..60a5ab32
+--- /dev/null
++++ b/news/fix_aliases_infinite_loop.rst
+@@ -0,0 +1,23 @@
++**Added:**
++
++* Ability to call the tool by the name from callable alias with the same name without the infinite loop error.
++
++**Changed:**
++
++* <news item>
++
++**Deprecated:**
++
++* <news item>
++
++**Removed:**
++
++* <news item>
++
++**Fixed:**
++
++* <news item>
++
++**Security:**
++
++* <news item>
+diff --git a/xonsh/procs/proxies.py b/xonsh/procs/proxies.py
+index 4e9b100b..d9a5ff74 100644
+--- a/xonsh/procs/proxies.py
++++ b/xonsh/procs/proxies.py
+@@ -500,10 +500,16 @@ class ProcProxyThread(threading.Thread):
+             sp_stderr = sys.stderr
+         # run the function itself
+         try:
++            alias_stack = builtins.__xonsh__.env.get("__ALIAS_STACK", "")
++            if self.env.get("__ALIAS_NAME"):
++                alias_stack += ":" + self.env["__ALIAS_NAME"]
++
+             with STDOUT_DISPATCHER.register(sp_stdout), STDERR_DISPATCHER.register(
+                 sp_stderr
+             ), xt.redirect_stdout(STDOUT_DISPATCHER), xt.redirect_stderr(
+                 STDERR_DISPATCHER
++            ), builtins.__xonsh__.env.swap(
++                __ALIAS_STACK=alias_stack
+             ):
+                 r = self.f(self.args, sp_stdin, sp_stdout, sp_stderr, spec, spec.stack)
+         except SystemExit as e:
+diff --git a/xonsh/procs/specs.py b/xonsh/procs/specs.py
+index 845c4e52..384edf71 100644
+--- a/xonsh/procs/specs.py
++++ b/xonsh/procs/specs.py
+@@ -355,6 +355,8 @@ class SubprocSpec:
+         # pure attrs
+         self.args = list(cmd)
+         self.alias = None
++        self.alias_name = None
++        self.alias_stack = builtins.__xonsh__.env.get("__ALIAS_STACK", "").split(":")
+         self.binary_loc = None
+         self.is_proxy = False
+         self.background = False
+@@ -442,6 +444,7 @@ class SubprocSpec:
+         kwargs = {n: getattr(self, n) for n in self.kwnames}
+         self.prep_env(kwargs)
+         if callable(self.alias):
++            kwargs["env"]["__ALIAS_NAME"] = self.alias_name
+             p = self.cls(self.alias, self.cmd, **kwargs)
+         else:
+             self.prep_preexec_fn(kwargs, pipeline_group=pipeline_group)
+@@ -589,17 +592,29 @@ class SubprocSpec:
+     def resolve_alias(self):
+         """Sets alias in command, if applicable."""
+         cmd0 = self.cmd[0]
++
++        if cmd0 in self.alias_stack:
++            # Disabling the alias resolving to prevent infinite loop in call stack
++            # and futher using binary_loc to resolve the alias name.
++            self.alias = None
++            return
++
+         if callable(cmd0):
+             alias = cmd0
+         else:
+             alias = builtins.aliases.get(cmd0, None)
++            if alias is not None:
++                self.alias_name = cmd0
+         self.alias = alias
+ 
+     def resolve_binary_loc(self):
+         """Sets the binary location"""
+         alias = self.alias
+         if alias is None:
+-            binary_loc = xenv.locate_binary(self.cmd[0])
++            cmd0 = self.cmd[0]
++            binary_loc = xenv.locate_binary(cmd0)
++            if binary_loc == cmd0 and cmd0 in self.alias_stack:
++                raise Exception(f'Recursive calls to "{cmd0}" alias.')
+         elif callable(alias):
+             binary_loc = None
+         else:

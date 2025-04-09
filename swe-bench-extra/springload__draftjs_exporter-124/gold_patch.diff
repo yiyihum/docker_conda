@@ -1,0 +1,116 @@
+diff --git a/.travis.yml b/.travis.yml
+index d42f54d..fb69f61 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -24,7 +24,7 @@ matrix:
+   - env: TOXENV=py38-upper_bound_deps
+     python: 3.8
+ install:
+-- pip install tox coveralls
++- pip install tox coveralls==1.10.0
+ script:
+ - make test-ci
+ after_success:
+diff --git a/docs/README.md b/docs/README.md
+index b984ef4..b37d3ee 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -53,7 +53,7 @@
+ 
+ ### Limitations of `html5lib`
+ 
+-- Generated HTML is always "made valid" by being wrapped in '<html><head></head><body></body></html>'.
++- Generated HTML is always "made valid" by being wrapped in `<html><head></head><body></body></html>`.
+ 
+ ### Limitations of `BeautifulSoup4`
+ 
+@@ -113,3 +113,9 @@ pip install draftjs_exporter
+ Solution: see http://stackoverflow.com/a/6504860/1798491
+ 
+ `apt-get install libxml2-dev libxslt1-dev python-dev`
++
++### Entity props override
++
++Entities receive their `data` as props, except for the key `entity` which is overriden with a dict containing additional data (`type`, `mutability`, etc.). This is a known issue (see [#91](https://github.com/springload/draftjs_exporter/issues/91)). There is no workaround if you need to use a data key called `entity` – it won’t be available.
++
++This is also a problem if the entity’s `data` contains a `children` key – this will also get overriden without any workaround possible.
+diff --git a/draftjs_exporter/entity_state.py b/draftjs_exporter/entity_state.py
+index 191f9f5..85a934c 100644
+--- a/draftjs_exporter/entity_state.py
++++ b/draftjs_exporter/entity_state.py
+@@ -1,11 +1,11 @@
+-from typing import List, Optional
++from typing import List, Optional, Sequence
+ 
+ from draftjs_exporter.command import Command
+ from draftjs_exporter.constants import ENTITY_TYPES
+ from draftjs_exporter.dom import DOM
+ from draftjs_exporter.error import ExporterException
+ from draftjs_exporter.options import Options, OptionsMap
+-from draftjs_exporter.types import Element, EntityDetails, EntityKey, EntityMap
++from draftjs_exporter.types import Block, Element, EntityDetails, EntityKey, EntityMap
+ 
+ 
+ class EntityException(ExporterException):
+@@ -48,7 +48,7 @@ class EntityState(object):
+ 
+         return details
+ 
+-    def render_entities(self, style_node: Element) -> Element:
++    def render_entities(self, style_node: Element, block: Block, blocks: Sequence[Block]) -> Element:
+         # We have a complete (start, stop) entity to render.
+         if self.completed_entity is not None:
+             entity_details = self.get_entity_details(self.completed_entity)
+@@ -56,6 +56,12 @@ class EntityState(object):
+             props = entity_details['data'].copy()
+             props['entity'] = {
+                 'type': entity_details['type'],
++                'mutability': entity_details['mutability'] if 'mutability' in entity_details else None,
++                'block': block,
++                'blocks': blocks,
++                'entity_range': {
++                    'key': self.completed_entity,
++                },
+             }
+ 
+             if len(self.element_stack) == 1:
+diff --git a/draftjs_exporter/html.py b/draftjs_exporter/html.py
+index a4766d4..eade7fb 100644
+--- a/draftjs_exporter/html.py
++++ b/draftjs_exporter/html.py
+@@ -82,7 +82,7 @@ class HTML(object):
+                     decorated_node = text
+ 
+                 styled_node = style_state.render_styles(decorated_node, block, wrapper_state.blocks)
+-                entity_node = entity_state.render_entities(styled_node)
++                entity_node = entity_state.render_entities(styled_node, block, wrapper_state.blocks)
+ 
+                 if entity_node is not None:
+                     DOM.append_child(content, entity_node)
+diff --git a/example.py b/example.py
+index be1f4d1..362126d 100644
+--- a/example.py
++++ b/example.py
+@@ -122,7 +122,8 @@ def block_fallback(props: Props) -> Element:
+ 
+ def entity_fallback(props: Props) -> Element:
+     type_ = props['entity']['type']
+-    logging.warn('Missing config for "%s".' % type_)
++    key = props['entity']['entity_range']['key']
++    logging.warn('Missing config for "%s", key "%s".' % (type_, key))
+     return DOM.create_element('span', {'class': 'missing-entity'}, props['children'])
+ 
+ 
+diff --git a/setup.py b/setup.py
+index 94b1ea9..5a3d711 100755
+--- a/setup.py
++++ b/setup.py
+@@ -29,7 +29,7 @@ dependencies['testing'] = [
+     'psutil==5.4.1',
+ 
+     # For coverage and PEP8 linting.
+-    'coverage==4.5.4',
++    'coverage==5.0.1',
+     'flake8>=3.2.0',
+     'isort==4.2.5',
+     'mypy==0.750',

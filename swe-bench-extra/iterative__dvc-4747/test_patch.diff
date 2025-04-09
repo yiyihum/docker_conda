@@ -1,0 +1,211 @@
+diff --git a/tests/docker-compose.yml b/tests/docker-compose.yml
+--- a/tests/docker-compose.yml
++++ b/tests/docker-compose.yml
+@@ -11,9 +11,12 @@ services:
+       - "8880"
+   hdfs:
+     image: rkuprieiev/docker-hdfs
++    hostname: localhost
+     ports:
+       - "8020"
+       # NOTE: having this port as dynamic one will require modifying
+       # `dfs.datanode.address` in `hdfs-site.xml` and probably something
+       # else, so using default one for now.
+       - "50010:50010"
++      - "50075:50075"
++      - "50070"
+diff --git a/tests/func/test_add.py b/tests/func/test_add.py
+--- a/tests/func/test_add.py
++++ b/tests/func/test_add.py
+@@ -288,6 +288,11 @@ def test_add_filtered_files_in_dir(
+             "checksum",
+             "000002000000000000000000a86fe4d846edc1bf4c355cb6112f141e",
+         ),
++        (
++            pytest.lazy_fixture("webhdfs"),
++            "checksum",
++            "000002000000000000000000a86fe4d846edc1bf4c355cb6112f141e00000000",
++        ),
+     ],
+     indirect=["workspace"],
+ )
+diff --git a/tests/func/test_api.py b/tests/func/test_api.py
+--- a/tests/func/test_api.py
++++ b/tests/func/test_api.py
+@@ -20,6 +20,7 @@
+     "http",
+     "hdfs",
+     "webdav",
++    "webhdfs",
+ ]
+ clouds = [pytest.lazy_fixture(cloud) for cloud in cloud_names]
+ all_clouds = [pytest.lazy_fixture("local_cloud")] + clouds
+diff --git a/tests/func/test_data_cloud.py b/tests/func/test_data_cloud.py
+--- a/tests/func/test_data_cloud.py
++++ b/tests/func/test_data_cloud.py
+@@ -30,6 +30,7 @@
+         "http",
+         "hdfs",
+         "webdav",
++        "webhdfs",
+     ]
+ ] + [
+     pytest.param(
+diff --git a/tests/func/test_gc.py b/tests/func/test_gc.py
+--- a/tests/func/test_gc.py
++++ b/tests/func/test_gc.py
+@@ -356,6 +356,7 @@ def test_gc_not_collect_pipeline_tracked_files(tmp_dir, dvc, run_copy):
+         pytest.lazy_fixture("s3"),
+         pytest.lazy_fixture("gs"),
+         pytest.lazy_fixture("hdfs"),
++        pytest.lazy_fixture("webhdfs"),
+         pytest.param(
+             pytest.lazy_fixture("ssh"),
+             marks=pytest.mark.skipif(
+diff --git a/tests/func/test_import_url.py b/tests/func/test_import_url.py
+--- a/tests/func/test_import_url.py
++++ b/tests/func/test_import_url.py
+@@ -122,6 +122,7 @@ def test_import_url_with_no_exec(tmp_dir, dvc, erepo_dir):
+         pytest.lazy_fixture("s3"),
+         pytest.lazy_fixture("gs"),
+         pytest.lazy_fixture("hdfs"),
++        pytest.lazy_fixture("webhdfs"),
+         pytest.param(
+             pytest.lazy_fixture("ssh"),
+             marks=pytest.mark.skipif(
+diff --git a/tests/func/test_update.py b/tests/func/test_update.py
+--- a/tests/func/test_update.py
++++ b/tests/func/test_update.py
+@@ -164,6 +164,7 @@ def test_update_before_and_after_dvc_init(tmp_dir, dvc, git_dir):
+         pytest.lazy_fixture("s3"),
+         pytest.lazy_fixture("gs"),
+         pytest.lazy_fixture("hdfs"),
++        pytest.lazy_fixture("webhdfs"),
+         pytest.param(
+             pytest.lazy_fixture("ssh"),
+             marks=pytest.mark.skipif(
+diff --git a/tests/remotes/__init__.py b/tests/remotes/__init__.py
+--- a/tests/remotes/__init__.py
++++ b/tests/remotes/__init__.py
+@@ -3,7 +3,7 @@
+ import pytest
+ 
+ from .azure import Azure, azure, azure_server  # noqa: F401
+-from .hdfs import HDFS, hadoop, hdfs, hdfs_server  # noqa: F401
++from .hdfs import HDFS, hadoop, hdfs, hdfs_server, webhdfs  # noqa: F401
+ from .http import HTTP, http, http_server  # noqa: F401
+ from .local import Local, local_cloud, local_remote  # noqa: F401
+ from .oss import (  # noqa: F401
+diff --git a/tests/remotes/hdfs.py b/tests/remotes/hdfs.py
+--- a/tests/remotes/hdfs.py
++++ b/tests/remotes/hdfs.py
+@@ -119,6 +119,7 @@ def hdfs_server(hadoop, docker_compose, docker_services):
+     import pyarrow
+ 
+     port = docker_services.port_for("hdfs", 8020)
++    web_port = docker_services.port_for("hdfs", 50070)
+ 
+     def _check():
+         try:
+@@ -136,11 +137,70 @@ def _check():
+ 
+     docker_services.wait_until_responsive(timeout=30.0, pause=5, check=_check)
+ 
+-    return port
++    return {"hdfs": port, "webhdfs": web_port}
+ 
+ 
+ @pytest.fixture
+ def hdfs(hdfs_server):
+-    port = hdfs_server
++    port = hdfs_server["hdfs"]
+     url = f"hdfs://127.0.0.1:{port}/{uuid.uuid4()}"
+     yield HDFS(url)
++
++
++class WebHDFS(Base, URLInfo):  # pylint: disable=abstract-method
++    @contextmanager
++    def _webhdfs(self):
++        from hdfs import InsecureClient
++
++        client = InsecureClient(f"http://{self.host}:{self.port}", self.user)
++        yield client
++
++    def is_file(self):
++        with self._webhdfs() as _hdfs:
++            return _hdfs.status(self.path)["type"] == "FILE"
++
++    def is_dir(self):
++        with self._webhdfs() as _hdfs:
++            return _hdfs.status(self.path)["type"] == "DIRECTORY"
++
++    def exists(self):
++        with self._webhdfs() as _hdfs:
++            return _hdfs.status(self.path, strict=False) is not None
++
++    def mkdir(self, mode=0o777, parents=False, exist_ok=False):
++        assert mode == 0o777
++        assert parents
++        assert not exist_ok
++
++        with self._webhdfs() as _hdfs:
++            # NOTE: hdfs.makekdirs always creates parents
++            _hdfs.makedirs(self.path, permission=mode)
++
++    def write_bytes(self, contents):
++        with self._webhdfs() as _hdfs:
++            with _hdfs.write(self.path, overwrite=True) as writer:
++                writer.write(contents)
++
++    def write_text(self, contents, encoding=None, errors=None):
++        if not encoding:
++            encoding = locale.getpreferredencoding(False)
++        assert errors is None
++        self.write_bytes(contents.encode(encoding))
++
++    def read_bytes(self):
++        with self._webhdfs() as _hdfs:
++            with _hdfs.read(self.path) as reader:
++                return reader.read()
++
++    def read_text(self, encoding=None, errors=None):
++        if not encoding:
++            encoding = locale.getpreferredencoding(False)
++        assert errors is None
++        return self.read_bytes().decode(encoding)
++
++
++@pytest.fixture
++def webhdfs(hdfs_server):
++    port = hdfs_server["webhdfs"]
++    url = f"webhdfs://127.0.0.1:{port}/{uuid.uuid4()}"
++    yield WebHDFS(url)
+diff --git a/tests/unit/remote/test_webhdfs.py b/tests/unit/remote/test_webhdfs.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/remote/test_webhdfs.py
+@@ -0,0 +1,24 @@
++from dvc.tree.webhdfs import WebHDFSTree
++
++user = "test"
++webhdfs_token = "token"
++webhdfs_alias = "alias-name"
++hdfscli_config = "path/to/cli/config"
++
++
++def test_init(dvc):
++    url = "webhdfs://test@127.0.0.1:50070"
++    config = {
++        "url": url,
++        "webhdfs_token": webhdfs_token,
++        "webhdfs_alias": webhdfs_alias,
++        "hdfscli_config": hdfscli_config,
++        "user": user,
++    }
++
++    tree = WebHDFSTree(dvc, config)
++    assert tree.path_info == url
++    assert tree.token == webhdfs_token
++    assert tree.alias == webhdfs_alias
++    assert tree.path_info.user == user
++    assert tree.hdfscli_config == hdfscli_config

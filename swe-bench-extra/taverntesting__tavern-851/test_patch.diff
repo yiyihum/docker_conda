@@ -1,0 +1,115 @@
+diff --git a/example/mqtt/test_mqtt.tavern.yaml b/example/mqtt/test_mqtt.tavern.yaml
+index 145d3b6..956a18a 100644
+--- a/example/mqtt/test_mqtt.tavern.yaml
++++ b/example/mqtt/test_mqtt.tavern.yaml
+@@ -740,3 +740,28 @@ stages:
+       payload: "there"
+       timeout: 5
+       qos: 1
++
++---
++
++test_name: Update an MQTT publish from an ext function
++
++includes:
++  - !include common.yaml
++
++paho-mqtt: *mqtt_spec
++
++stages:
++  - *setup_device_for_test
++
++  - name: step 1 - ping/pong
++    mqtt_publish:
++      topic: /device/{random_device_id}/echo
++      json:
++        $ext:
++          function: testing_utils:return_hello
++    mqtt_response:
++        topic: /device/{random_device_id}/echo/response
++        timeout: 3
++        qos: 1
++        json:
++          hello: there
+diff --git a/example/mqtt/testing_utils.py b/example/mqtt/testing_utils.py
+index 70021ab..f483ca9 100644
+--- a/example/mqtt/testing_utils.py
++++ b/example/mqtt/testing_utils.py
+@@ -3,5 +3,5 @@ def message_says_hello(msg):
+     assert msg.payload.get("message") == "hello world"
+ 
+ 
+-def return_hello(_):
++def return_hello(_=None):
+     return {"hello": "there"}
+diff --git a/tests/unit/test_mqtt.py b/tests/unit/test_mqtt.py
+index b9603da..1d55b06 100644
+--- a/tests/unit/test_mqtt.py
++++ b/tests/unit/test_mqtt.py
+@@ -1,3 +1,4 @@
++from typing import Dict
+ from unittest.mock import MagicMock, Mock, patch
+ 
+ import paho.mqtt.client as paho
+@@ -18,18 +19,19 @@ def test_host_required():
+     MQTTClient(**args)
+ 
+ 
+-class TestClient:
+-    @pytest.fixture(name="fake_client")
+-    def fix_fake_client(self):
+-        args = {"connect": {"host": "localhost"}}
++@pytest.fixture(name="fake_client")
++def fix_fake_client():
++    args = {"connect": {"host": "localhost"}}
++
++    mqtt_client = MQTTClient(**args)
+ 
+-        mqtt_client = MQTTClient(**args)
++    mqtt_client._subscribed[2] = _Subscription("abc")
++    mqtt_client._subscription_mappings["abc"] = 2
+ 
+-        mqtt_client._subscribed[2] = _Subscription("abc")
+-        mqtt_client._subscription_mappings["abc"] = 2
++    return mqtt_client
+ 
+-        return mqtt_client
+ 
++class TestClient:
+     def test_no_queue(self, fake_client):
+         """Trying to fetch from a nonexistent queue raised exception"""
+ 
+@@ -192,3 +194,33 @@ class TestSubscription:
+         MQTTClient._on_subscribe(mock_client, "abc", {}, 123, 0)
+ 
+         assert mock_client._subscribed == {}
++
++
++class TestExtFunctions:
++    @pytest.fixture()
++    def basic_mqtt_request_args(self) -> Dict:
++        return {
++            "topic": "/a/b/c",
++        }
++
++    def test_basic(self, fake_client, basic_mqtt_request_args, includes):
++        MQTTRequest(fake_client, basic_mqtt_request_args, includes)
++
++    def test_ext_function_bad(self, fake_client, basic_mqtt_request_args, includes):
++        basic_mqtt_request_args["json"] = {"$ext": "kk"}
++
++        with pytest.raises(exceptions.InvalidExtFunctionError):
++            MQTTRequest(fake_client, basic_mqtt_request_args, includes)
++
++    def test_ext_function_good(self, fake_client, basic_mqtt_request_args, includes):
++        basic_mqtt_request_args["json"] = {
++            "$ext": {
++                "function": "operator:add",
++                "extra_args": (1, 2),
++            }
++        }
++
++        m = MQTTRequest(fake_client, basic_mqtt_request_args, includes)
++
++        assert "payload" in m._publish_args
++        assert m._publish_args["payload"] == "3"

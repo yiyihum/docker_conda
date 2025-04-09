@@ -1,0 +1,93 @@
+diff --git a/pycytominer/annotate.py b/pycytominer/annotate.py
+index 816e2e5..e64e833 100644
+--- a/pycytominer/annotate.py
++++ b/pycytominer/annotate.py
+@@ -79,7 +79,9 @@ def annotate(
+ 
+     annotated = platemap.merge(
+         profiles, left_on=join_on[0], right_on=join_on[1], how="inner"
+-    ).drop(join_on[0], axis="columns")
++    )
++    if join_on[0] != join_on[1]:
++        annotated = annotated.drop(join_on[0], axis="columns")
+ 
+     # Add specific Connectivity Map (CMAP) formatting
+     if format_broad_cmap:
+@@ -95,6 +97,9 @@ def annotate(
+             ), "external metadata at {} does not exist".format(external_metadata)
+ 
+             external_metadata = pd.read_csv(external_metadata)
++    else:
++        # Make a copy of the external metadata to avoid modifying the original column names
++        external_metadata = external_metadata.copy()
+ 
+     if isinstance(external_metadata, pd.DataFrame):
+         external_metadata.columns = [
+diff --git a/pycytominer/cyto_utils/cells.py b/pycytominer/cyto_utils/cells.py
+index 08029fe..e26d792 100644
+--- a/pycytominer/cyto_utils/cells.py
++++ b/pycytominer/cyto_utils/cells.py
+@@ -52,7 +52,7 @@ class SingleCells(object):
+     image_feature_categories : list of str, optional
+         List of categories of features from the image table to add to the profiles.
+     features: str or list of str, default "infer"
+-        List of features that should be aggregated.
++        List of features that should be loaded or aggregated.
+     load_image_data : bool, default True
+         Whether or not the image data should be loaded into memory.
+     image_table_name : str, default "image"
+@@ -415,10 +415,14 @@ class SingleCells(object):
+         return num_rows
+ 
+     def get_sql_table_col_names(self, table):
+-        """Get feature and metadata columns lists."""
++        """Get column names from the database."""
+         ptr = self.conn.execute(f"SELECT * FROM {table} LIMIT 1").cursor
+         col_names = [obj[0] for obj in ptr.description]
+ 
++        return col_names
++
++    def split_column_categories(self, col_names):
++        """Split a list of column names into feature and metadata columns lists."""
+         feat_cols = []
+         meta_cols = []
+         for col in col_names:
+@@ -445,7 +449,10 @@ class SingleCells(object):
+ 
+         # Get data useful to pre-alloc memory
+         num_cells = self.count_sql_table_rows(compartment)
+-        meta_cols, feat_cols = self.get_sql_table_col_names(compartment)
++        col_names = self.get_sql_table_col_names(compartment)
++        if self.features != "infer":  # allow to get only some features
++            col_names = [x for x in col_names if x in self.features]
++        meta_cols, feat_cols = self.split_column_categories(col_names)
+         num_meta, num_feats = len(meta_cols), len(feat_cols)
+ 
+         # Use pre-allocated np.array for data
+@@ -613,7 +620,11 @@ class SingleCells(object):
+             sql=f"select {cols} from {compartment} limit 1",
+             con=self.conn,
+         )
+-        typeof_str = ", ".join([f"typeof({x})" for x in compartment_row1.columns])
++        all_columns = compartment_row1.columns
++        if self.features != "infer": # allow to get only some features
++            all_columns = [x for x in all_columns if x in self.features]
++
++        typeof_str = ", ".join([f"typeof({x})" for x in all_columns])
+         compartment_dtypes = pd.read_sql(
+             sql=f"select {typeof_str} from {compartment} limit 1",
+             con=self.conn,
+diff --git a/pycytominer/cyto_utils/load.py b/pycytominer/cyto_utils/load.py
+index 5bb17ad..7224144 100644
+--- a/pycytominer/cyto_utils/load.py
++++ b/pycytominer/cyto_utils/load.py
+@@ -74,6 +74,9 @@ def load_platemap(platemap, add_metadata_id=True):
+             platemap = pd.read_csv(platemap, sep=delim)
+         except FileNotFoundError:
+             raise FileNotFoundError(f"{platemap} platemap file not found")
++    else:
++        # Setting platemap to a copy to prevent column name changes from back-propagating
++        platemap = platemap.copy()
+ 
+     if add_metadata_id:
+         platemap.columns = [

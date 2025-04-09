@@ -1,0 +1,362 @@
+diff --git a/dvc/cache/__init__.py b/dvc/cache/__init__.py
+--- a/dvc/cache/__init__.py
++++ b/dvc/cache/__init__.py
+@@ -36,7 +36,13 @@ class Cache:
+     """
+ 
+     CACHE_DIR = "cache"
+-    CLOUD_SCHEMES = [Schemes.S3, Schemes.GS, Schemes.SSH, Schemes.HDFS]
++    CLOUD_SCHEMES = [
++        Schemes.S3,
++        Schemes.GS,
++        Schemes.SSH,
++        Schemes.HDFS,
++        Schemes.WEBHDFS,
++    ]
+ 
+     def __init__(self, repo):
+         self.repo = repo
+diff --git a/dvc/config.py b/dvc/config.py
+--- a/dvc/config.py
++++ b/dvc/config.py
+@@ -149,6 +149,7 @@ class RelPath(str):
+         "s3": str,
+         "gs": str,
+         "hdfs": str,
++        "webhdfs": str,
+         "ssh": str,
+         "azure": str,
+         # This is for default local cache
+@@ -195,6 +196,13 @@ class RelPath(str):
+                     **REMOTE_COMMON,
+                 },
+                 "hdfs": {"user": str, **REMOTE_COMMON},
++                "webhdfs": {
++                    "hdfscli_config": str,
++                    "webhdfs_token": str,
++                    "user": str,
++                    "webhdfs_alias": str,
++                    **REMOTE_COMMON,
++                },
+                 "azure": {"connection_string": str, **REMOTE_COMMON},
+                 "oss": {
+                     "oss_key_id": str,
+diff --git a/dvc/dependency/__init__.py b/dvc/dependency/__init__.py
+--- a/dvc/dependency/__init__.py
++++ b/dvc/dependency/__init__.py
+@@ -13,6 +13,7 @@
+ from dvc.dependency.ssh import SSHDependency
+ from dvc.dependency.webdav import WebDAVDependency
+ from dvc.dependency.webdavs import WebDAVSDependency
++from dvc.dependency.webhdfs import WebHDFSDependency
+ from dvc.output.base import BaseOutput
+ from dvc.scheme import Schemes
+ 
+@@ -28,7 +29,8 @@
+     S3Dependency,
+     SSHDependency,
+     WebDAVDependency,
+-    WebDAVSDependency
++    WebDAVSDependency,
++    WebHDFSDependency,
+     # NOTE: LocalDependency is the default choice
+ ]
+ 
+@@ -43,6 +45,7 @@
+     Schemes.HTTPS: HTTPSDependency,
+     Schemes.WEBDAV: WebDAVDependency,
+     Schemes.WEBDAVS: WebDAVSDependency,
++    Schemes.WEBHDFS: WebHDFSDependency,
+ }
+ 
+ 
+diff --git a/dvc/dependency/webhdfs.py b/dvc/dependency/webhdfs.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/dependency/webhdfs.py
+@@ -0,0 +1,6 @@
++from dvc.dependency.base import BaseDependency
++from dvc.output.webhdfs import WebHDFSOutput
++
++
++class WebHDFSDependency(BaseDependency, WebHDFSOutput):
++    pass
+diff --git a/dvc/output/__init__.py b/dvc/output/__init__.py
+--- a/dvc/output/__init__.py
++++ b/dvc/output/__init__.py
+@@ -11,18 +11,21 @@
+ from dvc.output.local import LocalOutput
+ from dvc.output.s3 import S3Output
+ from dvc.output.ssh import SSHOutput
++from dvc.output.webhdfs import WebHDFSOutput
+ from dvc.scheme import Schemes
+ 
+ from ..tree import get_cloud_tree
+ from ..tree.hdfs import HDFSTree
+ from ..tree.local import LocalTree
+ from ..tree.s3 import S3Tree
++from ..tree.webhdfs import WebHDFSTree
+ 
+ OUTS = [
+     HDFSOutput,
+     S3Output,
+     GSOutput,
+     SSHOutput,
++    WebHDFSOutput,
+     # NOTE: LocalOutput is the default choice
+ ]
+ 
+@@ -32,6 +35,7 @@
+     Schemes.GS: GSOutput,
+     Schemes.SSH: SSHOutput,
+     Schemes.LOCAL: LocalOutput,
++    Schemes.WEBHDFS: WebHDFSOutput,
+ }
+ 
+ CHECKSUM_SCHEMA = Any(
+@@ -52,6 +56,7 @@
+     LocalTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
+     S3Tree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
+     HDFSTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
++    WebHDFSTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
+ }
+ 
+ SCHEMA = CHECKSUMS_SCHEMA.copy()
+diff --git a/dvc/output/webhdfs.py b/dvc/output/webhdfs.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/output/webhdfs.py
+@@ -0,0 +1,7 @@
++from dvc.output.base import BaseOutput
++
++from ..tree.webhdfs import WebHDFSTree
++
++
++class WebHDFSOutput(BaseOutput):
++    TREE_CLS = WebHDFSTree
+diff --git a/dvc/scheme.py b/dvc/scheme.py
+--- a/dvc/scheme.py
++++ b/dvc/scheme.py
+@@ -1,6 +1,7 @@
+ class Schemes:
+     SSH = "ssh"
+     HDFS = "hdfs"
++    WEBHDFS = "webhdfs"
+     S3 = "s3"
+     AZURE = "azure"
+     HTTP = "http"
+diff --git a/dvc/tree/__init__.py b/dvc/tree/__init__.py
+--- a/dvc/tree/__init__.py
++++ b/dvc/tree/__init__.py
+@@ -13,6 +13,7 @@
+ from .ssh import SSHTree
+ from .webdav import WebDAVTree
+ from .webdavs import WebDAVSTree
++from .webhdfs import WebHDFSTree
+ 
+ TREES = [
+     AzureTree,
+@@ -26,6 +27,7 @@
+     OSSTree,
+     WebDAVTree,
+     WebDAVSTree,
++    WebHDFSTree
+     # NOTE: LocalTree is the default
+ ]
+ 
+diff --git a/dvc/tree/webhdfs.py b/dvc/tree/webhdfs.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/tree/webhdfs.py
+@@ -0,0 +1,164 @@
++import logging
++import os
++import threading
++from contextlib import contextmanager
++from urllib.parse import urlparse
++
++from funcy import cached_property, wrap_prop
++
++from dvc.hash_info import HashInfo
++from dvc.path_info import CloudURLInfo
++from dvc.progress import Tqdm
++from dvc.scheme import Schemes
++
++from .base import BaseTree
++
++logger = logging.getLogger(__name__)
++
++
++def update_pbar(pbar, total):
++    """Update pbar to accept the two arguments passed by hdfs"""
++
++    def update(_, bytes_transfered):
++        if bytes_transfered == -1:
++            pbar.update_to(total)
++            return
++        pbar.update_to(bytes_transfered)
++
++    return update
++
++
++class WebHDFSTree(BaseTree):
++    scheme = Schemes.WEBHDFS
++    PATH_CLS = CloudURLInfo
++    REQUIRES = {"hdfs": "hdfs"}
++    PARAM_CHECKSUM = "checksum"
++
++    def __init__(self, repo, config):
++        super().__init__(repo, config)
++
++        self.path_info = None
++        url = config.get("url")
++        if not url:
++            return
++
++        parsed = urlparse(url)
++        user = parsed.username or config.get("user")
++
++        self.path_info = self.PATH_CLS.from_parts(
++            scheme="webhdfs",
++            host=parsed.hostname,
++            user=user,
++            port=parsed.port,
++            path=parsed.path,
++        )
++
++        self.hdfscli_config = config.get("hdfscli_config")
++        self.token = config.get("webhdfs_token")
++        self.alias = config.get("webhdfs_alias")
++
++    @wrap_prop(threading.Lock())
++    @cached_property
++    def hdfs_client(self):
++        import hdfs
++
++        logger.debug("URL: %s", self.path_info)
++        logger.debug("HDFSConfig: %s", self.hdfscli_config)
++
++        try:
++            return hdfs.config.Config(self.hdfscli_config).get_client(
++                self.alias
++            )
++        except hdfs.util.HdfsError as exc:
++            exc_msg = str(exc)
++            errors = (
++                "No alias specified",
++                "Invalid configuration file",
++                f"Alias {self.alias} not found",
++            )
++            if not any(err in exc_msg for err in errors):
++                raise
++
++            http_url = f"http://{self.path_info.host}:{self.path_info.port}"
++
++            if self.token is not None:
++                client = hdfs.TokenClient(http_url, token=self.token, root="/")
++            else:
++                client = hdfs.InsecureClient(
++                    http_url, user=self.path_info.user, root="/"
++                )
++
++        return client
++
++    @contextmanager
++    def open(self, path_info, mode="r", encoding=None):
++        assert mode in {"r", "rt", "rb"}
++
++        with self.hdfs_client.read(
++            path_info.path, encoding=encoding
++        ) as reader:
++            yield reader.read()
++
++    def walk_files(self, path_info, **kwargs):
++        if not self.exists(path_info):
++            return
++
++        root = path_info.path
++        for path, _, files in self.hdfs_client.walk(root):
++            for file_ in files:
++                path = os.path.join(path, file_)
++                yield path_info.replace(path=path)
++
++    def remove(self, path_info):
++        if path_info.scheme != self.scheme:
++            raise NotImplementedError
++
++        self.hdfs_client.delete(path_info.path)
++
++    def exists(self, path_info, use_dvcignore=True):
++        assert not isinstance(path_info, list)
++        assert path_info.scheme == "webhdfs"
++
++        status = self.hdfs_client.status(path_info.path, strict=False)
++        return status is not None
++
++    def get_file_hash(self, path_info):
++        checksum = self.hdfs_client.checksum(path_info.path)
++        hash_info = HashInfo(self.PARAM_CHECKSUM, checksum["bytes"])
++
++        hash_info.size = self.hdfs_client.status(path_info.path)["length"]
++        return hash_info
++
++    def copy(self, from_info, to_info, **_kwargs):
++        with self.hdfs_client.read(from_info.path) as reader:
++            content = reader.read()
++        self.hdfs_client.write(to_info.path, data=content)
++
++    def move(self, from_info, to_info, mode=None):
++        self.hdfs_client.makedirs(to_info.parent.path)
++        self.hdfs_client.rename(from_info.path, to_info.path)
++
++    def _upload(
++        self, from_file, to_info, name=None, no_progress_bar=False, **_kwargs
++    ):
++        total = os.path.getsize(from_file)
++        with Tqdm(
++            desc=name, total=total, disable=no_progress_bar, bytes=True
++        ) as pbar:
++            self.hdfs_client.upload(
++                to_info.path,
++                from_file,
++                overwrite=True,
++                progress=update_pbar(pbar, total),
++            )
++
++    def _download(
++        self, from_info, to_file, name=None, no_progress_bar=False, **_kwargs
++    ):
++        total = self.hdfs_client.status(from_info.path)["length"]
++        with Tqdm(
++            desc=name, total=total, disable=no_progress_bar, bytes=True
++        ) as pbar:
++            self.hdfs_client.download(
++                from_info.path, to_file, progress=update_pbar(pbar, total)
++            )
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -98,13 +98,14 @@ def run(self):
+ 
+ # Remove the env marker if/when pyarrow is available for Python3.9
+ hdfs = ["pyarrow>=2.0.0;  python_version < '3.9'"]
++webhdfs = ["hdfs==2.5.8"]
+ webdav = ["webdavclient3>=3.14.5"]
+ # gssapi should not be included in all_remotes, because it doesn't have wheels
+ # for linux and mac, so it will fail to compile if user doesn't have all the
+ # requirements, including kerberos itself. Once all the wheels are available,
+ # we can start shipping it by default.
+ ssh_gssapi = ["paramiko[invoke,gssapi]>=2.7.0"]
+-all_remotes = gs + s3 + azure + ssh + oss + gdrive + hdfs + webdav
++all_remotes = gs + s3 + azure + ssh + oss + gdrive + hdfs + webhdfs + webdav
+ 
+ # Extra dependecies to run tests
+ tests_requirements = [
+@@ -173,6 +174,7 @@ def run(self):
+         "ssh": ssh,
+         "ssh_gssapi": ssh_gssapi,
+         "hdfs": hdfs,
++        "webhdfs": webhdfs,
+         "webdav": webdav,
+         "tests": tests_requirements,
+     },

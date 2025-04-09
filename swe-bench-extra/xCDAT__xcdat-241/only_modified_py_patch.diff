@@ -1,0 +1,126 @@
+diff --git a/xcdat/bounds.py b/xcdat/bounds.py
+index 0d81742..0b011fe 100644
+--- a/xcdat/bounds.py
++++ b/xcdat/bounds.py
+@@ -1,9 +1,12 @@
+ """Bounds module for functions related to coordinate bounds."""
+ import collections
++import warnings
+ from typing import Dict, List, Literal, Optional
+ 
+ import cf_xarray as cfxr  # noqa: F401
++import cftime
+ import numpy as np
++import pandas as pd
+ import xarray as xr
+ 
+ from xcdat.axis import GENERIC_AXIS_MAP
+@@ -253,13 +256,32 @@ class BoundsAccessor:
+         diffs = da_coord.diff(dim).values
+ 
+         # Add beginning and end points to account for lower and upper bounds.
++        # np.array of string values with `dtype="timedelta64[ns]"`
+         diffs = np.insert(diffs, 0, diffs[0])
+         diffs = np.append(diffs, diffs[-1])
+ 
+-        # Get lower and upper bounds by using the width relative to nearest point.
++        # In xarray and xCDAT, time coordinates with non-CF compliant calendars
++        # (360-day, noleap) and/or units ("months", "years") are decoded using
++        # `cftime` objects instead of `datetime` objects. `cftime` objects only
++        # support arithmetic using `timedelta` objects, so the values of `diffs`
++        # must be casted from `dtype="timedelta64[ns]"` to `timedelta`.
++        if da_coord.name in ("T", "time") and issubclass(
++            type(da_coord.values[0]), cftime.datetime
++        ):
++            diffs = pd.to_timedelta(diffs)
++
++        # FIXME: These lines produces the warning: `PerformanceWarning:
++        # Adding/subtracting object-dtype array to TimedeltaArray not
++        # vectorized` after converting diffs to `timedelta`. I (Tom) was not
++        # able to find an alternative, vectorized solution at the time of this
++        # implementation.
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", category=pd.errors.PerformanceWarning)
++            # Get lower and upper bounds by using the width relative to nearest point.
++            lower_bounds = da_coord - diffs[:-1] * width
++            upper_bounds = da_coord + diffs[1:] * (1 - width)
++
+         # Transpose both bound arrays into a 2D array.
+-        lower_bounds = da_coord - diffs[:-1] * width
+-        upper_bounds = da_coord + diffs[1:] * (1 - width)
+         bounds = np.array([lower_bounds, upper_bounds]).transpose()
+ 
+         # Clip latitude bounds at (-90, 90)
+diff --git a/xcdat/dataset.py b/xcdat/dataset.py
+index eddc9bb..0c7e3c5 100644
+--- a/xcdat/dataset.py
++++ b/xcdat/dataset.py
+@@ -457,7 +457,7 @@ def _postprocess_dataset(
+ 
+     if center_times:
+         if dataset.cf.dims.get("T") is not None:
+-            dataset = dataset.temporal.center_times(dataset)
++            dataset = dataset.temporal.center_times()
+         else:
+             raise ValueError("This dataset does not have a time coordinates to center.")
+ 
+diff --git a/xcdat/temporal.py b/xcdat/temporal.py
+index 20baec6..4a6078c 100644
+--- a/xcdat/temporal.py
++++ b/xcdat/temporal.py
+@@ -677,7 +677,7 @@ class TemporalAccessor:
+ 
+         return ds_departs
+ 
+-    def center_times(self, dataset: xr.Dataset) -> xr.Dataset:
++    def center_times(self) -> xr.Dataset:
+         """Centers the time coordinates using the midpoint between time bounds.
+ 
+         Time coordinates can be recorded using different intervals, including
+@@ -695,12 +695,9 @@ class TemporalAccessor:
+         xr.Dataset
+             The Dataset with centered time coordinates.
+         """
+-        ds = dataset.copy()
+-
+-        if hasattr(self, "_time_bounds") is False:
+-            self._time_bounds = ds.bounds.get_bounds("time")
++        ds = self._dataset.copy()
++        time_bounds = ds.bounds.get_bounds("time")
+ 
+-        time_bounds = self._time_bounds.copy()
+         lower_bounds, upper_bounds = (time_bounds[:, 0].data, time_bounds[:, 1].data)
+         bounds_diffs: np.timedelta64 = (upper_bounds - lower_bounds) / 2
+         bounds_mids: np.ndarray = lower_bounds + bounds_diffs
+@@ -842,7 +839,7 @@ class TemporalAccessor:
+         ds = self._dataset.copy()
+ 
+         if self._center_times:
+-            ds = self.center_times(ds)
++            ds = self.center_times()
+ 
+         if (
+             self._freq == "season"
+@@ -1393,14 +1390,14 @@ class TemporalAccessor:
+                 self._time_bounds[:, 1] - self._time_bounds[:, 0]
+             )
+ 
+-        # Must be convert dtype from timedelta64[ns] to float64, specifically
+-        # when chunking DataArrays using Dask. Otherwise, the numpy warning
+-        # below is thrown: `DeprecationWarning: The `dtype` and `signature`
+-        # arguments to ufuncs only select the general DType and not details such
+-        # as the byte order or time unit (with rare exceptions see release
+-        # notes). To avoid this warning please use the scalar types
+-        # `np.float64`, or string notation.`
++        # Must be cast dtype from "timedelta64[ns]" to "float64", specifically
++        # when using Dask arrays. Otherwise, the numpy warning below is thrown:
++        # `DeprecationWarning: The `dtype` and `signature` arguments to ufuncs
++        # only select the general DType and not details such as the byte order
++        # or time unit (with rare exceptions see release notes). To avoid this
++        # warning please use the scalar types `np.float64`, or string notation.`
+         time_lengths = time_lengths.astype(np.float64)
++
+         grouped_time_lengths = self._group_data(time_lengths)
+         weights: xr.DataArray = grouped_time_lengths / grouped_time_lengths.sum()  # type: ignore
+ 
+

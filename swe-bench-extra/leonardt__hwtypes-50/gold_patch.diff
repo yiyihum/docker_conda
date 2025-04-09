@@ -1,0 +1,168 @@
+diff --git a/hwtypes/bit_vector.py b/hwtypes/bit_vector.py
+index 885b2cb..e7f0010 100644
+--- a/hwtypes/bit_vector.py
++++ b/hwtypes/bit_vector.py
+@@ -175,6 +175,10 @@ class BitVector(AbstractBitVector):
+     def __repr__(self):
+         return "BitVector[{size}]({value})".format(value=self._value, size=self.size)
+ 
++    @property
++    def value(self):
++        return self._value
++
+     def __setitem__(self, index, value):
+         if isinstance(index, slice):
+             raise NotImplementedError()
+@@ -211,10 +215,11 @@ class BitVector(AbstractBitVector):
+     def __len__(self):
+         return self.size
+ 
+-    # Note: In concat(x, y), the MSB of the result is the MSB of x.
+-    @classmethod
+-    def concat(cls, x, y):
+-        return cls.unsized_t[x.size+y.size](y.bits() + x.bits())
++    def concat(self, other):
++        T = type(self).unsized_t
++        if not isinstance(other, T):
++            raise TypeError(f'value must of type {T}')
++        return T[self.size+other.size](self.value | (other.value << self.size))
+ 
+     def bvnot(self):
+         return type(self)(~self.as_uint())
+@@ -246,12 +251,12 @@ class BitVector(AbstractBitVector):
+     @bv_cast
+     def bvrol(self, other):
+         other = other.as_uint() % len(self)
+-        return self.concat( self[other:], self[0:other] )
++        return self[:other].concat(self[other:])
+ 
+     @bv_cast
+     def bvror(self, other):
+         other = (len(self) - other.as_uint()) % len(self)
+-        return self.concat( self[other:], self[0:other] )
++        return self[:other].concat(self[other:])
+ 
+     @bv_cast
+     def bvcomp(self, other):
+@@ -400,7 +405,7 @@ class BitVector(AbstractBitVector):
+             raise ValueError()
+ 
+         T = type(self).unsized_t
+-        return T.concat(T[1](self[-1]).repeat(ext), self)
++        return self.concat(T[1](self[-1]).repeat(ext))
+ 
+     def ext(self, ext):
+         return self.zext(other)
+@@ -411,7 +416,7 @@ class BitVector(AbstractBitVector):
+             raise ValueError()
+ 
+         T = type(self).unsized_t
+-        return T.concat(T[ext](0), self)
++        return self.concat(T[ext](0))
+ 
+     @staticmethod
+     def random(width):
+diff --git a/hwtypes/bit_vector_abc.py b/hwtypes/bit_vector_abc.py
+index 616ee76..1521849 100644
+--- a/hwtypes/bit_vector_abc.py
++++ b/hwtypes/bit_vector_abc.py
+@@ -176,10 +176,8 @@ class AbstractBitVector(metaclass=AbstractBitVectorMeta):
+     def __len__(self) -> int:
+         pass
+ 
+-    #could still be staticmethod but I think thats annoying
+-    @classmethod
+     @abstractmethod
+-    def concat(cls, x, y) -> 'AbstractBitVector':
++    def concat(self, other) -> 'AbstractBitVector':
+         pass
+ 
+     @abstractmethod
+diff --git a/hwtypes/fp_vector.py b/hwtypes/fp_vector.py
+index 9fd7320..3e1f0f0 100644
+--- a/hwtypes/fp_vector.py
++++ b/hwtypes/fp_vector.py
+@@ -269,15 +269,15 @@ class FPVector(AbstractFPVector):
+         sign_bit = BitVector[1](gmpy2.is_signed(self._value))
+ 
+         if self.fp_is_zero():
+-            return BitVector.concat(sign_bit, BitVector[cls.size-1](0))
++            return BitVector[cls.size-1](0).concat(sign_bit)
+         elif self.fp_is_infinite():
+             exp_bits = BitVector[cls.exponent_size](-1)
+             mantissa_bits = BitVector[cls.mantissa_size](0)
+-            return BitVector.concat(BitVector.concat(sign_bit, exp_bits), mantissa_bits)
++            return mantissa_bits.concat(exp_bits).concat(sign_bit)
+         elif self.fp_is_NaN():
+             exp_bits = BitVector[cls.exponent_size](-1)
+             mantissa_bits = BitVector[cls.mantissa_size](1)
+-            return BitVector.concat(BitVector.concat(sign_bit, exp_bits), mantissa_bits)
++            return mantissa_bits.concat(exp_bits).concat(sign_bit)
+ 
+ 
+         bias = (1 << (cls.exponent_size - 1)) - 1
+@@ -307,7 +307,7 @@ class FPVector(AbstractFPVector):
+             mantissa = BitVector[cls.mantissa_size+1](mantissa_int)
+         exp_bits = BitVector[cls.exponent_size](exp)
+         mantissa_bits = mantissa[:cls.mantissa_size]
+-        return BitVector.concat(BitVector.concat(sign_bit, exp_bits), mantissa_bits)
++        return mantissa_bits.concat(exp_bits).concat(sign_bit)
+ 
+     @classmethod
+     @set_context
+diff --git a/hwtypes/smt_bit_vector.py b/hwtypes/smt_bit_vector.py
+index 892dcdc..0b46323 100644
+--- a/hwtypes/smt_bit_vector.py
++++ b/hwtypes/smt_bit_vector.py
+@@ -231,7 +231,7 @@ class SMTBitVector(AbstractBitVector):
+                 raise ValueError('Iterable is not the correct size')
+             cls = type(self)
+             B1 = cls.unsized_t[1]
+-            self._value = ft.reduce(cls.concat, map(B1, reversed(value))).value
++            self._value = ft.reduce(lambda acc, elem : acc.concat(elem), map(B1, value)).value
+         elif isinstance(value, int):
+             self._value =  smt.BV(value % (1 << self.size), self.size)
+ 
+@@ -320,9 +320,11 @@ class SMTBitVector(AbstractBitVector):
+     def __len__(self):
+         return self.size
+ 
+-    @classmethod
+-    def concat(cls, x, y):
+-        return cls.unsized_t[x.size + y.size](smt.BVConcat(x.value, y.value))
++    def concat(self, other):
++        T = type(self).unsized_t
++        if not isinstance(other, T):
++            raise TypeError(f'value must of type {T}')
++        return T[self.size + other.size](smt.BVConcat(other.value, self.value))
+ 
+     def bvnot(self):
+         return type(self)(smt.BVNot(self.value))
+diff --git a/hwtypes/z3_bit_vector.py b/hwtypes/z3_bit_vector.py
+index c555656..9947eb1 100644
+--- a/hwtypes/z3_bit_vector.py
++++ b/hwtypes/z3_bit_vector.py
+@@ -229,7 +229,7 @@ class z3BitVector(AbstractBitVector):
+                 raise ValueError('Iterable is not the correct size')
+             cls = type(self)
+             B1 = cls.unsized_t[1]
+-            self._value = ft.reduce(cls.concat, map(B1, reversed(value))).value
++            self._value = ft.reduce(lambda acc, elem : acc.concat(elem), map(B1, value)).value
+         elif isinstance(value, int):
+             self._value =  z3.BitVecVal(value, self.size)
+ 
+@@ -318,9 +318,11 @@ class z3BitVector(AbstractBitVector):
+     def __len__(self):
+         return self.size
+ 
+-    @classmethod
+-    def concat(cls, x, y):
+-        return cls.unsized_t[x.size + y.size](z3.Concat(x.value, y.value))
++    def concat(self, other):
++        T = type(self).unsized_t
++        if not isinstance(other, T):
++            raise TypeError(f'value must of type {T}')
++        return T[self.size + other.size](z3.Concat(other.value, self.value))
+ 
+     def bvnot(self):
+         return type(self)(~self.value)

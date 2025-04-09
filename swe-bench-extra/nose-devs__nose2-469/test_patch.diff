@@ -1,0 +1,104 @@
+diff --git a/nose2/plugins/doctests.py b/nose2/plugins/doctests.py
+index 20a25e6..af16195 100644
+--- a/nose2/plugins/doctests.py
++++ b/nose2/plugins/doctests.py
+@@ -42,6 +42,9 @@ class DocTestLoader(Plugin):
+             return
+ 
+         name, package_path = util.name_from_path(path)
++        # ignore top-level setup.py which cannot be imported
++        if name == 'setup':
++            return
+         util.ensure_importable(package_path)
+         try:
+             module = util.module_from_name(name)
+diff --git a/nose2/tests/unit/test_doctest_plugin.py b/nose2/tests/unit/test_doctest_plugin.py
+index 79b2967..6ea9344 100644
+--- a/nose2/tests/unit/test_doctest_plugin.py
++++ b/nose2/tests/unit/test_doctest_plugin.py
+@@ -2,6 +2,8 @@
+ import sys
+ import doctest
+ 
++from textwrap import dedent
++
+ from nose2 import events, loader, session
+ from nose2.plugins import doctests
+ from nose2.tests._common import TestCase
+@@ -60,6 +62,22 @@ def func():
+         else:
+             self.assertEqual(event.extraTests, [])
+ 
++    def test_handle_file_python_setup_py(self):
++        # Test calling handleFile on a top-level setup.py file.
++        # The file should be ignored by the plugin as it cannot safely be
++        # imported.
++
++        setup_py = dedent("""\
++            '''
++            >>> never executed
++            '''
++            from setuptools import setup
++            setup(name='foo')
++            """
++        )
++        event = self._handle_file("setup.py", setup_py)
++        self.assertEqual(event.extraTests, [])
++
+     def _handle_file(self, fpath, content):
+         """Have plugin handle a file with certain content.
+ 
+diff --git a/nose2/tests/unit/test_functions_loader.py b/nose2/tests/unit/test_functions_loader.py
+index cf1d6fd..e6fd25d 100644
+--- a/nose2/tests/unit/test_functions_loader.py
++++ b/nose2/tests/unit/test_functions_loader.py
+@@ -1,4 +1,11 @@
+ import unittest
++
++try:
++    from unittest import mock
++except ImportError:
++    # Python versions older than 3.3 don't have mock by default
++    import mock
++
+ from nose2 import events, loader, session
+ from nose2.plugins.loader import functions
+ from nose2.tests._common import TestCase
+@@ -47,3 +54,37 @@ class TestFunctionLoader(TestCase):
+         event = events.LoadFromModuleEvent(self.loader, m)
+         self.session.hooks.loadTestsFromModule(event)
+         self.assertEqual(len(event.extraTests), 0)
++
++    def test_can_load_test_functions_from_name(self):
++        event = events.LoadFromNameEvent(self.loader, __name__+'.func', None)
++        suite = self.session.hooks.loadTestsFromName(event)
++        self.assertNotEqual(suite, None)
++
++    def test_ignores_test_methods_from_name(self):
++        # Should ignore test methods even when specified directly
++        event = events.LoadFromNameEvent(self.loader, __name__+'.Case.test_method', None)
++        suite = self.session.hooks.loadTestsFromName(event)
++        self.assertEqual(suite, None)
++
++    def test_ignores_decorated_test_methods_from_name(self):
++        # Should ignore test methods even when they are of FunctionType
++        event = events.LoadFromNameEvent(self.loader, __name__+'.Case.test_patched', None)
++        suite = self.session.hooks.loadTestsFromName(event)
++        self.assertEqual(suite, None)
++
++
++def func():
++    pass
++
++def dummy():
++    pass
++
++class Case(unittest.TestCase):
++    __test__ = False # do not run this
++
++    def test_method(self):
++        pass
++
++    @mock.patch(__name__+'.dummy')
++    def test_patched(self, mock):
++        pass

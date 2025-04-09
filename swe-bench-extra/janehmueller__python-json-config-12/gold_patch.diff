@@ -1,0 +1,194 @@
+diff --git a/README.md b/README.md
+index 58cf9b3..a4bb335 100644
+--- a/README.md
++++ b/README.md
+@@ -13,26 +13,37 @@ pip install python-json-config
+ # Usage
+ ```
+ from python_json_config import ConfigBuilder
+-from datetime import datetime
++from python_json_config.validators import is_unreserved_port, is_ipv4_address, is_timedelta
++from python_json_config.transformers import to_timedelta
++from datetime import datetime, timedelta
+ 
+ # create config parser
+ builder = ConfigBuilder()
+ 
+ # assert that port contains an int value
++builder.validate_field_type('server.ip', str)
+ builder.validate_field_type('server.port', int)
++builder.validate_field_type('jwt.access_token_expires', str)
+ 
+ # assert that the port is not a reserved port 
+-builder.validate_field_value('server.port', lambda port: port > 1024)
++builder.validate_field_value('server.ip', is_ipv4_address)
++builder.validate_field_value('server.port', is_unreserved_port)
++builder.validate_field_value('jwt.access_token_expires', is_timedelta)
+ 
+-# parse a date string (e.g., Jun 1 2005) into a datetime object
++# parse a timedelta (e.g., Jun 1 2005) into a datetime object
+ builder.transform_field_value('important_date', lambda date: datetime.strptime(date, '%b %d %Y'))
++builder.transform_field_value('jwt.access_token_expires', to_timedelta)
+ 
+ # parse config
+ config = builder.parse_config('path/to/config.json')
+ 
+ # access config values
+ port = config.server.port
+-assert isinstance(port, int)
++assert port > 1024
++
+ important_date = config.important_date
+ assert isinstance(important_date, datetime)
++
++jwt_access_token_expires = config.jwt.access_token_expires
++assert isinstance(jwt_access_token_expires, timedelta)
+ ```
+diff --git a/python_json_config/__init__.py b/python_json_config/__init__.py
+index 0783796..567dcba 100644
+--- a/python_json_config/__init__.py
++++ b/python_json_config/__init__.py
+@@ -1,4 +1,7 @@
+ from .config_node import Config
+ from .config_builder import ConfigBuilder
+ 
+-__all__ = ['Config', 'ConfigBuilder']
++__all__ = [
++    'Config',
++    'ConfigBuilder'
++]
+diff --git a/python_json_config/transformers/__init__.py b/python_json_config/transformers/__init__.py
+new file mode 100644
+index 0000000..bb32639
+--- /dev/null
++++ b/python_json_config/transformers/__init__.py
+@@ -0,0 +1,5 @@
++from .generic_transformers import to_timedelta
++
++__all__ = [
++    'to_timedelta'
++]
+diff --git a/python_json_config/transformers/generic_transformers.py b/python_json_config/transformers/generic_transformers.py
+new file mode 100644
+index 0000000..5fd0f46
+--- /dev/null
++++ b/python_json_config/transformers/generic_transformers.py
+@@ -0,0 +1,33 @@
++from datetime import timedelta
++
++
++def to_timedelta(value: str):
++    """
++    Converts the given value into a timedelta object.
++    The timedelta needs to be specified as a colon separated string, e.g.: "0:0:23:00:00"
++        The format is as follows "WW:DD:HH:MM:SS"
++        W = number of months
++        D = number of days
++        H = number of hours
++        M = number of minutes
++        S = number of seconds
++
++    :param value: The timedelta as string.
++    :return: A timedelta value representing the timespan that is specified.
++    """
++    split_values = value.split(':')
++
++    try:
++        int_values = [int(element) for element in split_values]
++    except ValueError:
++        return None
++
++    if len(int_values) <= 5:
++        padded_values = [0] * (5 - len(int_values)) + int_values
++        return timedelta(
++            weeks=padded_values[0],
++            days=padded_values[1],
++            hours=padded_values[2],
++            minutes=padded_values[3],
++            seconds=padded_values[4],
++        )
+diff --git a/python_json_config/validators/__init__.py b/python_json_config/validators/__init__.py
+new file mode 100644
+index 0000000..07a7938
+--- /dev/null
++++ b/python_json_config/validators/__init__.py
+@@ -0,0 +1,9 @@
++from .network_validators import is_ipv4_address, is_unreserved_port
++from .generic_validators import is_timedelta, is_valid_choice
++
++__all__ = [
++    'is_timedelta',
++    'is_valid_choice',
++    'is_ipv4_address',
++    'is_unreserved_port'
++]
+diff --git a/python_json_config/validators/generic_validators.py b/python_json_config/validators/generic_validators.py
+new file mode 100644
+index 0000000..4914b03
+--- /dev/null
++++ b/python_json_config/validators/generic_validators.py
+@@ -0,0 +1,35 @@
++def is_timedelta(value: str) -> bool:
++    """
++    Tests if the given value is a valid timedelta specification.
++    The timedelta needs to be specified as a colon separated string, e.g.: "0:0:23:00:00"
++        The format is as follows "WW:DD:HH:MM:SS"
++        W = number of months
++        D = number of days
++        H = number of hours
++        M = number of minutes
++        S = number of seconds
++    :param value: The timedelta as string.
++    :return: True if the value is a valid timedelta specification otherwise False.
++    """
++    split_values = value.split(':')
++    if len(split_values) > 5:
++        return False
++
++    try:
++        [int(element) for element in split_values]
++    except ValueError:
++        return False
++
++    return True
++
++def is_valid_choice(options):
++    """
++    Returns a function that tests if the config value is an element of the passed options.
++    :param options: The options that are considered as valid choices.
++    :return: A functions that takes a value and tests if it is within the specified choices. This function returns True
++             if the value in the config is in the passed options.
++    """
++    def validator(value):
++        return value in options
++
++    return validator
+diff --git a/python_json_config/validators/network_validators.py b/python_json_config/validators/network_validators.py
+new file mode 100644
+index 0000000..6579ccf
+--- /dev/null
++++ b/python_json_config/validators/network_validators.py
+@@ -0,0 +1,23 @@
++import socket
++
++
++def is_ipv4_address(ip_address: str):
++    """
++    Tests if the given value is a valid IPv4 address
++    :param ip_address: The ip address that is tested.
++    :return: True if the passed address is a valid IPv4 address otherwise False.
++    """
++    try:
++        socket.inet_aton(ip_address)
++        return True
++    except socket.error:
++        return False
++
++
++def is_unreserved_port(port: int):
++    """
++    Tests if the given port is an unreserved port.
++    :param port: The port that is tested.
++    :return: True if the port is not reserved otherwise False.
++    """
++    return port > 1023

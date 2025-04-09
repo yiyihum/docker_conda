@@ -1,0 +1,234 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index cfc7f74..d885c34 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -28,7 +28,7 @@ repos:
+       - id: isort
+ 
+   - repo: https://github.com/pre-commit/pygrep-hooks
+-    rev: v1.4.4
++    rev: v1.5.1
+     hooks:
+       - id: python-check-blanket-noqa
+ 
+diff --git a/LICENCE b/LICENCE
+index 5a60037..e068795 100644
+--- a/LICENCE
++++ b/LICENCE
+@@ -1,4 +1,4 @@
+-Copyright (c) 2010 Jason Moiron and Contributors
++Copyright (c) 2010-2020 Jason Moiron and Contributors
+ 
+ Permission is hereby granted, free of charge, to any person obtaining
+ a copy of this software and associated documentation files (the
+diff --git a/README.md b/README.md
+index 4201fe1..1398875 100644
+--- a/README.md
++++ b/README.md
+@@ -30,7 +30,7 @@ readable size or throughput. It is localized to:
+ 
+ ## Usage
+ 
+-Integer humanization:
++### Integer humanization
+ 
+ ```pycon
+ >>> import humanize
+@@ -46,7 +46,7 @@ Integer humanization:
+ '41'
+ ```
+ 
+-Date & time humanization:
++### Date & time humanization
+ 
+ ```pycon
+ >>> import humanize
+@@ -67,7 +67,35 @@ Date & time humanization:
+ 'an hour ago'
+ ```
+ 
+-File size humanization:
++#### Smaller units
++
++If seconds are too large, set `minimum_unit` to milliseconds or microseconds:
++
++```pycon
++>>> import humanize
++>>> import datetime as dt
++>>> humanize.naturaldelta(dt.timedelta(seconds=2))
++'2 seconds'
++```
++```pycon
++>>> delta = dt.timedelta(milliseconds=4)
++>>> humanize.naturaldelta(delta)
++'a moment'
++>>> humanize.naturaldelta(delta, minimum_unit="milliseconds")
++'4 milliseconds'
++>>> humanize.naturaldelta(delta, minimum_unit="microseconds")
++'4000 microseconds'
++```
++```pycon
++>>> humanize.naturaltime(delta)
++'now'
++>>> humanize.naturaltime(delta, minimum_unit="milliseconds")
++'4 milliseconds ago'
++>>> humanize.naturaltime(delta, minimum_unit="microseconds")
++'4000 microseconds ago'
++```
++
++### File size humanization
+ 
+ ```pycon
+ >>> import humanize
+@@ -79,7 +107,7 @@ File size humanization:
+ '976.6K'
+ ```
+ 
+-Human readable floating point numbers:
++### Human-readable floating point numbers
+ 
+ ```pycon
+ >>> import humanize
+diff --git a/setup.cfg b/setup.cfg
+index e7f6993..1fdc9cd 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -2,7 +2,7 @@
+ max_line_length = 88
+ 
+ [tool:isort]
+-known_third_party = freezegun,humanize,pkg_resources,setuptools
++known_third_party = freezegun,humanize,pkg_resources,pytest,setuptools
+ force_grid_wrap = 0
+ include_trailing_comma = True
+ line_length = 88
+diff --git a/src/humanize/time.py b/src/humanize/time.py
+index 5e90610..7f68ff9 100644
+--- a/src/humanize/time.py
++++ b/src/humanize/time.py
+@@ -4,6 +4,7 @@
+ ``contrib.humanize``."""
+ 
+ import datetime as dt
++from enum import Enum
+ 
+ from .i18n import gettext as _
+ from .i18n import ngettext
+@@ -11,6 +12,12 @@ from .i18n import ngettext
+ __all__ = ["naturaldelta", "naturaltime", "naturalday", "naturaldate"]
+ 
+ 
++class Unit(Enum):
++    MILLISECONDS = 0
++    MICROSECONDS = 1
++    SECONDS = 2
++
++
+ def _now():
+     return dt.datetime.now()
+ 
+@@ -24,10 +31,11 @@ def abs_timedelta(delta):
+     return delta
+ 
+ 
+-def date_and_delta(value):
++def date_and_delta(value, *, now=None):
+     """Turn a value into a date and a timedelta which represents how long ago
+     it was.  If that's not possible, return (None, value)."""
+-    now = _now()
++    if not now:
++        now = _now()
+     if isinstance(value, dt.datetime):
+         date = value
+         delta = now - value
+@@ -44,12 +52,22 @@ def date_and_delta(value):
+     return date, abs_timedelta(delta)
+ 
+ 
+-def naturaldelta(value, months=True):
+-    """Given a timedelta or a number of seconds, return a natural
+-    representation of the amount of time elapsed.  This is similar to
+-    ``naturaltime``, but does not add tense to the result.  If ``months``
+-    is True, then a number of months (based on 30.5 days) will be used
+-    for fuzziness between years."""
++def naturaldelta(value, months=True, minimum_unit="seconds"):
++    """Return a natural representation of a timedelta or number of seconds.
++
++    This is similar to naturaltime, but does not add tense to the result.
++
++    Args:
++        value: A timedelta or a number of seconds.
++        months: If True, then a number of months (based on 30.5 days) will be used for
++            fuzziness between years.
++        minimum_unit: If microseconds or milliseconds, use those units for subsecond
++            deltas.
++
++    Returns:
++        str: A natural representation of the amount of time elapsed.
++    """
++    minimum_unit = Unit[minimum_unit.upper()]
+     date, delta = date_and_delta(value)
+     if date is None:
+         return value
+@@ -64,6 +82,17 @@ def naturaldelta(value, months=True):
+ 
+     if not years and days < 1:
+         if seconds == 0:
++            if minimum_unit == Unit.MICROSECONDS:
++                return (
++                    ngettext("%d microsecond", "%d microseconds", delta.microseconds)
++                    % delta.microseconds
++                )
++            elif minimum_unit == Unit.MILLISECONDS:
++                milliseconds = delta.microseconds / 1000
++                return (
++                    ngettext("%d millisecond", "%d milliseconds", milliseconds)
++                    % milliseconds
++                )
+             return _("a moment")
+         elif seconds == 1:
+             return _("a second")
+@@ -109,15 +138,26 @@ def naturaldelta(value, months=True):
+         return ngettext("%d year", "%d years", years) % years
+ 
+ 
+-def naturaltime(value, future=False, months=True):
+-    """Given a datetime or a number of seconds, return a natural representation
+-    of that time in a resolution that makes sense.  This is more or less
+-    compatible with Django's ``naturaltime`` filter.  ``future`` is ignored for
+-    datetimes, where the tense is always figured out based on the current time.
+-    If an integer is passed, the return value will be past tense by default,
+-    unless ``future`` is set to True."""
++def naturaltime(value, future=False, months=True, minimum_unit="seconds"):
++    """Return a natural representation of a time in a resolution that makes sense.
++
++    This is more or less compatible with Django's naturaltime filter.
++
++    Args:
++        value: A timedate or a number of seconds.
++        future: Ignored for datetimes, where the tense is always figured out based on
++            the current time. For integers, the return value will be past tense by
++            default, unless future is True.
++        months: If True, then a number of months (based on 30.5 days) will be used for
++            fuzziness between years.
++        minimum_unit: If microseconds or milliseconds, use those units for subsecond
++            times.
++
++    Returns:
++        str: A natural representation of the input in a resolution that makes sense.
++    """
+     now = _now()
+-    date, delta = date_and_delta(value)
++    date, delta = date_and_delta(value, now=now)
+     if date is None:
+         return value
+     # determine tense by value only if datetime/timedelta were passed
+@@ -125,7 +165,7 @@ def naturaltime(value, future=False, months=True):
+         future = date > now
+ 
+     ago = _("%s from now") if future else _("%s ago")
+-    delta = naturaldelta(delta, months)
++    delta = naturaldelta(delta, months, minimum_unit)
+ 
+     if delta == _("a moment"):
+         return _("now")

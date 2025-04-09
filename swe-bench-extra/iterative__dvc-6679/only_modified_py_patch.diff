@@ -1,0 +1,429 @@
+diff --git a/dvc/dvcfile.py b/dvc/dvcfile.py
+--- a/dvc/dvcfile.py
++++ b/dvc/dvcfile.py
+@@ -1,7 +1,7 @@
+ import contextlib
+ import logging
+ import os
+-from typing import TYPE_CHECKING, Any, Callable, Tuple, Type, TypeVar, Union
++from typing import TYPE_CHECKING, Any, Callable, Tuple, TypeVar, Union
+ 
+ from dvc.exceptions import DvcException
+ from dvc.parsing.versions import LOCKFILE_VERSION, SCHEMA_KWD
+@@ -9,14 +9,12 @@
+ from dvc.stage.exceptions import (
+     StageFileBadNameError,
+     StageFileDoesNotExistError,
+-    StageFileFormatError,
+     StageFileIsNotDvcFileError,
+ )
+ from dvc.types import AnyPath
+ from dvc.utils import relpath
+ from dvc.utils.collections import apply_diff
+ from dvc.utils.serialize import dump_yaml, modify_yaml
+-from dvc.utils.strictyaml import YAMLValidationError
+ 
+ if TYPE_CHECKING:
+     from dvc.repo import Repo
+@@ -39,11 +37,6 @@ def __init__(self, path, pipeline_file=False):
+         )
+ 
+ 
+-class LockfileCorruptedError(DvcException):
+-    def __init__(self, path):
+-        super().__init__(f"Lockfile '{path}' is corrupted.")
+-
+-
+ class ParametrizedDumpError(DvcException):
+     pass
+ 
+@@ -92,7 +85,6 @@ def check_dvcfile_path(repo, path):
+ 
+ class FileMixin:
+     SCHEMA: Callable[[_T], _T]
+-    ValidationError: Type[DvcException] = StageFileFormatError
+ 
+     def __init__(self, repo, path, verify=True, **kwargs):
+         self.repo = repo
+@@ -134,7 +126,11 @@ def _check_gitignored(self):
+         if self._is_git_ignored():
+             raise FileIsGitIgnored(self.path)
+ 
+-    def _load(self) -> Tuple[Any, str]:
++    def load(self, **kwargs: Any) -> Any:
++        d, _ = self._load(**kwargs)
++        return d
++
++    def _load(self, **kwargs: Any) -> Tuple[Any, str]:
+         # it raises the proper exceptions by priority:
+         # 1. when the file doesn't exists
+         # 2. filename is not a DVC file
+@@ -151,29 +147,23 @@ def _load(self) -> Tuple[Any, str]:
+             raise StageFileIsNotDvcFileError(self.path)
+ 
+         self._check_gitignored()
+-        return self._load_yaml()
++        return self._load_yaml(**kwargs)
+ 
+     @classmethod
+     def validate(cls, d: _T, fname: str = None) -> _T:
+         from dvc.utils.strictyaml import validate
+ 
+-        try:
+-            return validate(d, cls.SCHEMA)  # type: ignore[arg-type]
+-        except YAMLValidationError as exc:
+-            raise cls.ValidationError(fname) from exc
++        return validate(d, cls.SCHEMA, path=fname)  # type: ignore[arg-type]
+ 
+     def _load_yaml(self, **kwargs: Any) -> Tuple[Any, str]:
+         from dvc.utils import strictyaml
+ 
+-        try:
+-            return strictyaml.load(
+-                self.path,
+-                self.SCHEMA,  # type: ignore[arg-type]
+-                self.repo.fs,
+-                **kwargs,
+-            )
+-        except YAMLValidationError as exc:
+-            raise self.ValidationError(self.relpath) from exc
++        return strictyaml.load(
++            self.path,
++            self.SCHEMA,  # type: ignore[arg-type]
++            self.repo.fs,
++            **kwargs,
++        )
+ 
+     def remove(self, force=False):  # pylint: disable=unused-argument
+         with contextlib.suppress(FileNotFoundError):
+@@ -354,24 +344,19 @@ def lockfile_schema(data: _T) -> _T:
+ 
+ class Lockfile(FileMixin):
+     SCHEMA = staticmethod(lockfile_schema)  # type: ignore[assignment]
+-    ValidationError = LockfileCorruptedError
+ 
+     def _verify_filename(self):
+         pass  # lockfile path is hardcoded, so no need to verify here
+ 
+-    def _load(self):
++    def _load(self, **kwargs: Any):
+         try:
+-            return super()._load()
++            return super()._load(**kwargs)
+         except StageFileDoesNotExistError:
+             # we still need to account for git-ignored dvc.lock file
+             # even though it may not exist or have been .dvcignored
+             self._check_gitignored()
+             return {}, ""
+ 
+-    def load(self):
+-        d, _ = self._load()
+-        return d
+-
+     @property
+     def latest_version_info(self):
+         version = LOCKFILE_VERSION.V2.value  # pylint:disable=no-member
+diff --git a/dvc/schema.py b/dvc/schema.py
+--- a/dvc/schema.py
++++ b/dvc/schema.py
+@@ -1,3 +1,5 @@
++from collections.abc import Mapping
++
+ from voluptuous import Any, Optional, Required, Schema
+ 
+ from dvc import dependency, output
+@@ -94,11 +96,27 @@
+     Optional(StageParams.PARAM_LIVE): Any(str, LIVE_PSTAGE_SCHEMA),
+ }
+ 
++
++def either_or(primary, fallback, fallback_includes=None):
++    def validator(data):
++        schema = primary
++        if (
++            isinstance(data, Mapping)
++            and set(fallback_includes or []) & data.keys()
++        ):
++            schema = fallback
++        return Schema(schema)(data)
++
++    return validator
++
++
+ FOREACH_IN = {
+     Required(FOREACH_KWD): Any(dict, list, str),
+     Required(DO_KWD): STAGE_DEFINITION,
+ }
+-SINGLE_PIPELINE_STAGE_SCHEMA = {str: Any(FOREACH_IN, STAGE_DEFINITION)}
++SINGLE_PIPELINE_STAGE_SCHEMA = {
++    str: either_or(STAGE_DEFINITION, FOREACH_IN, [FOREACH_KWD, DO_KWD])
++}
+ MULTI_STAGE_SCHEMA = {
+     STAGES: SINGLE_PIPELINE_STAGE_SCHEMA,
+     VARS_KWD: VARS_SCHEMA,
+diff --git a/dvc/stage/exceptions.py b/dvc/stage/exceptions.py
+--- a/dvc/stage/exceptions.py
++++ b/dvc/stage/exceptions.py
+@@ -9,11 +9,6 @@ def __init__(self, cmd, status=None):
+         super().__init__(msg)
+ 
+ 
+-class StageFileFormatError(DvcException):
+-    def __init__(self, path):
+-        super().__init__(f"'{path}' format error")
+-
+-
+ class StageFileDoesNotExistError(DvcException):
+     DVC_IGNORED = "is dvc-ignored"
+     DOES_NOT_EXIST = "does not exist"
+diff --git a/dvc/utils/strictyaml.py b/dvc/utils/strictyaml.py
+--- a/dvc/utils/strictyaml.py
++++ b/dvc/utils/strictyaml.py
+@@ -6,42 +6,67 @@
+ 
+ Not to be confused with strictyaml, a python library with similar motivations.
+ """
+-from typing import TYPE_CHECKING, Any, Callable, List, TypeVar
++import re
++import typing
++from contextlib import suppress
++from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, TypeVar
+ 
+-from dvc.exceptions import DvcException, PrettyDvcException
++from dvc.exceptions import PrettyDvcException
+ from dvc.ui import ui
+ from dvc.utils.serialize import (
+     EncodingError,
+     YAMLFileCorruptedError,
+     parse_yaml,
++    parse_yaml_for_update,
+ )
+ 
+ if TYPE_CHECKING:
+     from rich.syntax import Syntax
+     from ruamel.yaml import StreamMark
++    from voluptuous import MultipleInvalid
+ 
+     from dvc.fs.base import BaseFileSystem
+     from dvc.ui import RichText
+ 
+ 
+ _T = TypeVar("_T")
++merge_conflict_marker = re.compile("^([<=>]{7}) .*$", re.MULTILINE)
++
++
++def make_relpath(path: str) -> str:
++    import os
++
++    from dvc.utils import relpath
++
++    rel = relpath(path)
++    prefix = ""
++    if not rel.startswith(".."):
++        prefix = "./" if os.name == "posix" else ".\\"
++    return prefix + rel
++
++
++def _prepare_message(message: str) -> "RichText":
++    return ui.rich_text(message, style="red")
+ 
+ 
+ def _prepare_cause(cause: str) -> "RichText":
+     return ui.rich_text(cause, style="bold")
+ 
+ 
+-def _prepare_code_snippets(code: str, start_line: int = 1) -> "Syntax":
++def _prepare_code_snippets(
++    code: str, start_line: int = 1, **kwargs: Any
++) -> "Syntax":
+     from rich.syntax import Syntax
+ 
++    kwargs.setdefault("start_line", start_line)
+     return Syntax(
+         code,
+         "yaml",
+-        start_line=start_line,
+         theme="ansi_dark",
+         word_wrap=True,
+         line_numbers=True,
+         indent_guides=True,
++        **kwargs,
+     )
+ 
+ 
+@@ -50,13 +75,14 @@ def __init__(self, path: str, yaml_text: str, exc: Exception) -> None:
+         self.path: str = path
+         self.yaml_text: str = yaml_text
+         self.exc: Exception = exc
++
++        merge_conflicts = merge_conflict_marker.search(self.yaml_text)
++        self.hint = " (possible merge conflicts)" if merge_conflicts else ""
+         super().__init__(self.path)
+ 
+     def __pretty_exc__(self, **kwargs: Any) -> None:
+         from ruamel.yaml.error import MarkedYAMLError
+ 
+-        from dvc.utils import relpath
+-
+         exc = self.exc.__cause__
+ 
+         if not isinstance(exc, MarkedYAMLError):
+@@ -101,25 +127,140 @@ def prepare_code(mark: "StreamMark") -> "Syntax":
+             if exc.problem_mark is not None:
+                 lines.append(prepare_code(exc.problem_mark))
+ 
+-        if lines and lines[-1]:
++        if lines:
++            # we should not add a newline after the main message
++            # if there are no other outputs
+             lines.insert(0, "")
+-        lines.insert(0, f"[red]'{relpath(self.path)}' structure is corrupted.")
+-        for message in lines:
+-            ui.error_write(message, styled=True)
+ 
++        rel = make_relpath(self.path)
++        lines.insert(0, _prepare_message(f"'{rel}' is invalid{self.hint}."))
++        for line in lines:
++            ui.error_write(line, styled=True)
++
++
++def determine_linecol(
++    data, paths, max_steps=5
++) -> Tuple[Optional[int], Optional[int], int]:
++    """Determine linecol from the CommentedMap for the `paths` location.
++
++    CommentedMap from `ruamel.yaml` has `.lc` property from which we can read
++    `.line` and `.col`. This is available in the collections type,
++    i.e. list and dictionaries.
++
++    But this may fail on non-collection types. For example, if the `paths` is
++    ['stages', 'metrics'], metrics being a boolean type does not have `lc`
++    prop.
++    ```
++    stages:
++      metrics: true
++    ```
++
++    To provide some context to the user, we step up to the
++    path ['stages'], which being a collection type, will have `lc` prop
++    with which we can find line and col.
++
++    This may end up being not accurate, so we try to show the same amount of
++    lines of code for `n` number of steps taken upwards. In a worst case,
++    it may be just 1 step (as non-collection item cannot have child items),
++    but `schema validator` may provide us arbitrary path. So, this caps the
++    number of steps upward to just 5. If it does not find any linecols, it'll
++    abort.
++    """
++    from dpath.util import get
++
++    step = 1
++    line, col = None, None
++    while paths and step < max_steps:
++        value = get(data, paths, default=None)
++        if value is not None:
++            with suppress(AttributeError, TypeError):
++                line = value.lc.line + 1
++                col = value.lc.col + 1
++                break
++        step += 1
++        *paths, _ = paths
++
++    return line, col, step
++
++
++class YAMLValidationError(PrettyDvcException):
++    def __init__(
++        self,
++        exc: "MultipleInvalid",
++        path: str = None,
++        text: str = None,
++    ) -> None:
++        self.text = text or ""
++        self.exc = exc
++
++        rel = make_relpath(path) if path else ""
++        self.path = path or ""
++
++        message = f"'{rel}' validation failed"
++        if len(self.exc.errors) > 1:
++            message += f": {len(self.exc.errors)} errors"
++        super().__init__(f"{message}")
++
++    def _prepare_context(self, data: typing.Mapping) -> List[object]:
++        lines: List[object] = []
++        for index, error in enumerate(self.exc.errors):
++            if index and lines[-1]:
++                lines.append("")
++            line, col, step = determine_linecol(data, error.path)
++            parts = [error.error_message]
++            if error.path:
++                parts.append("in " + " -> ".join(str(p) for p in error.path))
++            if line:
++                parts.append(f"line {line}")
++            if col:
++                parts.append(f"column {col}")
++            lines.append(_prepare_cause(", ".join(parts)))
++
++            if line:
++                # we show one line above the error
++                # we try to show few more lines if we could not
++                # reliably figure out where the error was
++                lr = (line - 1, line + step - 1)
++                code = _prepare_code_snippets(self.text, line_range=lr)
++                lines.append(code)
++        return lines
+ 
+-class YAMLValidationError(DvcException):
+-    def __init__(self, exc):
+-        super().__init__(str(exc))
+-
++    def __pretty_exc__(self, **kwargs: Any) -> None:
++        """Prettify exception message."""
++        from collections.abc import Mapping
+ 
+-def validate(data: _T, schema: Callable[[_T], _T], _text: str = None) -> _T:
++        lines: List[object] = []
++        data = parse_yaml_for_update(self.text, self.path)
++        if isinstance(data, Mapping):
++            lines.extend(self._prepare_context(data))
++
++        cause = ""
++        if lines:
++            # we should not add a newline after the main message
++            # if there are no other outputs
++            lines.insert(0, "")
++        else:
++            # if we don't have any context to show, we'll fallback to what we
++            # got from voluptuous and print them in the same line.
++            cause = f": {self.exc}"
++
++        lines.insert(0, _prepare_message(f"{self}{cause}."))
++        for line in lines:
++            ui.error_write(line, styled=True)
++
++
++def validate(
++    data: _T,
++    schema: Callable[[_T], _T],
++    text: str = None,
++    path: str = None,
++) -> _T:
+     from voluptuous import MultipleInvalid
+ 
+     try:
+         return schema(data)
+     except MultipleInvalid as exc:
+-        raise YAMLValidationError(str(exc))
++        raise YAMLValidationError(exc, path, text) from exc
+ 
+ 
+ def load(
+@@ -143,5 +284,5 @@ def load(
+     if schema:
+         # not returning validated data, as it may remove
+         # details from CommentedMap that we get from roundtrip parser
+-        validate(data, schema, text)
++        validate(data, schema, text=text, path=path)
+     return data, text
+

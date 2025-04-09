@@ -1,0 +1,123 @@
+diff --git a/yapf/__init__.py b/yapf/__init__.py
+index 65584f8..97a9633 100644
+--- a/yapf/__init__.py
++++ b/yapf/__init__.py
+@@ -195,9 +195,9 @@ def main(argv):
+   exclude_patterns_from_ignore_file = file_resources.GetExcludePatternsForDir(
+       os.getcwd())
+ 
+-  files = file_resources.GetCommandLineFiles(
+-      args.files, args.recursive,
+-      (args.exclude or []) + exclude_patterns_from_ignore_file)
++  files = file_resources.GetCommandLineFiles(args.files, args.recursive,
++                                             (args.exclude or []) +
++                                             exclude_patterns_from_ignore_file)
+   if not files:
+     raise errors.YapfError('Input filenames did not match any python files')
+ 
+diff --git a/yapf/yapflib/format_decision_state.py b/yapf/yapflib/format_decision_state.py
+index 8dd5e55..486be8b 100644
+--- a/yapf/yapflib/format_decision_state.py
++++ b/yapf/yapflib/format_decision_state.py
+@@ -359,6 +359,11 @@ class FormatDecisionState(object):
+             # assigns.
+             return False
+ 
++          # Don't split if not required
++          if (not style.Get('SPLIT_BEFORE_EXPRESSION_AFTER_OPENING_PAREN') and
++              not style.Get('SPLIT_BEFORE_FIRST_ARGUMENT')):
++            return False
++
+           column = self.column - self.stack[-1].last_space
+           return column > style.Get('CONTINUATION_INDENT_WIDTH')
+ 
+@@ -412,12 +417,14 @@ class FormatDecisionState(object):
+     pprevious = previous.previous_token
+     if (current.is_name and pprevious and pprevious.is_name and
+         previous.value == '('):
++
+       if (not self._FitsOnLine(previous, previous.matching_bracket) and
+           _IsFunctionCallWithArguments(current)):
+         # There is a function call, with more than 1 argument, where the first
+-        # argument is itself a function call with arguments.  In this specific
+-        # case, if we split after the first argument's opening '(', then the
+-        # formatting will look bad for the rest of the arguments. E.g.:
++        # argument is itself a function call with arguments that does not fit
++        # into the line.  In this specific case, if we split after the first
++        # argument's opening '(', then the formatting will look bad for the
++        # rest of the arguments. E.g.:
+         #
+         #     outer_function_call(inner_function_call(
+         #         inner_arg1, inner_arg2),
+@@ -425,7 +432,31 @@ class FormatDecisionState(object):
+         #
+         # Instead, enforce a split before that argument to keep things looking
+         # good.
+-        return True
++        if (style.Get('SPLIT_BEFORE_EXPRESSION_AFTER_OPENING_PAREN') or
++            style.Get('SPLIT_BEFORE_FIRST_ARGUMENT')):
++          return True
++
++        opening = _GetOpeningBracket(current)
++        if (opening and opening.value == '(' and opening.previous_token and
++            (opening.previous_token.is_name or
++             opening.previous_token.value in {'*', '**'})):
++          is_func_call = False
++          opening = current
++          while opening:
++            if opening.value == '(':
++              is_func_call = True
++              break
++            if (not (opening.is_name or opening.value in {'*', '**'}) and
++                opening.value != '.'):
++              break
++            opening = opening.next_token
++
++          if is_func_call:
++            if (not self._FitsOnLine(current, opening.matching_bracket) or
++                (opening.matching_bracket.next_token and
++                 opening.matching_bracket.next_token.value != ',' and
++                 not opening.matching_bracket.next_token.ClosesScope())):
++              return True
+ 
+     if (previous.OpensScope() and not current.OpensScope() and
+         not current.is_comment and
+diff --git a/yapf/yapflib/reformatter.py b/yapf/yapflib/reformatter.py
+index b7c7491..48858a3 100644
+--- a/yapf/yapflib/reformatter.py
++++ b/yapf/yapflib/reformatter.py
+@@ -660,8 +660,9 @@ def _CalculateNumberOfNewlines(first_token, indent_depth, prev_uwline,
+             prev_last_token.AdjustNewlinesBefore(
+                 1 + style.Get('BLANK_LINES_AROUND_TOP_LEVEL_DEFINITION'))
+           if first_token.newlines is not None:
+-            pytree_utils.SetNodeAnnotation(
+-                first_token.node, pytree_utils.Annotation.NEWLINES, None)
++            pytree_utils.SetNodeAnnotation(first_token.node,
++                                           pytree_utils.Annotation.NEWLINES,
++                                           None)
+           return NO_BLANK_LINES
+     elif _IsClassOrDef(prev_uwline):
+       if not style.Get('BLANK_LINE_BEFORE_NESTED_CLASS_OR_DEF'):
+diff --git a/yapf/yapflib/style.py b/yapf/yapflib/style.py
+index c94da3c..359246e 100644
+--- a/yapf/yapflib/style.py
++++ b/yapf/yapflib/style.py
+@@ -202,7 +202,7 @@ _STYLE_HELP = dict(
+       alignment column values; trailing comments within a block will
+       be aligned to the first column value that is greater than the maximum
+       line length within the block). For example:
+-      
++
+       With spaces_before_comment=5:
+ 
+         1 + 1 # Adding values
+@@ -377,7 +377,7 @@ def CreatePEP8Style():
+       SPLIT_BEFORE_LOGICAL_OPERATOR=True,
+       SPLIT_BEFORE_NAMED_ASSIGNS=True,
+       SPLIT_COMPLEX_COMPREHENSION=False,
+-      SPLIT_PENALTY_AFTER_OPENING_BRACKET=30,
++      SPLIT_PENALTY_AFTER_OPENING_BRACKET=300,
+       SPLIT_PENALTY_AFTER_UNARY_OPERATOR=10000,
+       SPLIT_PENALTY_ARITHMETIC_OPERATOR=300,
+       SPLIT_PENALTY_BEFORE_IF_EXPR=0,
+

@@ -1,0 +1,242 @@
+diff --git a/dvc/ignore.py b/dvc/ignore.py
+--- a/dvc/ignore.py
++++ b/dvc/ignore.py
+@@ -6,8 +6,10 @@
+ from funcy import cached_property
+ from pathspec.patterns import GitWildMatchPattern
+ from pathspec.util import normalize_file
++from pygtrie import StringTrie
+ 
+ from dvc.path_info import PathInfo
++from dvc.pathspec_math import merge_patterns
+ from dvc.scm.tree import BaseTree
+ from dvc.system import System
+ from dvc.utils import relpath
+@@ -23,25 +25,33 @@ def __call__(self, root, dirs, files):
+ 
+ 
+ class DvcIgnorePatterns(DvcIgnore):
+-    def __init__(self, ignore_file_path, tree):
+-        assert os.path.isabs(ignore_file_path)
++    def __init__(self, pattern_list, dirname):
++
++        self.pattern_list = pattern_list
++        self.dirname = dirname
++        self.prefix = self.dirname + os.sep
+ 
+-        self.ignore_file_path = ignore_file_path
+-        self.dirname = os.path.normpath(os.path.dirname(ignore_file_path))
++        regex_pattern_list = map(
++            GitWildMatchPattern.pattern_to_regex, pattern_list
++        )
+ 
++        self.ignore_spec = [
++            (ignore, re.compile("|".join(item[0] for item in group)))
++            for ignore, group in groupby(regex_pattern_list, lambda x: x[1])
++            if ignore is not None
++        ]
++
++    @classmethod
++    def from_files(cls, ignore_file_path, tree):
++        assert os.path.isabs(ignore_file_path)
++        dirname = os.path.normpath(os.path.dirname(ignore_file_path))
+         with tree.open(ignore_file_path, encoding="utf-8") as fobj:
+-            path_spec_lines = fobj.readlines()
+-            regex_pattern_list = map(
+-                GitWildMatchPattern.pattern_to_regex, path_spec_lines
+-            )
+-            self.ignore_spec = [
+-                (ignore, re.compile("|".join(item[0] for item in group)))
+-                for ignore, group in groupby(
+-                    regex_pattern_list, lambda x: x[1]
+-                )
+-                if ignore is not None
++            path_spec_lines = [
++                line for line in map(str.strip, fobj.readlines()) if line
+             ]
+ 
++        return cls(path_spec_lines, dirname)
++
+     def __call__(self, root, dirs, files):
+         files = [f for f in files if not self.matches(root, f)]
+         dirs = [d for d in dirs if not self.matches(root, d, True)]
+@@ -51,11 +61,10 @@ def __call__(self, root, dirs, files):
+     def matches(self, dirname, basename, is_dir=False):
+         # NOTE: `relpath` is too slow, so we have to assume that both
+         # `dirname` and `self.dirname` are relative or absolute together.
+-        prefix = self.dirname + os.sep
+         if dirname == self.dirname:
+             path = basename
+-        elif dirname.startswith(prefix):
+-            rel = dirname[len(prefix) :]
++        elif dirname.startswith(self.prefix):
++            rel = dirname[len(self.prefix) :]
+             # NOTE: `os.path.join` is ~x5.5 slower
+             path = f"{rel}{os.sep}{basename}"
+         else:
+@@ -79,13 +88,47 @@ def ignore(self, path, is_dir):
+         return result
+ 
+     def __hash__(self):
+-        return hash(self.ignore_file_path)
++        return hash(self.dirname + ":" + "\n".join(self.pattern_list))
+ 
+     def __eq__(self, other):
+         if not isinstance(other, DvcIgnorePatterns):
+             return NotImplemented
++        return (self.dirname == other.dirname) & (
++            self.pattern_list == other.pattern_list
++        )
++
++    def __bool__(self):
++        return bool(self.pattern_list)
+ 
+-        return self.ignore_file_path == other.ignore_file_path
++
++class DvcIgnorePatternsTrie(DvcIgnore):
++    trie = None
++
++    def __init__(self):
++        if self.trie is None:
++            self.trie = StringTrie(separator=os.sep)
++
++    def __call__(self, root, dirs, files):
++        ignore_pattern = self[root]
++        if ignore_pattern:
++            return ignore_pattern(root, dirs, files)
++        return dirs, files
++
++    def __setitem__(self, root, ignore_pattern):
++        base_pattern = self[root]
++        common_dirname, merged_pattern = merge_patterns(
++            base_pattern.dirname,
++            base_pattern.pattern_list,
++            ignore_pattern.dirname,
++            ignore_pattern.pattern_list,
++        )
++        self.trie[root] = DvcIgnorePatterns(merged_pattern, common_dirname)
++
++    def __getitem__(self, root):
++        ignore_pattern = self.trie.longest_prefix(root)
++        if ignore_pattern:
++            return ignore_pattern.value
++        return DvcIgnorePatterns([], root)
+ 
+ 
+ class DvcIgnoreDirs(DvcIgnore):
+@@ -127,14 +170,19 @@ def __init__(self, tree, root_dir):
+             DvcIgnoreDirs([".git", ".hg", ".dvc"]),
+             DvcIgnoreRepo(),
+         }
+-        for root, dirs, files in self.tree.walk(self.root_dir):
+-            self._update(root)
+-            dirs[:], files[:] = self(root, dirs, files)
+-
+-    def _update(self, dirname):
++        ignore_pattern_trie = DvcIgnorePatternsTrie()
++        for root, dirs, _ in self.tree.walk(self.root_dir):
++            ignore_pattern = self._get_ignore_pattern(root)
++            if ignore_pattern:
++                ignore_pattern_trie[root] = ignore_pattern
++                self.ignores.add(ignore_pattern_trie)
++            dirs[:], _ = self(root, dirs, [])
++
++    def _get_ignore_pattern(self, dirname):
+         ignore_file_path = os.path.join(dirname, DvcIgnore.DVCIGNORE_FILE)
+         if self.tree.exists(ignore_file_path):
+-            self.ignores.add(DvcIgnorePatterns(ignore_file_path, self.tree))
++            return DvcIgnorePatterns.from_files(ignore_file_path, self.tree)
++        return None
+ 
+     def __call__(self, root, dirs, files):
+         for ignore in self.ignores:
+diff --git a/dvc/pathspec_math.py b/dvc/pathspec_math.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/pathspec_math.py
+@@ -0,0 +1,85 @@
++# Path Specification Pattern Math
++# Including changing base dir of path specification patterns and merging
++# of two path specification patterns with different base
++# All the operations follow the documents of `gitignore`
++import os
++
++from pathspec.util import normalize_file
++
++
++def _not_ignore(rule):
++    return (True, rule[1:]) if rule.startswith("!") else (False, rule)
++
++
++def _is_comment(rule):
++    return rule.startswith("#")
++
++
++def _remove_slash(rule):
++    if rule.startswith("\\"):
++        return rule[1:]
++    return rule
++
++
++def _match_all_level(rule):
++    if rule[:-1].find("/") >= 0 and not rule.startswith("**/"):
++        if rule.startswith("/"):
++            rule = rule[1:]
++        return False, rule
++    if rule.startswith("**/"):
++        rule = rule[3:]
++    return True, rule
++
++
++def change_rule(rule, rel):
++    rule = rule.strip()
++    if _is_comment(rule):
++        return rule
++    not_ignore, rule = _not_ignore(rule)
++    match_all, rule = _match_all_level(rule)
++    rule = _remove_slash(rule)
++    if not match_all:
++        rule = f"/{rule}"
++    else:
++        rule = f"/**/{rule}"
++    if not_ignore:
++        rule = f"!/{rel}{rule}"
++    else:
++        rule = f"/{rel}{rule}"
++    rule = normalize_file(rule)
++    return rule
++
++
++def _change_dirname(dirname, pattern_list, new_dirname):
++    if new_dirname == dirname:
++        return pattern_list
++    rel = os.path.relpath(dirname, new_dirname)
++    if rel.startswith(".."):
++        raise ValueError("change dirname can only change to parent path")
++
++    return [change_rule(rule, rel) for rule in pattern_list]
++
++
++def merge_patterns(prefix_a, pattern_a, prefix_b, pattern_b):
++    """
++    Merge two path specification patterns.
++
++    This implementation merge two path specification patterns on different
++    bases. It returns the longest common parent directory, and the patterns
++    based on this new base directory.
++    """
++    if not pattern_a:
++        return prefix_b, pattern_b
++    elif not pattern_b:
++        return prefix_a, pattern_a
++
++    longest_common_dir = os.path.commonpath([prefix_a, prefix_b])
++    new_pattern_a = _change_dirname(prefix_a, pattern_a, longest_common_dir)
++    new_pattern_b = _change_dirname(prefix_b, pattern_b, longest_common_dir)
++
++    if len(prefix_a) < len(prefix_b):
++        merged_pattern = new_pattern_a + new_pattern_b
++    else:
++        merged_pattern = new_pattern_b + new_pattern_a
++
++    return longest_common_dir, merged_pattern

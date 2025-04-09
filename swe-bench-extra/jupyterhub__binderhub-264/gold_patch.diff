@@ -1,0 +1,142 @@
+diff --git a/.travis.yml b/.travis.yml
+index bab73d2..3f92a90 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -11,6 +11,7 @@ install:
+   | tar -xz -C bin --strip-components 1 linux-amd64/helm
+ - chmod +x bin/helm
+ - helm init --client-only
++- pip install .
+ script:
+ - |
+   if [[ "$TRAVIS_PULL_REQUEST" == "false" ]]; then
+@@ -20,6 +21,8 @@ script:
+     cd - 
+   fi
+ - "./helm-chart/build.py build --commit-range ${TRAVIS_COMMIT_RANGE} $PUSH"
++- pip install pytest
++- pytest -v
+ branches:
+   only:
+   - master
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index ca19102..78a0d6e 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -52,6 +52,12 @@ and run binderhub on the host system.
+ 
+ All features should work, including building and launching.
+ 
++9. Running unit tests
++
++  ```bash
++  python setup.py test
++  ```
++
+ ## Pure HTML / CSS / JS development
+ 
+ If you do not want to set up minikube but just want to hack on the html / css / js,
+diff --git a/binderhub/repoproviders.py b/binderhub/repoproviders.py
+index 69e66f2..32dbdc7 100644
+--- a/binderhub/repoproviders.py
++++ b/binderhub/repoproviders.py
+@@ -21,6 +21,25 @@ from traitlets.config import LoggingConfigurable
+ 
+ GITHUB_RATE_LIMIT = Gauge('binderhub_github_rate_limit_remaining', 'GitHub rate limit remaining')
+ 
++
++def tokenize_spec(spec):
++    """Tokenize a Git Spec into parts, error if spec invalid."""
++
++    spec_parts = spec.split('/', 2)  # allow ref to contain "/"
++    if len(spec_parts) != 3:
++        msg = 'Spec is not of the form "user/repo/ref", provided: "{spec}".'.format(spec=spec)
++        if len(spec_parts) == 2 and spec_parts[-1] != 'master':
++            msg += ' Did you mean "{spec}/master"?'.format(spec=spec)
++        raise ValueError(msg)
++
++    return spec_parts
++
++def strip_suffix(text, suffix):
++    if text.endswith(suffix):
++        text = text[:-(len(suffix))]
++    return text
++
++
+ class RepoProvider(LoggingConfigurable):
+     """Base class for a repo provider"""
+     name = Unicode(
+@@ -117,16 +136,8 @@ class GitHubRepoProvider(RepoProvider):
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+-        spec_parts = self.spec.split('/')
+-        if len(spec_parts) != 3:
+-            msg = 'Spec is not of the form "user/repo/ref", provided: "{spec}".'.format(spec=self.spec)
+-            if len(spec_parts) == 2 and spec_parts[-1] != 'master':
+-                msg += ' Did you mean "{spec}/master"?'.format(spec=self.spec)
+-            raise ValueError(msg)
+-
+-        self.user, self.repo, self.unresolved_ref = spec_parts
+-        if self.repo.endswith('.git'):
+-            self.repo = self.repo[:len(self.repo) - 4]
++        self.user, self.repo, self.unresolved_ref = self.process_spec(self.spec)
++        self.repo = strip_suffix(self.repo, ".git")
+ 
+     def get_repo_url(self):
+         return "https://github.com/{user}/{repo}".format(user=self.user, repo=self.repo)
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..1d38a43
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,6 @@
++kubernetes==3.*
++tornado
++traitlets
++docker
++jinja2
++prometheus_client
+diff --git a/setup.py b/setup.py
+index d8e1470..2f6f031 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,20 +1,29 @@
+ from setuptools import setup, find_packages
++from pip.req import parse_requirements
++import uuid
++
++setup_requirements = [
++    'pytest-runner'
++]
++
++test_requirements = [
++    'pytest'
++]
++
++install_requirements = [str(ir.req) for ir in parse_requirements(
++                        "requirements.txt", session=uuid.uuid1())]
+ 
+ setup(
+     name='binderhub',
+-    version='0.1',
+-    install_requires=[
+-        'kubernetes==3.*',
+-        'tornado',
+-        'traitlets',
+-        'docker',
+-        'jinja2',
+-        'prometheus_client'
+-    ],
++    version='0.1.1',
++    install_requires=install_requirements,
+     python_requires='>=3.5',
+     author='Project Jupyter Contributors',
+     author_email='jupyter@googlegroups.com',
+     license='BSD',
+     packages=find_packages(),
+     include_package_data=True,
++    setup_requires=setup_requirements,
++    test_suite='tests',
++    tests_require=test_requirements
+ )

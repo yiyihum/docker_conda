@@ -1,0 +1,159 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 66a8bf9..2aa5c7d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -16,6 +16,7 @@ exclude = '''
+ '''
+ 
+ [tool.pytest.ini_options]
++xfail_strict=true
+ filterwarnings = [
+     "error",
+     "ignore:SelectableGroups:DeprecationWarning",
+diff --git a/src/dicognito/__main__.py b/src/dicognito/__main__.py
+index 5aa176f..2dafeb7 100644
+--- a/src/dicognito/__main__.py
++++ b/src/dicognito/__main__.py
+@@ -130,10 +130,12 @@ def main(main_args: Optional[Sequence[str]] = None) -> None:
+         help="Set the log level. May be one of DEBUG, INFO, WARNING, ERROR, or CRITICAL.",
+     )
+     parser.add_argument(
+-        "--seed",  # currently only intended to make testing easier
+-        help="The seed to use when generating random attribute values. Primarily "
+-        "intended to make testing easier. Best anonymization practice is to omit "
+-        "this value and let dicognito generate its own random seed.",
++        "--seed",
++        help="The seed to use when generating anonymized attribute values. "
++        "If the same value is supplied for subsequent dicognito invocations, then "
++        "the same input objects will result in consistent anonymized results. "
++        "Omitting this value allows dicognito to generate its own random seed, which "
++        "may be slightly more secure, but does not support reproducible anonymization.",
+     )
+     parser.add_argument("--version", action=VersionAction)
+ 
+diff --git a/src/dicognito/anonymizer.py b/src/dicognito/anonymizer.py
+index 78f2f32..1113636 100644
+--- a/src/dicognito/anonymizer.py
++++ b/src/dicognito/anonymizer.py
+@@ -52,9 +52,9 @@ class Anonymizer:
+         id_suffix : str
+             A prefix to add to all unstructured ID fields, such as Patient
+             ID, Accession Number, etc.
+-        seed
+-            Not intended for general use. Seeds the data randomizer in order
+-            to produce consistent results. Used for testing.
++        seed : Optional[str]
++            Seeds the data randomizer, which will produce consistent results when
++            invoked with the same seed.
+         """
+         minimum_offset_hours = 62 * 24
+         maximum_offset_hours = 730 * 24
+@@ -79,7 +79,7 @@ class Anonymizer:
+                 "ReferencedPatientPhotoSequence",
+                 "ResponsibleOrganization",
+             ),
+-            UIAnonymizer(),
++            UIAnonymizer(randomizer),
+             PNAnonymizer(randomizer),
+             IDAnonymizer(
+                 randomizer,
+diff --git a/src/dicognito/randomizer.py b/src/dicognito/randomizer.py
+index aba519e..c81e676 100644
+--- a/src/dicognito/randomizer.py
++++ b/src/dicognito/randomizer.py
+@@ -11,9 +11,9 @@ class Randomizer:
+         Parameters
+         ----------
+         seed
+-            Not intended for general use. Seeds the data randomizer so it
+-            produces consistent results when anonymizing elements with the
+-            same initial values.
++            Used to convert input values into large integers.
++            The results are completely determined by the
++            given seed and the input value.
+         """
+         if seed is None:
+             self.seed = str(os.urandom(20))
+@@ -39,10 +39,10 @@ class Randomizer:
+             result += c
+         return result
+ 
+-    def get_ints_from_ranges(self, original_value: Any, *suprenums: int) -> Sequence[int]:
++    def get_ints_from_ranges(self, original_value: Any, *suprema: int) -> Sequence[int]:
+         """\
+         Convert an original data element value into a series of
+-        integers, each between 0 (inclusive) and one of the suprenums
++        integers, each between 0 (inclusive) and one of the suprema
+         (exclusive) passed in.
+ 
+         Parameters
+@@ -55,7 +55,7 @@ class Randomizer:
+         """
+         big_int = self.to_int(original_value)
+         result = []
+-        for s in suprenums:
++        for s in suprema:
+             result.append(big_int % s)
+             big_int //= s
+         return result
+diff --git a/src/dicognito/release_notes.md b/src/dicognito/release_notes.md
+index 88a7173..40af54d 100644
+--- a/src/dicognito/release_notes.md
++++ b/src/dicognito/release_notes.md
+@@ -2,6 +2,7 @@
+ 
+ - Now assuming DA fields are 8 characters long ([#123](https://github.com/blairconrad/dicognito/issues/123))
+ - Summary formatted as GitHub Flavored Markdown ([#125](https://github.com/blairconrad/dicognito/issues/125))
++- Anonymized UI values are now consistent between runs if the same seed is supplied ([#126](https://github.com/blairconrad/dicognito/issues/126))
+ 
+ ## 0.13.0
+ 
+diff --git a/src/dicognito/uianonymizer.py b/src/dicognito/uianonymizer.py
+index c882e3f..0a05357 100644
+--- a/src/dicognito/uianonymizer.py
++++ b/src/dicognito/uianonymizer.py
+@@ -1,20 +1,15 @@
+-from typing import Dict
+-
+-import collections
+-import datetime
+ import pydicom
+ import pydicom.dataelem
+-import random
++
++from dicognito.randomizer import Randomizer
+ 
+ 
+ class UIAnonymizer:
+-    def __init__(self) -> None:
++    def __init__(self, randomizer: Randomizer) -> None:
+         """\
+         Create a new UIAnonymizer.
+         """
+-        self._ui_map: Dict[str, str] = collections.defaultdict(self._new_ui)
+-        self._creation_date: str = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+-        self._counter: int = 10000000
++        self._randomizer = randomizer
+ 
+     def __call__(self, dataset: pydicom.dataset.Dataset, data_element: pydicom.DataElement) -> bool:
+         """\
+@@ -44,15 +39,10 @@ class UIAnonymizer:
+             return False
+ 
+         if isinstance(data_element.value, pydicom.multival.MultiValue):
+-            data_element.value = list([self._ui_map[v] for v in data_element.value])
++            data_element.value = list(self._new_ui(v) for v in data_element.value)
+         else:
+-            data_element.value = self._ui_map[data_element.value]
++            data_element.value = self._new_ui(data_element.value)
+         return True
+ 
+-    def _new_ui(self) -> str:
+-        self._counter += 1
+-        counter_part = str(self._counter)
+-        prefix = "2." + self._creation_date + "." + counter_part + "."
+-        random_begin = pow(10, 63 - len(prefix))
+-        random_end = pow(10, 64 - len(prefix)) - 1
+-        return prefix + str(random.randint(random_begin, random_end))
++    def _new_ui(self, ui: str) -> str:
++        return "2." + str(10**39 + self._randomizer.to_int(ui))

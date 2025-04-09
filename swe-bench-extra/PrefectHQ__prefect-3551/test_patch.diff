@@ -1,0 +1,95 @@
+diff --git a/tests/agent/test_local_agent.py b/tests/agent/test_local_agent.py
+index 4c2d4d657d..5abedcfe12 100644
+--- a/tests/agent/test_local_agent.py
++++ b/tests/agent/test_local_agent.py
+@@ -87,18 +87,22 @@ def test_local_agent_uses_ip_if_dockerdesktop_hostname(monkeypatch):
+     assert "IP" in agent.labels
+ 
+ 
+-def test_populate_env_vars():
++def test_populate_env_vars(monkeypatch):
+     agent = LocalAgent()
+ 
++    # The python path may be a single item and we want to ensure the correct separator
++    # is added so we will ensure PYTHONPATH has an item in it to start
++    if not os.environ.get("PYTHONPATH", ""):
++        monkeypatch.setenv("PYTHONPATH", "foobar")
++
+     env_vars = agent.populate_env_vars(
+         GraphQLResult({"id": "id", "name": "name", "flow": {"id": "foo"}})
+     )
+-    python_path = env_vars.pop("PYTHONPATH", "")
+-    assert os.getcwd() in python_path
+ 
+     expected = os.environ.copy()
+     expected.update(
+         {
++            "PYTHONPATH": os.getcwd() + os.pathsep + expected.get("PYTHONPATH", ""),
+             "PREFECT__CLOUD__API": "https://api.prefect.io",
+             "PREFECT__CLOUD__AUTH_TOKEN": "TEST_TOKEN",
+             "PREFECT__CLOUD__AGENT__LABELS": str(DEFAULT_AGENT_LABELS),
+diff --git a/tests/tasks/prefect/test_flow_run_rename.py b/tests/tasks/prefect/test_flow_run_rename.py
+index 6801c0c7a2..d6dba9f2da 100644
+--- a/tests/tasks/prefect/test_flow_run_rename.py
++++ b/tests/tasks/prefect/test_flow_run_rename.py
+@@ -1,6 +1,7 @@
+ import pytest
+ from unittest.mock import MagicMock
+ 
++import prefect
+ from prefect.tasks.prefect.flow_run_rename import RenameFlowRun
+ 
+ 
+@@ -34,9 +35,29 @@ def test_flow_run_rename_task(monkeypatch):
+     assert client.set_flow_run_name.call_args[0][1] == "a_new_name!"
+ 
+ 
++def test_flow_run_id_defaults_from_context(monkeypatch):
++    client = MagicMock()
++    client.set_flow_run_name = MagicMock(return_value=True)
++    monkeypatch.setattr(
++        "prefect.tasks.prefect.flow_run_rename.Client", MagicMock(return_value=client)
++    )
++
++    task = RenameFlowRun(flow_run_name="a_new_name!")
++
++    # Verify client called with arguments
++    with prefect.context(flow_run_id="id123"):
++        task.run()
++    assert client.set_flow_run_name.called
++    assert client.set_flow_run_name.call_args[0][0] == "id123"
++    assert client.set_flow_run_name.call_args[0][1] == "a_new_name!"
++
++
+ def test_missing_flow_run_id():
+     task = RenameFlowRun()
+-    with pytest.raises(ValueError, match="Must provide a flow run ID."):
++    with pytest.raises(
++        ValueError,
++        match="`flow_run_id` must be explicitly provided or available in the context",
++    ):
+         task.run(flow_run_name="a_new_name!")
+ 
+ 
+diff --git a/tests/utilities/test_serialization.py b/tests/utilities/test_serialization.py
+index e4313f9404..6a72ca3787 100644
+--- a/tests/utilities/test_serialization.py
++++ b/tests/utilities/test_serialization.py
+@@ -71,11 +71,15 @@ class TestJSONCompatibleField:
+         assert serialized["j"] == value
+ 
+     def test_validate_on_dump(self):
+-        with pytest.raises(marshmallow.ValidationError):
++        with pytest.raises(
++            marshmallow.ValidationError, match="must be JSON compatible"
++        ):
+             self.Schema().dump({"j": lambda: 1})
+ 
+     def test_validate_on_load(self):
+-        with pytest.raises(marshmallow.ValidationError):
++        with pytest.raises(
++            marshmallow.ValidationError, match="must be JSON compatible"
++        ):
+             self.Schema().load({"j": lambda: 1})
+ 
+ 

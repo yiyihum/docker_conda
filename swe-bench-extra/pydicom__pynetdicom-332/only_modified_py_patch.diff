@@ -1,0 +1,100 @@
+diff --git a/pynetdicom/association.py b/pynetdicom/association.py
+index 94d08f7c5..68ad63067 100644
+--- a/pynetdicom/association.py
++++ b/pynetdicom/association.py
+@@ -1,6 +1,7 @@
+ """
+ Defines the Association class which handles associating with peers.
+ """
++import gc
+ from io import BytesIO
+ import logging
+ import threading
+@@ -130,6 +131,10 @@ class Association(threading.Thread):
+         self._ae = ae
+         self.mode = mode
+ 
++        # If acceptor this is the parent AssociationServer, used to identify
++        #   the thread when updating bound event-handlers
++        self._server = None
++
+         # Represents the association requestor and acceptor users
+         self.requestor = ServiceUser(self, MODE_REQUESTOR)
+         self.acceptor = ServiceUser(self, MODE_ACCEPTOR)
+diff --git a/pynetdicom/pdu_items.py b/pynetdicom/pdu_items.py
+index 5f65a2064..4570836a8 100644
+--- a/pynetdicom/pdu_items.py
++++ b/pynetdicom/pdu_items.py
+@@ -125,7 +125,8 @@ class PDUItem(object):
+         if other is self:
+             return True
+ 
+-        if isinstance(other, self.__class__):
++        if isinstance(other, type(self)):
++            # Use the values of the class attributes that get encoded
+             self_dict = {
+                 en[0]: getattr(self, en[0]) for en in self._encoders if en[0]
+             }
+@@ -216,11 +217,7 @@ class PDUItem(object):
+     @property
+     def item_type(self):
+         """Return the item's *Item Type* field value as an int."""
+-        key_val = PDU_ITEM_TYPES.items()
+-        keys = [key for (key, val) in key_val]
+-        vals = [val for (key, val) in key_val]
+-
+-        return keys[vals.index(self.__class__)]
++        return {vv: kk for kk, vv in PDU_ITEM_TYPES.items()}[type(self)]
+ 
+     def __len__(self):
+         """Return the total length of the encoded item as an int."""
+diff --git a/pynetdicom/transport.py b/pynetdicom/transport.py
+index 7b517efd3..fd7a80420 100644
+--- a/pynetdicom/transport.py
++++ b/pynetdicom/transport.py
+@@ -342,6 +342,7 @@ class RequestHandler(BaseRequestHandler):
+         from pynetdicom.association import Association
+ 
+         assoc = Association(self.ae, MODE_ACCEPTOR)
++        assoc._server = self.server
+ 
+         # Set the thread name
+         timestamp = datetime.strftime(datetime.now(), "%Y%m%d%H%M%S")
+@@ -385,9 +386,6 @@ class RequestHandler(BaseRequestHandler):
+ 
+         assoc.start()
+ 
+-        # Track the server's associations
+-        self.server._children.append(assoc)
+-
+     @property
+     def local(self):
+         """Return a 2-tuple of the local server's ``(host, port)`` address."""
+@@ -448,10 +446,8 @@ class AssociationServer(TCPServer):
+ 
+         self.timeout = 60
+ 
+-        # Tracks child Association acceptors
+-        self._children = []
+         # Stores all currently bound event handlers so future
+-        #   children can be bound
++        #   Associations can be bound
+         self._handlers = {}
+         self._bind_defaults()
+ 
+@@ -506,9 +502,11 @@ class AssociationServer(TCPServer):
+     @property
+     def active_associations(self):
+         """Return the server's running ``Association`` acceptor instances"""
+-        self._children = [
+-            child for child in self._children if child.is_alive()]
+-        return self._children
++        # Find all AcceptorThreads with `_server` as self
++        threads = [
++            tt for tt in threading.enumerate() if 'AcceptorThread' in tt.name
++        ]
++        return [tt for tt in threads if tt._server is self]
+ 
+     def get_events(self):
+         """Return a list of currently bound events."""
+

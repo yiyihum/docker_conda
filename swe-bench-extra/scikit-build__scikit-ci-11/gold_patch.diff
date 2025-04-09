@@ -1,0 +1,201 @@
+diff --git a/appveyor.yml b/appveyor.yml
+index 55b5f23..9d2d11c 100644
+--- a/appveyor.yml
++++ b/appveyor.yml
+@@ -31,13 +31,13 @@ install:
+ 
+ build_script:
+   - python -m ci before_build
+-  - python -m ci build"
++  - python -m ci build
+ 
+ test_script:
+-  - python -m ci test"
++  - python -m ci test
+ 
+ after_test:
+-  - python -m ci after_test"
++  - python -m ci after_test
+ # scikit-ci-yml.rst: end
+ 
+ on_finish:
+diff --git a/ci/__main__.py b/ci/__main__.py
+index fc661ea..236b426 100644
+--- a/ci/__main__.py
++++ b/ci/__main__.py
+@@ -9,29 +9,25 @@ import ci
+ import os
+ 
+ 
+-class _OptionalChoices(argparse.Action):
+-    """Custom action making a positional argument with choices optional.
+-
+-    Possible choices should be set with:
+-    - ``default`` attribute set as a list
+-    - ``nargs`` attribute set to ``'*'``
++class _OptionalStep(argparse.Action):
++    """Custom action making the ``step`` positional argument with choices
++    optional.
+ 
+     Setting the ``choices`` attribute will fail with an *invalid choice* error.
+ 
+     Adapted from http://stackoverflow.com/questions/8526675/python-argparse-optional-append-argument-with-choices/8527629#8527629
+     """  # noqa: E501
+-    def __call__(self, parser, namespace, values, option_string=None):
+-        if values:
+-            for value in values:
+-                if value not in self.default:
+-                    message = ("invalid choice: {0!r} (choose from {1})"
+-                               .format(value,
+-                                       ', '.join([repr(action)
+-                                                  for action in
+-                                                  self.default])))
++    def __call__(self, parser, namespace, value, option_string=None):
++        if value:
++            if value not in ci.STEPS:
++                message = ("invalid choice: {0!r} (choose from {1})"
++                           .format(value,
++                                   ', '.join([repr(action)
++                                              for action in
++                                              ci.STEPS])))
+ 
+-                    raise argparse.ArgumentError(self, message)
+-            setattr(namespace, self.dest, values)
++                raise argparse.ArgumentError(self, message)
++            setattr(namespace, self.dest, value)
+ 
+ 
+ def main():
+@@ -45,21 +41,29 @@ def main():
+ 
+     parser = argparse.ArgumentParser(description=ci.__doc__)
+     parser.add_argument(
+-        "steps", type=str, nargs='*', default=ci.STEPS,
+-        action=_OptionalChoices, metavar='STEP',
+-        help="name of the steps to execute. "
++        "step", type=str, nargs='?', default=ci.STEPS[-1],
++        action=_OptionalStep, metavar='STEP',
++        help="name of the step to execute. "
+              "Choose from: {}. "
+-             "If not steps are specified, all are executed.".format(", ".join(
++             "If no step is specified, all are executed.".format(", ".join(
+                 [repr(action) for action in ci.STEPS]))
+     )
++    parser.add_argument(
++        "--force", action="store_true",
++        help="always execute the steps"
++    )
++    parser.add_argument(
++        "--without-deps", action="store_false",
++        help="do not execute dependent steps", dest='with_dependencies'
++    )
+     parser.add_argument(
+         "--version", action="version",
+         version=version_str,
+         help="display scikit-ci version and import information.")
+     args = parser.parse_args()
+ 
+-    for step in args.steps:
+-        ci.execute_step(step)
++    ci.execute_step(
++        args.step, force=args.force, with_dependencies=args.with_dependencies)
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/ci/driver.py b/ci/driver.py
+index 5ce0f01..6713d1a 100644
+--- a/ci/driver.py
++++ b/ci/driver.py
+@@ -28,7 +28,7 @@ class DriverContext(object):
+ 
+     def __exit__(self, exc_type, exc_value, traceback):
+         if exc_type is None and exc_value is None and traceback is None:
+-            self.driver.save_env()
++            self.driver.save_env(self.driver.env, self.env_file)
+ 
+         self.driver.unload_env()
+ 
+@@ -43,6 +43,13 @@ class Driver(object):
+         print(" ".join(s))
+         sys.stdout.flush()
+ 
++    @staticmethod
++    def read_env(env_file="env.json"):
++        if not os.path.exists(env_file):
++            return {}
++        with open(env_file) as _file:
++            return json.load(_file)
++
+     def load_env(self, env_file="env.json"):
+         if self.env is not None:
+             self.unload_env()
+@@ -52,16 +59,14 @@ class Driver(object):
+         self._env_file = env_file
+ 
+         if os.path.exists(self._env_file):
+-            self.env.update(json.load(open(self._env_file)))
++            self.env.update(self.read_env(self._env_file))
+ 
+         self.env = {str(k): str(v) for k, v in self.env.items()}
+ 
+-    def save_env(self, env_file=None):
+-        if env_file is None:
+-            env_file = self._env_file
+-
+-        with open(env_file, "w") as env:
+-            json.dump(self.env, env, indent=4)
++    @staticmethod
++    def save_env(env, env_file="env.json"):
++        with open(env_file, "w") as _file:
++            json.dump(env, _file, indent=4)
+ 
+     def unload_env(self):
+         self.env = None
+@@ -266,14 +271,45 @@ class Driver(object):
+             self.check_call(cmd.replace("\\\\", "\\\\\\\\"), env=self.env)
+ 
+ 
+-def execute_step(step):
++def dependent_steps(step):
++    if step not in STEPS:  # pragma: no cover
++        raise KeyError("invalid step: {}".format(step))
++    step_index = STEPS.index(step)
++    if step_index == 0:
++        return []
++    return STEPS[0:step_index]
++
++
++def execute_step(step, force=False, with_dependencies=True):
+ 
+     if not os.path.exists(SCIKIT_CI_CONFIG):  # pragma: no cover
+         raise OSError(errno.ENOENT, "Couldn't find %s" % SCIKIT_CI_CONFIG)
+ 
+     if step not in STEPS:  # pragma: no cover
+-        raise KeyError("invalid stage: {}".format(step))
++        raise KeyError("invalid step: {}".format(step))
++
++    depends = dependent_steps(step)
++
++    # If forcing execution, remove SCIKIT_CI_<step> env. variables
++    if force:
++        env = Driver.read_env()
++        steps = [step]
++        if with_dependencies:
++            steps += depends
++        for _step in steps:
++            if 'SCIKIT_CI_%s' % _step.upper() in env:
++                del env['SCIKIT_CI_%s' % _step.upper()]
++        Driver.save_env(env)
++
++    # Skip step if it has already been executed
++    if 'SCIKIT_CI_%s' % step.upper() in Driver.read_env():
++        return
++
++    # Recursively execute dependent steps
++    if with_dependencies and depends:
++        execute_step(depends[-1], with_dependencies=with_dependencies)
+ 
+     d = Driver()
+     with d.env_context():
+         d.execute_commands(step)
++        d.env['SCIKIT_CI_%s' % step.upper()] = '1'

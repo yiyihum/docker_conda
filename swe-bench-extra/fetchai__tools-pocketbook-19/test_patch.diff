@@ -1,0 +1,193 @@
+diff --git a/tests/commands/test_transfer.py b/tests/commands/test_transfer.py
+index 456e80f..5835785 100644
+--- a/tests/commands/test_transfer.py
++++ b/tests/commands/test_transfer.py
+@@ -1,5 +1,5 @@
+ import unittest
+-from unittest.mock import patch, Mock, MagicMock
++from unittest.mock import patch, Mock, MagicMock, PropertyMock
+ 
+ from fetchai.ledger.crypto import Entity, Address
+ from fetchai.ledger.serialisation.transaction import encode_transaction
+@@ -41,6 +41,7 @@ class TransferCommandUnitTests(unittest.TestCase):
+         mock_create_api.return_value = api
+ 
+         tx = MagicMock()
++        tx.charge_rate = PropertyMock()
+         api.tokens._create_skeleton_tx.return_value = tx
+         api.tokens._post_tx_json.return_value = '0xTransactionHexId'
+ 
+@@ -49,7 +50,8 @@ class TransferCommandUnitTests(unittest.TestCase):
+ 
+         args = Mock()
+         args.destination = person2.name
+-        args.amount = 2
++        args.amount = 20000000000
++        args.charge_rate = 1
+         args.signers = [person1.name]
+         args.from_address = None
+         args.network = 'super-duper-net'
+@@ -95,7 +97,8 @@ class TransferCommandUnitTests(unittest.TestCase):
+ 
+         args = Mock()
+         args.destination = person2.name
+-        args.amount = 2
++        args.amount = 20000000000
++        args.charge_rate = 1
+         args.signers = [person1.name]
+         args.from_address = None
+         args.network = 'super-duper-net'
+@@ -103,14 +106,6 @@ class TransferCommandUnitTests(unittest.TestCase):
+         from pocketbook.commands.transfer import run_transfer
+         run_transfer(args)
+ 
+-        # mock_create_api.assert_called_once_with('super-duper-net')
+-        # key_store.load_key.assert_called_once_with(person1.name, 'weak-password')
+-        # api.tokens._create_skeleton_tx.assert_called_once_with(1)  # single signature
+-        # tx.add_transfer.assert_called_once_with(person2.address, 20000000000)
+-        # mock_encode_transaction.assert_called_once_with(tx, [person1.entity])
+-        # api.tokens._post_tx_json.assert_called_once_with(encoded_tx, 'transfer')
+-        # api.sync.assert_called_once_with('0xTransactionHexId')
+-
+     @patch('getpass.getpass', side_effect=['weak-password'])
+     @patch('builtins.input', return_value='')
+     @patch('fetchai.ledger.serialisation.transaction.encode_transaction', spec=encode_transaction)
+@@ -141,7 +136,8 @@ class TransferCommandUnitTests(unittest.TestCase):
+ 
+         args = Mock()
+         args.destination = str(person2.address)
+-        args.amount = 2
++        args.amount = 20000000000
++        args.charge_rate = 1
+         args.signers = [person1.name]
+         args.from_address = None
+         args.network = 'super-duper-net'
+@@ -189,7 +185,8 @@ class TransferCommandUnitTests(unittest.TestCase):
+ 
+         args = Mock()
+         args.destination = person2.name
+-        args.amount = 2
++        args.amount = 20000000000
++        args.charge_rate = 1
+         args.signers = [person1.name]
+         args.from_address = multisig.name
+         args.network = 'super-duper-net'
+@@ -229,7 +226,8 @@ class TransferCommandUnitTests(unittest.TestCase):
+ 
+         args = Mock()
+         args.destination = person2.name
+-        args.amount = 2
++        args.amount = 20000000000
++        args.charge_rate = 1
+         args.signers = [person1.name]
+         args.from_address = person2.name
+         args.network = 'super-duper-net'
+@@ -263,7 +261,8 @@ class TransferCommandUnitTests(unittest.TestCase):
+ 
+         args = Mock()
+         args.destination = person2.name
+-        args.amount = 2
++        args.amount = 20000000000
++        args.charge_rate = 1
+         args.signers = [person1.name]
+         args.from_address = 'some-one-missing'
+         args.network = 'super-duper-net'
+@@ -297,7 +296,8 @@ class TransferCommandUnitTests(unittest.TestCase):
+ 
+         args = Mock()
+         args.destination = person2.name
+-        args.amount = 2
++        args.amount = 20000000000
++        args.charge_rate = 1
+         args.signers = []
+         args.from_address = 'some-one-missing'
+         args.network = 'super-duper-net'
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index a752b53..7b18a51 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -1,16 +1,18 @@
+ import unittest
++from typing import Union
+ from unittest.mock import MagicMock, patch
+ 
+ from fetchai.ledger.crypto import Address, Entity
+ 
+-from pocketbook.utils import get_balance, get_stake, NetworkUnavailableError, checked_address
++from pocketbook.utils import get_balance, get_stake, NetworkUnavailableError, checked_address, to_canonical, \
++    from_canonical, token_amount, ConversionError
+ 
+ 
+ class UtilsTests(unittest.TestCase):
+ 
+     def test_get_balance(self):
+         api = MagicMock()
+-        api.tokens.balance.return_value = 100000000000
++        api.tokens.balance.return_value = to_canonical(10)
+ 
+         balance = get_balance(api, 'some address')
+         self.assertEqual(balance, 10)
+@@ -19,7 +21,7 @@ class UtilsTests(unittest.TestCase):
+ 
+     def test_get_stake(self):
+         api = MagicMock()
+-        api.tokens.stake.return_value = 50000000000
++        api.tokens.stake.return_value = to_canonical(5)
+ 
+         stake = get_stake(api, 'some address')
+         self.assertEqual(stake, 5)
+@@ -57,3 +59,54 @@ class UtilsTests(unittest.TestCase):
+             checked_address('foo-bar-baz')
+         self.assertEqual(str(ctx.exception),
+                          'Unable to convert foo-bar-baz into and address. The address needs to be a base58 encoded value')
++
++
++class FetConversionTests(unittest.TestCase):
++    def assertIsConvertible(self, canonical: int, value: Union[int, float]):
++        converted_canonical = to_canonical(value)
++        self.assertEqual(canonical, converted_canonical)
++        self.assertEqual(float(value), from_canonical(converted_canonical))
++
++    def test_canonical_conversions(self):
++        self.assertIsConvertible(10000000000, 1)
++        self.assertIsConvertible(10000000000, 1.0)
++        self.assertIsConvertible(12000000000, 1.2)
++        self.assertIsConvertible(10020000000, 1.002)
++        self.assertIsConvertible(1, 1e-10)
++        self.assertIsConvertible(100, 1e-8)
++        self.assertIsConvertible(10000000, 1e-3)
++        self.assertIsConvertible(10000, 1e-6)
++        self.assertIsConvertible(10, 1e-9)
++        self.assertIsConvertible(10000000000000, 1e3)
++        self.assertIsConvertible(10000000000000000, 1e6)
++        self.assertIsConvertible(10000000000000000000, 1e9)
++
++    def test_token_amount_formatting(self):
++        self.assertEqual(token_amount(1), '1.0000000000 FET')
++        self.assertEqual(token_amount(1.0), '1.0000000000 FET')
++        self.assertEqual(token_amount(1.2), '1.2000000000 FET')
++        self.assertEqual(token_amount(1.002), '1.0020000000 FET')
++        self.assertEqual(token_amount(1e-10), '0.0000000001 FET')
++        self.assertEqual(token_amount(1e-8), '0.0000000100 FET')
++        self.assertEqual(token_amount(1e-3), '0.0010000000 FET')
++        self.assertEqual(token_amount(1e-6), '0.0000010000 FET')
++        self.assertEqual(token_amount(1e-9), '0.0000000010 FET')
++        self.assertEqual(token_amount(1e3), '1000.0000000000 FET')
++        self.assertEqual(token_amount(1e6), '1000000.0000000000 FET')
++        self.assertEqual(token_amount(1e9), '1000000000.0000000000 FET')
++
++    def test_invalid_negative_to_canonical(self):
++        with self.assertRaises(ConversionError):
++            to_canonical(-10)
++
++    def test_invalid_too_small_to_canonical(self):
++        with self.assertRaises(ConversionError):
++            to_canonical(1e-20)
++
++    def test_invalid_non_number_to_canonical(self):
++        with self.assertRaises(ValueError):
++            to_canonical('foo-bar')
++
++    def test_invalid_negative_from_canonical(self):
++        with self.assertRaises(ConversionError):
++            from_canonical(-10)

@@ -1,0 +1,61 @@
+diff --git a/libcst/matchers/_visitors.py b/libcst/matchers/_visitors.py
+index 301e675..be50edf 100644
+--- a/libcst/matchers/_visitors.py
++++ b/libcst/matchers/_visitors.py
+@@ -79,8 +79,18 @@ def _get_possible_match_classes(matcher: BaseMatcherNode) -> List[Type[cst.CSTNo
+         return [getattr(cst, matcher.__class__.__name__)]
+ 
+ 
+-def _get_possible_annotated_classes(annotation: object) -> List[Type[object]]:
++def _annotation_looks_like_union(annotation: object) -> bool:
+     if getattr(annotation, "__origin__", None) is Union:
++        return True
++    # support PEP-604 style unions introduced in Python 3.10
++    return (
++        annotation.__class__.__name__ == "Union"
++        and annotation.__class__.__module__ == "types"
++    )
++
++
++def _get_possible_annotated_classes(annotation: object) -> List[Type[object]]:
++    if _annotation_looks_like_union(annotation):
+         return getattr(annotation, "__args__", [])
+     else:
+         return [cast(Type[object], annotation)]
+diff --git a/libcst/metadata/scope_provider.py b/libcst/metadata/scope_provider.py
+index 580cc11..b5c6ba6 100644
+--- a/libcst/metadata/scope_provider.py
++++ b/libcst/metadata/scope_provider.py
+@@ -45,7 +45,6 @@ _ASSIGNMENT_LIKE_NODES = (
+     cst.AugAssign,
+     cst.ClassDef,
+     cst.CompFor,
+-    cst.For,
+     cst.FunctionDef,
+     cst.Global,
+     cst.Import,
+@@ -125,7 +124,7 @@ class Access:
+             for assignment in assignments
+             if assignment.scope != self.scope or assignment._index < self.__index
+         }
+-        if not previous_assignments and assignments:
++        if not previous_assignments and assignments and self.scope.parent != self.scope:
+             previous_assignments = self.scope.parent[name]
+         self.__assignments |= previous_assignments
+ 
+@@ -993,6 +992,14 @@ class ScopeVisitor(cst.CSTVisitor):
+                 node.elt.visit(self)
+         return False
+ 
++    def visit_For(self, node: cst.For) -> Optional[bool]:
++        node.target.visit(self)
++        self.scope._assignment_count += 1
++        for child in [node.iter, node.body, node.orelse, node.asynchronous]:
++            if child is not None:
++                child.visit(self)
++        return False
++
+     def infer_accesses(self) -> None:
+         # Aggregate access with the same name and batch add with set union as an optimization.
+         # In worst case, all accesses (m) and assignments (n) refer to the same name,
+

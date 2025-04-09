@@ -1,0 +1,141 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b92576f..aa5dda5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ## [Unreleased](https://github.com/hynek/doc2dash/compare/3.0.0...HEAD)
+ 
++### Added
++
++- Support for 2x icons using the `--icon-2x` option.
++  [#200](https://github.com/hynek/doc2dash/pull/200)
++
++
+ ### Fixed
+ 
+-- The table of contents-generation for *pydoctor*-based documentation has been restored. [#133](https://github.com/hynek/doc2dash/pull/133)
++- The table of contents-generation for *pydoctor*-based documentation has been restored.
++  [#133](https://github.com/hynek/doc2dash/pull/133)
+ 
+ 
+ ## [3.0.0](https://github.com/hynek/doc2dash/compare/2.4.1...3.0.0) - 2022-09-13
+diff --git a/docs/how-to.md b/docs/how-to.md
+index f8064ae..3d3f209 100644
+--- a/docs/how-to.md
++++ b/docs/how-to.md
+@@ -82,21 +82,25 @@ Confusingly, the file name of the index is `genindex.html` and the file name of
+ Therefore, we'll add `--index-page index.html` to the command line.
+ 
+ 
+-### Add an Icon
++### Add Icons
+ 
+ Documentation sets can have icons that are shown throughout Dash next to the docsets's names and symbols.
+-That's pretty but also helpful to recognize docsets faster and if you're searching across multiple docsets, where a symbol is coming from.
++That's pretty, but also helpful to recognize where a symbol is coming from when searching across multiple docsets
+ 
+-*structlog* has a cool beaver logo, so let's use [ImageMagick](https://imagemagick.org/) to resize the logo to 16x16 pixels:
++*structlog* has a cool beaver logo, so let's use [ImageMagick](https://imagemagick.org/) to resize the logo to 16x16 and 32x32 pixels:
+ 
+ ```console
+ $ magick \
+     docs/_static/structlog_logo_transparent.png \
+     -resize 16x16 \
+     docs/_static/docset-icon.png
++$ magick \
++    docs/_static/structlog_logo_transparent.png \
++    -resize 32x32 \
++    docs/_static/docset-icon@2x.png
+ ```
+ 
+-Now we can add it to the docset using the `--icon docset-icon.png` option.
++Now we can add it to the docset using the `--icon` and `--icon-2x` options.
+ 
+ 
+ ### Support Online Redirection
+@@ -125,6 +129,7 @@ Let's run the whole command line and see how it looks in Dash:
+ $ doc2dash \
+     --index-page index.html \
+     --icon docs/_static/docset-icon.png \
++    --icon-2x docs/_static/docset-icon@2x.png \
+     --online-redirect-url https://www.structlog.org/en/latest/ \
+     docs/_build/html
+ Converting intersphinx docs from '/Users/hynek/FOSS/structlog/docs/_build/html' to 'structlog.docset'.
+@@ -163,13 +168,11 @@ allowlist_externals =
+ commands =
+     rm -rf structlog.docset docs/_build
+     sphinx-build -n -T -W -b html -d {envtmpdir}/doctrees docs docs/_build/html
+-    doc2dash --index-page index.html --icon docs/_static/docset-icon.png --online-redirect-url https://www.structlog.org/en/latest/ docs/_build/html
+-    cp docs/_static/docset-icon@2x.png structlog.docset/icon@2x.png
++    doc2dash --index-page index.html --icon docs/_static/docset-icon.png --icon-2x docs/_static/docset-icon@2x.png --online-redirect-url https://www.structlog.org/en/latest/ docs/_build/html
+     tar --exclude='.DS_Store' -cvzf structlog.tgz structlog.docset
+ ```
+ 
+ Now I can build a docset just by calling `tox run -e docset`.
+-[Until *doc2dash* supports hi-res icons](https://github.com/hynek/doc2dash/issues/130), it also copies a 32x32 pixels big version of the logo directly into the docset.
+ 
+ Doing that in CI is trivial, but entails tons of boilerplate, so I'll just [link to the workflow](https://github.com/hynek/structlog/blob/main/.github/workflows/build-docset.yml).
+ Note the `upload-artifact` action at the end that allows me to download the built docsets from the run summaries.
+diff --git a/src/doc2dash/__main__.py b/src/doc2dash/__main__.py
+index 4e0320b..39d0eb6 100644
+--- a/src/doc2dash/__main__.py
++++ b/src/doc2dash/__main__.py
+@@ -95,6 +95,11 @@ IMPORTABLE = ImportableType()
+     type=click.Path(exists=True, dir_okay=False, path_type=Path),
+     help="Add PNG icon to docset.",
+ )
++@click.option(
++    "--icon-2x",
++    type=click.Path(exists=True, dir_okay=False, path_type=Path),
++    help="Add a 2x-sized PNG icon for hires displays to docset.",
++)
+ @click.option(
+     "--index-page",
+     "-I",
+@@ -150,6 +155,7 @@ def main(
+     add_to_dash: bool,
+     add_to_global: bool,
+     icon: Path | None,
++    icon_2x: Path | None,
+     index_page: Path | None,
+     enable_js: bool,
+     online_redirect_url: str | None,
+@@ -210,7 +216,14 @@ def main(
+         force=force,
+     )
+     docset = docsets.prepare_docset(
+-        source, dest, name, index_page, enable_js, online_redirect_url, icon
++        source,
++        dest,
++        name,
++        index_page,
++        enable_js,
++        online_redirect_url,
++        icon,
++        icon_2x,
+     )
+ 
+     parser = parser_type(docset.docs)
+diff --git a/src/doc2dash/docsets.py b/src/doc2dash/docsets.py
+index 0a8d634..c10d24e 100644
+--- a/src/doc2dash/docsets.py
++++ b/src/doc2dash/docsets.py
+@@ -38,6 +38,7 @@ def prepare_docset(
+     enable_js: bool,
+     online_redirect_url: str | None,
+     icon: Path | None,
++    icon_2x: Path | None,
+ ) -> DocSet:
+     """
+     Create boilerplate files & directories and copy vanilla docs inside.
+@@ -78,6 +79,9 @@ def prepare_docset(
+     if icon:
+         shutil.copy2(icon, dest / "icon.png")
+ 
++    if icon_2x:
++        shutil.copy2(icon_2x, dest / "icon@2x.png")
++
+     return DocSet(path=dest, plist=plist_path, db_conn=db_conn)
+ 
+ 

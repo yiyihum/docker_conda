@@ -1,0 +1,126 @@
+diff --git a/marko/_compat.py b/marko/_compat.py
+index ba77dd7..2a12269 100644
+--- a/marko/_compat.py
++++ b/marko/_compat.py
+@@ -16,8 +16,17 @@ if PY2:
+         s = s.encode("utf-8")
+         return _quote(s, safe)
+ 
++    def lru_cache(maxsize=128, typed=False):
++        """Python 2.7 doesn't support LRU cache, return a fake decoractor."""
++
++        def decorator(f):
++            return f
++
++        return decorator
++
+ 
+ else:
+     string_types = str
+     import html
+     from urllib.parse import quote
++    from functools import lru_cache
+diff --git a/marko/block.py b/marko/block.py
+index a50e17c..c4f4fac 100644
+--- a/marko/block.py
++++ b/marko/block.py
+@@ -84,7 +84,7 @@ class Document(BlockElement):
+     virtual = True
+ 
+     def __init__(self, text):  # type: (str) -> None
+-        self.link_ref_defs = {}   # type: Dict[str, Tuple[str, str]]
++        self.link_ref_defs = {}  # type: Dict[str, Tuple[str, str]]
+         source = Source(text)
+         inline._root_node = self  # type: ignore
+         with source.under_state(self):
+@@ -168,7 +168,7 @@ class CodeBlock(BlockElement):
+         if isinstance(source.state, Quote):
+             # requires five spaces to prefix
+             prefix = source.prefix[:-1] + " {4}"
+-        return cls.strip_prefix(line, prefix)   # type: ignore
++        return cls.strip_prefix(line, prefix)  # type: ignore
+ 
+     @classmethod
+     def parse(cls, source):  # type: (Source) -> str
+@@ -229,9 +229,9 @@ class FencedCode(BlockElement):
+         if not m:
+             return None
+         prefix, leading, info = m.groups()
+-        if leading[0] == '`' and '`' in info:
++        if leading[0] == "`" and "`" in info:
+             return None
+-        lang, extra = (info.split(None, 1) + [''] * 2)[:2]
++        lang, extra = (info.split(None, 1) + [""] * 2)[:2]
+         cls._parse_info = prefix, leading, lang, extra
+         return m
+ 
+@@ -281,7 +281,7 @@ class HTMLBlock(BlockElement):
+     """HTML blocks, parsed as it is"""
+ 
+     priority = 5
+-    _end_cond = None    # Optional[Match]
++    _end_cond = None  # Optional[Match]
+ 
+     def __init__(self, lines):  # type: (str) -> None
+         self.children = lines
+@@ -532,7 +532,15 @@ class ListItem(BlockElement):
+             return False
+         if not source.expect_re(cls.pattern):
+             return False
+-        indent, bullet, mid, tail = cls.parse_leading(source.next_line())  # type: ignore
++        next_line = source.next_line(False)
++        assert next_line is not None
++        for i in range(1, len(next_line) + 1):
++            m = re.match(source.prefix, next_line[:i].expandtabs(4))
++            if not m:
++                continue
++            next_line = next_line[:i].expandtabs(4)[m.end() :] + next_line[i:]
++            break
++        indent, bullet, mid, tail = cls.parse_leading(next_line)  # type: ignore
+         parent = source.state
+         assert isinstance(parent, List)
+         if (
+diff --git a/marko/cli.py b/marko/cli.py
+index cb1d301..c4ddccb 100644
+--- a/marko/cli.py
++++ b/marko/cli.py
+@@ -41,15 +41,11 @@ def parse(args):
+         default="marko.HTMLRenderer",
+         help="Specify another renderer class",
+     )
+-    parser.add_argument(
+-        "-o",
+-        "--output",
+-        help="Ouput to a file"
+-    )
++    parser.add_argument("-o", "--output", help="Ouput to a file")
+     parser.add_argument(
+         "document",
+         nargs="?",
+-        help="The document to convert, will use stdin if not given."
++        help="The document to convert, will use stdin if not given.",
+     )
+     return parser.parse_args(args)
+ 
+diff --git a/marko/helpers.py b/marko/helpers.py
+index 9e6654d..c733baf 100644
+--- a/marko/helpers.py
++++ b/marko/helpers.py
+@@ -6,7 +6,7 @@ from contextlib import contextmanager
+ from importlib import import_module
+ import warnings
+ 
+-from ._compat import string_types
++from ._compat import string_types, lru_cache
+ 
+ 
+ def camel_to_snake_case(name):  # type: (str) -> str
+@@ -102,6 +102,7 @@ class Source(object):
+         return regexp.match(self._buffer, pos)
+ 
+     @staticmethod
++    @lru_cache()
+     def match_prefix(prefix, line):  # type: (str, str) -> int
+         """Check if the line starts with given prefix and
+         return the position of the end of prefix.
+

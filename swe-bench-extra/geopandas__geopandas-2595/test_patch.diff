@@ -1,0 +1,164 @@
+diff --git a/geopandas/tests/test_geom_methods.py b/geopandas/tests/test_geom_methods.py
+index d29932d..606102e 100644
+--- a/geopandas/tests/test_geom_methods.py
++++ b/geopandas/tests/test_geom_methods.py
+@@ -5,7 +5,16 @@ import numpy as np
+ from numpy.testing import assert_array_equal
+ from pandas import DataFrame, Index, MultiIndex, Series
+ 
+-from shapely.geometry import LinearRing, LineString, MultiPoint, Point, Polygon
++import shapely
++
++from shapely.geometry import (
++    LinearRing,
++    LineString,
++    MultiPoint,
++    Point,
++    Polygon,
++    MultiPolygon,
++)
+ from shapely.geometry.collection import GeometryCollection
+ from shapely.ops import unary_union
+ from shapely import wkt
+@@ -682,6 +691,43 @@ class TestGeomMethods:
+         expected = GeoSeries([polygon2, linestring, point])
+         assert_geoseries_equal(series.normalize(), expected)
+ 
++    @pytest.mark.skipif(
++        not compat.SHAPELY_GE_18,
++        reason="make_valid keyword introduced in shapely 1.8.0",
++    )
++    def test_make_valid(self):
++        polygon1 = Polygon([(0, 0), (0, 2), (1, 1), (2, 2), (2, 0), (1, 1), (0, 0)])
++        polygon2 = Polygon([(0, 2), (0, 1), (2, 0), (0, 0), (0, 2)])
++        linestring = LineString([(0, 0), (1, 1), (1, 0)])
++        series = GeoSeries([polygon1, polygon2, linestring])
++        out_polygon1 = MultiPolygon(
++            [
++                Polygon([(1, 1), (0, 0), (0, 2), (1, 1)]),
++                Polygon([(2, 0), (1, 1), (2, 2), (2, 0)]),
++            ]
++        )
++        out_polygon2 = GeometryCollection(
++            [Polygon([(2, 0), (0, 0), (0, 1), (2, 0)]), LineString([(0, 2), (0, 1)])]
++        )
++        expected = GeoSeries([out_polygon1, out_polygon2, linestring])
++        assert not series.is_valid.all()
++        result = series.make_valid()
++        assert_geoseries_equal(result, expected)
++        assert result.is_valid.all()
++
++    @pytest.mark.skipif(
++        compat.SHAPELY_GE_18,
++        reason="make_valid keyword introduced in shapely 1.8.0",
++    )
++    def test_make_valid_shapely_pre18(self):
++        s = GeoSeries([Point(1, 1)])
++        with pytest.raises(
++            NotImplementedError,
++            match=f"shapely >= 1.8 or PyGEOS is required, "
++            f"version {shapely.__version__} is installed",
++        ):
++            s.make_valid()
++
+     def test_convex_hull(self):
+         # the convex hull of a square should be the same as the square
+         squares = GeoSeries([self.sq for i in range(3)])
+diff --git a/geopandas/tests/test_merge.py b/geopandas/tests/test_merge.py
+index 5794b6c..3f65346 100644
+--- a/geopandas/tests/test_merge.py
++++ b/geopandas/tests/test_merge.py
+@@ -54,11 +54,6 @@ class TestMerging:
+         self._check_metadata(res)
+         exp = GeoDataFrame(pd.concat([pd.DataFrame(self.gdf), pd.DataFrame(self.gdf)]))
+         assert_geodataframe_equal(exp, res)
+-        # check metadata comes from first gdf
+-        res4 = pd.concat([self.gdf.set_crs("epsg:4326"), self.gdf], axis=0)
+-        # Note: this behaviour potentially does not make sense. If geom cols are
+-        # concatenated but have different CRS, then the CRS will be overridden.
+-        self._check_metadata(res4, crs="epsg:4326")
+ 
+         # series
+         res = pd.concat([self.gdf.geometry, self.gdf.geometry])
+@@ -66,6 +61,48 @@ class TestMerging:
+         assert isinstance(res, GeoSeries)
+         assert isinstance(res.geometry, GeoSeries)
+ 
++    def test_concat_axis0_crs(self):
++
++        # CRS not set for both GeoDataFrame
++        res = pd.concat([self.gdf, self.gdf])
++        self._check_metadata(res)
++
++        # CRS set for both GeoDataFrame, same CRS
++        res1 = pd.concat([self.gdf.set_crs("epsg:4326"), self.gdf.set_crs("epsg:4326")])
++        self._check_metadata(res1, crs="epsg:4326")
++
++        # CRS not set for one GeoDataFrame, but set for the other GeoDataFrame
++        with pytest.warns(
++            UserWarning, match=r"CRS not set for some of the concatenation inputs.*"
++        ):
++            res2 = pd.concat([self.gdf, self.gdf.set_crs("epsg:4326")])
++            self._check_metadata(res2, crs="epsg:4326")
++
++        # CRS set for both GeoDataFrame, different CRS
++        with pytest.raises(
++            ValueError, match=r"Cannot determine common CRS for concatenation inputs.*"
++        ):
++            pd.concat([self.gdf.set_crs("epsg:4326"), self.gdf.set_crs("epsg:4327")])
++
++        # CRS not set for one GeoDataFrame, but set for the other GeoDataFrames,
++        # same CRS
++        with pytest.warns(
++            UserWarning, match=r"CRS not set for some of the concatenation inputs.*"
++        ):
++            res3 = pd.concat(
++                [self.gdf, self.gdf.set_crs("epsg:4326"), self.gdf.set_crs("epsg:4326")]
++            )
++            self._check_metadata(res3, crs="epsg:4326")
++
++        # CRS not set for one GeoDataFrame, but set for the other GeoDataFrames,
++        # different CRS
++        with pytest.raises(
++            ValueError, match=r"Cannot determine common CRS for concatenation inputs.*"
++        ):
++            pd.concat(
++                [self.gdf, self.gdf.set_crs("epsg:4326"), self.gdf.set_crs("epsg:4327")]
++            )
++
+     def test_concat_axis1(self):
+ 
+         res = pd.concat([self.gdf, self.df], axis=1)
+diff --git a/geopandas/tools/tests/test_clip.py b/geopandas/tools/tests/test_clip.py
+index c643d5a..29006fd 100644
+--- a/geopandas/tools/tests/test_clip.py
++++ b/geopandas/tools/tests/test_clip.py
+@@ -450,3 +450,28 @@ def test_clip_single_multipoly_no_extra_geoms(
+     multi = buffered_locations.dissolve(by="type").reset_index()
+     clipped = clip(multi, masks)
+     assert clipped.geom_type[0] == "Polygon"
++
++
++@pytest.mark.filterwarnings("ignore:All-NaN slice encountered")
++@pytest.mark.parametrize(
++    "mask",
++    [
++        Polygon(),
++        (np.nan,) * 4,
++        (np.nan, 0, np.nan, 1),
++        GeoSeries([Polygon(), Polygon()], crs="EPSG:3857"),
++        GeoSeries([Polygon(), Polygon()], crs="EPSG:3857").to_frame(),
++        GeoSeries([], crs="EPSG:3857"),
++        GeoSeries([], crs="EPSG:3857").to_frame(),
++    ],
++)
++def test_clip_empty_mask(buffered_locations, mask):
++    """Test that clipping with empty mask returns an empty result."""
++    clipped = clip(buffered_locations, mask)
++    assert_geodataframe_equal(
++        clipped,
++        GeoDataFrame([], columns=["geometry", "type"], crs="EPSG:3857"),
++        check_index_type=False,
++    )
++    clipped = clip(buffered_locations.geometry, mask)
++    assert_geoseries_equal(clipped, GeoSeries([], crs="EPSG:3857"))

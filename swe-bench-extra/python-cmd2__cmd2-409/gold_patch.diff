@@ -1,0 +1,224 @@
+diff --git a/cmd2/argcomplete_bridge.py b/cmd2/argcomplete_bridge.py
+index a036af1e..0ac68f1c 100644
+--- a/cmd2/argcomplete_bridge.py
++++ b/cmd2/argcomplete_bridge.py
+@@ -6,11 +6,16 @@ try:
+     import argcomplete
+ except ImportError:  # pragma: no cover
+     # not installed, skip the rest of the file
+-    pass
+-
++    DEFAULT_COMPLETER = None
+ else:
+     # argcomplete is installed
+ 
++    # Newer versions of argcomplete have FilesCompleter at top level, older versions only have it under completers
++    try:
++        DEFAULT_COMPLETER = argcomplete.FilesCompleter()
++    except AttributeError:
++        DEFAULT_COMPLETER = argcomplete.completers.FilesCompleter()
++
+     from contextlib import redirect_stdout
+     import copy
+     from io import StringIO
+@@ -102,7 +107,7 @@ else:
+ 
+         def __call__(self, argument_parser, completer=None, always_complete_options=True, exit_method=os._exit, output_stream=None,
+                      exclude=None, validator=None, print_suppressed=False, append_space=None,
+-                     default_completer=argcomplete.FilesCompleter()):
++                     default_completer=DEFAULT_COMPLETER):
+             """
+             :param argument_parser: The argument parser to autocomplete on
+             :type argument_parser: :class:`argparse.ArgumentParser`
+@@ -140,9 +145,14 @@ else:
+             added to argcomplete.safe_actions, if their values are wanted in the ``parsed_args`` completer argument, or
+             their execution is otherwise desirable.
+             """
+-            self.__init__(argument_parser, always_complete_options=always_complete_options, exclude=exclude,
+-                          validator=validator, print_suppressed=print_suppressed, append_space=append_space,
+-                          default_completer=default_completer)
++            # Older versions of argcomplete have fewer keyword arguments
++            if sys.version_info >= (3, 5):
++                self.__init__(argument_parser, always_complete_options=always_complete_options, exclude=exclude,
++                            validator=validator, print_suppressed=print_suppressed, append_space=append_space,
++                            default_completer=default_completer)
++            else:
++                self.__init__(argument_parser, always_complete_options=always_complete_options, exclude=exclude,
++                            validator=validator, print_suppressed=print_suppressed)
+ 
+             if "_ARGCOMPLETE" not in os.environ:
+                 # not an argument completion invocation
+diff --git a/cmd2/argparse_completer.py b/cmd2/argparse_completer.py
+index a8a0f24a..1995b8d5 100755
+--- a/cmd2/argparse_completer.py
++++ b/cmd2/argparse_completer.py
+@@ -472,8 +472,23 @@ class AutoCompleter(object):
+         if action.dest in self._arg_choices:
+             arg_choices = self._arg_choices[action.dest]
+ 
+-            if isinstance(arg_choices, tuple) and len(arg_choices) > 0 and callable(arg_choices[0]):
+-                completer = arg_choices[0]
++            # if arg_choices is a tuple
++            #   Let's see if it's a custom completion function.  If it is, return what it provides
++            # To do this, we make sure the first element is either a callable
++            #   or it's the name of a callable in the application
++            if isinstance(arg_choices, tuple) and len(arg_choices) > 0 and \
++                    (callable(arg_choices[0]) or
++                         (isinstance(arg_choices[0], str) and hasattr(self._cmd2_app, arg_choices[0]) and
++                          callable(getattr(self._cmd2_app, arg_choices[0]))
++                          )
++                     ):
++
++                if callable(arg_choices[0]):
++                    completer = arg_choices[0]
++                elif isinstance(arg_choices[0], str) and callable(getattr(self._cmd2_app, arg_choices[0])):
++                    completer = getattr(self._cmd2_app, arg_choices[0])
++
++                # extract the positional and keyword arguments from the tuple
+                 list_args = None
+                 kw_args = None
+                 for index in range(1, len(arg_choices)):
+@@ -481,14 +496,19 @@ class AutoCompleter(object):
+                         list_args = arg_choices[index]
+                     elif isinstance(arg_choices[index], dict):
+                         kw_args = arg_choices[index]
+-                if list_args is not None and kw_args is not None:
+-                    return completer(text, line, begidx, endidx, *list_args, **kw_args)
+-                elif list_args is not None:
+-                    return completer(text, line, begidx, endidx, *list_args)
+-                elif kw_args is not None:
+-                    return completer(text, line, begidx, endidx, **kw_args)
+-                else:
+-                    return completer(text, line, begidx, endidx)
++                try:
++                    # call the provided function differently depending on the provided positional and keyword arguments
++                    if list_args is not None and kw_args is not None:
++                        return completer(text, line, begidx, endidx, *list_args, **kw_args)
++                    elif list_args is not None:
++                        return completer(text, line, begidx, endidx, *list_args)
++                    elif kw_args is not None:
++                        return completer(text, line, begidx, endidx, **kw_args)
++                    else:
++                        return completer(text, line, begidx, endidx)
++                except TypeError:
++                    # assume this is due to an incorrect function signature, return nothing.
++                    return []
+             else:
+                 return AutoCompleter.basic_complete(text, line, begidx, endidx,
+                                                     self._resolve_choices_for_arg(action, used_values))
+@@ -499,6 +519,16 @@ class AutoCompleter(object):
+         if action.dest in self._arg_choices:
+             args = self._arg_choices[action.dest]
+ 
++            # is the argument a string? If so, see if we can find an attribute in the
++            # application matching the string.
++            if isinstance(args, str):
++                try:
++                    args = getattr(self._cmd2_app, args)
++                except AttributeError:
++                    # Couldn't find anything matching the name
++                    return []
++
++            # is the provided argument a callable. If so, call it
+             if callable(args):
+                 try:
+                     if self._cmd2_app is not None:
+@@ -535,7 +565,10 @@ class AutoCompleter(object):
+ 
+             prefix = '{}{}'.format(flags, param)
+         else:
+-            prefix = '{}'.format(str(action.dest).upper())
++            if action.dest != SUPPRESS:
++                prefix = '{}'.format(str(action.dest).upper())
++            else:
++                prefix = ''
+ 
+         prefix = '  {0: <{width}}    '.format(prefix, width=20)
+         pref_len = len(prefix)
+diff --git a/cmd2/pyscript_bridge.py b/cmd2/pyscript_bridge.py
+index 277d8531..196be82b 100644
+--- a/cmd2/pyscript_bridge.py
++++ b/cmd2/pyscript_bridge.py
+@@ -230,7 +230,7 @@ class ArgparseFunctor:
+             if action.option_strings:
+                 cmd_str[0] += '{} '.format(action.option_strings[0])
+ 
+-            if isinstance(value, List) or isinstance(value, Tuple):
++            if isinstance(value, List) or isinstance(value, tuple):
+                 for item in value:
+                     item = str(item).strip()
+                     if ' ' in item:
+@@ -250,7 +250,7 @@ class ArgparseFunctor:
+                         cmd_str[0] += '{} '.format(self._args[action.dest])
+                         traverse_parser(action.choices[self._args[action.dest]])
+                     elif isinstance(action, argparse._AppendAction):
+-                        if isinstance(self._args[action.dest], List) or isinstance(self._args[action.dest], Tuple):
++                        if isinstance(self._args[action.dest], list) or isinstance(self._args[action.dest], tuple):
+                             for values in self._args[action.dest]:
+                                 process_flag(action, values)
+                         else:
+diff --git a/examples/tab_autocompletion.py b/examples/tab_autocompletion.py
+index f3302533..adfe9702 100755
+--- a/examples/tab_autocompletion.py
++++ b/examples/tab_autocompletion.py
+@@ -96,6 +96,15 @@ class TabCompleteExample(cmd2.Cmd):
+                                  },
+                      }
+ 
++    file_list = \
++        [
++            '/home/user/file.db',
++            '/home/user/file space.db',
++            '/home/user/another.db',
++            '/home/other user/maps.db',
++            '/home/other user/tests.db'
++        ]
++
+     def instance_query_actors(self) -> List[str]:
+         """Simulating a function that queries and returns a completion values"""
+         return actors
+@@ -225,9 +234,23 @@ class TabCompleteExample(cmd2.Cmd):
+                                                          required=True)
+     actor_action = vid_movies_add_parser.add_argument('actor', help='Actors', nargs='*')
+ 
++    vid_movies_load_parser = vid_movies_commands_subparsers.add_parser('load')
++    vid_movie_file_action = vid_movies_load_parser.add_argument('movie_file', help='Movie database')
++
++    vid_movies_read_parser = vid_movies_commands_subparsers.add_parser('read')
++    vid_movie_fread_action = vid_movies_read_parser.add_argument('movie_file', help='Movie database')
++
+     # tag the action objects with completion providers. This can be a collection or a callable
+     setattr(director_action, argparse_completer.ACTION_ARG_CHOICES, static_list_directors)
+-    setattr(actor_action, argparse_completer.ACTION_ARG_CHOICES, instance_query_actors)
++    setattr(actor_action, argparse_completer.ACTION_ARG_CHOICES, 'instance_query_actors')
++
++    # tag the file property with a custom completion function 'delimeter_complete' provided by cmd2.
++    setattr(vid_movie_file_action, argparse_completer.ACTION_ARG_CHOICES,
++            ('delimiter_complete',
++             {'delimiter': '/',
++              'match_against': file_list}))
++    setattr(vid_movie_fread_action, argparse_completer.ACTION_ARG_CHOICES,
++            ('path_complete', [False, False]))
+ 
+     vid_movies_delete_parser = vid_movies_commands_subparsers.add_parser('delete')
+ 
+@@ -306,6 +329,9 @@ class TabCompleteExample(cmd2.Cmd):
+ 
+     movies_delete_parser = movies_commands_subparsers.add_parser('delete')
+ 
++    movies_load_parser = movies_commands_subparsers.add_parser('load')
++    movie_file_action = movies_load_parser.add_argument('movie_file', help='Movie database')
++
+     shows_parser = media_types_subparsers.add_parser('shows')
+     shows_parser.set_defaults(func=_do_media_shows)
+ 
+@@ -333,7 +359,8 @@ class TabCompleteExample(cmd2.Cmd):
+     def complete_media(self, text, line, begidx, endidx):
+         """ Adds tab completion to media"""
+         choices = {'actor': query_actors,  # function
+-                   'director': TabCompleteExample.static_list_directors  # static list
++                   'director': TabCompleteExample.static_list_directors,  # static list
++                   'movie_file': (self.path_complete, [False, False])
+                    }
+         completer = argparse_completer.AutoCompleter(TabCompleteExample.media_parser, arg_choices=choices)
+ 

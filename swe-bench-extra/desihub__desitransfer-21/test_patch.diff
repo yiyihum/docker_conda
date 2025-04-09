@@ -1,0 +1,142 @@
+diff --git a/py/desitransfer/test/test_common.py b/py/desitransfer/test/test_common.py
+index 1642616..8be6d5e 100644
+--- a/py/desitransfer/test/test_common.py
++++ b/py/desitransfer/test/test_common.py
+@@ -6,7 +6,8 @@ import datetime
+ import os
+ import unittest
+ from unittest.mock import patch
+-from ..common import dir_perm, file_perm, empty_rsync, rsync, stamp, yesterday, today
++from tempfile import TemporaryDirectory
++from ..common import dir_perm, file_perm, empty_rsync, rsync, stamp, ensure_scratch, yesterday, today
+ 
+ 
+ class TestCommon(unittest.TestCase):
+@@ -22,10 +23,14 @@ class TestCommon(unittest.TestCase):
+         pass
+ 
+     def setUp(self):
+-        pass
++        """Create a temporary directory to simulate CSCRATCH.
++        """
++        self.tmp = TemporaryDirectory()
+ 
+     def tearDown(self):
+-        pass
++        """Clean up temporary directory.
++        """
++        self.tmp.cleanup()
+ 
+     def test_permissions(self):
+         """Ensure that file and directory permissions do not change.
+@@ -72,6 +77,19 @@ total size is 118,417,836,324  speedup is 494,367.55
+         s = stamp('US/Arizona')
+         self.assertEqual(s, '2019-07-03 05:00:00 MST')
+ 
++    def test_ensure_scratch(self):
++        """Test ensure_scratch.
++        """
++        tmp = self.tmp.name
++        t = ensure_scratch(tmp, ['/foo', '/bar'])
++        self.assertEqual(t, tmp)
++        t = ensure_scratch('/foo', tmp)
++        self.assertEqual(t, tmp)
++        t = ensure_scratch('/foo', ['/bar', tmp])
++        self.assertEqual(t, tmp)
++        t = ensure_scratch('/foo', ['/bar', '/abcdefg', tmp])
++        self.assertEqual(t, tmp)
++
+     @patch('desitransfer.common.dt')
+     def test_yesterday(self, mock_dt):
+         """Test yesterday's date.
+diff --git a/py/desitransfer/test/test_daemon.py b/py/desitransfer/test/test_daemon.py
+index 0944a75..fa0551e 100644
+--- a/py/desitransfer/test/test_daemon.py
++++ b/py/desitransfer/test/test_daemon.py
+@@ -288,7 +288,7 @@ class TestDaemon(unittest.TestCase):
+         mock_popen.assert_called_once_with(['/bin/rsync', '--verbose', '--recursive',
+                                             '--copy-dirlinks', '--times', '--omit-dir-times',
+                                             'dts:/data/dts/exposures/raw/20190703/00000127/', '/desi/root/spectro/staging/raw/20190703/00000127/'])
+-        mock_log.error.assert_called_once_with('rsync problem detected!')
++        mock_log.error.assert_called_once_with('rsync problem detected for %s/%s!', '20190703', '00000127')
+         mock_status.update.assert_called_once_with('20190703', '00000127', 'rsync', failure=True)
+         #
+         # Actually run the pipeline
+diff --git a/py/desitransfer/test/test_daily.py b/py/desitransfer/test/test_daily.py
+index 863f9e9..18feddd 100644
+--- a/py/desitransfer/test/test_daily.py
++++ b/py/desitransfer/test/test_daily.py
+@@ -37,6 +37,8 @@ class TestDaily(unittest.TestCase):
+             self.assertEqual(c[0].source, '/exposures/desi/sps')
+             self.assertEqual(c[0].destination, os.path.join(os.environ['DESI_ROOT'],
+                                                             'engineering', 'spectrograph', 'sps'))
++            self.assertEqual(c[1].extra[0], '--exclude-from')
++            self.assertTrue(c[2].dirlinks)
+ 
+     def test_options(self):
+         """Test command-line arguments.
+@@ -45,7 +47,7 @@ class TestDaily(unittest.TestCase):
+                           ['desi_daily_transfer', '--daemon', '--kill',
+                            os.path.expanduser('~/stop_daily_transfer')]):
+             options = _options()
+-            self.assertTrue(options.apache)
++            self.assertTrue(options.permission)
+             self.assertEqual(options.sleep, 24)
+             self.assertTrue(options.daemon)
+             self.assertEqual(options.kill,
+@@ -69,7 +71,7 @@ class TestDaily(unittest.TestCase):
+                              call().__enter__(),
+                              call().write(('DEBUG: desi_daily_transfer {}\n'.format(dtVersion)).encode('utf-8')),
+                              call().write(b'DEBUG: 2019-07-03\n'),
+-                             call().write(b'DEBUG: /bin/rsync --verbose --recursive --copy-dirlinks --times --omit-dir-times dts:/src/d0/ /dst/d0/\n'),
++                             call().write(b'DEBUG: /bin/rsync --verbose --recursive --links --times --omit-dir-times dts:/src/d0/ /dst/d0/\n'),
+                              call().flush(),
+                              call().__exit__(None, None, None)])
+         mock_walk.assert_called_once_with('/dst/d0')
+@@ -79,6 +81,30 @@ class TestDaily(unittest.TestCase):
+ 
+     @patch('os.walk')
+     @patch('os.chmod')
++    @patch('subprocess.Popen')
++    @patch('desitransfer.daily.stamp')
++    @patch('builtins.open', new_callable=mock_open)
++    def test_transfer_extra(self, mo, mock_stamp, mock_popen, mock_chmod, mock_walk):
++        """Test the transfer functions in DailyDirectory.transfer() with extra options.
++        """
++        mock_walk.return_value = [('/dst/d0', [], ['f1', 'f2'])]
++        mock_stamp.return_value = '2019-07-03'
++        mock_popen().wait.return_value = 0
++        d = DailyDirectory('/src/d0', '/dst/d0', extra=['--exclude-from', 'foo'])
++        d.transfer()
++        mo.assert_has_calls([call('/dst/d0.log', 'ab'),
++                             call().__enter__(),
++                             call().write(('DEBUG: desi_daily_transfer {}\n'.format(dtVersion)).encode('utf-8')),
++                             call().write(b'DEBUG: 2019-07-03\n'),
++                             call().write(b'DEBUG: /bin/rsync --verbose --recursive --links --times --omit-dir-times --exclude-from foo dts:/src/d0/ /dst/d0/\n'),
++                             call().flush(),
++                             call().__exit__(None, None, None)])
++        mock_walk.assert_called_once_with('/dst/d0')
++        mock_chmod.assert_has_calls([call('/dst/d0', 1512),
++                                     call('/dst/d0/f1', 288),
++                                     call('/dst/d0/f2', 288)])
++    @patch('os.walk')
++    @patch('os.chmod')
+     def test_lock(self, mock_chmod, mock_walk):
+         """Test the lock functions in DailyDirectory.lock().
+         """
+@@ -98,12 +124,12 @@ class TestDaily(unittest.TestCase):
+ 
+     @patch('subprocess.Popen')
+     @patch('builtins.open', new_callable=mock_open)
+-    def test_apache(self, mo, mock_popen):
+-        """Test granting apache/www permissions.
++    def test_permission(self, mo, mock_popen):
++        """Test granting permissions.
+         """
+         mock_popen().wait.return_value = 0
+         d = DailyDirectory('/src/d0', '/dst/d0')
+-        d.apache()
++        d.permission()
+         mo.assert_has_calls([call('/dst/d0.log', 'ab'),
+                              call().__enter__(),
+                              call().write(b'DEBUG: fix_permissions.sh /dst/d0\n'),

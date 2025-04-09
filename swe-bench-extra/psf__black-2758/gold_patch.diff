@@ -1,0 +1,145 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index dc52ca3..634db79 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -36,6 +36,8 @@
+   Jupyter Notebooks (#2744)
+ - Deprecate `--experimental-string-processing` and move the functionality under
+   `--preview` (#2789)
++- Enable Python 3.10+ by default, without any extra need to specify
++  `--target-version=py310`. (#2758)
+ 
+ ### Packaging
+ 
+diff --git a/src/black/parsing.py b/src/black/parsing.py
+index 6b63368..db48ae4 100644
+--- a/src/black/parsing.py
++++ b/src/black/parsing.py
+@@ -42,7 +42,6 @@ except ImportError:
+         ast3 = ast
+ 
+ 
+-PY310_HINT: Final = "Consider using --target-version py310 to parse Python 3.10 code."
+ PY2_HINT: Final = "Python 2 support was removed in version 22.0."
+ 
+ 
+@@ -58,12 +57,11 @@ def get_grammars(target_versions: Set[TargetVersion]) -> List[Grammar]:
+             pygram.python_grammar_no_print_statement_no_exec_statement_async_keywords,
+             # Python 3.0-3.6
+             pygram.python_grammar_no_print_statement_no_exec_statement,
++            # Python 3.10+
++            pygram.python_grammar_soft_keywords,
+         ]
+ 
+     grammars = []
+-    if supports_feature(target_versions, Feature.PATTERN_MATCHING):
+-        # Python 3.10+
+-        grammars.append(pygram.python_grammar_soft_keywords)
+     # If we have to parse both, try to parse async as a keyword first
+     if not supports_feature(
+         target_versions, Feature.ASYNC_IDENTIFIERS
+@@ -75,6 +73,10 @@ def get_grammars(target_versions: Set[TargetVersion]) -> List[Grammar]:
+     if not supports_feature(target_versions, Feature.ASYNC_KEYWORDS):
+         # Python 3.0-3.6
+         grammars.append(pygram.python_grammar_no_print_statement_no_exec_statement)
++    if supports_feature(target_versions, Feature.PATTERN_MATCHING):
++        # Python 3.10+
++        grammars.append(pygram.python_grammar_soft_keywords)
++
+     # At least one of the above branches must have been taken, because every Python
+     # version has exactly one of the two 'ASYNC_*' flags
+     return grammars
+@@ -86,6 +88,7 @@ def lib2to3_parse(src_txt: str, target_versions: Iterable[TargetVersion] = ()) -
+         src_txt += "\n"
+ 
+     grammars = get_grammars(set(target_versions))
++    errors = {}
+     for grammar in grammars:
+         drv = driver.Driver(grammar)
+         try:
+@@ -99,20 +102,21 @@ def lib2to3_parse(src_txt: str, target_versions: Iterable[TargetVersion] = ()) -
+                 faulty_line = lines[lineno - 1]
+             except IndexError:
+                 faulty_line = "<line number missing in source>"
+-            exc = InvalidInput(f"Cannot parse: {lineno}:{column}: {faulty_line}")
++            errors[grammar.version] = InvalidInput(
++                f"Cannot parse: {lineno}:{column}: {faulty_line}"
++            )
+ 
+         except TokenError as te:
+             # In edge cases these are raised; and typically don't have a "faulty_line".
+             lineno, column = te.args[1]
+-            exc = InvalidInput(f"Cannot parse: {lineno}:{column}: {te.args[0]}")
++            errors[grammar.version] = InvalidInput(
++                f"Cannot parse: {lineno}:{column}: {te.args[0]}"
++            )
+ 
+     else:
+-        if pygram.python_grammar_soft_keywords not in grammars and matches_grammar(
+-            src_txt, pygram.python_grammar_soft_keywords
+-        ):
+-            original_msg = exc.args[0]
+-            msg = f"{original_msg}\n{PY310_HINT}"
+-            raise InvalidInput(msg) from None
++        # Choose the latest version when raising the actual parsing error.
++        assert len(errors) >= 1
++        exc = errors[max(errors)]
+ 
+         if matches_grammar(src_txt, pygram.python_grammar) or matches_grammar(
+             src_txt, pygram.python_grammar_no_print_statement
+diff --git a/src/blib2to3/pgen2/grammar.py b/src/blib2to3/pgen2/grammar.py
+index 5685107..337a64f 100644
+--- a/src/blib2to3/pgen2/grammar.py
++++ b/src/blib2to3/pgen2/grammar.py
+@@ -92,6 +92,7 @@ class Grammar(object):
+         self.soft_keywords: Dict[str, int] = {}
+         self.tokens: Dict[int, int] = {}
+         self.symbol2label: Dict[str, int] = {}
++        self.version: Tuple[int, int] = (0, 0)
+         self.start = 256
+         # Python 3.7+ parses async as a keyword, not an identifier
+         self.async_keywords = False
+@@ -145,6 +146,7 @@ class Grammar(object):
+         new.labels = self.labels[:]
+         new.states = self.states[:]
+         new.start = self.start
++        new.version = self.version
+         new.async_keywords = self.async_keywords
+         return new
+ 
+diff --git a/src/blib2to3/pygram.py b/src/blib2to3/pygram.py
+index aa20b81..a3df9be 100644
+--- a/src/blib2to3/pygram.py
++++ b/src/blib2to3/pygram.py
+@@ -178,6 +178,8 @@ def initialize(cache_dir: Union[str, "os.PathLike[str]", None] = None) -> None:
+ 
+     # Python 2
+     python_grammar = driver.load_packaged_grammar("blib2to3", _GRAMMAR_FILE, cache_dir)
++    python_grammar.version = (2, 0)
++
+     soft_keywords = python_grammar.soft_keywords.copy()
+     python_grammar.soft_keywords.clear()
+ 
+@@ -191,6 +193,7 @@ def initialize(cache_dir: Union[str, "os.PathLike[str]", None] = None) -> None:
+     python_grammar_no_print_statement_no_exec_statement = python_grammar.copy()
+     del python_grammar_no_print_statement_no_exec_statement.keywords["print"]
+     del python_grammar_no_print_statement_no_exec_statement.keywords["exec"]
++    python_grammar_no_print_statement_no_exec_statement.version = (3, 0)
+ 
+     # Python 3.7+
+     python_grammar_no_print_statement_no_exec_statement_async_keywords = (
+@@ -199,12 +202,14 @@ def initialize(cache_dir: Union[str, "os.PathLike[str]", None] = None) -> None:
+     python_grammar_no_print_statement_no_exec_statement_async_keywords.async_keywords = (
+         True
+     )
++    python_grammar_no_print_statement_no_exec_statement_async_keywords.version = (3, 7)
+ 
+     # Python 3.10+
+     python_grammar_soft_keywords = (
+         python_grammar_no_print_statement_no_exec_statement_async_keywords.copy()
+     )
+     python_grammar_soft_keywords.soft_keywords = soft_keywords
++    python_grammar_soft_keywords.version = (3, 10)
+ 
+     pattern_grammar = driver.load_packaged_grammar(
+         "blib2to3", _PATTERN_GRAMMAR_FILE, cache_dir

@@ -1,0 +1,110 @@
+diff --git a/docs/conf.py b/docs/conf.py
+index 94e6d8a..a3ffd5e 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -94,7 +94,7 @@ version = release = find_version("..", "vcr", "__init__.py")
+ #
+ # This is also used if you do content translation via gettext catalogs.
+ # Usually you set "language" from the command line for these cases.
+-language = None
++language = "en"
+ 
+ # There are two options for replacing |today|: either, you set today to some
+ # non-false value, then it is used:
+diff --git a/vcr/cassette.py b/vcr/cassette.py
+index 901b7fb..5822afa 100644
+--- a/vcr/cassette.py
++++ b/vcr/cassette.py
+@@ -45,7 +45,11 @@ class CassetteContextDecorator:
+     this class as a context manager in ``__exit__``.
+     """
+ 
+-    _non_cassette_arguments = ("path_transformer", "func_path_generator")
++    _non_cassette_arguments = (
++        "path_transformer",
++        "func_path_generator",
++        "record_on_exception",
++    )
+ 
+     @classmethod
+     def from_args(cls, cassette_class, **kwargs):
+@@ -55,6 +59,7 @@ class CassetteContextDecorator:
+         self.cls = cls
+         self._args_getter = args_getter
+         self.__finish = None
++        self.__cassette = None
+ 
+     def _patch_generator(self, cassette):
+         with contextlib.ExitStack() as exit_stack:
+@@ -64,9 +69,6 @@ class CassetteContextDecorator:
+             log.debug(log_format.format(action="Entering", path=cassette._path))
+             yield cassette
+             log.debug(log_format.format(action="Exiting", path=cassette._path))
+-            # TODO(@IvanMalison): Hmmm. it kind of feels like this should be
+-            # somewhere else.
+-            cassette._save()
+ 
+     def __enter__(self):
+         # This assertion is here to prevent the dangerous behavior
+@@ -84,10 +86,22 @@ class CassetteContextDecorator:
+         if other_kwargs.get("path_transformer"):
+             transformer = other_kwargs["path_transformer"]
+             cassette_kwargs["path"] = transformer(cassette_kwargs["path"])
+-        self.__finish = self._patch_generator(self.cls.load(**cassette_kwargs))
++        self.__cassette = self.cls.load(**cassette_kwargs)
++        self.__finish = self._patch_generator(self.__cassette)
+         return next(self.__finish)
+ 
+-    def __exit__(self, *args):
++    def __exit__(self, *exc_info):
++        exception_was_raised = any(exc_info)
++        record_on_exception = self._args_getter().get("record_on_exception", True)
++        if record_on_exception or not exception_was_raised:
++            self.__cassette._save()
++            self.__cassette = None
++        # Fellow programmer, don't remove this `next`, if `self.__finish` is
++        # not consumed the unpatcher functions accumulated in the `exit_stack`
++        # object created in `_patch_generator` will not be called until
++        # `exit_stack` is not garbage collected.
++        # This works in CPython but not in Pypy, where the unpatchers will not
++        # be called until much later.
+         next(self.__finish, None)
+         self.__finish = None
+ 
+diff --git a/vcr/config.py b/vcr/config.py
+index 45412e3..a991c95 100644
+--- a/vcr/config.py
++++ b/vcr/config.py
+@@ -49,6 +49,7 @@ class VCR:
+         cassette_library_dir=None,
+         func_path_generator=None,
+         decode_compressed_response=False,
++        record_on_exception=True,
+     ):
+         self.serializer = serializer
+         self.match_on = match_on
+@@ -80,6 +81,7 @@ class VCR:
+         self.path_transformer = path_transformer
+         self.func_path_generator = func_path_generator
+         self.decode_compressed_response = decode_compressed_response
++        self.record_on_exception = record_on_exception
+         self._custom_patches = tuple(custom_patches)
+ 
+     def _get_serializer(self, serializer_name):
+@@ -123,6 +125,7 @@ class VCR:
+         func_path_generator = kwargs.get("func_path_generator", self.func_path_generator)
+         cassette_library_dir = kwargs.get("cassette_library_dir", self.cassette_library_dir)
+         additional_matchers = kwargs.get("additional_matchers", ())
++        record_on_exception = kwargs.get("record_on_exception", self.record_on_exception)
+ 
+         if cassette_library_dir:
+ 
+@@ -149,6 +152,7 @@ class VCR:
+             "path_transformer": path_transformer,
+             "func_path_generator": func_path_generator,
+             "allow_playback_repeats": kwargs.get("allow_playback_repeats", False),
++            "record_on_exception": record_on_exception,
+         }
+         path = kwargs.get("path")
+         if path:
+

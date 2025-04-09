@@ -1,0 +1,229 @@
+diff --git a/.azure-pipelines.yml b/.azure-pipelines.yml
+index dc65525..df24826 100644
+--- a/.azure-pipelines.yml
++++ b/.azure-pipelines.yml
+@@ -83,6 +83,10 @@ jobs:
+       Python37:
+         python.version: '3.7'
+         PYTHON: '3.7'
++      Python37-optional:
++        python.version: '3.7'
++        PYTHON: '3.7'
++        CONDA_INSTALL_EXTRA: "codecov tqdm"
+       Python36:
+         python.version: '3.6'
+         PYTHON: '3.6'
+@@ -177,6 +181,10 @@ jobs:
+       Python37:
+         python.version: '3.7'
+         PYTHON: '3.7'
++      Python37-optional:
++        python.version: '3.7'
++        PYTHON: '3.7'
++        CONDA_INSTALL_EXTRA: "codecov tqdm"
+       Python36:
+         python.version: '3.6'
+         PYTHON: '3.6'
+diff --git a/.travis.yml b/.travis.yml
+index c2cbcfc..5ae62c7 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -38,6 +38,11 @@ matrix:
+           os: linux
+           env:
+               - PYTHON=3.7
++        - name: "Linux - Python 3.7 [optional]"
++          os: linux
++          env:
++              - PYTHON=3.7
++              - CONDA_INSTALL_EXTRA="codecov tqdm"
+         - name: "Linux - Python 3.6"
+           os: linux
+           env:
+diff --git a/doc/install.rst b/doc/install.rst
+index a13ec63..623eb20 100644
+--- a/doc/install.rst
++++ b/doc/install.rst
+@@ -25,10 +25,17 @@ doesn't interfere with any other Python installations in your system.
+ Dependencies
+ ------------
+ 
++Required:
++
+ * `requests <http://docs.python-requests.org/>`__
+ * `packaging <https://github.com/pypa/packaging>`__
+ * `appdirs <https://github.com/ActiveState/appdirs>`__
+ 
++Optional:
++
++* `tqdm <https://github.com/tqdm/tqdm>`__: Required to print a download progress bar
++  (see :class:`pooch.HTTPDownloader`).
++
+ The following are only required for Python 2.7:
+ 
+ * `pathlib <https://pypi.org/project/pathlib/>`__
+diff --git a/doc/usage.rst b/doc/usage.rst
+index 8b05c45..14e5501 100644
+--- a/doc/usage.rst
++++ b/doc/usage.rst
+@@ -404,6 +404,38 @@ redirected from the original download URL in the :class:`~pooch.Pooch` registry:
+         return data
+ 
+ 
++Printing a download progress bar
++--------------------------------
++
++The :class:`~pooch.HTTPDownloader` can use `tqdm <https://github.com/tqdm/tqdm>`__ to
++print a download progress bar. This is turned off by default but can be enabled using:
++
++.. code:: python
++
++    from pooch import HTTPDownloader
++
++
++    def fetch_large_data():
++        """
++        Fetch a large file from a server and print a progress bar.
++        """
++        download = HTTPDownloader(progressbar=True)
++        fname = GOODBOY.fetch("large-data-file.h5", downloader=download)
++        data = h5py.File(fname, "r")
++        return data
++
++The resulting progress bar will be printed to stderr and should look something like
++this:
++
++.. code::
++
++    100%|█████████████████████████████████████████| 336/336 [...]
++
++.. note::
++    
++    ``tqdm`` is not installed by default with Pooch. You will have to install it
++    separately in order to use this feature.
++
+ So you have 1000 data files
+ ---------------------------
+ 
+diff --git a/pooch/core.py b/pooch/core.py
+index 7fd27f6..820de66 100644
+--- a/pooch/core.py
++++ b/pooch/core.py
+@@ -247,7 +247,8 @@ class Pooch:
+         Custom file downloaders can be provided through the *downloader* argument. By
+         default, files are downloaded over HTTP. If the server for a given file requires
+         authentication (username and password) or if the file is served over FTP, use
+-        custom downloaders that support these features. See below for details.
++        custom downloaders that support these features. Downloaders can also be used to
++        print custom messages (like a progress bar), etc. See below for details.
+ 
+         Parameters
+         ----------
+@@ -328,6 +329,16 @@ class Pooch:
+             authdownload = HTTPDownloader(auth=(username, password))
+             mypooch.fetch("some-data-file.txt", downloader=authdownload)
+ 
++        **Progress bar** for the download can be printed by :class:`pooch.HTTPDownloader`
++        by passing the argument ``progressbar=True``:
++
++        .. code:: python
++
++            progress_download = HTTPDownloader(progressbar=True)
++            mypooch.fetch("some-data-file.txt", downloader=progress_download)
++            # Will print a progress bar to standard error like:
++            # 100%|█████████████████████████████████████████| 336/336 [...]
++
+         """
+         self._assert_file_in_registry(fname)
+ 
+diff --git a/pooch/downloaders.py b/pooch/downloaders.py
+index e9e7fbd..42b9e74 100644
+--- a/pooch/downloaders.py
++++ b/pooch/downloaders.py
+@@ -2,9 +2,15 @@
+ Download hooks for Pooch.fetch
+ """
+ from __future__ import print_function
++import sys
+ 
+ import requests
+ 
++try:
++    from tqdm import tqdm
++except ImportError:
++    tqdm = None
++
+ 
+ class HTTPDownloader:  # pylint: disable=too-few-public-methods
+     """
+@@ -14,10 +20,16 @@ class HTTPDownloader:  # pylint: disable=too-few-public-methods
+     :mod:`requests` library to manage downloads.
+ 
+     Use with :meth:`pooch.Pooch.fetch` to customize the download of files (for example,
+-    to use authentication).
++    to use authentication or print a progress bar).
+ 
+     Parameters
+     ----------
++    progressbar : bool
++        If True, will print a progress bar of the download to standard error (stderr).
++        Requires `tqdm <https://github.com/tqdm/tqdm>`__ to be installed.
++    chunk_size : int
++        Files are streamed *chunk_size* bytes at a time instead of loading everything
++        into memory at one. Usually doesn't need to be changed.
+     **kwargs
+         All keyword arguments given when creating an instance of this class will be
+         passed to :func:`requests.get`.
+@@ -73,8 +85,12 @@ class HTTPDownloader:  # pylint: disable=too-few-public-methods
+ 
+     """
+ 
+-    def __init__(self, **kwargs):
++    def __init__(self, progressbar=False, chunk_size=1024, **kwargs):
+         self.kwargs = kwargs
++        self.progressbar = progressbar
++        self.chunk_size = chunk_size
++        if self.progressbar and tqdm is None:
++            raise ValueError("Missing package 'tqdm' required for progress bars.")
+ 
+     def __call__(self, url, output_file, pooch):
+         """
+@@ -100,9 +116,37 @@ class HTTPDownloader:  # pylint: disable=too-few-public-methods
+         try:
+             response = requests.get(url, **kwargs)
+             response.raise_for_status()
+-            for chunk in response.iter_content(chunk_size=1024):
++            content = response.iter_content(chunk_size=self.chunk_size)
++            if self.progressbar:
++                total = int(response.headers.get("content-length", 0))
++                # Need to use ascii characters on Windows because there isn't always
++                # full unicode support (see https://github.com/tqdm/tqdm/issues/454)
++                use_ascii = bool(sys.platform == "win32")
++                progress = tqdm(
++                    total=total,
++                    ncols=79,
++                    ascii=use_ascii,
++                    unit="B",
++                    unit_scale=True,
++                    leave=True,
++                )
++            for chunk in content:
+                 if chunk:
+                     output_file.write(chunk)
++                    output_file.flush()
++                    if self.progressbar:
++                        # Use the chunk size here because chunk may be much larger if
++                        # the data are decompressed by requests after reading (happens
++                        # with text files).
++                        progress.update(self.chunk_size)
++            # Make sure the progress bar gets filled even if the actual number is
++            # chunks is smaller than expected. This happens when streaming text files
++            # that are compressed by the server when sending (gzip). Binary files don't
++            # experience this.
++            if self.progressbar:
++                progress.reset()
++                progress.update(total)
++                progress.close()
+         finally:
+             if ispath:
+                 output_file.close()

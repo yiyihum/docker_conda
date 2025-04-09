@@ -1,0 +1,192 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7859d9034..24410aa10 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ ### Added
+ 
+ - Mapping of ANSI colors to hex codes configurable via `App.ansi_theme_dark` and `App.ansi_theme_light` https://github.com/Textualize/textual/pull/4192
++- `Pilot.resize_terminal` to resize the terminal in testing https://github.com/Textualize/textual/issues/4212
+ 
+ ### Fixed
+ 
+@@ -26,9 +27,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ - Rename `CollapsibleTitle.action_toggle` to `action_toggle_collapsible` to fix clash with `DOMNode.action_toggle` https://github.com/Textualize/textual/pull/4221
+ - Markdown component classes weren't refreshed when watching for CSS https://github.com/Textualize/textual/issues/3464
+ 
+-### Added
++### Changed
+ 
+-- `Pilot.resize_terminal` to resize the terminal in testing https://github.com/Textualize/textual/issues/4212
++- Clicking a non focusable widget focus ancestors https://github.com/Textualize/textual/pull/4236
+ 
+ ## [0.52.1] - 2024-02-20
+ 
+diff --git a/mkdocs-nav.yml b/mkdocs-nav.yml
+index ccb858f35..c97e5396b 100644
+--- a/mkdocs-nav.yml
++++ b/mkdocs-nav.yml
+@@ -67,6 +67,7 @@ nav:
+           - "events/screen_suspend.md"
+           - "events/show.md"
+       - Styles:
++          - "styles/index.md"
+           - "styles/align.md"
+           - "styles/background.md"
+           - "styles/border.md"
+@@ -83,8 +84,6 @@ nav:
+           - "styles/content_align.md"
+           - "styles/display.md"
+           - "styles/dock.md"
+-          - "styles/index.md"
+-          - "styles/keyline.md"
+           - Grid:
+               - "styles/grid/index.md"
+               - "styles/grid/column_span.md"
+@@ -94,6 +93,7 @@ nav:
+               - "styles/grid/grid_size.md"
+               - "styles/grid/row_span.md"
+           - "styles/height.md"
++          - "styles/keyline.md"
+           - "styles/layer.md"
+           - "styles/layers.md"
+           - "styles/layout.md"
+diff --git a/src/textual/app.py b/src/textual/app.py
+index 2e9c7f532..124f2d25c 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -1286,7 +1286,7 @@ class App(Generic[ReturnType], DOMNode):
+                 except KeyError:
+                     char = key if len(key) == 1 else None
+                 key_event = events.Key(key, char)
+-                key_event._set_sender(app)
++                key_event.set_sender(app)
+                 driver.send_event(key_event)
+                 await wait_for_idle(0)
+                 await app._animator.wait_until_complete()
+diff --git a/src/textual/await_complete.py b/src/textual/await_complete.py
+index 51d807f6d..3ac56b03b 100644
+--- a/src/textual/await_complete.py
++++ b/src/textual/await_complete.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ from asyncio import Future, gather
+-from typing import Any, Coroutine, Iterator, TypeVar
++from typing import Any, Coroutine, Generator, TypeVar
+ 
+ import rich.repr
+ 
+@@ -19,12 +19,12 @@ class AwaitComplete:
+             coroutines: One or more coroutines to execute.
+         """
+         self.coroutines: tuple[Coroutine[Any, Any, Any], ...] = coroutines
+-        self._future: Future = gather(*self.coroutines)
++        self._future: Future[Any] = gather(*self.coroutines)
+ 
+     async def __call__(self) -> Any:
+         return await self
+ 
+-    def __await__(self) -> Iterator[None]:
++    def __await__(self) -> Generator[Any, None, Any]:
+         return self._future.__await__()
+ 
+     @property
+diff --git a/src/textual/driver.py b/src/textual/driver.py
+index 8500e3099..c70edf958 100644
+--- a/src/textual/driver.py
++++ b/src/textual/driver.py
+@@ -66,7 +66,7 @@ class Driver(ABC):
+         """
+         # NOTE: This runs in a thread.
+         # Avoid calling methods on the app.
+-        event._set_sender(self._app)
++        event.set_sender(self._app)
+         if isinstance(event, events.MouseDown):
+             if event.button:
+                 self._down_buttons.append(event.button)
+diff --git a/src/textual/message.py b/src/textual/message.py
+index becdb374e..97d6b6c40 100644
+--- a/src/textual/message.py
++++ b/src/textual/message.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ from typing import TYPE_CHECKING, ClassVar
+ 
+ import rich.repr
++from typing_extensions import Self
+ 
+ from . import _time
+ from ._context import active_message_pump
+@@ -90,9 +91,23 @@ class Message:
+         """Mark this event as being forwarded."""
+         self._forwarded = True
+ 
+-    def _set_sender(self, sender: MessagePump) -> None:
+-        """Set the sender."""
++    def set_sender(self, sender: MessagePump) -> Self:
++        """Set the sender of the message.
++
++        Args:
++            sender: The sender.
++
++        Note:
++            When creating a message the sender is automatically set.
++            Normally there will be no need for this method to be called.
++            This method will be used when strict control is required over
++            the sender of a message.
++
++        Returns:
++            Self.
++        """
+         self._sender = sender
++        return self
+ 
+     def can_replace(self, message: "Message") -> bool:
+         """Check if another message may supersede this one.
+diff --git a/src/textual/screen.py b/src/textual/screen.py
+index 99d65ddf2..f9674a472 100644
+--- a/src/textual/screen.py
++++ b/src/textual/screen.py
+@@ -307,6 +307,29 @@ class Screen(Generic[ScreenResultType], Widget):
+         """
+         return self._compositor.get_widgets_at(x, y)
+ 
++    def get_focusable_widget_at(self, x: int, y: int) -> Widget | None:
++        """Get the focusable widget under a given coordinate.
++
++        If the widget directly under the given coordinate is not focusable, then this method will check
++        if any of the ancestors are focusable. If no ancestors are focusable, then `None` will be returned.
++
++        Args:
++            x: X coordinate.
++            y: Y coordinate.
++
++        Returns:
++            A `Widget`, or `None` if there is no focusable widget underneath the coordinate.
++        """
++        try:
++            widget, _region = self.get_widget_at(x, y)
++        except NoWidget:
++            return None
++
++        for node in widget.ancestors_with_self:
++            if isinstance(node, Widget) and node.focusable:
++                return node
++        return None
++
+     def get_style_at(self, x: int, y: int) -> Style:
+         """Get the style under a given coordinate.
+ 
+@@ -1015,8 +1038,10 @@ class Screen(Generic[ScreenResultType], Widget):
+             except errors.NoWidget:
+                 self.set_focus(None)
+             else:
+-                if isinstance(event, events.MouseDown) and widget.focusable:
+-                    self.set_focus(widget, scroll_visible=False)
++                if isinstance(event, events.MouseDown):
++                    focusable_widget = self.get_focusable_widget_at(event.x, event.y)
++                    if focusable_widget:
++                        self.set_focus(focusable_widget, scroll_visible=False)
+                 event.style = self.get_style_at(event.screen_x, event.screen_y)
+                 if widget is self:
+                     event._set_forwarded()

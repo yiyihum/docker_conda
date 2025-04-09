@@ -1,0 +1,136 @@
+diff --git a/rioxarray/raster_array.py b/rioxarray/raster_array.py
+index 3bf1685..3b3b872 100644
+--- a/rioxarray/raster_array.py
++++ b/rioxarray/raster_array.py
+@@ -50,7 +50,12 @@ from rioxarray.raster_writer import (
+     RasterioWriter,
+     _ensure_nodata_dtype,
+ )
+-from rioxarray.rioxarray import XRasterBase, _get_data_var_message, _make_coords
++from rioxarray.rioxarray import (
++    XRasterBase,
++    _get_data_var_message,
++    _make_coords,
++    _order_bounds,
++)
+ 
+ # DTYPE TO NODATA MAP
+ # Based on: https://github.com/OSGeo/gdal/blob/
+@@ -744,21 +749,17 @@ class RasterArray(XRasterBase):
+                 f"{_get_data_var_message(self._obj)}"
+             )
+ 
++        resolution_x, resolution_y = self.resolution()
+         # make sure that if the coordinates are
+         # in reverse order that it still works
+-        resolution_x, resolution_y = self.resolution()
+-        if resolution_y < 0:
+-            top = maxy
+-            bottom = miny
+-        else:
+-            top = miny
+-            bottom = maxy
+-        if resolution_x < 0:
+-            left = maxx
+-            right = minx
+-        else:
+-            left = minx
+-            right = maxx
++        left, bottom, right, top = _order_bounds(
++            minx=minx,
++            miny=miny,
++            maxx=maxx,
++            maxy=maxy,
++            resolution_x=resolution_x,
++            resolution_y=resolution_y,
++        )
+ 
+         # pull the data out
+         window_error = None
+diff --git a/rioxarray/rioxarray.py b/rioxarray/rioxarray.py
+index 9819e75..d22a7b5 100644
+--- a/rioxarray/rioxarray.py
++++ b/rioxarray/rioxarray.py
+@@ -215,6 +215,33 @@ def _has_spatial_dims(
+     return True
+ 
+ 
++def _order_bounds(
++    minx: float,
++    miny: float,
++    maxx: float,
++    maxy: float,
++    resolution_x: float,
++    resolution_y: float,
++) -> Tuple[float, float, float, float]:
++    """
++    Make sure that the bounds are in the correct order
++    """
++    if resolution_y < 0:
++        top = maxy
++        bottom = miny
++    else:
++        top = miny
++        bottom = maxy
++    if resolution_x < 0:
++        left = maxx
++        right = minx
++    else:
++        left = minx
++        right = maxx
++
++    return left, bottom, right, top
++
++
+ class XRasterBase:
+     """This is the base class for the GIS extensions for xarray"""
+ 
+@@ -626,7 +653,7 @@ class XRasterBase:
+             return transform
+ 
+         try:
+-            src_left, _, _, src_top = self.bounds(recalc=recalc)
++            src_left, _, _, src_top = self._unordered_bounds(recalc=recalc)
+             src_resolution_x, src_resolution_y = self.resolution(recalc=recalc)
+         except (DimensionMissingCoordinateError, DimensionError):
+             return Affine.identity() if transform is None else transform
+@@ -981,8 +1008,12 @@ class XRasterBase:
+         resolution_y = (bottom - top) / (self.height - 1)
+         return resolution_x, resolution_y
+ 
+-    def bounds(self, recalc: bool = False) -> Tuple[float, float, float, float]:
++    def _unordered_bounds(
++        self, recalc: bool = False
++    ) -> Tuple[float, float, float, float]:
+         """
++        Unordered bounds.
++
+         Parameters
+         ----------
+         recalc: bool, optional
+@@ -1014,6 +1045,24 @@ class XRasterBase:
+ 
+         return left, bottom, right, top
+ 
++    def bounds(self, recalc: bool = False) -> Tuple[float, float, float, float]:
++        """
++        Parameters
++        ----------
++        recalc: bool, optional
++            Will force the bounds to be recalculated instead of using the
++            transform attribute.
++
++        Returns
++        -------
++        left, bottom, right, top: float
++            Outermost coordinates of the `xarray.DataArray` | `xarray.Dataset`.
++        """
++        return _order_bounds(
++            *self._unordered_bounds(recalc=recalc),
++            *self.resolution(recalc=recalc),
++        )
++
+     def isel_window(
+         self, window: rasterio.windows.Window, pad: bool = False
+     ) -> Union[xarray.Dataset, xarray.DataArray]:
+

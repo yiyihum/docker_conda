@@ -1,0 +1,78 @@
+diff --git a/riffdog/command_line.py b/riffdog/command_line.py
+index e3c46df..7009182 100644
+--- a/riffdog/command_line.py
++++ b/riffdog/command_line.py
+@@ -77,6 +77,7 @@ def _add_core_arguments(parser):
+     parser.add_argument('--json', help='Produce Json output rather then Human readble', action='store_const', const=True)  # noqa: E501
+     parser.add_argument('--show-matched', help='Shows all resources, including those that matched', action='store_const', const=True)  # noqa: E501
+     parser.add_argument('--exclude-resource', help="Excludes a particular resource", action='append', default=[])
++    parser.add_argument('--include-resource', help="Includes a particular resource", action="append", default=[])
+     
+ 
+ def main(*args):
+@@ -112,6 +113,8 @@ def main(*args):
+     config = RDConfig()
+ 
+     config.external_resource_libs += pre_parsed_args.include
++    config.excluded_resources = pre_parsed_args.exclude_resource
++    config.included_resources = pre_parsed_args.include_resource
+ 
+     find_arguments(parser, config.external_resource_libs)
+     
+diff --git a/riffdog/config.py b/riffdog/config.py
+index 4e1d847..d5d3536 100644
+--- a/riffdog/config.py
++++ b/riffdog/config.py
+@@ -24,8 +24,11 @@ class RDConfig:
+ 
+         @property
+         def elements_to_scan(self):
+-            return (x for x in self.base_elements_to_scan if x not in self.excluded_resources)
+-
++            if self.included_resources:
++                resources = (x for x in self.included_resources)
++            else:
++                resources = (x for x in self.base_elements_to_scan if x not in self.excluded_resources)
++            return resources
+ 
+         def __init__(self):
+             # Set defaults and must-have settings
+@@ -37,6 +40,7 @@ class RDConfig:
+             self.state_file_locations = []
+ 
+             self.excluded_resources = []
++            self.included_resources = []
+ 
+             self.base_elements_to_scan = []
+ 
+diff --git a/riffdog/scanner.py b/riffdog/scanner.py
+index bf576bb..f4c1001 100644
+--- a/riffdog/scanner.py
++++ b/riffdog/scanner.py
+@@ -150,6 +150,7 @@ def _search_state(bucket_name, key, s3):
+     obj = s3.Object(bucket_name, key)
+     content = obj.get()['Body'].read()
+     rd = ResourceDirectory()
++    config = RDConfig()
+     parsed = ""
+     try:
+         parsed = json.loads(content)
+@@ -160,11 +161,14 @@ def _search_state(bucket_name, key, s3):
+             elements = parsed['modules'][0]['resources'].values()
+ 
+         for res in elements:
+-            element = rd.lookup(res['type'])
+-            if element:
+-                element.process_state_resource(res, key)
++            if res['type'] in config.elements_to_scan:
++                element = rd.lookup(res['type'])
++                if element:
++                    element.process_state_resource(res, key)
++                else:
++                    logging.debug(" Unsupported resource %s" % res['type'])
+             else:
+-                logging.debug(" Unsupported resource %s" % res['type'])
++                logging.debug("Skipped %s as not in elments to scan" % res['type'])
+ 
+     except Exception as e:
+         # FIXME: tighten this up could be - file not Json issue, permission of s3 etc, as well as the terraform state

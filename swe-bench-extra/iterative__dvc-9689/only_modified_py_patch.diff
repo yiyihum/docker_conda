@@ -1,0 +1,114 @@
+diff --git a/dvc/repo/experiments/executor/base.py b/dvc/repo/experiments/executor/base.py
+--- a/dvc/repo/experiments/executor/base.py
++++ b/dvc/repo/experiments/executor/base.py
+@@ -44,7 +44,7 @@
+     from dvc.repo import Repo
+     from dvc.repo.experiments.stash import ExpStashEntry
+     from dvc.scm import Git
+-    from dvc.stage import PipelineStage
++    from dvc.stage import PipelineStage, Stage
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -255,6 +255,15 @@ def _from_stash_entry(
+             **kwargs,
+         )
+ 
++    @classmethod
++    def _get_stage_files(cls, stages: List["Stage"]) -> List[str]:
++        from dvc.stage.utils import _get_stage_files
++
++        ret: List[str] = []
++        for stage in stages:
++            ret.extend(_get_stage_files(stage))
++        return ret
++
+     @classmethod
+     def _get_top_level_paths(cls, repo: "Repo") -> List["str"]:
+         return list(
+@@ -511,6 +520,9 @@ def reproduce(
+                 )
+ 
+             stages = dvc.reproduce(*args, **kwargs)
++            if paths := cls._get_stage_files(stages):
++                logger.debug("Staging stage-related files: %s", paths)
++                dvc.scm_context.add(paths)
+             if paths := cls._get_top_level_paths(dvc):
+                 logger.debug("Staging top-level files: %s", paths)
+                 dvc.scm_context.add(paths)
+diff --git a/dvc/repo/reproduce.py b/dvc/repo/reproduce.py
+--- a/dvc/repo/reproduce.py
++++ b/dvc/repo/reproduce.py
+@@ -1,5 +1,5 @@
+ import logging
+-from typing import TYPE_CHECKING, Iterator, List, Optional, cast
++from typing import TYPE_CHECKING, List, Optional, cast
+ 
+ from funcy import ldistinct
+ 
+@@ -29,33 +29,9 @@ def _reproduce_stage(stage: "Stage", **kwargs) -> Optional["Stage"]:
+     ret = stage.reproduce(**kwargs)
+     if ret and not kwargs.get("dry", False):
+         stage.dump(update_pipeline=False)
+-        _track_stage(stage)
+     return ret
+ 
+ 
+-def _get_stage_files(stage: "Stage") -> Iterator[str]:
+-    yield stage.dvcfile.relpath
+-    for dep in stage.deps:
+-        if (
+-            not dep.use_scm_ignore
+-            and dep.is_in_repo
+-            and not stage.repo.dvcfs.isdvc(stage.repo.dvcfs.from_os_path(str(dep)))
+-        ):
+-            yield dep.fs_path
+-    for out in stage.outs:
+-        if not out.use_scm_ignore and out.is_in_repo:
+-            yield out.fs_path
+-
+-
+-def _track_stage(stage: "Stage") -> None:
+-    from dvc.utils import relpath
+-
+-    context = stage.repo.scm_context
+-    for path in _get_stage_files(stage):
+-        context.track_file(relpath(path))
+-    return context.track_changed_files()
+-
+-
+ @locked
+ @scm_context
+ def reproduce(  # noqa: C901, PLR0912
+diff --git a/dvc/stage/utils.py b/dvc/stage/utils.py
+--- a/dvc/stage/utils.py
++++ b/dvc/stage/utils.py
+@@ -280,3 +280,27 @@ def validate_kwargs(
+         kwargs.pop("name", None)
+ 
+     return kwargs
++
++
++def _get_stage_files(stage: "Stage") -> List[str]:
++    from dvc.dvcfile import ProjectFile
++    from dvc.utils import relpath
++
++    ret: List[str] = []
++    file = stage.dvcfile
++    ret.append(file.relpath)
++    if isinstance(file, ProjectFile):
++        ret.append(file._lockfile.relpath)  # pylint: disable=protected-access
++
++    for dep in stage.deps:
++        if (
++            not dep.use_scm_ignore
++            and dep.is_in_repo
++            and not stage.repo.dvcfs.isdvc(stage.repo.dvcfs.from_os_path(str(dep)))
++        ):
++            ret.append(relpath(dep.fs_path))
++
++    for out in stage.outs:
++        if not out.use_scm_ignore and out.is_in_repo:
++            ret.append(relpath(out.fs_path))
++    return ret
+

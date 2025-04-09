@@ -1,0 +1,195 @@
+diff --git a/doc/writing_modules.rst b/doc/writing_modules.rst
+index 3e431627..e937c295 100644
+--- a/doc/writing_modules.rst
++++ b/doc/writing_modules.rst
+@@ -27,6 +27,40 @@ which if you are used to XDG_CONFIG paths relates to:
+ You can also specify the modules location using ``py3status -i <path to custom
+ modules directory>`` in your i3 configuration file.
+ 
++Publishing custom modules on PyPI
++---------------------------------
++
++.. note::
++    Available since py3status version 3.20.
++
++You can share your custom modules and make them available for py3status users even
++if they are not directly part of the py3status main project!
++
++All you have to do is to package your module and publish it to PyPI.
++
++py3status will discover custom modules if they are installed in the same host
++interpreter and if an entry_point in your package ``setup.py`` is defined::
++
++    setup(
++        entry_points={"py3status": ["module = package_name.py3status_module_name"]},
++    )
++
++The awesome `pewpew` module can be taken as an example on how to do it easily:
++
++- Module repository: https://github.com/obestwalter/pew3wm
++- Example setup.py: https://github.com/obestwalter/pew3wm/blob/master/setup.py
++
++We will gladly add ``extra_requires`` pointing to your modules so that users can require
++them while installing py3status. Just open an issue to request this or propose a PR.
++
++If you have installed py3status in a virtualenv (maybe because your custom module
++has dependencies that need to be available) you can also create an installable
++package from your module and publish it on PyPI.
++
++.. note::
++    To clearly identify your py3status package and for others to discover it easily
++    it is recommended to name the PyPI package ``py3status-<your module name>``.
++
+ Example 1: The basics - Hello World!
+ ------------------------------------
+ 
+diff --git a/py3status/core.py b/py3status/core.py
+index 5e3cd49c..bcfef6ac 100644
+--- a/py3status/core.py
++++ b/py3status/core.py
+@@ -2,6 +2,7 @@ from __future__ import print_function
+ from __future__ import division
+ 
+ import os
++import pkg_resources
+ import sys
+ import time
+ 
+@@ -39,6 +40,9 @@ CONFIG_SPECIAL_SECTIONS = [
+     "py3status",
+ ]
+ 
++ENTRY_POINT_NAME = "py3status"
++ENTRY_POINT_KEY = "entry_point"
++
+ 
+ class Runner(Thread):
+     """
+@@ -421,6 +425,19 @@ class Py3statusWrapper:
+         return False
+ 
+     def get_user_modules(self):
++        """Mapping from module name to relevant objects.
++
++        There are two ways of discovery and storage:
++        `include_paths` (no installation): include_path, f_name
++        `entry_point` (from installed package): "entry_point", <Py3Status class>
++
++        Modules of the same name from entry points shadow all other modules.
++        """
++        user_modules = self._get_path_based_modules()
++        user_modules.update(self._get_entry_point_based_modules())
++        return user_modules
++
++    def _get_path_based_modules(self):
+         """
+         Search configured include directories for user provided modules.
+ 
+@@ -438,12 +455,35 @@ class Py3statusWrapper:
+                 if module_name in user_modules:
+                     pass
+                 user_modules[module_name] = (include_path, f_name)
++                self.log(
++                    "available module from {}: {}".format(include_path, module_name)
++                )
+         return user_modules
+ 
++    def _get_entry_point_based_modules(self):
++        classes_from_entry_points = {}
++        for entry_point in pkg_resources.iter_entry_points(ENTRY_POINT_NAME):
++            try:
++                module = entry_point.load()
++            except Exception as err:
++                self.log("entry_point '{}' error: {}".format(entry_point, err))
++                continue
++            klass = getattr(module, Module.EXPECTED_CLASS, None)
++            if klass:
++                module_name = entry_point.module_name.split(".")[-1]
++                classes_from_entry_points[module_name] = (ENTRY_POINT_KEY, klass)
++                self.log(
++                    "available module from {}: {}".format(ENTRY_POINT_KEY, module_name)
++                )
++        return classes_from_entry_points
++
+     def get_user_configured_modules(self):
+         """
+         Get a dict of all available and configured py3status modules
+         in the user's i3status.conf.
++
++        As we already have a convenient way of loading the module, we'll
++        populate the map with the Py3Status class right away
+         """
+         user_modules = {}
+         if not self.py3_modules:
+@@ -451,8 +491,8 @@ class Py3statusWrapper:
+         for module_name, module_info in self.get_user_modules().items():
+             for module in self.py3_modules:
+                 if module_name == module.split(" ")[0]:
+-                    include_path, f_name = module_info
+-                    user_modules[module_name] = (include_path, f_name)
++                    source, item = module_info
++                    user_modules[module_name] = (source, item)
+         return user_modules
+ 
+     def load_modules(self, modules_list, user_modules):
+@@ -460,9 +500,10 @@ class Py3statusWrapper:
+         Load the given modules from the list (contains instance name) with
+         respect to the user provided modules dict.
+ 
+-        modules_list: ['weather_yahoo paris', 'net_rate']
++        modules_list: ['weather_yahoo paris', 'pewpew', 'net_rate']
+         user_modules: {
+-            'weather_yahoo': ('/etc/py3status.d/', 'weather_yahoo.py')
++            'weather_yahoo': ('/etc/py3status.d/', 'weather_yahoo.py'),
++            'pewpew': (entry_point', <Py3Status class>),
+         }
+         """
+         for module in modules_list:
+@@ -470,7 +511,13 @@ class Py3statusWrapper:
+             if module in self.modules:
+                 continue
+             try:
+-                my_m = Module(module, user_modules, self)
++                instance = None
++                payload = user_modules.get(module)
++                if payload:
++                    kind, Klass = payload
++                    if kind == ENTRY_POINT_KEY:
++                        instance = Klass()
++                my_m = Module(module, user_modules, self, instance=instance)
+                 # only handle modules with available methods
+                 if my_m.methods:
+                     self.modules[module] = my_m
+diff --git a/py3status/module.py b/py3status/module.py
+index 68c80f5e..15bd285a 100644
+--- a/py3status/module.py
++++ b/py3status/module.py
+@@ -28,6 +28,7 @@ class Module:
+ 
+     PARAMS_NEW = "new"
+     PARAMS_LEGACY = "legacy"
++    EXPECTED_CLASS = "Py3status"
+ 
+     def __init__(self, module, user_modules, py3_wrapper, instance=None):
+         """
+@@ -101,17 +102,16 @@ class Module:
+     def __repr__(self):
+         return "<Module {}>".format(self.module_full_name)
+ 
+-    @staticmethod
+-    def load_from_file(filepath):
++    @classmethod
++    def load_from_file(cls, filepath):
+         """
+         Return user-written class object from given path.
+         """
+         class_inst = None
+-        expected_class = "Py3status"
+         module_name, file_ext = os.path.splitext(os.path.split(filepath)[-1])
+         if file_ext.lower() == ".py":
+             py_mod = imp.load_source(module_name, filepath)
+-            if hasattr(py_mod, expected_class):
++            if hasattr(py_mod, cls.EXPECTED_CLASS):
+                 class_inst = py_mod.Py3status()
+         return class_inst
+ 

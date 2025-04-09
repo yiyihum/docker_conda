@@ -1,0 +1,286 @@
+diff --git a/docs/settings.md b/docs/settings.md
+index c40905f..14b2882 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -67,7 +67,7 @@ Using Uvicorn with watchfiles will enable the following options (which are other
+ 
+ * `--loop <str>` - Set the event loop implementation. The uvloop implementation provides greater performance, but is not compatible with Windows or PyPy. **Options:** *'auto', 'asyncio', 'uvloop'.* **Default:** *'auto'*.
+ * `--http <str>` - Set the HTTP protocol implementation. The httptools implementation provides greater performance, but it not compatible with PyPy. **Options:** *'auto', 'h11', 'httptools'.* **Default:** *'auto'*.
+-* `--ws <str>` - Set the WebSockets protocol implementation. Either of the `websockets` and `wsproto` packages are supported. Use `'none'` to deny all websocket requests. **Options:** *'auto', 'none', 'websockets', 'wsproto'.* **Default:** *'auto'*.
++* `--ws <str>` - Set the WebSockets protocol implementation. Either of the `websockets` and `wsproto` packages are supported. Use `'none'` to ignore all websocket requests. **Options:** *'auto', 'none', 'websockets', 'wsproto'.* **Default:** *'auto'*.
+ * `--ws-max-size <int>` - Set the WebSockets max message size, in bytes. Please note that this can be used only with the default `websockets` protocol.
+ * `--ws-ping-interval <float>` - Set the WebSockets ping interval, in seconds. Please note that this can be used only with the default `websockets` protocol.
+ * `--ws-ping-timeout <float>` - Set the WebSockets ping timeout, in seconds. Please note that this can be used only with the default `websockets` protocol.
+diff --git a/scripts/install b/scripts/install
+index 58b6324..edd3009 100755
+--- a/scripts/install
++++ b/scripts/install
+@@ -12,8 +12,8 @@ if [ -z "$GITHUB_ACTIONS" ]; then
+     "$PYTHON" -m venv "$VENV"
+     PIP="$VENV/bin/pip"
+ else
+-    PIP="pip"
++    PIP="$PYTHON -m pip"
+ fi
+ 
+-"$PIP" install -U pip
+-"$PIP" install -r "$REQUIREMENTS"
++${PIP} install -U pip
++${PIP} install -r "$REQUIREMENTS"
+diff --git a/uvicorn/config.py b/uvicorn/config.py
+index 589d72d..df91a6c 100644
+--- a/uvicorn/config.py
++++ b/uvicorn/config.py
+@@ -87,10 +87,8 @@ LOOP_SETUPS: Dict[LoopSetupType, Optional[str]] = {
+ }
+ INTERFACES: List[InterfaceType] = ["auto", "asgi3", "asgi2", "wsgi"]
+ 
+-
+ SSL_PROTOCOL_VERSION: int = ssl.PROTOCOL_TLS_SERVER
+ 
+-
+ LOGGING_CONFIG: Dict[str, Any] = {
+     "version": 1,
+     "disable_existing_loggers": False,
+@@ -159,7 +157,6 @@ def is_dir(path: Path) -> bool:
+ def resolve_reload_patterns(
+     patterns_list: List[str], directories_list: List[str]
+ ) -> Tuple[List[str], List[Path]]:
+-
+     directories: List[Path] = list(set(map(Path, directories_list.copy())))
+     patterns: List[str] = patterns_list.copy()
+ 
+diff --git a/uvicorn/protocols/http/h11_impl.py b/uvicorn/protocols/http/h11_impl.py
+index 5fff70b..9f6931e 100644
+--- a/uvicorn/protocols/http/h11_impl.py
++++ b/uvicorn/protocols/http/h11_impl.py
+@@ -92,7 +92,6 @@ class H11Protocol(asyncio.Protocol):
+         self.server_state = server_state
+         self.connections = server_state.connections
+         self.tasks = server_state.tasks
+-        self.default_headers = server_state.default_headers
+ 
+         # Per-connection state
+         self.transport: asyncio.Transport = None  # type: ignore[assignment]
+@@ -155,6 +154,28 @@ class H11Protocol(asyncio.Protocol):
+             self.timeout_keep_alive_task.cancel()
+             self.timeout_keep_alive_task = None
+ 
++    def _get_upgrade(self) -> Optional[bytes]:
++        connection = []
++        upgrade = None
++        for name, value in self.headers:
++            if name == b"connection":
++                connection = [token.lower().strip() for token in value.split(b",")]
++            if name == b"upgrade":
++                upgrade = value.lower()
++        if b"upgrade" in connection:
++            return upgrade
++        return None
++
++    def _should_upgrade_to_ws(self) -> bool:
++        if self.ws_protocol_class is None:
++            if self.config.ws == "auto":
++                msg = "Unsupported upgrade request."
++                self.logger.warning(msg)
++                msg = "No supported WebSocket library detected. Please use 'pip install uvicorn[standard]', or install 'websockets' or 'wsproto' manually."  # noqa: E501
++                self.logger.warning(msg)
++            return False
++        return True
++
+     def data_received(self, data: bytes) -> None:
+         self._unset_keepalive_if_required()
+ 
+@@ -204,12 +225,10 @@ class H11Protocol(asyncio.Protocol):
+                     "headers": self.headers,
+                 }
+ 
+-                for name, value in self.headers:
+-                    if name == b"connection":
+-                        tokens = [token.lower().strip() for token in value.split(b",")]
+-                        if b"upgrade" in tokens:
+-                            self.handle_upgrade(event)
+-                            return
++                upgrade = self._get_upgrade()
++                if upgrade == b"websocket" and self._should_upgrade_to_ws():
++                    self.handle_websocket_upgrade(event)
++                    return
+ 
+                 # Handle 503 responses when 'limit_concurrency' is exceeded.
+                 if self.limit_concurrency is not None and (
+@@ -230,7 +249,7 @@ class H11Protocol(asyncio.Protocol):
+                     logger=self.logger,
+                     access_logger=self.access_logger,
+                     access_log=self.access_log,
+-                    default_headers=self.default_headers,
++                    default_headers=self.server_state.default_headers,
+                     message_event=asyncio.Event(),
+                     on_response=self.on_response_complete,
+                 )
+@@ -254,23 +273,7 @@ class H11Protocol(asyncio.Protocol):
+                 self.cycle.more_body = False
+                 self.cycle.message_event.set()
+ 
+-    def handle_upgrade(self, event: H11Event) -> None:
+-        upgrade_value = None
+-        for name, value in self.headers:
+-            if name == b"upgrade":
+-                upgrade_value = value.lower()
+-
+-        if upgrade_value != b"websocket" or self.ws_protocol_class is None:
+-            msg = "Unsupported upgrade request."
+-            self.logger.warning(msg)
+-            from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+-
+-            if AutoWebSocketsProtocol is None:  # pragma: no cover
+-                msg = "No supported WebSocket library detected. Please use 'pip install uvicorn[standard]', or install 'websockets' or 'wsproto' manually."  # noqa: E501
+-                self.logger.warning(msg)
+-            self.send_400_response(msg)
+-            return
+-
++    def handle_websocket_upgrade(self, event: H11Event) -> None:
+         if self.logger.level <= TRACE_LOG_LEVEL:
+             prefix = "%s:%d - " % self.client if self.client else ""
+             self.logger.log(TRACE_LOG_LEVEL, "%sUpgrading to WebSocket", prefix)
+@@ -280,7 +283,7 @@ class H11Protocol(asyncio.Protocol):
+         for name, value in self.headers:
+             output += [name, b": ", value, b"\r\n"]
+         output.append(b"\r\n")
+-        protocol = self.ws_protocol_class(  # type: ignore[call-arg]
++        protocol = self.ws_protocol_class(  # type: ignore[call-arg, misc]
+             config=self.config, server_state=self.server_state
+         )
+         protocol.connection_made(self.transport)
+diff --git a/uvicorn/protocols/http/httptools_impl.py b/uvicorn/protocols/http/httptools_impl.py
+index f018c59..734e894 100644
+--- a/uvicorn/protocols/http/httptools_impl.py
++++ b/uvicorn/protocols/http/httptools_impl.py
+@@ -90,7 +90,6 @@ class HttpToolsProtocol(asyncio.Protocol):
+         self.server_state = server_state
+         self.connections = server_state.connections
+         self.tasks = server_state.tasks
+-        self.default_headers = server_state.default_headers
+ 
+         # Per-connection state
+         self.transport: asyncio.Transport = None  # type: ignore[assignment]
+@@ -149,6 +148,32 @@ class HttpToolsProtocol(asyncio.Protocol):
+             self.timeout_keep_alive_task.cancel()
+             self.timeout_keep_alive_task = None
+ 
++    def _get_upgrade(self) -> Optional[bytes]:
++        connection = []
++        upgrade = None
++        for name, value in self.headers:
++            if name == b"connection":
++                connection = [token.lower().strip() for token in value.split(b",")]
++            if name == b"upgrade":
++                upgrade = value.lower()
++        if b"upgrade" in connection:
++            return upgrade
++        return None
++
++    def _should_upgrade_to_ws(self, upgrade: Optional[bytes]) -> bool:
++        if upgrade == b"websocket" and self.ws_protocol_class is not None:
++            return True
++        if self.config.ws == "auto":
++            msg = "Unsupported upgrade request."
++            self.logger.warning(msg)
++            msg = "No supported WebSocket library detected. Please use 'pip install uvicorn[standard]', or install 'websockets' or 'wsproto' manually."  # noqa: E501
++            self.logger.warning(msg)
++        return False
++
++    def _should_upgrade(self) -> bool:
++        upgrade = self._get_upgrade()
++        return self._should_upgrade_to_ws(upgrade)
++
+     def data_received(self, data: bytes) -> None:
+         self._unset_keepalive_if_required()
+ 
+@@ -160,25 +185,11 @@ class HttpToolsProtocol(asyncio.Protocol):
+             self.send_400_response(msg)
+             return
+         except httptools.HttpParserUpgrade:
+-            self.handle_upgrade()
+-
+-    def handle_upgrade(self) -> None:
+-        upgrade_value = None
+-        for name, value in self.headers:
+-            if name == b"upgrade":
+-                upgrade_value = value.lower()
+-
+-        if upgrade_value != b"websocket" or self.ws_protocol_class is None:
+-            msg = "Unsupported upgrade request."
+-            self.logger.warning(msg)
+-            from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+-
+-            if AutoWebSocketsProtocol is None:  # pragma: no cover
+-                msg = "No supported WebSocket library detected. Please use 'pip install uvicorn[standard]', or install 'websockets' or 'wsproto' manually."  # noqa: E501
+-                self.logger.warning(msg)
+-            self.send_400_response(msg)
+-            return
++            upgrade = self._get_upgrade()
++            if self._should_upgrade_to_ws(upgrade):
++                self.handle_websocket_upgrade()
+ 
++    def handle_websocket_upgrade(self) -> None:
+         if self.logger.level <= TRACE_LOG_LEVEL:
+             prefix = "%s:%d - " % self.client if self.client else ""
+             self.logger.log(TRACE_LOG_LEVEL, "%sUpgrading to WebSocket", prefix)
+@@ -189,7 +200,7 @@ class HttpToolsProtocol(asyncio.Protocol):
+         for name, value in self.scope["headers"]:
+             output += [name, b": ", value, b"\r\n"]
+         output.append(b"\r\n")
+-        protocol = self.ws_protocol_class(  # type: ignore[call-arg]
++        protocol = self.ws_protocol_class(  # type: ignore[call-arg, misc]
+             config=self.config, server_state=self.server_state
+         )
+         protocol.connection_made(self.transport)
+@@ -199,7 +210,7 @@ class HttpToolsProtocol(asyncio.Protocol):
+     def send_400_response(self, msg: str) -> None:
+ 
+         content = [STATUS_LINE[400]]
+-        for name, value in self.default_headers:
++        for name, value in self.server_state.default_headers:
+             content.extend([name, b": ", value, b"\r\n"])
+         content.extend(
+             [
+@@ -244,7 +255,7 @@ class HttpToolsProtocol(asyncio.Protocol):
+         self.scope["method"] = method.decode("ascii")
+         if http_version != "1.1":
+             self.scope["http_version"] = http_version
+-        if self.parser.should_upgrade():
++        if self.parser.should_upgrade() and self._should_upgrade():
+             return
+         parsed_url = httptools.parse_url(self.url)
+         raw_path = parsed_url.path
+@@ -274,7 +285,7 @@ class HttpToolsProtocol(asyncio.Protocol):
+             logger=self.logger,
+             access_logger=self.access_logger,
+             access_log=self.access_log,
+-            default_headers=self.default_headers,
++            default_headers=self.server_state.default_headers,
+             message_event=asyncio.Event(),
+             expect_100_continue=self.expect_100_continue,
+             keep_alive=http_version != "1.0",
+@@ -291,7 +302,9 @@ class HttpToolsProtocol(asyncio.Protocol):
+             self.pipeline.appendleft((self.cycle, app))
+ 
+     def on_body(self, body: bytes) -> None:
+-        if self.parser.should_upgrade() or self.cycle.response_complete:
++        if (
++            self.parser.should_upgrade() and self._should_upgrade()
++        ) or self.cycle.response_complete:
+             return
+         self.cycle.body += body
+         if len(self.cycle.body) > HIGH_WATER_LIMIT:
+@@ -299,7 +312,9 @@ class HttpToolsProtocol(asyncio.Protocol):
+         self.cycle.message_event.set()
+ 
+     def on_message_complete(self) -> None:
+-        if self.parser.should_upgrade() or self.cycle.response_complete:
++        if (
++            self.parser.should_upgrade() and self._should_upgrade()
++        ) or self.cycle.response_complete:
+             return
+         self.cycle.more_body = False
+         self.cycle.message_event.set()

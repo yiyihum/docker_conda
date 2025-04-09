@@ -1,0 +1,141 @@
+diff --git a/sqlglot/dialects/mysql.py b/sqlglot/dialects/mysql.py
+index 13f8b858..7a160c1d 100644
+--- a/sqlglot/dialects/mysql.py
++++ b/sqlglot/dialects/mysql.py
+@@ -391,6 +391,11 @@ class MySQL(Dialect):
+             "WARNINGS": _show_parser("WARNINGS"),
+         }
+ 
++        PROPERTY_PARSERS = {
++            **parser.Parser.PROPERTY_PARSERS,
++            "LOCK": lambda self: self._parse_property_assignment(exp.LockProperty),
++        }
++
+         SET_PARSERS = {
+             **parser.Parser.SET_PARSERS,
+             "PERSIST": lambda self: self._parse_set_item_assignment("PERSIST"),
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 4fb3679a..3bec25ee 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -2322,6 +2322,10 @@ class LocationProperty(Property):
+     arg_types = {"this": True}
+ 
+ 
++class LockProperty(Property):
++    arg_types = {"this": True}
++
++
+ class LockingProperty(Property):
+     arg_types = {
+         "this": False,
+@@ -2505,6 +2509,7 @@ class Properties(Expression):
+         "FORMAT": FileFormatProperty,
+         "LANGUAGE": LanguageProperty,
+         "LOCATION": LocationProperty,
++        "LOCK": LockProperty,
+         "PARTITIONED_BY": PartitionedByProperty,
+         "RETURNS": ReturnsProperty,
+         "ROW_FORMAT": RowFormatProperty,
+@@ -3923,7 +3928,13 @@ class Rollback(Expression):
+ 
+ 
+ class AlterTable(Expression):
+-    arg_types = {"this": True, "actions": True, "exists": False, "only": False}
++    arg_types = {
++        "this": True,
++        "actions": True,
++        "exists": False,
++        "only": False,
++        "options": False,
++    }
+ 
+ 
+ class AddConstraint(Expression):
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index d8b6290d..66466734 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -388,6 +388,7 @@ class Generator(metaclass=_Generator):
+         exp.LanguageProperty: exp.Properties.Location.POST_SCHEMA,
+         exp.LikeProperty: exp.Properties.Location.POST_SCHEMA,
+         exp.LocationProperty: exp.Properties.Location.POST_SCHEMA,
++        exp.LockProperty: exp.Properties.Location.POST_SCHEMA,
+         exp.LockingProperty: exp.Properties.Location.POST_ALIAS,
+         exp.LogProperty: exp.Properties.Location.POST_NAME,
+         exp.MaterializedProperty: exp.Properties.Location.POST_CREATE,
+@@ -2833,7 +2834,9 @@ class Generator(metaclass=_Generator):
+ 
+         exists = " IF EXISTS" if expression.args.get("exists") else ""
+         only = " ONLY" if expression.args.get("only") else ""
+-        return f"ALTER TABLE{exists}{only} {self.sql(expression, 'this')} {actions}"
++        options = self.expressions(expression, key="options")
++        options = f", {options}" if options else ""
++        return f"ALTER TABLE{exists}{only} {self.sql(expression, 'this')} {actions}{options}"
+ 
+     def add_column_sql(self, expression: exp.AlterTable) -> str:
+         if self.ALTER_TABLE_INCLUDE_COLUMN_KEYWORD:
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 322fa1ca..3465c56d 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -5281,6 +5281,9 @@ class Parser(metaclass=_Parser):
+     def _parse_var_or_string(self) -> t.Optional[exp.Expression]:
+         return self._parse_var() or self._parse_string()
+ 
++    def _parse_primary_or_var(self) -> t.Optional[exp.Expression]:
++        return self._parse_primary() or self._parse_var(any_token=True)
++
+     def _parse_null(self) -> t.Optional[exp.Expression]:
+         if self._match_set(self.NULL_TOKENS):
+             return self.PRIMARY_PARSERS[TokenType.NULL](self, self._prev)
+@@ -5299,16 +5302,12 @@ class Parser(metaclass=_Parser):
+         return self._parse_placeholder()
+ 
+     def _parse_parameter(self) -> exp.Parameter:
+-        def _parse_parameter_part() -> t.Optional[exp.Expression]:
+-            return (
+-                self._parse_identifier() or self._parse_primary() or self._parse_var(any_token=True)
+-            )
+-
+         self._match(TokenType.L_BRACE)
+-        this = _parse_parameter_part()
+-        expression = self._match(TokenType.COLON) and _parse_parameter_part()
++        this = self._parse_identifier() or self._parse_primary_or_var()
++        expression = self._match(TokenType.COLON) and (
++            self._parse_identifier() or self._parse_primary_or_var()
++        )
+         self._match(TokenType.R_BRACE)
+-
+         return self.expression(exp.Parameter, this=this, expression=expression)
+ 
+     def _parse_placeholder(self) -> t.Optional[exp.Expression]:
+@@ -5551,6 +5550,7 @@ class Parser(metaclass=_Parser):
+         parser = self.ALTER_PARSERS.get(self._prev.text.upper()) if self._prev else None
+         if parser:
+             actions = ensure_list(parser(self))
++            options = self._parse_csv(self._parse_property)
+ 
+             if not self._curr and actions:
+                 return self.expression(
+@@ -5559,6 +5559,7 @@ class Parser(metaclass=_Parser):
+                     exists=exists,
+                     actions=actions,
+                     only=only,
++                    options=options,
+                 )
+ 
+         return self._parse_as_command(start)
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index eab61052..004b2882 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -1187,7 +1187,7 @@ class Tokenizer(metaclass=_Tokenizer):
+                 self._advance()
+             elif self._peek == "." and not decimal:
+                 after = self.peek(1)
+-                if after.isdigit() or not after.isalpha():
++                if after.isdigit() or not (after.isalpha() or after == "_"):
+                     decimal = True
+                     self._advance()
+                 else:

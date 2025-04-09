@@ -1,0 +1,136 @@
+diff --git a/CHANGES b/CHANGES
+index 57ecf16..3f99aee 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -1,12 +1,15 @@
+ 0.19.0
+ ------
+ 
++* Added support for the registry depending on the invocation index.
++  See `responses.registries.OrderedRegistry`.
+ * Expose `get_registry()` method of `RequestsMock` object. Replaces internal `_get_registry()`.
+ * `query_param_matcher` can now accept dictionaries with `int` and `float` values.
+ * Added support for `async/await` functions.
+ * `response_callback` is no longer executed on exceptions raised by failed `Response`s
+ * An error is now raised when both `content_type` and `headers[content-type]` are provided as parameters.
+ 
++
+ 0.18.0
+ ------
+ 
+diff --git a/README.rst b/README.rst
+index eb89879..476371d 100644
+--- a/README.rst
++++ b/README.rst
+@@ -460,12 +460,67 @@ Note, ``PreparedRequest`` is customized and has additional attributes ``params``
+ Response Registry
+ ---------------------------
+ 
++Default Registry
++^^^^^^^^^^^^^^^^
++
+ By default, ``responses`` will search all registered ``Response`` objects and
+ return a match. If only one ``Response`` is registered, the registry is kept unchanged.
+ However, if multiple matches are found for the same request, then first match is returned and
+ removed from registry.
+ 
+-Such behavior is suitable for most of use cases, but to handle special conditions, you can
++Ordered Registry
++^^^^^^^^^^^^^^^^
++
++In some scenarios it is important to preserve the order of the requests and responses.
++You can use ``registries.OrderedRegistry`` to force all ``Response`` objects to be dependent
++on the insertion order and invocation index.
++In following example we add multiple ``Response`` objects that target the same URL. However,
++you can see, that status code will depend on the invocation order.
++
++
++.. code-block:: python
++
++    @responses.activate(registry=OrderedRegistry)
++    def test_invocation_index():
++        responses.add(
++            responses.GET,
++            "http://twitter.com/api/1/foobar",
++            json={"msg": "not found"},
++            status=404,
++        )
++        responses.add(
++            responses.GET,
++            "http://twitter.com/api/1/foobar",
++            json={"msg": "OK"},
++            status=200,
++        )
++        responses.add(
++            responses.GET,
++            "http://twitter.com/api/1/foobar",
++            json={"msg": "OK"},
++            status=200,
++        )
++        responses.add(
++            responses.GET,
++            "http://twitter.com/api/1/foobar",
++            json={"msg": "not found"},
++            status=404,
++        )
++
++        resp = requests.get("http://twitter.com/api/1/foobar")
++        assert resp.status_code == 404
++        resp = requests.get("http://twitter.com/api/1/foobar")
++        assert resp.status_code == 200
++        resp = requests.get("http://twitter.com/api/1/foobar")
++        assert resp.status_code == 200
++        resp = requests.get("http://twitter.com/api/1/foobar")
++        assert resp.status_code == 404
++
++
++Custom Registry
++^^^^^^^^^^^^^^^
++
++Built-in ``registries`` are suitable for most of use cases, but to handle special conditions, you can
+ implement custom registry which must follow interface of ``registries.FirstMatchRegistry``.
+ Redefining the ``find`` method will allow you to create custom search logic and return
+ appropriate ``Response``
+diff --git a/responses/registries.py b/responses/registries.py
+index 5a0be34..a47b846 100644
+--- a/responses/registries.py
++++ b/responses/registries.py
+@@ -67,3 +67,25 @@ class FirstMatchRegistry(object):
+                 "Response is not registered for URL {}".format(response.url)
+             )
+         self.registered[index] = response
++
++
++class OrderedRegistry(FirstMatchRegistry):
++    def find(
++        self, request: "PreparedRequest"
++    ) -> Tuple[Optional["BaseResponse"], List[str]]:
++
++        if not self.registered:
++            return None, ["No more registered responses"]
++
++        response = self.registered.pop(0)
++        match_result, reason = response.matches(request)
++        if not match_result:
++            self.reset()
++            self.add(response)
++            reason = (
++                "Next 'Response' in the order doesn't match "
++                f"due to the following reason: {reason}."
++            )
++            return None, [reason]
++
++        return response, []
+diff --git a/setup.py b/setup.py
+index c94b3ea..9d66877 100644
+--- a/setup.py
++++ b/setup.py
+@@ -55,7 +55,7 @@ class PyTest(TestCommand):
+ 
+ setup(
+     name="responses",
+-    version="0.17.0",
++    version="0.18.0",
+     author="David Cramer",
+     description=("A utility library for mocking out the `requests` Python library."),
+     url="https://github.com/getsentry/responses",

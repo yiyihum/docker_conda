@@ -1,0 +1,81 @@
+diff --git a/src/prefect/configuration.py b/src/prefect/configuration.py
+index 8251ff5b5f..025ca3f181 100644
+--- a/src/prefect/configuration.py
++++ b/src/prefect/configuration.py
+@@ -206,11 +206,6 @@ def interpolate_config(config: dict, env_var_prefix: str = None) -> Config:
+                 if "__" not in env_var:
+                     continue
+ 
+-                # env vars with escaped characters are interpreted as literal "\", which
+-                # Python helpfully escapes with a second "\". This step makes sure that
+-                # escaped characters are properly interpreted.
+-                value = cast(str, env_var_value.encode().decode("unicode_escape"))
+-
+                 # place the env var in the flat config as a compound key
+                 if env_var_option.upper().startswith("CONTEXT__SECRETS"):
+                     formatted_option = env_var_option.split("__")
+@@ -224,7 +219,7 @@ def interpolate_config(config: dict, env_var_prefix: str = None) -> Config:
+                     )
+ 
+                 flat_config[config_option] = string_to_type(
+-                    cast(str, interpolate_env_vars(value))
++                    cast(str, interpolate_env_vars(env_var_value))
+                 )
+ 
+     # interpolate any env vars referenced
+diff --git a/src/prefect/engine/task_runner.py b/src/prefect/engine/task_runner.py
+index 056df601db..501a00cbec 100644
+--- a/src/prefect/engine/task_runner.py
++++ b/src/prefect/engine/task_runner.py
+@@ -430,8 +430,18 @@ class TaskRunner(Runner):
+             - ENDRUN: either way, we dont continue past this point
+         """
+         if state.is_mapped():
++            # this indicates we are executing a re-run of a mapped pipeline;
++            # in this case, we populate both `map_states` and `cached_inputs`
++            # to ensure the flow runner can properly regenerate the child tasks,
++            # regardless of whether we mapped over an exchanged piece of data
++            # or a non-data-exchanging upstream dependency
+             if len(state.map_states) == 0 and state.n_map_states > 0:  # type: ignore
+                 state.map_states = [None] * state.n_map_states  # type: ignore
++            state.cached_inputs = {
++                edge.key: state._result  # type: ignore
++                for edge, state in upstream_states.items()
++                if edge.key
++            }
+             raise ENDRUN(state)
+ 
+         # we can't map if there are no success states with iterables upstream
+diff --git a/src/prefect/utilities/executors.py b/src/prefect/utilities/executors.py
+index 9dbff70d26..2001cbee4e 100644
+--- a/src/prefect/utilities/executors.py
++++ b/src/prefect/utilities/executors.py
+@@ -506,21 +506,14 @@ def prepare_upstream_states_for_mapping(
+                         not state.is_mapped()
+                         or upstream_state._result != prefect.engine.result.NoResult
+                     ):
+-                        # this line should never be hit due to a check
+-                        # in the TaskRunner when evaluating the mapped parent
+                         if not hasattr(upstream_state.result, "__getitem__"):
+-                            raise TypeError(
+-                                (
+-                                    "Cannot map over unsubscriptable object of type {t}: {val}..."
+-                                ).format(
+-                                    t=type(upstream_state.result),
+-                                    val=repr(upstream_state.result)[:10],
+-                                )
+-                            )
+-                        upstream_result = upstream_state._result.from_value(  # type: ignore
+-                            upstream_state.result[i]
+-                        )
++                            value = None
++                        else:
++                            value = upstream_state.result[i]
++                        upstream_result = upstream_state._result.from_value(value)  # type: ignore
+                         states[edge].result = upstream_result
++                        if state.map_states and i >= len(state.map_states):  # type: ignore
++                            raise IndexError()
+                     elif state.is_mapped():
+                         if i >= len(state.map_states):  # type: ignore
+                             raise IndexError()
+

@@ -1,0 +1,102 @@
+diff --git a/dandi/cli/command.py b/dandi/cli/command.py
+index 7764b0f5..d93efd05 100644
+--- a/dandi/cli/command.py
++++ b/dandi/cli/command.py
+@@ -107,16 +107,12 @@ def main(ctx, log_level, pdb=False):
+     handler.setFormatter(fmter)
+     root.addHandler(handler)
+ 
+-    import h5py
+-    import hdmf
+-    import pynwb
+-
+     lgr.info(
+         "dandi v%s, hdmf v%s, pynwb v%s, h5py v%s",
+         __version__,
+-        get_module_version(hdmf),
+-        get_module_version(pynwb),
+-        get_module_version(h5py),
++        get_module_version("hdmf"),
++        get_module_version("pynwb"),
++        get_module_version("h5py"),
+         extra={"file_only": True},
+     )
+     lgr.info("sys.argv = %r", sys.argv, extra={"file_only": True})
+diff --git a/dandi/dandiarchive.py b/dandi/dandiarchive.py
+index 5f56eacc..55e1f7d8 100644
+--- a/dandi/dandiarchive.py
++++ b/dandi/dandiarchive.py
+@@ -198,12 +198,22 @@ class _dandi_url_parser:
+             re.compile(
+                 rf"{server_grp}(?P<asset_type>dandiset)s/{dandiset_id_grp}"
+                 r"/versions/(?P<version>[.0-9]{5,}|draft)"
+-                r"/assets/(?P<asset_id>[^/]+)(/(download/?)?)?"
++                r"/assets/(?P<asset_id>[^?/]+)(/(download/?)?)?"
+             ),
+             {"server_type": "api"},
+             "https://<server>[/api]/dandisets/<dandiset id>/versions/<version>"
+             "/assets/<asset id>[/download]",
+         ),
++        (
++            re.compile(
++                rf"{server_grp}(?P<asset_type>dandiset)s/{dandiset_id_grp}"
++                r"/versions/(?P<version>[.0-9]{5,}|draft)"
++                r"/assets/\?path=(?P<path>[^&]+)",
++            ),
++            {"server_type": "api"},
++            "https://<server>[/api]/dandisets/<dandiset id>/versions/<version>"
++            "/assets/?path=<path>",
++        ),
+         # But for drafts files navigator it is a bit different beast and there
+         # could be no versions, only draft
+         # https://deploy-preview-341--gui-dandiarchive-org.netlify.app/#/dandiset/000027/draft/files?_id=5f176583f63d62e1dbd06943&_modelType=folder
+@@ -375,6 +385,7 @@ class _dandi_url_parser:
+         version = groups.get("version")
+         location = groups.get("location")
+         asset_key = groups.get("asset_id")
++        path = groups.get("path")
+         if location:
+             location = urlunquote(location)
+             # ATM carries leading '/' which IMHO is not needed/misguiding somewhat, so
+@@ -396,6 +407,9 @@ class _dandi_url_parser:
+         elif asset_key:
+             asset_type = "item"
+             asset_ids["asset_id"] = asset_key
++        elif path:
++            asset_type = "folder"
++            asset_ids["location"] = path
+         # TODO: remove whenever API supports "draft" and this type of url
+         if groups.get("id"):
+             assert version == "draft"
+diff --git a/dandi/utils.py b/dandi/utils.py
+index 2b24bf4f..bab3670e 100644
+--- a/dandi/utils.py
++++ b/dandi/utils.py
+@@ -699,7 +699,7 @@ def is_url(s):
+ def get_module_version(module: Union[str, types.ModuleType]) -> Optional[str]:
+     """Return version of the module
+ 
+-    Return module's `__version__` and if present, or use importlib
++    Return module's `__version__` if present, or use importlib
+     to get version.
+ 
+     Returns
+@@ -708,13 +708,14 @@ def get_module_version(module: Union[str, types.ModuleType]) -> Optional[str]:
+     """
+     if isinstance(module, str):
+         mod_name = module
+-        if module not in sys.modules:
+-            return None
+-        module = sys.modules[module]
++        module = sys.modules.get(module)
+     else:
+         mod_name = module.__name__.split(".", 1)[0]
+ 
+-    version = getattr(module, "__version__", None)
++    if module is not None:
++        version = getattr(module, "__version__", None)
++    else:
++        version = None
+     if version is None:
+         # Let's use the standard Python mechanism if underlying module
+         # did not provide __version__

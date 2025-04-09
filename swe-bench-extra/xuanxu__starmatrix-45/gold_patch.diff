@@ -1,0 +1,187 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index ddd32f0..e643d2d 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -4,6 +4,12 @@
+ Changelog
+ =========
+ 
++
++1.6.0 (unreleased)
++==================
++- Added Phi function from Strolger et al (2020)
++
++
+ 1.5.3 (2021-07-14)
+ ==================
+ - Better normalization rates and fits for Greggio DTDs
+diff --git a/README.rst b/README.rst
+index 89b1cea..14143c5 100644
+--- a/README.rst
++++ b/README.rst
+@@ -141,6 +141,11 @@ The ``dtd_sn`` param in the config file can be set to use any of the available D
+ :greggio-WDD1: DTD from model Wide DD 1 Gyr from Greggio, L. (2005)
+ :greggio-SDCH: DTD from model SD Chandra from Greggio, L. (2005)
+ :greggio-SDSCH: DTD from model SD sub-Chandra from Greggio, L. (2005)
++:strolger-fit1: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (10, 600, 220)
++:strolger-fit2: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (110, 1000, 2)
++:strolger-fit3: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (350, 1200, 20)
++:strolger-fit4: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (6000, 6000, -2)
++:strolger-optimized: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (-1518, 51, 50)
+ 
+ Supernovae yields
+ -----------------
+@@ -215,3 +220,4 @@ Starmatrix is built upon a long list of previous works from different authors/pa
+ * *Gronow, S. et al.*, 2021, A&A
+ * *Mori, K. et al.*, 2018, ApJ, 863:176
+ * *Chen, X., Hu, L. & Wang, L.*, 2021, ApJ
++* *Strolger et al*, 2020, ApJ, Vol 890, 2. doi: 10.3847/1538-4357/ab6a97
+diff --git a/docs/configuration.rst b/docs/configuration.rst
+index f8d9052..a92aced 100644
+--- a/docs/configuration.rst
++++ b/docs/configuration.rst
+@@ -87,6 +87,11 @@ The ``dtd_sn`` param in the config file can be set to use any of the available D
+ :greggio-WDD1: DTD from model Wide DD 1 Gyr from Greggio, L. (2005)
+ :greggio-SDCH: DTD from model SD Chandra from Greggio, L. (2005)
+ :greggio-SDSCH: DTD from model SD sub-Chandra from Greggio, L. (2005)
++:strolger-fit1: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (10, 600, 220)
++:strolger-fit2: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (110, 1000, 2)
++:strolger-fit3: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (350, 1200, 20)
++:strolger-fit4: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (6000, 6000, -2)
++:strolger-optimized: Phi function from Strolger et al (2020) with (ξ, ω, 𝛼) = (-1518, 51, 50)
+ 
+ Supernovae yields
+ -----------------
+diff --git a/docs/credits.rst b/docs/credits.rst
+index f9dd88c..7f885a3 100644
+--- a/docs/credits.rst
++++ b/docs/credits.rst
+@@ -36,6 +36,7 @@ Starmatrix is built upon a long list of previous works from different authors/pa
+ * *Leung & Nomoto*, 2018, ApJ, Vol 861, Issue 2, Id 143
+ * *Leung & Nomoto*, 2020, ApJ, Vol 888, Issue 2, Id 80
+ * *Chen, X., Hu, L. & Wang, L.*, 2021, ApJ
++* *Strolger et al*, 2020, ApJ, Vol 890, 2. doi: 10.3847/1538-4357/ab6a97
+ 
+ License
+ -------
+diff --git a/src/starmatrix/dtds.py b/src/starmatrix/dtds.py
+index 5bfdda5..03943c7 100644
+--- a/src/starmatrix/dtds.py
++++ b/src/starmatrix/dtds.py
+@@ -7,10 +7,14 @@ Contains some predefined DTDs from different papers/authors:
+ * Maoz & Graur (2017)
+ * Castrillo et al (2020)
+ * Greggio, L. (2005)
++* Strolger et al. (2020)
+ 
+ """
+ 
+ import math
++import scipy.integrate
++import starmatrix.constants as constants
++from functools import lru_cache
+ 
+ 
+ def select_dtd(option):
+@@ -25,7 +29,12 @@ def select_dtd(option):
+         "greggio-WDD1": dtd_wide_dd_1,
+         "greggio-SDCH": dtd_sd_chandra,
+         "greggio-SDSCH": dtd_sd_subchandra,
+-        "chen": dtd_chen
++        "chen": dtd_chen,
++        "strolger-fit1": dtds_strolger["fit_1"],
++        "strolger-fit2": dtds_strolger["fit_2"],
++        "strolger-fit3": dtds_strolger["fit_3"],
++        "strolger-fit4": dtds_strolger["fit_4"],
++        "strolger-optimized": dtds_strolger["optimized"],
+     }
+     return dtds[option]
+ 
+@@ -284,3 +293,57 @@ def dtd_chen(t):
+     rate = 2.069e-4  # [SN / Yr / M*]
+ 
+     return rate * dtd
++
++
++class Strolger:
++    def __init__(self, psi, omega, alpha):
++        self.psi = psi
++        self.omega = omega
++        self.alpha = alpha
++
++    def description(self):
++        return ("Delay Time Distributions (DTDs) from Strolger et al, "
++                "The Astrophysical Journal, 2020, 890, 2. "
++                "DOI: 10.3847/1538-4357/ab6a97")
++
++    def phi(self, t_gyrs):
++        t_myrs = t_gyrs * 1e3
++
++        u = t_myrs - self.psi
++        term_1 = (1/(self.omega * math.pi)) * math.exp((-(u**2))/(2*(self.omega**2)))
++
++        t_low = -math.inf
++        t_up = self.alpha*(u/self.omega)
++
++        if 12 < t_up:
++            term_2 = 2 * scipy.integrate.quad(self.term_2_f, t_low, 0)[0]
++        else:
++            term_2 = scipy.integrate.quad(self.term_2_f, t_low, t_up)[0]
++
++        return term_1 * term_2
++
++    def term_2_f(self, t_prime):
++        return math.exp(-math.pow(t_prime, 2)/2)
++
++    @lru_cache(maxsize=128)
++    def normalization_rate(self):
++        return self.efficiency() / self.phi_integrated()
++
++    def efficiency(self):
++        # SN/M* as Hubble-time-integrated production efficiency SN/Mo
++        return 1.03e-3
++
++    def phi_integrated(self):
++        return scipy.integrate.quad(self.phi, 0, constants.TOTAL_TIME)[0]
++
++    def at_time(self, t):
++        return self.normalization_rate() * self.phi(t)
++
++
++dtds_strolger = {
++    "fit_1": Strolger(10, 600, 220).at_time,
++    "fit_2": Strolger(110, 1000, 2).at_time,
++    "fit_3": Strolger(350, 1200, 20).at_time,
++    "fit_4": Strolger(6000, 6000, -2).at_time,
++    "optimized": Strolger(-1518, 51, 50).at_time,
++}
+diff --git a/src/starmatrix/sample_input/params.yml b/src/starmatrix/sample_input/params.yml
+index 35fa2c4..eb92429 100644
+--- a/src/starmatrix/sample_input/params.yml
++++ b/src/starmatrix/sample_input/params.yml
+@@ -54,6 +54,11 @@
+ #            greggio-WDD1 = DTD from model Wide DD 1 Gyr from Greggio, L. (2005)
+ #            greggio-SDCH = DTD from model SD Chandra from Greggio, L. (2005)
+ #            greggio-SDSCH = DTD from model SD sub-Chandra from Greggio, L. (2005)
++#            strolger-fit1 = Phi from Strolger et al (2020) with (ξ, ω, 𝛼) = (10, 600, 220)
++#            strolger-fit2 = Phi from Strolger et al (2020) with (ξ, ω, 𝛼) = (110, 1000, 2)
++#            strolger-fit3 = Phi from Strolger et al (2020) with (ξ, ω, 𝛼) = (350, 1200, 20)
++#            strolger-fit4 = Phi from Strolger et al (2020) with (ξ, ω, 𝛼) = (6000, 6000, -2)
++#            strolger-optimized = Phi from Strolger et al (2020) with (ξ, ω, 𝛼) = (-1518, 51, 50)
+ #          ]
+ 
+ # sn_yields = [
+diff --git a/src/starmatrix/settings.py b/src/starmatrix/settings.py
+index cd22f91..8cceb63 100644
+--- a/src/starmatrix/settings.py
++++ b/src/starmatrix/settings.py
+@@ -34,7 +34,8 @@ default = {
+ valid_values = {
+     "imf": ["salpeter", "starburst", "chabrier", "ferrini", "kroupa", "miller_scalo", "maschberger"],
+     "dtd_sn": ["rlp", "maoz", "castrillo", "greggio", "chen", "greggio-CDD04", "greggio-CDD1",
+-               "greggio-WDD04", "greggio-WDD1", "greggio-SDCH", "greggio-SDSCH"],
++               "greggio-WDD04", "greggio-WDD1", "greggio-SDCH", "greggio-SDSCH",
++               "strolger-fit1", "strolger-fit2", "strolger-fit3", "strolger-fit4", "strolger-optimized"],
+     "sn_yields": ["iwa1998",
+                   "sei2013",
+                   "ln2020",

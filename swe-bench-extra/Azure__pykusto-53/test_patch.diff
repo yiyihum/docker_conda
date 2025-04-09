@@ -1,0 +1,87 @@
+diff --git a/test/test_query.py b/test/test_query.py
+index ba09eaa..e5911ea 100644
+--- a/test/test_query.py
++++ b/test/test_query.py
+@@ -1,10 +1,11 @@
+ from pykusto import functions as f
+ from pykusto.client import PyKustoClient
+ from pykusto.expressions import column_generator as col
+-from pykusto.query import Query, Order, Nulls, JoinKind, JoinException, BagExpansion
++from pykusto.query import Query, Order, Nulls, JoinKind, JoinException, BagExpansion, Distribution
+ from pykusto.type_utils import TypeName
+ from test.test_base import TestBase
+ from test.test_table import MockKustoClient
++from test.udf import func, STRINGIFIED
+ 
+ 
+ class TestQuery(TestBase):
+@@ -290,14 +291,38 @@ class TestQuery(TestBase):
+             Query().distinct_all().render(),
+         )
+ 
++    def test_evaluate(self):
++        self.assertEqual(
++            " | evaluate some_plugin(foo, 3)",
++            Query().evaluate('some_plugin', col.foo, 3).render(),
++        )
++
++    def test_evaluate_with_distribution(self):
++        self.assertEqual(
++            " | evaluate hint.distribution=per_shard some_plugin(foo, 3)",
++            Query().evaluate('some_plugin', col.foo, 3, distribution=Distribution.PER_SHARD).render(),
++        )
++
+     def test_udf(self):
+-        # noinspection PyGlobalUndefined
+-        def func():
+-            global result
+-            global df
++        self.assertEqual(
++            " | evaluate python(typeof(*, StateZone:string), {})".format(STRINGIFIED),
++            Query().evaluate_udf(func, StateZone=TypeName.STRING).render(),
++        )
+ 
+-            result = df
+-            result['StateZone'] = result["State"] + result["Zone"]
++    def test_udf_no_extend(self):
++        self.assertEqual(
++            " | evaluate python(typeof(StateZone:string), {})".format(STRINGIFIED),
++            Query().evaluate_udf(func, extend=False, StateZone=TypeName.STRING).render(),
++        )
+ 
+-        # TODO assert
+-        Query().evaluate(func, "typeof(*, StateZone: string)").render()
++    def test_bag_unpack(self):
++        self.assertEqual(
++            " | evaluate bag_unpack(foo)",
++            Query().bag_unpack(col.foo).render(),
++        )
++
++    def test_bag_unpack_with_prefix(self):
++        self.assertEqual(
++            ' | evaluate bag_unpack(foo, "bar_")',
++            Query().bag_unpack(col.foo, 'bar_').render(),
++        )
+diff --git a/test/udf.py b/test/udf.py
+new file mode 100644
+index 0000000..c0c7b02
+--- /dev/null
++++ b/test/udf.py
+@@ -0,0 +1,17 @@
++# Function for testing python evaluation plugin, with the result of stringification given below.
++# Kept in a separate file because any change to the function (even whitespace) might cause the stringified text to change.
++
++
++# noinspection PyGlobalUndefined
++def func():
++    global result
++    global df
++
++    result = df
++    result['StateZone'] = result["State"] + result["Zone"]
++
++
++STRINGIFIED = "\"from types import CodeType\\n" \
++              "code=CodeType(0,0,0,3,67,b't\\\\x00a\\\\x01t\\\\x01d\\\\x01\\\\x19\\\\x00t\\\\x01d\\\\x02\\\\x19\\\\x00\\\\x17\\\\x00t\\\\x01d\\\\x03<\\\\x00d\\\\x00S\\\\x00'," \
++              "(None, 'State', 'Zone', 'StateZone'),('df', 'result'),(),'{}','func',6,b'\\\\x00\\\\x04\\\\x04\\\\x01',(),())\\n" \
++              "exec(code)\\n\"".format(__file__)

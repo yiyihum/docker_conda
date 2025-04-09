@@ -1,0 +1,158 @@
+diff --git a/src/pdm/cli/commands/run.py b/src/pdm/cli/commands/run.py
+index 36f7ed64..506072eb 100644
+--- a/src/pdm/cli/commands/run.py
++++ b/src/pdm/cli/commands/run.py
+@@ -36,11 +36,12 @@ if TYPE_CHECKING:
+         help: str
+         keep_going: bool
+         site_packages: bool
++        working_dir: str
+ 
+ 
+ def exec_opts(*options: TaskOptions | None) -> dict[str, Any]:
+     return dict(
+-        env={k: v for opts in options if opts for k, v in opts.get("env", {}).items()},
++        env={k: v for opts in options if opts for k, v in opts.get("env", {}).items()} or None,
+         **{k: v for opts in options if opts for k, v in opts.items() if k not in ("env", "help")},
+     )
+ 
+@@ -104,7 +105,7 @@ class TaskRunner:
+     """The task runner for pdm project"""
+ 
+     TYPES = ("cmd", "shell", "call", "composite")
+-    OPTIONS = ("env", "env_file", "help", "keep_going", "site_packages")
++    OPTIONS = ("env", "env_file", "help", "keep_going", "working_dir", "site_packages")
+ 
+     def __init__(self, project: Project, hooks: HookManager) -> None:
+         self.project = project
+@@ -159,6 +160,7 @@ class TaskRunner:
+         site_packages: bool = False,
+         env: Mapping[str, str] | None = None,
+         env_file: EnvFileOptions | str | None = None,
++        working_dir: str | None = None,
+     ) -> int:
+         """Run command in a subprocess and return the exit code."""
+         project = self.project
+@@ -213,7 +215,7 @@ class TaskRunner:
+                 # Don't load system site-packages
+                 process_env["NO_SITE_PACKAGES"] = "1"
+ 
+-        cwd = project.root if chdir else None
++        cwd = (project.root / working_dir) if working_dir else project.root if chdir else None
+ 
+         def forward_signal(signum: int, frame: FrameType | None) -> None:
+             if sys.platform == "win32" and signum == signal.SIGINT:
+@@ -285,12 +287,7 @@ class TaskRunner:
+                         return code
+                     composite_code = code
+             return composite_code
+-        return self._run_process(
+-            args,
+-            chdir=True,
+-            shell=shell,
+-            **exec_opts(self.global_options, options, opts),
+-        )
++        return self._run_process(args, chdir=True, shell=shell, **exec_opts(self.global_options, options, opts))
+ 
+     def run(self, command: str, args: list[str], opts: TaskOptions | None = None, chdir: bool = False) -> int:
+         if command in self.hooks.skip:
+@@ -312,11 +309,7 @@ class TaskRunner:
+             self.hooks.try_emit("post_script", script=command, args=args)
+             return code
+         else:
+-            return self._run_process(
+-                [command, *args],
+-                chdir=chdir,
+-                **exec_opts(self.global_options, opts),
+-            )
++            return self._run_process([command, *args], chdir=chdir, **exec_opts(self.global_options, opts))
+ 
+     def show_list(self) -> None:
+         if not self.project.scripts:
+diff --git a/src/pdm/termui.py b/src/pdm/termui.py
+index 22eee13c..2984571e 100644
+--- a/src/pdm/termui.py
++++ b/src/pdm/termui.py
+@@ -8,6 +8,7 @@ import tempfile
+ import warnings
+ from typing import TYPE_CHECKING
+ 
++import rich
+ from rich.box import ROUNDED
+ from rich.console import Console
+ from rich.progress import Progress, ProgressColumn
+@@ -36,21 +37,21 @@ DEFAULT_THEME = {
+     "info": "blue",
+     "req": "bold green",
+ }
+-_console = Console(highlight=False, theme=Theme(DEFAULT_THEME))
++rich.reconfigure(highlight=False, theme=Theme(DEFAULT_THEME))
+ _err_console = Console(stderr=True, theme=Theme(DEFAULT_THEME))
+ 
+ 
+ def is_interactive(console: Console | None = None) -> bool:
+     """Check if the terminal is run under interactive mode"""
+     if console is None:
+-        console = _console
++        console = rich.get_console()
+     return console.is_interactive
+ 
+ 
+ def is_legacy_windows(console: Console | None = None) -> bool:
+     """Legacy Windows renderer may have problem rendering emojis"""
+     if console is None:
+-        console = _console
++        console = rich.get_console()
+     return console.legacy_windows
+ 
+ 
+@@ -61,6 +62,7 @@ def style(text: str, *args: str, style: str | None = None, **kwargs: Any) -> str
+     :param style: rich style to apply to whole string
+     :return: string containing ansi codes
+     """
++    _console = rich.get_console()
+     if _console.legacy_windows or not _console.is_terminal:  # pragma: no cover
+         return text
+     with _console.capture() as capture:
+@@ -176,7 +178,7 @@ class UI:
+ 
+         :param theme: dict of theme
+         """
+-        _console.push_theme(theme)
++        rich.get_console().push_theme(theme)
+         _err_console.push_theme(theme)
+ 
+     def echo(
+@@ -193,7 +195,7 @@ class UI:
+         :param verbosity: verbosity level, defaults to QUIET.
+         """
+         if self.verbosity >= verbosity:
+-            console = _err_console if err else _console
++            console = _err_console if err else rich.get_console()
+             if not console.is_interactive:
+                 kwargs.setdefault("crop", False)
+                 kwargs.setdefault("overflow", "ignore")
+@@ -223,7 +225,7 @@ class UI:
+         for row in rows:
+             table.add_row(*row)
+ 
+-        _console.print(table)
++        rich.print(table)
+ 
+     @contextlib.contextmanager
+     def logging(self, type_: str = "install") -> Iterator[logging.Logger]:
+@@ -276,12 +278,7 @@ class UI:
+ 
+     def make_progress(self, *columns: str | ProgressColumn, **kwargs: Any) -> Progress:
+         """create a progress instance for indented spinners"""
+-        return Progress(
+-            *columns,
+-            console=_console,
+-            disable=self.verbosity >= Verbosity.DETAIL,
+-            **kwargs,
+-        )
++        return Progress(*columns, disable=self.verbosity >= Verbosity.DETAIL, **kwargs)
+ 
+     def info(self, message: str, verbosity: Verbosity = Verbosity.QUIET) -> None:
+         """Print a message to stdout."""
+

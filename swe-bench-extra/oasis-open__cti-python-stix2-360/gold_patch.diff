@@ -1,0 +1,179 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index b764735..dc0d91e 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -1,6 +1,19 @@
+ CHANGELOG
+ =========
+ 
++1.3.1 - 2020-03-06
++
++* #322 Adds encoding option FileSystemSource and MemorySource
++* #354 Adds ability to specify id-contributing properties on custom SCOs
++* #346 Certain SCO properties are no longer deprecated
++* #327 Fixes missing 'name' property on Marking Definitions
++* #303 Fixes bug with escaping quotes in patterns
++* #331 Fixes crashing bug of property names that conflict with Mapping methods
++* #337 Fixes bug with detecting STIX version of content when parsing
++* #342, #343 Fixes bug when adding SCOs to Memory or FileSystem Stores
++* #348 Fixes bug with generating deterministic IDs for SCOs
++* #344 Fixes bug with propagating errors from the pattern validator
++
+ 1.3.0 - 2020-01-04
+ 
+ * #305 Updates support of STIX 2.1 to WD06
+diff --git a/setup.cfg b/setup.cfg
+index 659a1cd..7e89c66 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,5 +1,5 @@
+ [bumpversion]
+-current_version = 1.3.0
++current_version = 1.3.1
+ commit = True
+ tag = True
+ 
+diff --git a/stix2/v21/common.py b/stix2/v21/common.py
+index cf3a3b3..ac8daf1 100644
+--- a/stix2/v21/common.py
++++ b/stix2/v21/common.py
+@@ -4,6 +4,7 @@ from collections import OrderedDict
+ 
+ from ..base import _STIXBase
+ from ..custom import _custom_marking_builder
++from ..exceptions import InvalidValueError
+ from ..markings import _MarkingsMixin
+ from ..markings.utils import check_tlp_marking
+ from ..properties import (
+@@ -28,10 +29,26 @@ class ExternalReference(_STIXBase):
+         ('external_id', StringProperty()),
+     ])
+ 
++    # This is hash-algorithm-ov
++    _LEGAL_HASHES = {
++        "MD5", "SHA-1", "SHA-256", "SHA-512", "SHA3-256", "SHA3-512", "SSDEEP",
++        "TLSH",
++    }
++
+     def _check_object_constraints(self):
+         super(ExternalReference, self)._check_object_constraints()
+         self._check_at_least_one_property(['description', 'external_id', 'url'])
+ 
++        if "hashes" in self:
++            if any(
++                hash_ not in self._LEGAL_HASHES
++                for hash_ in self["hashes"]
++            ):
++                raise InvalidValueError(
++                    ExternalReference, "hashes",
++                    "Hash algorithm names must be members of hash-algorithm-ov",
++                )
++
+ 
+ class KillChainPhase(_STIXBase):
+     # TODO: Add link
+diff --git a/stix2/v21/observables.py b/stix2/v21/observables.py
+index e8c1925..622e933 100644
+--- a/stix2/v21/observables.py
++++ b/stix2/v21/observables.py
+@@ -760,6 +760,7 @@ class Software(_Observable):
+         ('id', IDProperty(_type, spec_version='2.1')),
+         ('name', StringProperty(required=True)),
+         ('cpe', StringProperty()),
++        ('swid', StringProperty()),
+         ('languages', ListProperty(StringProperty)),
+         ('vendor', StringProperty()),
+         ('version', StringProperty()),
+diff --git a/stix2/v21/sdo.py b/stix2/v21/sdo.py
+index 1d97261..c0bdf30 100644
+--- a/stix2/v21/sdo.py
++++ b/stix2/v21/sdo.py
+@@ -173,7 +173,7 @@ class Identity(STIXDomainObject):
+         ('name', StringProperty(required=True)),
+         ('description', StringProperty()),
+         ('roles', ListProperty(StringProperty)),
+-        ('identity_class', StringProperty(required=True)),
++        ('identity_class', StringProperty()),
+         ('sectors', ListProperty(StringProperty)),
+         ('contact_information', StringProperty()),
+         ('revoked', BooleanProperty(default=lambda: False)),
+@@ -202,7 +202,7 @@ class Indicator(STIXDomainObject):
+         ('modified', TimestampProperty(default=lambda: NOW, precision='millisecond')),
+         ('name', StringProperty()),
+         ('description', StringProperty()),
+-        ('indicator_types', ListProperty(StringProperty, required=True)),
++        ('indicator_types', ListProperty(StringProperty)),
+         ('pattern', PatternProperty(required=True)),
+         ('pattern_type', StringProperty(required=True)),
+         ('pattern_version', StringProperty()),
+@@ -269,7 +269,7 @@ class Infrastructure(STIXDomainObject):
+         ('granular_markings', ListProperty(GranularMarking)),
+         ('name', StringProperty(required=True)),
+         ('description', StringProperty()),
+-        ('infrastructure_types', ListProperty(StringProperty, required=True)),
++        ('infrastructure_types', ListProperty(StringProperty)),
+         ('aliases', ListProperty(StringProperty)),
+         ('kill_chain_phases', ListProperty(KillChainPhase)),
+         ('first_seen', TimestampProperty()),
+@@ -454,7 +454,7 @@ class Malware(STIXDomainObject):
+         ('modified', TimestampProperty(default=lambda: NOW, precision='millisecond')),
+         ('name', StringProperty()),
+         ('description', StringProperty()),
+-        ('malware_types', ListProperty(StringProperty, required=True)),
++        ('malware_types', ListProperty(StringProperty)),
+         ('is_family', BooleanProperty(required=True)),
+         ('aliases', ListProperty(StringProperty)),
+         ('kill_chain_phases', ListProperty(KillChainPhase)),
+@@ -524,14 +524,16 @@ class MalwareAnalysis(STIXDomainObject):
+         ('submitted', TimestampProperty()),
+         ('analysis_started', TimestampProperty()),
+         ('analysis_ended', TimestampProperty()),
+-        ('av_result', StringProperty()),
++        ('result_name', StringProperty()),
++        ('result', StringProperty()),
+         ('analysis_sco_refs', ListProperty(ReferenceProperty(valid_types="SCO", spec_version='2.1'))),
++        ('sample_ref', ReferenceProperty(valid_types="SCO", spec_version="2.1")),
+     ])
+ 
+     def _check_object_constraints(self):
+         super(MalwareAnalysis, self)._check_object_constraints()
+ 
+-        self._check_at_least_one_property(["av_result", "analysis_sco_refs"])
++        self._check_at_least_one_property(["result", "analysis_sco_refs"])
+ 
+ 
+ class Note(STIXDomainObject):
+@@ -672,7 +674,7 @@ class Report(STIXDomainObject):
+         ('modified', TimestampProperty(default=lambda: NOW, precision='millisecond')),
+         ('name', StringProperty(required=True)),
+         ('description', StringProperty()),
+-        ('report_types', ListProperty(StringProperty, required=True)),
++        ('report_types', ListProperty(StringProperty)),
+         ('published', TimestampProperty(required=True)),
+         ('object_refs', ListProperty(ReferenceProperty(valid_types=["SCO", "SDO", "SRO"], spec_version='2.1'), required=True)),
+         ('revoked', BooleanProperty(default=lambda: False)),
+@@ -701,7 +703,7 @@ class ThreatActor(STIXDomainObject):
+         ('modified', TimestampProperty(default=lambda: NOW, precision='millisecond')),
+         ('name', StringProperty(required=True)),
+         ('description', StringProperty()),
+-        ('threat_actor_types', ListProperty(StringProperty, required=True)),
++        ('threat_actor_types', ListProperty(StringProperty)),
+         ('aliases', ListProperty(StringProperty)),
+         ('first_seen', TimestampProperty()),
+         ('last_seen', TimestampProperty()),
+@@ -748,7 +750,7 @@ class Tool(STIXDomainObject):
+         ('modified', TimestampProperty(default=lambda: NOW, precision='millisecond')),
+         ('name', StringProperty(required=True)),
+         ('description', StringProperty()),
+-        ('tool_types', ListProperty(StringProperty, required=True)),
++        ('tool_types', ListProperty(StringProperty)),
+         ('aliases', ListProperty(StringProperty)),
+         ('kill_chain_phases', ListProperty(KillChainPhase)),
+         ('tool_version', StringProperty()),
+diff --git a/stix2/version.py b/stix2/version.py
+index 67bc602..9c73af2 100644
+--- a/stix2/version.py
++++ b/stix2/version.py
+@@ -1,1 +1,1 @@
+-__version__ = "1.3.0"
++__version__ = "1.3.1"

@@ -1,0 +1,151 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e1d39cc..ae086b8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -60,9 +60,6 @@ extra-dependencies = [
+     "urllib3~=1.24",
+     "httpx~=0.26.0",
+ 
+-    # aiohttp depends on multidict, so we can't test aiohttp until
+-    # https://github.com/aio-libs/multidict/issues/887 is resolved
+-    # async-timeout is only used for testing aiohttp
+     "aiohttp~=3.8",
+     "async-timeout~=4.0.3",
+ 
+diff --git a/src/pook/engine.py b/src/pook/engine.py
+index b7dd1bc..81651bb 100644
+--- a/src/pook/engine.py
++++ b/src/pook/engine.py
+@@ -3,7 +3,7 @@ from inspect import isfunction
+ from .mock import Mock
+ from .regex import isregex
+ from .mock_engine import MockEngine
+-from .exceptions import PookNoMatches, PookExpiredMock
++from .exceptions import PookNoMatches
+ 
+ 
+ class Engine(object):
+@@ -416,16 +416,12 @@ class Engine(object):
+ 
+         # Try to match the request against registered mock definitions
+         for mock in self.mocks[:]:
+-            try:
+-                # Return the first matched HTTP request mock
+-                matches, errors = mock.match(request.copy())
+-                if len(errors):
+-                    match_errors += errors
+-                if matches:
+-                    return mock
+-            except PookExpiredMock:
+-                # Remove the mock if already expired
+-                self.mocks.remove(mock)
++            # Return the first matched HTTP request mock
++            matches, errors = mock.match(request.copy())
++            if len(errors):
++                match_errors += errors
++            if matches:
++                return mock
+ 
+         # Validate that we have a mock
+         if not self.should_use_network(request):
+@@ -442,7 +438,11 @@ class Engine(object):
+                     msg += "\n\n=> Detailed matching errors:\n{}\n".format(err)
+ 
+             # Raise no matches exception
+-            raise PookNoMatches(msg)
++            self.no_matches(msg)
+ 
+         # Register unmatched request
+         self.unmatched_reqs.append(request)
++
++    def no_matches(self, msg):
++        """Raise `PookNoMatches` and reduce pytest printed stacktrace noise"""
++        raise PookNoMatches(msg)
+diff --git a/src/pook/exceptions.py b/src/pook/exceptions.py
+index b5da0a6..931a3a4 100644
+--- a/src/pook/exceptions.py
++++ b/src/pook/exceptions.py
+@@ -1,3 +1,6 @@
++import warnings
++
++
+ class PookInvalidBody(Exception):
+     pass
+ 
+@@ -11,7 +14,13 @@ class PookNetworkFilterError(Exception):
+ 
+ 
+ class PookExpiredMock(Exception):
+-    pass
++    def __init__(self, *args, **kwargs):
++        warnings.warn(
++            "PookExpiredMock is deprecated and will be removed in a future version of Pook",
++            DeprecationWarning,
++            stacklevel=2,
++        )
++        super().__init__(*args, **kwargs)
+ 
+ 
+ class PookInvalidArgument(Exception):
+diff --git a/src/pook/matcher.py b/src/pook/matcher.py
+index b86333f..9c03c9f 100644
+--- a/src/pook/matcher.py
++++ b/src/pook/matcher.py
+@@ -29,7 +29,7 @@ class MatcherEngine(list):
+             request (pook.Request): outgoing request to match.
+ 
+         Returns:
+-            tuple(bool, list[Exception]): ``True`` if all matcher tests
++            tuple(bool, list[str]): ``True`` if all matcher tests
+                 passes, otherwise ``False``. Also returns an optional list
+                 of error exceptions.
+         """
+diff --git a/src/pook/mock.py b/src/pook/mock.py
+index 246aeb3..ae606d0 100644
+--- a/src/pook/mock.py
++++ b/src/pook/mock.py
+@@ -7,7 +7,6 @@ from .constants import TYPES
+ from .request import Request
+ from .matcher import MatcherEngine
+ from .helpers import trigger_methods
+-from .exceptions import PookExpiredMock
+ from .matchers import init as matcher
+ 
+ 
+@@ -750,10 +749,6 @@ class Mock(object):
+                 the outgoing HTTP request, otherwise ``False``. Also returns
+                 an optional list of error exceptions.
+         """
+-        # If mock already expired, fail it
+-        if self._times <= 0:
+-            raise PookExpiredMock("Mock expired")
+-
+         # Trigger mock filters
+         for test in self.filters:
+             if not test(request, self):
+@@ -772,6 +767,9 @@ class Mock(object):
+         if not matches:
+             return False, errors
+ 
++        if self._times <= 0:
++            return False, [f"Mock matches request but is expired.\n{repr(self)}"]
++
+         # Register matched request for further inspecion and reference
+         self._calls.append(request)
+ 
+diff --git a/src/pook/regex.py b/src/pook/regex.py
+index 1e8dd77..a76b6c1 100644
+--- a/src/pook/regex.py
++++ b/src/pook/regex.py
+@@ -1,10 +1,6 @@
+ import re
+-import sys
+ 
+-if sys.version_info < (3, 7):
+-    Pattern = type(re.compile(""))
+-else:
+-    Pattern = re.Pattern
++Pattern = re.Pattern
+ 
+ 
+ def isregex_expr(expr):

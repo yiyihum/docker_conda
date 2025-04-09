@@ -1,0 +1,195 @@
+diff --git a/hwtypes/__init__.py b/hwtypes/__init__.py
+index 7e71d46..eca7ea7 100644
+--- a/hwtypes/__init__.py
++++ b/hwtypes/__init__.py
+@@ -5,3 +5,4 @@ from .smt_bit_vector import *
+ from .z3_bit_vector import *
+ from .fp_vector_abc import *
+ from .fp_vector import *
++from .modifiers import *
+diff --git a/hwtypes/adt.py b/hwtypes/adt.py
+index c54f98c..c47a51a 100644
+--- a/hwtypes/adt.py
++++ b/hwtypes/adt.py
+@@ -2,23 +2,11 @@ from .adt_meta import TupleMeta, ProductMeta, SumMeta, EnumMeta, is_adt_type
+ from types import MappingProxyType
+ 
+ __all__  = ['Tuple', 'Product', 'Sum', 'Enum']
+-__all__ += ['new', 'new_instruction', 'is_adt_type']
++__all__ += ['new_instruction', 'is_adt_type']
+ 
+ #special sentinal value
+ class _MISSING: pass
+ 
+-def new(klass, bind=_MISSING, *, name=_MISSING, module=_MISSING):
+-    class T(klass): pass
+-    if name is not _MISSING:
+-        T.__name__ = name
+-    if module is not _MISSING:
+-        T.__module__ = module
+-
+-    if bind is not _MISSING:
+-        return T[bind]
+-    else:
+-        return T
+-
+ class Tuple(metaclass=TupleMeta):
+     def __new__(cls, *value):
+         if cls.is_bound:
+diff --git a/hwtypes/fp_vector.py b/hwtypes/fp_vector.py
+index 68d833c..9fd7320 100644
+--- a/hwtypes/fp_vector.py
++++ b/hwtypes/fp_vector.py
+@@ -1,11 +1,11 @@
+-import typing as tp
+ import functools
+-import random
+ import gmpy2
++import random
++import typing as tp
+ import warnings
+ 
+-from .fp_vector_abc import AbstractFPVector, RoundingMode
+ from .bit_vector import Bit, BitVector, SIntVector
++from .fp_vector_abc import AbstractFPVector, RoundingMode
+ 
+ __ALL__ = ['FPVector']
+ 
+@@ -42,7 +42,36 @@ def set_context(fn: tp.Callable) -> tp.Callable:
+ class FPVector(AbstractFPVector):
+     @set_context
+     def __init__(self, value):
+-        value = gmpy2.mpfr(value)
++        # Because for some reason gmpy2.mpfr is a function and not a type
++        if isinstance(value, type(gmpy2.mpfr(0))):
++            #need to specify precision because mpfr will use the input
++            #precision not the context precision when constructing from mpfr
++            value = gmpy2.mpfr(value, self._ctx_.precision)
++        elif isinstance(value, FPVector):
++            value = gmpy2.mpfr(value._value, self._ctx_.precision)
++        elif isinstance(value, (int, float, type(gmpy2.mpz(0)), type(gmpy2.mpq(0)))):
++            value = gmpy2.mpfr(value)
++        elif isinstance(value, str):
++            try:
++                #Handles '0.5'
++                value = gmpy2.mpfr(value)
++            except ValueError:
++                try:
++                    #Handles '1/2'
++                    value = gmpy2.mpfr(gmpy2.mpq(value))
++                except ValueError:
++                    raise ValueError('Invalid string')
++        elif hasattr(value, '__float__'):
++            value = gmpy2.mpfr(float(value))
++        elif hasattr(value, '__int__'):
++            value = gmpy2.mpfr(int(value))
++        else:
++            try:
++                #if gmpy2 doesn't complain I wont
++                value = gmpy2.mpfr(value)
++            except TypeError:
++                raise TypeError(f"Can't construct FPVector from {type(value)}")
++
+         if gmpy2.is_nan(value) and not type(self).ieee_compliance:
+             if gmpy2.is_signed(value):
+                 self._value = gmpy2.mpfr('-inf')
+diff --git a/hwtypes/fp_vector_abc.py b/hwtypes/fp_vector_abc.py
+index ed4c1df..1e32487 100644
+--- a/hwtypes/fp_vector_abc.py
++++ b/hwtypes/fp_vector_abc.py
+@@ -2,16 +2,16 @@ from abc import ABCMeta, abstractmethod
+ import typing as tp
+ import weakref
+ import warnings
+-from enum import Enum, auto
++import enum
+ 
+ from . import AbstractBitVectorMeta, AbstractBitVector, AbstractBit
+ 
+-class RoundingMode(Enum):
+-    RNE = auto() # roundTiesToEven
+-    RNA = auto() # roundTiesToAway
+-    RTP = auto() # roundTowardPositive
+-    RTN = auto() # roundTowardNegative
+-    RTZ = auto() # roundTowardZero
++class RoundingMode(enum.Enum):
++    RNE = enum.auto() # roundTiesToEven
++    RNA = enum.auto() # roundTiesToAway
++    RTP = enum.auto() # roundTowardPositive
++    RTN = enum.auto() # roundTowardNegative
++    RTZ = enum.auto() # roundTowardZero
+ 
+ class AbstractFPVectorMeta(ABCMeta):
+     # FPVectorType, (eb, mb, mode, ieee_compliance) :  FPVectorType[eb, mb, mode, ieee_compliance]
+diff --git a/hwtypes/modifiers.py b/hwtypes/modifiers.py
+new file mode 100644
+index 0000000..15df6ba
+--- /dev/null
++++ b/hwtypes/modifiers.py
+@@ -0,0 +1,53 @@
++import types
++import weakref
++
++#special sentinal value
++class _MISSING: pass
++
++def new(klass, bind=_MISSING, *, name=_MISSING, module=_MISSING):
++    class T(klass): pass
++    if name is not _MISSING:
++        T.__name__ = name
++    if module is not _MISSING:
++        T.__module__ = module
++
++    if bind is not _MISSING:
++        return T[bind]
++    else:
++        return T
++
++class _ModifierMeta(type):
++    def __instancecheck__(cls, obj):
++        return type(obj) in cls._sub_classes.values()
++
++    def __subclasscheck__(cls, typ):
++        return typ in cls._sub_classes.values()
++
++    def __call__(cls, *args):
++        if len(args) != 1:
++            return super().__call__(*args)
++        sub = args[0]
++        try:
++            return cls._sub_classes[sub]
++        except KeyError:
++            pass
++
++        mod_sub_name = cls.__name__ + sub.__name__
++        mod_sub = type(mod_sub_name, (sub,), {})
++        return cls._sub_classes.setdefault(sub, mod_sub)
++
++_mod_cache = weakref.WeakValueDictionary()
++# This is a factory for type modifiers.
++def make_modifier(name, cache=False):
++    if cache:
++        try:
++            return _mod_cache[name]
++        except KeyError:
++            pass
++
++    ModType = _ModifierMeta(name, (), {'_sub_classes' : weakref.WeakValueDictionary()})
++
++    if cache:
++        return _mod_cache.setdefault(name, ModType)
++
++    return ModType
+diff --git a/setup.py b/setup.py
+index 99e7d82..a2c7bc6 100644
+--- a/setup.py
++++ b/setup.py
+@@ -19,7 +19,7 @@ setup(
+     url='https://github.com/leonardt/hwtypes',
+     author='Leonard Truong',
+     author_email='lenny@cs.stanford.edu',
+-    version='1.0.10',
++    version='1.0.11',
+     description='Python implementations of fixed size hardware types (Bit, '
+                 'BitVector, UInt, SInt, ...) based on the SMT-LIB2 semantics',
+     scripts=[],

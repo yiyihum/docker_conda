@@ -1,0 +1,90 @@
+diff --git a/funsor/__init__.py b/funsor/__init__.py
+index 11a1812..64b0f35 100644
+--- a/funsor/__init__.py
++++ b/funsor/__init__.py
+@@ -5,8 +5,8 @@ from funsor.interpreter import reinterpret
+ from funsor.terms import Funsor, Number, Variable, of_shape, to_funsor
+ from funsor.torch import Function, Tensor, arange, function, torch_einsum
+ 
+-from . import adjoint, contract, distributions, domains, einsum, gaussian, \
+-    handlers, interpreter, minipyro, ops, terms, torch
++from . import (adjoint, contract, delta, distributions, domains, einsum, gaussian, handlers, interpreter, minipyro, ops,
++               terms, torch)
+ 
+ __all__ = [
+     'Domain',
+@@ -20,6 +20,7 @@ __all__ = [
+     'backward',
+     'bint',
+     'contract',
++    'delta',
+     'distributions',
+     'domains',
+     'einsum',
+diff --git a/funsor/distributions.py b/funsor/distributions.py
+index c958e01..26ad08c 100644
+--- a/funsor/distributions.py
++++ b/funsor/distributions.py
+@@ -7,6 +7,7 @@ import pyro.distributions as dist
+ import torch
+ from six import add_metaclass
+ 
++import funsor.delta
+ import funsor.ops as ops
+ from funsor.domains import bint, reals
+ from funsor.gaussian import Gaussian
+@@ -150,6 +151,19 @@ def eager_delta(v, log_density, value):
+     return Tensor(data, inputs)
+ 
+ 
++@eager.register(Delta, Funsor, Funsor, Variable)
++@eager.register(Delta, Variable, Funsor, Variable)
++def eager_delta(v, log_density, value):
++    assert v.output == value.output
++    return funsor.delta.Delta(value.name, v, log_density)
++
++
++@eager.register(Delta, Variable, Funsor, Funsor)
++def eager_delta(v, log_density, value):
++    assert v.output == value.output
++    return funsor.delta.Delta(v.name, value, log_density)
++
++
+ class Normal(Distribution):
+     dist_class = dist.Normal
+ 
+diff --git a/funsor/ops.py b/funsor/ops.py
+index 54ed23b..2f23cf7 100644
+--- a/funsor/ops.py
++++ b/funsor/ops.py
+@@ -67,7 +67,14 @@ def exp(x):
+ 
+ @Op
+ def log(x):
+-    return np.log(x) if isinstance(x, Number) else x.log()
++    if isinstance(x, Number):
++        return np.log(x)
++    elif isinstance(x, torch.Tensor):
++        if x.dtype in (torch.uint8, torch.long):
++            x = x.float()
++        return x.log()
++    else:
++        return x.log()
+ 
+ 
+ @Op
+diff --git a/funsor/terms.py b/funsor/terms.py
+index 76f57a3..cc8493a 100644
+--- a/funsor/terms.py
++++ b/funsor/terms.py
+@@ -137,6 +137,9 @@ class Funsor(object):
+     def __hash__(self):
+         return id(self)
+ 
++    def __repr__(self):
++        return '{}({})'.format(type(self).__name__, ', '.join(map(repr, self._ast_args)))
++
+     def __call__(self, *args, **kwargs):
+         """
+         Partially evaluates this funsor by substituting dimensions.
+

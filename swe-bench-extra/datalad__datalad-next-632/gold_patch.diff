@@ -1,0 +1,409 @@
+diff --git a/datalad_next/gitremotes/datalad_annex.py b/datalad_next/gitremotes/datalad_annex.py
+index a39fa8d..561d4c4 100755
+--- a/datalad_next/gitremotes/datalad_annex.py
++++ b/datalad_next/gitremotes/datalad_annex.py
+@@ -210,8 +210,9 @@ from datalad_next.datasets import (
+ from datalad_next.exceptions import CapturedException
+ from datalad_next.runners import (
+     CommandError,
+-    NoCapture,
+-    StdOutCapture,
++    call_git,
++    call_git_oneline,
++    call_git_success,
+ )
+ from datalad_next.uis import ui_switcher as ui
+ from datalad_next.utils import (
+@@ -224,6 +225,7 @@ from datalad_next.utils import (
+     get_specialremote_credential_envpatch,
+     get_specialremote_credential_properties,
+     needs_specialremote_credential_envpatch,
++    patched_env,
+     specialremote_credential_envmap,
+     update_specialremote_credential,
+ )
+@@ -494,8 +496,9 @@ class RepoAnnexGitRemote(object):
+         try:
+             # send annex into private mode, if supported
+             # this repo will never ever be shared
+-            ra.call_git(['config', 'annex.private', 'true'])
+-            ra.call_git(['annex', 'init'])
++            call_git_success(['config', 'annex.private', 'true'],
++                             cwd=ra.pathobj, capture_output=True)
++            call_git_success(['annex', 'init'], capture_output=True)
+             ra = AnnexRepo(self._repoannexdir)
+             if 'type=web' in self.initremote_params:
+                 self._init_repoannex_type_web(ra)
+@@ -620,8 +623,15 @@ class RepoAnnexGitRemote(object):
+             # otherwise we can end up in a conflict situation where the mirror
+             # points to 'master' (or something else) and the source actually
+             # has 'main' (or something different)
+-            src_head_ref = self.repo.call_git(['symbolic-ref', 'HEAD']).strip()
+-            mr.call_git(['symbolic-ref', 'HEAD', src_head_ref])
++            src_head_ref = call_git_oneline(
++                ['symbolic-ref', 'HEAD'],
++                cwd=self.repo.pathobj,
++            ).strip()
++            call_git_success(
++                ['symbolic-ref', 'HEAD', src_head_ref],
++                cwd=mr.pathobj,
++                capture_output=True,
++            )
+ 
+         self.log('Established mirror')
+         self._mirrorrepo = mr
+@@ -669,9 +679,9 @@ class RepoAnnexGitRemote(object):
+                 pre_refs = sorted(self.mirrorrepo.for_each_ref_(),
+                                   key=lambda x: x['refname'])
+                 # must not capture -- git is talking to it directly from here
+-                self.mirrorrepo._git_runner.run(
+-                    ['git', 'receive-pack', self.mirrorrepo.path],
+-                    protocol=NoCapture,
++                call_git(
++                    ['receive-pack', self.mirrorrepo.path],
++                    cwd=self.mirrorrepo.pathobj,
+                 )
+                 post_refs = sorted(self.mirrorrepo.for_each_ref_(),
+                                    key=lambda x: x['refname'])
+@@ -698,12 +708,15 @@ class RepoAnnexGitRemote(object):
+                         for ref in post_refs:
+                             # best MIH can think of is to leave behind another
+                             # ref to indicate the unsuccessful upload
+-                            self.repo.call_git([
++                            call_git_success([
+                                 'update-ref',
+                                 # strip 'refs/heads/' from refname
+                                 f'refs/dlra-upload-failed/{self.remote_name}/'
+                                 f'{ref["refname"][11:]}',
+-                                ref['objectname']])
++                                ref['objectname']],
++                                cwd=self.repo.pathobj,
++                                capture_output=True,
++                            )
+                         raise
+ 
+                 # clean-up potential upload failure markers for this particular
+@@ -712,7 +725,11 @@ class RepoAnnexGitRemote(object):
+                 for ref in self.repo.for_each_ref_(
+                         fields=('refname',),
+                         pattern=f'refs/dlra-upload-failed/{self.remote_name}'):
+-                    self.repo.call_git(['update-ref', '-d', ref['refname']])
++                    call_git_success(
++                        ['update-ref', '-d', ref['refname']],
++                        cwd=self.repo.pathobj,
++                        capture_output=True,
++                    )
+                 # we do not need to update `self._cached_remote_refs`,
+                 # because we end the remote-helper process here
+                 # everything has worked, if we used a credential, update it
+@@ -724,9 +741,9 @@ class RepoAnnexGitRemote(object):
+                 # must not capture -- git is talking to it directly from here.
+                 # the `self.mirrorrepo` access will ensure that the mirror
+                 # is up-to-date
+-                self.mirrorrepo._git_runner.run(
+-                    ['git', 'upload-pack', self.mirrorrepo.path],
+-                    protocol=NoCapture,
++                call_git(
++                    ['upload-pack', self.mirrorrepo.path],
++                    cwd=self.mirrorrepo.pathobj,
+                 )
+                 # everything has worked, if we used a credential, update it
+                 self._store_credential()
+@@ -766,7 +783,7 @@ class RepoAnnexGitRemote(object):
+         repoannex = self.repoannex
+ 
+         # trim it down, as much as possible
+-        mirrorrepo.call_git(['gc'])
++        call_git(['gc'], cwd=mirrorrepo.pathobj)
+ 
+         # update the repo state keys
+         # it is critical to drop the local keys first, otherwise
+@@ -1047,7 +1064,10 @@ def _format_refs(repo, refs=None):
+     if refstr:
+         refstr += '\n'
+     refstr += '@{} HEAD\n'.format(
+-        repo.call_git(['symbolic-ref', 'HEAD']).strip()
++        call_git_oneline(
++            ['symbolic-ref', 'HEAD'],
++            cwd=repo.pathobj,
++        ).strip()
+     )
+     return refstr
+ 
+@@ -1156,69 +1176,67 @@ def make_export_tree(repo):
+     # we need to force Git to use a throwaway index file to maintain
+     # the bare nature of the repoannex, git-annex would stop functioning
+     # properly otherwise
+-    env = os.environ.copy()
+     index_file = repo.pathobj / 'datalad_tmp_index'
+-    env['GIT_INDEX_FILE'] = str(index_file)
+-    try:
+-        for key, kinfo in RepoAnnexGitRemote.xdlra_key_locations.items():
+-            # create a blob for the annex link
+-            out = repo._git_runner.run(
+-                ['git', 'hash-object', '-w', '--stdin'],
+-                stdin=bytes(
+-                    f'../../.git/annex/objects/{kinfo["prefix"]}/{key}/{key}',
+-                    'utf-8'),
+-                protocol=StdOutCapture)
+-            linkhash = out['stdout'].strip()
+-            # place link into a tree
+-            out = repo._git_runner.run(
+-                ['git', 'update-index', '--add', '--cacheinfo', '120000',
+-                 linkhash, kinfo["loc"]],
+-                protocol=StdOutCapture,
+-                env=env)
+-        # write the complete tree, and return ID
+-        out = repo._git_runner.run(
+-            ['git', 'write-tree'],
+-            protocol=StdOutCapture,
+-            env=env)
+-        exporttree = out['stdout'].strip()
+-        # this should always come out identically
+-        # unless we made changes in the composition of the export tree
+-        assert exporttree == '7f0e7953e93b4c9920c2bff9534773394f3a5762'
+-
+-        # clean slate
+-        if index_file.exists():
+-            index_file.unlink()
+-        # fake export.log record
+-        # <unixepoch>s <here>:<origin> <exporttree>
+-        now_ts = datetime.datetime.now().timestamp()
+-        out = repo._git_runner.run(
+-            ['git', 'hash-object', '-w', '--stdin'],
+-            stdin=bytes(
+-                f'{now_ts}s {here}:{origin} {exporttree}\n', 'utf-8'),
+-            protocol=StdOutCapture)
+-        exportlog = out['stdout'].strip()
+-        repo._git_runner.run(
+-            ['git', 'read-tree', 'git-annex'],
+-            env=env)
+-        out = repo._git_runner.run(
+-            ['git', 'update-index', '--add', '--cacheinfo', '100644',
+-             exportlog, 'export.log'],
+-            protocol=StdOutCapture,
+-            env=env)
+-        out = repo._git_runner.run(
+-            ['git', 'write-tree'],
+-            protocol=StdOutCapture,
+-            env=env)
+-        gaupdate = out['stdout'].strip()
+-        out = repo._git_runner.run(
+-            ['git', 'commit-tree', '-m', 'Fake export', '-p', 'git-annex',
+-             gaupdate],
+-            protocol=StdOutCapture,
+-            env=env)
+-        gacommit = out['stdout'].strip()
+-        repo.call_git(['update-ref', 'refs/heads/git-annex', gacommit])
+-    finally:
+-        index_file.unlink()
++    with patched_env(GIT_INDEX_FILE=index_file):
++        try:
++            for key, kinfo in RepoAnnexGitRemote.xdlra_key_locations.items():
++                # create a blob for the annex link
++                linkhash = call_git_oneline(
++                    ['hash-object', '-w', '--stdin'],
++                    cwd=repo.pathobj,
++                    input=f'../../.git/annex/objects/{kinfo["prefix"]}/{key}/{key}',
++                ).strip()
++                # place link into a tree
++                call_git_success(
++                    ['update-index', '--add', '--cacheinfo', '120000',
++                     linkhash, kinfo["loc"]],
++                    cwd=repo.pathobj,
++                    capture_output=True,
++                )
++            # write the complete tree, and return ID
++            exporttree = call_git_oneline(
++                ['write-tree'], cwd=repo.pathobj
++            ).strip()
++            # this should always come out identically
++            # unless we made changes in the composition of the export tree
++            assert exporttree == '7f0e7953e93b4c9920c2bff9534773394f3a5762'
++
++            # clean slate
++            if index_file.exists():
++                index_file.unlink()
++            # fake export.log record
++            # <unixepoch>s <here>:<origin> <exporttree>
++            now_ts = datetime.datetime.now().timestamp()
++            exportlog = call_git_oneline(
++                ['hash-object', '-w', '--stdin'],
++                input=f'{now_ts}s {here}:{origin} {exporttree}\n',
++                cwd=repo.pathobj,
++            ).strip()
++            call_git_success(
++                ['read-tree', 'git-annex'],
++                cwd=repo.pathobj,
++            )
++            call_git_success(
++                ['update-index', '--add', '--cacheinfo', '100644',
++                 exportlog, 'export.log'],
++                cwd=repo.pathobj,
++                capture_output=True,
++            )
++            gaupdate = call_git_oneline(
++                ['write-tree'], cwd=repo.pathobj,
++            ).strip()
++            gacommit = call_git_oneline(
++                ['commit-tree', '-m', 'Fake export', '-p', 'git-annex',
++                 gaupdate],
++                cwd=repo.pathobj,
++            ).strip()
++            call_git_success(
++                ['update-ref', 'refs/heads/git-annex', gacommit],
++                cwd=repo.pathobj,
++            )
++        finally:
++            if index_file.exists():
++                index_file.unlink()
+ 
+     return exporttree
+ 
+diff --git a/datalad_next/runners/git.py b/datalad_next/runners/git.py
+index ec158f2..bc6b74b 100644
+--- a/datalad_next/runners/git.py
++++ b/datalad_next/runners/git.py
+@@ -18,6 +18,7 @@ def _call_git(
+     cwd: Path | None = None,
+     check: bool = False,
+     text: bool | None = None,
++    input: str | bytes | None = None,
+     # TODO
+     #patch_env: dict[str, str] | None = None,
+ ) -> subprocess.CompletedProcess:
+@@ -39,6 +40,7 @@ def _call_git(
+             cwd=cwd,
+             check=check,
+             text=text,
++            input=input,
+         )
+     except subprocess.CalledProcessError as e:
+         # TODO we could support post-error forensics, but some client
+@@ -77,6 +79,7 @@ def call_git_success(
+     args: list[str],
+     *,
+     cwd: Path | None = None,
++    capture_output: bool = False,
+ ) -> bool:
+     """Call Git for a single line of output.
+ 
+@@ -86,11 +89,14 @@ def call_git_success(
+ 
+     If ``cwd`` is not None, the function changes the working directory to
+     ``cwd`` before executing the command.
++
++    If ``capture_output`` is ``True``, process output is captured, but not
++    returned. By default process output is not captured.
+     """
+     try:
+         _call_git(
+             args,
+-            capture_output=False,
++            capture_output=capture_output,
+             cwd=cwd,
+             check=True,
+         )
+@@ -104,7 +110,8 @@ def call_git_lines(
+     args: list[str],
+     *,
+     cwd: Path | None = None,
+-) -> bool:
++    input: str | None = None,
++) -> list[str]:
+     """Call Git for any (small) number of lines of output.
+ 
+     ``args`` is a list of arguments for the Git command. This list must not
+@@ -114,6 +121,10 @@ def call_git_lines(
+     If ``cwd`` is not None, the function changes the working directory to
+     ``cwd`` before executing the command.
+ 
++    If ``input`` is not None, the argument becomes the subprocess’s stdin.
++    This is intended for small-scale inputs. For call that require processing
++    large inputs, ``iter_git_subproc()`` is to be preferred.
++
+     Raises
+     ------
+     CommandError if the call exits with a non-zero status.
+@@ -124,6 +135,7 @@ def call_git_lines(
+         cwd=cwd,
+         check=True,
+         text=True,
++        input=input,
+     )
+     return res.stdout.splitlines()
+ 
+@@ -132,6 +144,7 @@ def call_git_oneline(
+     args: list[str],
+     *,
+     cwd: Path | None = None,
++    input: str | None = None,
+ ) -> str:
+     """Call git for a single line of output.
+ 
+@@ -143,7 +156,7 @@ def call_git_oneline(
+     CommandError if the call exits with a non-zero status.
+     AssertionError if there is more than one line of output.
+     """
+-    lines = call_git_lines(args, cwd=cwd)
++    lines = call_git_lines(args, cwd=cwd, input=input)
+     if len(lines) > 1:
+         raise AssertionError(
+             f"Expected Git {args} to return a single line, but got {lines}"
+diff --git a/datalad_next/utils/__init__.py b/datalad_next/utils/__init__.py
+index 6729d0c..faed7c2 100644
+--- a/datalad_next/utils/__init__.py
++++ b/datalad_next/utils/__init__.py
+@@ -12,6 +12,7 @@
+    external_versions
+    log_progress
+    parse_www_authenticate
++   patched_env
+    rmtree
+    get_specialremote_param_dict
+    get_specialremote_credential_properties
+@@ -72,7 +73,7 @@ from .specialremote import (
+     needs_specialremote_credential_envpatch,
+     get_specialremote_credential_envpatch,
+ )
+-
++from .patch import patched_env
+ 
+ # TODO REMOVE EVERYTHING BELOW FOR V2.0
+ # https://github.com/datalad/datalad-next/issues/611
+diff --git a/datalad_next/utils/patch.py b/datalad_next/utils/patch.py
+index 299b321..3ea1cdb 100644
+--- a/datalad_next/utils/patch.py
++++ b/datalad_next/utils/patch.py
+@@ -1,2 +1,31 @@
++import contextlib
++from os import environ
++
+ # legacy import
+ from datalad_next.patches import apply_patch
++
++
++@contextlib.contextmanager
++def patched_env(**env):
++    """Context manager for patching the process environment
++
++    Any number of kwargs can be given. Keys represent environment variable
++    names, and values their values. A value of ``None`` indicates that
++    the respective variable should be unset, i.e., removed from the
++    environment.
++    """
++    preserve = {}
++    for name, val in env.items():
++        preserve[name] = environ.get(name, None)
++        if val is None:
++            del environ[name]
++        else:
++            environ[name] = str(val)
++    try:
++        yield
++    finally:
++        for name, val in preserve.items():
++            if val is None:
++                del environ[name]
++            else:
++                environ[name] = val

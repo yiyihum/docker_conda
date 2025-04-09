@@ -1,0 +1,150 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e712a80..8e927e4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ New methods:
+ 
++- Added ``delaunay_triangles`` method from shapely to GeoSeries/GeoDataframe (#2907)
+ - Added ``concave_hull`` method from shapely to GeoSeries/GeoDataframe. (#2903)
+ - Added ``offset_curve`` method from shapely to GeoSeries/GeoDataframe. (#2902)
+ 
+@@ -11,6 +12,7 @@ New features and improvements:
+ 
+ Bug fixes:
+ 
++- ``assert_geodataframe_equal`` now handles GeoDataFrames with no active geometry (#2498)
+ 
+ ## Version 0.13.2 (Jun 6, 2023)
+ 
+diff --git a/doc/source/docs/reference/geoseries.rst b/doc/source/docs/reference/geoseries.rst
+index a248a3e..f584479 100644
+--- a/doc/source/docs/reference/geoseries.rst
++++ b/doc/source/docs/reference/geoseries.rst
+@@ -89,6 +89,7 @@ Constructive methods and attributes
+    GeoSeries.centroid
+    GeoSeries.concave_hull
+    GeoSeries.convex_hull
++   GeoSeries.delaunay_triangles
+    GeoSeries.envelope
+    GeoSeries.make_valid
+    GeoSeries.minimum_bounding_circle
+diff --git a/doc/source/docs/user_guide/geometric_manipulations.rst b/doc/source/docs/user_guide/geometric_manipulations.rst
+index f3b944a..1df5e5f 100644
+--- a/doc/source/docs/user_guide/geometric_manipulations.rst
++++ b/doc/source/docs/user_guide/geometric_manipulations.rst
+@@ -38,6 +38,12 @@ Constructive methods
+   number of points in the object is less than three. For two points,
+   the convex hull collapses to a `LineString`; for 1, a `Point`.
+ 
++.. method:: GeoSeries.delaunay_triangles(tolerance, preserve_topology=True)
++
++  Returns a :class:`~geopandas.GeoSeries` consisting of polygons (default) or linestrings
++  (`only_edges=True`) representing the computed Delaunay triangulation around the vertices
++  of an input geometry.
++
+ .. attribute:: GeoSeries.envelope
+ 
+   Returns a :class:`~geopandas.GeoSeries` of geometries representing the point or
+diff --git a/geopandas/_vectorized.py b/geopandas/_vectorized.py
+index e185f28..92d3666 100644
+--- a/geopandas/_vectorized.py
++++ b/geopandas/_vectorized.py
+@@ -637,6 +637,18 @@ def convex_hull(data):
+         return _unary_geo("convex_hull", data)
+ 
+ 
++def delaunay_triangles(data, tolerance, only_edges):
++    if compat.USE_SHAPELY_20:
++        return shapely.delaunay_triangles(data, tolerance, only_edges)
++    elif compat.USE_PYGEOS:
++        return pygeos.delaunay_triangles(data, tolerance, only_edges)
++    else:
++        raise NotImplementedError(
++            f"shapely >= 2.0 or PyGEOS is required, "
++            f"version {shapely.__version__} is installed"
++        )
++
++
+ def envelope(data):
+     if compat.USE_SHAPELY_20:
+         return shapely.envelope(data)
+diff --git a/geopandas/array.py b/geopandas/array.py
+index 81acfb5..37dfcfd 100644
+--- a/geopandas/array.py
++++ b/geopandas/array.py
+@@ -519,6 +519,12 @@ class GeometryArray(ExtensionArray):
+     def convex_hull(self):
+         return GeometryArray(vectorized.convex_hull(self._data), crs=self.crs)
+ 
++    def delaunay_triangles(self, tolerance, only_edges):
++        return GeometryArray(
++            vectorized.delaunay_triangles(self._data, tolerance, only_edges),
++            crs=self.crs,
++        )
++
+     @property
+     def envelope(self):
+         return GeometryArray(vectorized.envelope(self._data), crs=self.crs)
+diff --git a/geopandas/base.py b/geopandas/base.py
+index fac044d..09d641f 100644
+--- a/geopandas/base.py
++++ b/geopandas/base.py
+@@ -603,6 +603,56 @@ GeometryCollection
+         """
+         return _delegate_property("convex_hull", self)
+ 
++    def delaunay_triangles(self, tolerance=0.0, only_edges=False):
++        """Returns a ``GeoSeries`` consisting of objects representing
++        the computed Delaunay triangulation around the vertices of
++        an input geometry.
++
++        The output is a ``GeometryCollection`` containing polygons
++        (default) or linestrings (see only_edges).
++
++        Returns an empty GeometryCollection if an input geometry
++        contains less than 3 vertices.
++
++        Parameters
++        ----------
++        tolerance : float | array-like, default 0.0
++            Snap input vertices together if their distance is less than this value.
++        only_edges : bool | array_like, (optional, default False)
++            If set to True, the triangulation will return a collection of
++            linestrings instead of polygons.
++
++        Examples
++        --------
++
++        >>> from shapely import LineString, MultiPoint, Polygon
++        >>> s = geopandas.GeoSeries(
++        ...     [
++        ...         MultiPoint([(50, 30), (60, 30), (100, 100)]),
++        ...         Polygon([(50, 30), (60, 30), (100, 100), (50, 30)]),
++        ...         LineString([(50, 30), (60, 30), (100, 100)]),
++        ...     ]
++        ... )
++        >>> s
++        0   MULTIPOINT (50.000 30.000, 60.000 30.000, 100....
++        1   POLYGON ((50.000 30.000, 60.000 30.000, 100.00...
++        2   LINESTRING (50.000 30.000, 60.000 30.000, 100....
++        dtype: geometry
++
++        >>> s.delaunay_triangles()
++        0    GEOMETRYCOLLECTION (POLYGON ((50.000 30.000, 6...
++        1    GEOMETRYCOLLECTION (POLYGON ((50.000 30.000, 6...
++        2    GEOMETRYCOLLECTION (POLYGON ((50.000 30.000, 6...
++        dtype: geometry
++
++        >>> s.delaunay_triangles(only_edges=True)
++        0    MULTILINESTRING ((50.000 30.000, 100.000 100.0...
++        1    MULTILINESTRING ((50.000 30.000, 100.000 100.0...
++        2    MULTILINESTRING ((50.000 30.000, 100.000 100.0...
++        dtype: geometry
++        """
++        return _delegate_geo_method("delaunay_triangles", self, tolerance, only_edges)
++
+     @property
+     def envelope(self):
+         """Returns a ``GeoSeries`` of geometries representing the envelope of

@@ -1,0 +1,194 @@
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index 216f9be..71d3e3c 100644
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+  - Change CDS keys from `.cdsapirc` file to `.config/eracli.txt` file. This will avoid conflict with e.g. ADS.
+  - If a user makes a request without `--splitmonths` they are warned that the behavior will change in the future, and that they have to choose between `--splitmonths False` and `--splitmonths True`.
+  - When a request would encounter a Request Too Large error in the CDS API, they are warned, and given a suggestion to use `--splitmonths`.
++ - When a file already exists and would be overwritten, the user is prompted for confirmation. This should prevent accidental overwriting of files. This check can be skipped with the `--overwrite` flag.
+  - The earliest valid start year of requests has been updated to 1950.
+  - Usage of `--prelimbe` now raises a deprecation warning. It will be deprecated in a future release, as all the back extension years are now included in the main products.
+ 
+diff --git a/era5cli/args/common.py b/era5cli/args/common.py
+index 35194b5..73d6c4d 100644
+--- a/era5cli/args/common.py
++++ b/era5cli/args/common.py
+@@ -27,6 +27,7 @@ def add_common_args(argument_parser: ArgumentParser) -> None:
+         --prelimbe,
+         --land,
+         --area,
++        --overwrite
+ 
+     Args:
+         argument_parser: the ArgumentParser that the arguments are added to.
+@@ -242,6 +243,22 @@ def add_common_args(argument_parser: ArgumentParser) -> None:
+         ),
+     )
+ 
++    argument_parser.add_argument(
++        "--overwrite",
++        action="store_true",
++        default=False,
++        help=textwrap.dedent(
++            """
++            Whether to overwrite existing files or not.
++            Providing the `--overwrite` argument will make
++            era5cli overwrite existing files. By default,
++            you will be prompted if a file already exists, with
++            the question if you want to overwrite it or not.
++
++            """
++        ),
++    )
++
+ 
+ def construct_year_list(args):
+     """Make a continous list of years from the startyear and endyear arguments."""
+diff --git a/era5cli/args/periods.py b/era5cli/args/periods.py
+index d6988fd..a049590 100644
+--- a/era5cli/args/periods.py
++++ b/era5cli/args/periods.py
+@@ -185,7 +185,6 @@ def set_period_args(args):
+             )
+         else:
+             splitmonths: bool = args.splitmonths
+-        print(splitmonths)
+ 
+         statistics: bool = args.statistics
+         if statistics:
+diff --git a/era5cli/cli.py b/era5cli/cli.py
+index 4a2d2c6..8bc6d06 100644
+--- a/era5cli/cli.py
++++ b/era5cli/cli.py
+@@ -69,6 +69,7 @@ def _execute(input_args: argparse.Namespace) -> True:
+         merge=input_args.merge,
+         prelimbe=input_args.prelimbe,
+         land=input_args.land,
++        overwrite=input_args.overwrite,
+     )
+     era5.fetch(dryrun=input_args.dryrun)
+     return True
+diff --git a/era5cli/fetch.py b/era5cli/fetch.py
+index 02d13ce..9f76188 100644
+--- a/era5cli/fetch.py
++++ b/era5cli/fetch.py
+@@ -86,6 +86,12 @@ class Fetch:
+             Note that the ERA5-Land dataset starts in 1981.
+             `land = True` is incompatible with the use of
+             `prelimbe = True` and `ensemble = True`.
++        overwrite: bool
++            Whether to overwrite existing files or not.
++            Setting `overwrite = True` will make
++            era5cli overwrite existing files. By default,
++            you will be prompted if a file already exists, with
++            the question if you want to overwrite it or not.
+     """
+ 
+     def __init__(
+@@ -108,6 +114,7 @@ class Fetch:
+         threads=None,
+         prelimbe=False,
+         land=False,
++        overwrite=False,
+     ):
+         """Initialization of Fetch class."""
+         self._get_login()  # Get login info from config file.
+@@ -166,6 +173,8 @@ class Fetch:
+         self.land = land
+         """bool: Whether to download from the ERA5-Land
+         dataset."""
++        self.overwrite = overwrite
++        """bool: Whether to overwrite existing files."""
+ 
+         if self.merge and self.splitmonths:
+             raise ValueError(
+@@ -197,6 +206,9 @@ class Fetch:
+             )
+ 
+     def _get_login(self):
++        # First check if the config exists, and guide the user if it does not.
++        key_management.check_era5cli_config()
++        # Only then load the keys (as they should be there now).
+         self.url, self.key = key_management.load_era5cli_config()
+ 
+     def fetch(self, dryrun=False):
+@@ -271,11 +283,12 @@ class Fetch:
+         outputfiles = [
+             self._define_outputfilename(var, self.years) for var in self.variables
+         ]
++        if not self.overwrite:
++            era5cli.utils.assert_outputfiles_not_exist(outputfiles)
++
+         years = len(outputfiles) * [self.years]
+-        if not self.threads:
+-            pool = Pool()
+-        else:
+-            pool = Pool(nodes=self.threads)
++
++        pool = Pool(nodes=self.threads) if self.threads else Pool()
+         pool.map(self._getdata, self.variables, years, outputfiles)
+ 
+     def _split_variable_yr(self):
+@@ -285,7 +298,12 @@ class Fetch:
+         for var in self.variables:
+             outputfiles += [self._define_outputfilename(var, [yr]) for yr in self.years]
+             variables += len(self.years) * [var]
++
++        if not self.overwrite:
++            era5cli.utils.assert_outputfiles_not_exist(outputfiles)
++
+         years = len(self.variables) * self.years
++
+         pool = Pool(nodes=self.threads) if self.threads else Pool()
+         pool.map(self._getdata, variables, years, outputfiles)
+ 
+@@ -304,6 +322,9 @@ class Fetch:
+             years += [year]
+             months += [month]
+ 
++        if not self.overwrite:
++            era5cli.utils.assert_outputfiles_not_exist(outputfiles)
++
+         pool = Pool(nodes=self.threads) if self.threads else Pool()
+         pool.map(self._getdata, variables, years, outputfiles, months)
+ 
+@@ -501,6 +522,7 @@ class Fetch:
+     def _getdata(self, variables: list, years: list, outputfile: str, months=None):
+         """Fetch variables using cds api call."""
+         name, request = self._build_request(variables, years, months)
++
+         if self.dryrun:
+             print(name, request, outputfile)
+         else:
+diff --git a/era5cli/utils.py b/era5cli/utils.py
+index 2f8545a..37650a8 100644
+--- a/era5cli/utils.py
++++ b/era5cli/utils.py
+@@ -4,6 +4,7 @@ import datetime
+ import shutil
+ import textwrap
+ from pathlib import Path
++from typing import List
+ import prettytable
+ from netCDF4 import Dataset
+ import era5cli
+@@ -205,3 +206,18 @@ def strtobool(value: str) -> bool:
+         "Could not convert string to boolean. Valid inputs are:"
+         f"{trues} and {falses} (case insensitive)."
+     )
++
++
++def assert_outputfiles_not_exist(outputfiles: List[str]) -> None:
++    """Check if files already exist, and prompt the user if they do."""
++    if any(Path(file).exists() for file in outputfiles):
++        answer = input(
++            "\n  Some filenames already exists in this folder."
++            "\n  Do you want to overwrite them? (Y/N)"
++            "\n  Tip: to skip this flag, use `--overwrite`."
++        )
++        if answer.lower() in ["n", "no", "nope"]:
++            raise FileExistsError(
++                "\n  One or more files already exist in this folder."
++                "\n  Please remove them, or change to a different folder to continue"
++            )

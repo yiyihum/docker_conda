@@ -1,0 +1,371 @@
+diff --git a/fdbk/_client_connection.py b/fdbk/_client_connection.py
+index d691355..eae4135 100644
+--- a/fdbk/_client_connection.py
++++ b/fdbk/_client_connection.py
+@@ -36,9 +36,14 @@ class ClientConnection(DBConnection):
+         if not response.ok:
+             raise RuntimeError(json.dumps(response.json()))
+ 
+-    def get_topics(self, type_=None):
++    def get_topics(self, type_=None, template=None):
+         # TODO: Error handling
+-        query = f"type={type_}" if type_ else ""
++        query = []
++        if type_:
++            query.append(f"type={type_}")
++        if template:
++            query.append(f"template={template}")
++        query = '&'.join(query)
+         query = f"?{query}" if query else ""
+         response = requests.get(f"{self.__url}/topics{query}")
+ 
+diff --git a/fdbk/_db_connection.py b/fdbk/_db_connection.py
+index b86c670..e29227c 100644
+--- a/fdbk/_db_connection.py
++++ b/fdbk/_db_connection.py
+@@ -11,6 +11,27 @@ class DBConnection:
+     '''Base class for DB connections.
+     '''
+ 
++    def validate_template(self, topic_d):
++        ''' Validate that topics template is a template topic
++
++        Args:
++            topic_d: Topic dict which template is validated
++
++        Returns:
++            None
++
++        Raises:
++            AssertionError: Template is not a valid template
++            KeyError: Template not found from DB
++        '''
++        template = topic_d.get('template')
++        if not template:
++            return
++
++        template_d = self.get_topic(template)
++        if template_d.get('type') != 'template':
++            raise AssertionError('Templates type is not template.')
++
+     def add_topic(self, name, **kwargs):
+         '''Adds new topic to DB.
+ 
+@@ -21,7 +42,8 @@ class DBConnection:
+             Topic ID of the newly created topic
+ 
+         Raises:
+-            KeyError: Topic already exists in DB
++            KeyError: Topic already exists in DB or topics template does not
++                exist in DB.
+         '''
+         raise NotImplementedError(
+             "Functionality not implemented by selected DB connection")
+@@ -38,26 +60,90 @@ class DBConnection:
+             None
+ 
+         Raises:
++            AssertionError: Topic is a template topic
+             KeyError: Topic does not exist in DB
+             ValueError: Values do not match those defined for the topic
+         '''
+         raise NotImplementedError(
+             "Functionality not implemented by selected DB connection")
+ 
+-    def get_topics(self, type_=None):
+-        '''Gets list of topic dicts
++    def get_topics_without_templates(self, type_=None, template=None):
++        '''Gets list of topic dicts without resolving templates
++
++        Fetches all topics by default.
+ 
+         Args:
+-            type_: Type of topics to fetch. By default all topics are fetched.
++            type_: Type of topics to fetch
++            template: Template of topics to fetch.
++
++        Returns:
++            List of topic dicts without fields from possible templates
++        '''
++        raise NotImplementedError(
++            "Functionality not implemented by selected DB connection")
++
++    @staticmethod
++    def _remove_empty(obj):
++        ret = {}
++        for key, value in obj.items():
++            if value:
++                ret[key] = value
++        return ret
++
++    @staticmethod
++    def _with_templates(topic_d, templates):
++        template = topic_d.get('template')
++        if template:
++            try:
++                template_d = next(
++                    i for i in templates if i.get('id') == template)
++            except StopIteration:
++                raise KeyError(topic_not_found(template))
++            return {
++                **DBConnection._with_templates(
++                    template_d,
++                    templates),
++                **DBConnection._remove_empty(topic_d)}
++        else:
++            return topic_d
++
++    def get_topics(self, type_=None, template=None):
++        '''Gets list of topic dicts with values from templates
++
++        Fetches all topics by default.
++
++        Args:
++            type_: Type of topics to fetch
++            template: Template of topics to fetch.
+ 
+         Returns:
+             List of topic dicts
++
++        Raises:
++            KeyError: Template of a topic not found from the DB
++        '''
++        topics = self.get_topics_without_templates(type_, template=template)
++        templates = self.get_topics_without_templates(type_='template')
++
++        return [self._with_templates(topic, templates) for topic in topics]
++
++    def get_topic_without_templates(self, topic_id):
++        '''Get topic dict by ID without resolving templates
++
++        Args:
++            topic_id: ID of the topic to find
++
++        Returns:
++            Topic dictionary without fields from possible templates
++
++        Raises:
++            KeyError: Topic does not exist in DB
+         '''
+         raise NotImplementedError(
+             "Functionality not implemented by selected DB connection")
+ 
+     def get_topic(self, topic_id):
+-        '''Get topic dict by ID
++        '''Get topic dict by ID with values from templates
+ 
+         Args:
+             topic_id: ID of the topic to find
+@@ -68,8 +154,12 @@ class DBConnection:
+         Raises:
+             KeyError: Topic does not exist in DB
+         '''
+-        raise NotImplementedError(
+-            "Functionality not implemented by selected DB connection")
++        topic_d = self.get_topic_without_templates(topic_id)
++        template = topic_d.get('template')
++        if template:
++            return {**self.get_topic(template), **self._remove_empty(topic_d)}
++        else:
++            return topic_d
+ 
+     def get_data(self, topic_id, since=None, until=None, limit=None):
+         '''Get all data under given topic
+@@ -168,7 +258,7 @@ class DBConnection:
+ 
+     def _run_data_tools_for_many(self,
+                                  topic_ids=None,
+-                                 type_=None,
++                                 template=None,
+                                  since=None,
+                                  until=None,
+                                  limit=None,
+@@ -185,7 +275,8 @@ class DBConnection:
+                 except KeyError as e:
+                     warnings.append(topic_not_found(topic_id))
+         else:
+-            topics = {topic["id"]: topic for topic in self.get_topics(type_)}
++            topics = {
++                topic["id"]: topic for topic in self.get_topics(template)}
+ 
+         result_d = {
+             "topic_names": [],
+@@ -219,17 +310,10 @@ class DBConnection:
+         result_d["fields"] = list(set(result_d["fields"]))
+         return result_d
+ 
+-    def get_comparison(self, topic_ids=None, **kwargs):
+-        '''Get comparison of the data of the given topic IDs
+-
+-        See get_overview.
+-        '''
+-        return self._run_data_tools_for_many(topic_ids, **kwargs)
+-
+     def get_overview(
+             self,
+             topic_ids=None,
+-            type_=None,
++            template=None,
+             since=None,
+             until=None,
+             limit=None,
+@@ -240,8 +324,8 @@ class DBConnection:
+         Args:
+             topic_ids: List of topic IDs to overview. By default all topics are
+                 included.
+-            type_: Type of topics to include. Only has effect is topic_ids is
+-                empty. By default all topics are included.
++            template: Template of topics to include. Only has effect if
++                topic_ids is empty. By default all topics are included.
+             since: Datetime of the earliest entry to include
+             until: Datetime of the most recent entry to include
+             limit: Number of entries to include from the most recent
+@@ -256,7 +340,7 @@ class DBConnection:
+         '''
+         return self._run_data_tools_for_many(
+             topic_ids=topic_ids,
+-            type_=type_,
++            template=template,
+             since=since,
+             until=until,
+             limit=limit,
+diff --git a/fdbk/_dict_connection.py b/fdbk/_dict_connection.py
+index 5492f32..7ceb9a4 100644
+--- a/fdbk/_dict_connection.py
++++ b/fdbk/_dict_connection.py
+@@ -35,6 +35,7 @@ class DictConnection(DBConnection):
+ 
+     def add_topic(self, name, **kwargs):
+         topic_d = generate_topic_dict(name, add_id=True, **kwargs)
++        self.validate_template(topic_d)
+ 
+         self._dict["topics"].append(topic_d)
+         self._dict[topic_d["id"]] = []
+@@ -47,15 +48,19 @@ class DictConnection(DBConnection):
+ 
+     def add_data(self, topic_id, values):
+         topic_d = self._get_topic_dict(topic_id)
++        if topic_d.get('type') == 'template':
++            raise AssertionError('Cannot add data to template topic.')
+         fields = topic_d["fields"]
+ 
+         data = generate_data_entry(topic_id, fields, values)
+         self._dict[topic_id].append(data)
+ 
+-    def get_topics(self, type_=None):
++    def get_topics_without_templates(self, type_=None, template=None):
+         topics = self._dict["topics"]
+         if type_:
+             topics = [i for i in topics if i.get('type') == type_]
++        if template:
++            topics = [i for i in topics if i.get('template') == template]
+ 
+         return generate_topics_list(topics)
+ 
+@@ -66,7 +71,7 @@ class DictConnection(DBConnection):
+         except StopIteration:
+             raise KeyError(topic_not_found(topic_id))
+ 
+-    def get_topic(self, topic_id):
++    def get_topic_without_templates(self, topic_id):
+         return generate_topic_response(self._get_topic_dict(topic_id))
+ 
+     def get_data(self, topic_id, since=None, until=None, limit=None):
+diff --git a/fdbk/server/_server_handlers.py b/fdbk/server/_server_handlers.py
+index b80865a..900337c 100644
+--- a/fdbk/server/_server_handlers.py
++++ b/fdbk/server/_server_handlers.py
+@@ -114,7 +114,7 @@ class ServerHandlers:
+         try:
+             params = parse_filter_parameters(
+                 query_args, include_aggregate=True)
+-            data = self._db_connection.get_comparison(
++            data = self._db_connection.get_overview(
+                 topic_ids_a, **params)
+             return data, 200
+         except KeyError as error:
+@@ -122,7 +122,7 @@ class ServerHandlers:
+                 "error": str(error)
+             }, 404
+ 
+-    def get_overview(self, type_=None, query_args=None):
++    def get_overview(self, template=None, query_args=None):
+         if not query_args:
+             query_args = {}
+ 
+@@ -130,7 +130,7 @@ class ServerHandlers:
+             params = parse_filter_parameters(
+                 query_args, include_aggregate=True)
+             data = self._db_connection.get_overview(
+-                type_=type_, **params)
++                template=template, **params)
+             return data, 200
+         except KeyError as error:
+             return {
+diff --git a/fdbk/utils/_format.py b/fdbk/utils/_format.py
+index 6562697..e3d343f 100644
+--- a/fdbk/utils/_format.py
++++ b/fdbk/utils/_format.py
+@@ -7,6 +7,7 @@ TOPIC_FIELDS = [
+     "name",
+     "id",
+     "type",
++    "template",
+     "description",
+     "fields",
+     "units",
+@@ -86,6 +87,7 @@ def generate_data_response(data, fields):
+ def generate_topic_dict(
+         name,
+         type_str=None,
++        template=None,
+         description=None,
+         fields=None,
+         units=None,
+@@ -96,7 +98,8 @@ def generate_topic_dict(
+ 
+     Args:
+         name: Name of the topic.
+-        type_str: Type of the topic, for example 'form' or 'sensor'.
++        type_str: Type of the topic, 'topic' or 'template'.
++        template: Template to inherit values from.
+         description: Description of the topic.
+         fields: List of data field names included in the topic.
+         units: List of units for field.
+@@ -107,11 +110,11 @@ def generate_topic_dict(
+ 
+     Returns:
+         Generated topic dict
+-
+     '''
+     topic_d = {
+         "name": name,
+-        "type": type_str,
++        "type": type_str if type_str is not None else "topic",
++        "template": template,
+         "description": description,
+         "fields": fields if fields is not None else [],
+         "units": units if units is not None else [],
+@@ -120,7 +123,10 @@ def generate_topic_dict(
+     }
+ 
+     if add_id:
+-        topic_d["id"] = str(uuid4())
++        if type_str == 'template':
++            topic_d["id"] = name
++        else:
++            topic_d["id"] = str(uuid4())
+ 
+     validate_topic_dict(topic_d)
+ 
+diff --git a/fdbk/utils/messages.py b/fdbk/utils/messages.py
+index 6814c52..6e1a37f 100644
+--- a/fdbk/utils/messages.py
++++ b/fdbk/utils/messages.py
+@@ -19,4 +19,4 @@ def no_data(topic_d=None):
+ 
+ 
+ def topic_not_found(id_):
+-    return f'Topic ID "{id_}" not found from database'
++    return f'Topic ID "{id_}" not found from database.'
+

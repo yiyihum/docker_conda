@@ -1,0 +1,101 @@
+diff --git a/tests/constraints/test_validity.py b/tests/constraints/test_validity.py
+index d4061a0..006b563 100644
+--- a/tests/constraints/test_validity.py
++++ b/tests/constraints/test_validity.py
+@@ -1,6 +1,7 @@
+ from unittest.mock import MagicMock
+ 
+ import networkx as nx
++import numpy
+ import pytest
+ 
+ from gerrychain.constraints import (SelfConfiguringLowerBound, Validator,
+@@ -140,6 +141,17 @@ def test_validator_raises_TypeError_if_constraint_returns_non_boolean():
+         validator(mock_partition)
+ 
+ 
++def test_validator_accepts_numpy_booleans():
++    mock_partition = MagicMock()
++
++    mock_constraint = MagicMock()
++    mock_constraint.return_value = numpy.bool_(True)
++    mock_constraint.__name__ = "mock_constraint"
++
++    is_valid = Validator([mock_constraint])
++    assert is_valid(mock_partition)
++
++
+ def test_no_vanishing_districts_works():
+     parent = MagicMock()
+     parent.assignment = get_assignment({1: 1, 2: 2}, MagicMock())
+diff --git a/tests/partition/test_partition.py b/tests/partition/test_partition.py
+index 6b44a41..56b0b16 100644
+--- a/tests/partition/test_partition.py
++++ b/tests/partition/test_partition.py
+@@ -137,6 +137,16 @@ def districtr_plan_file():
+             json.dump(districtr_plan, f)
+         yield filename
+ 
+-
+ def test_repr(example_partition):
+     assert repr(example_partition) == "<Partition [2 parts]>"
++
++def test_partition_has_default_updaters(example_partition):
++    partition = example_partition
++    default_updaters = partition.default_updaters
++    should_have_updaters = {
++        "cut_edges": cut_edges
++    }
++
++    for updater in should_have_updaters:
++        assert default_updaters.get(updater, None) is not None
++        assert should_have_updaters[updater](partition) == partition[updater]
+diff --git a/tests/test_tree.py b/tests/test_tree.py
+index 1cab047..1acefaf 100644
+--- a/tests/test_tree.py
++++ b/tests/test_tree.py
+@@ -11,6 +11,7 @@ from gerrychain.tree import (
+     bipartition_tree,
+     random_spanning_tree,
+     find_balanced_edge_cuts,
++    recursive_tree_part,
+     PopulatedGraph,
+ )
+ from gerrychain.updaters import Tally, cut_edges
+@@ -32,6 +33,16 @@ def partition_with_pop(graph_with_pop):
+     )
+ 
+ 
++@pytest.fixture
++def twelve_by_twelve_with_pop():
++    xy_grid = networkx.grid_graph([12, 12])
++    nodes = {node: node[1] + 12 * node[0] for node in xy_grid}
++    grid = networkx.relabel_nodes(xy_grid, nodes)
++    for node in grid:
++        grid.nodes[node]["pop"] = 1
++    return grid
++
++
+ def test_bipartition_tree_returns_a_subset_of_nodes(graph_with_pop):
+     ideal_pop = sum(graph_with_pop.nodes[node]["pop"] for node in graph_with_pop) / 2
+     result = bipartition_tree(graph_with_pop, "pop", ideal_pop, 0.25, 10)
+@@ -48,6 +59,19 @@ def test_bipartition_tree_returns_within_epsilon_of_target_pop(graph_with_pop):
+     assert abs(part_pop - ideal_pop) / ideal_pop < epsilon
+ 
+ 
++def test_recursive_tree_part_returns_within_epsilon_of_target_pop(twelve_by_twelve_with_pop):
++    n_districts = 7  # 144/7 ≈ 20.5 nodes/subgraph (1 person/node)
++    ideal_pop = (sum(twelve_by_twelve_with_pop.nodes[node]["pop"]
++                     for node in twelve_by_twelve_with_pop)) / n_districts
++    epsilon = 0.05
++    result = recursive_tree_part(twelve_by_twelve_with_pop, range(n_districts),
++                                 ideal_pop, "pop", epsilon)
++    partition = Partition(twelve_by_twelve_with_pop, result,
++                          updaters={"pop": Tally("pop")})
++    return all(abs(part_pop - ideal_pop) / ideal_pop < epsilon
++               for part_pop in partition['pop'].values())
++
++
+ def test_random_spanning_tree_returns_tree_with_pop_attribute(graph_with_pop):
+     tree = random_spanning_tree(graph_with_pop)
+     assert networkx.is_tree(tree)

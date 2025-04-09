@@ -1,0 +1,141 @@
+diff --git a/mido/messages/messages.py b/mido/messages/messages.py
+index ff82681..9f760a4 100644
+--- a/mido/messages/messages.py
++++ b/mido/messages/messages.py
+@@ -111,19 +111,25 @@ class SysexData(tuple):
+ 
+ 
+ class Message(BaseMessage):
+-    def __init__(self, type, **args):
++    def __init__(self, type, skip_checks=False, **args):
+         msgdict = make_msgdict(type, args)
+         if type == 'sysex':
+             msgdict['data'] = SysexData(msgdict['data'])
+-        check_msgdict(msgdict)
++
++        if not skip_checks:
++            check_msgdict(msgdict)
++
+         vars(self).update(msgdict)
+ 
+-    def copy(self, **overrides):
++    def copy(self, skip_checks=False, **overrides):
+         """Return a copy of the message.
+ 
+         Attributes will be overridden by the passed keyword arguments.
+         Only message specific attributes can be overridden. The message
+         type can not be changed.
++
++        The skip_checks arg can be used to bypass validation of message
++        attributes and should be used cautiously.
+         """
+         if not overrides:
+             # Bypass all checks.
+@@ -139,8 +145,11 @@ class Message(BaseMessage):
+ 
+         msgdict = vars(self).copy()
+         msgdict.update(overrides)
+-        check_msgdict(msgdict)
+-        return self.__class__(**msgdict)
++
++        if not skip_checks:
++            check_msgdict(msgdict)
++
++        return self.__class__(skip_checks=skip_checks, **msgdict)
+ 
+     @classmethod
+     def from_bytes(cl, data, time=0):
+diff --git a/mido/midifiles/midifiles.py b/mido/midifiles/midifiles.py
+index 3ee2847..cd3be20 100644
+--- a/mido/midifiles/midifiles.py
++++ b/mido/midifiles/midifiles.py
+@@ -327,7 +327,7 @@ class MidiFile:
+             raise TypeError("can't merge tracks in type 2 (asynchronous) file")
+ 
+         if self._merged_track is None:
+-            self._merged_track = merge_tracks(self.tracks)
++            self._merged_track = merge_tracks(self.tracks, skip_checks=True)
+         return self._merged_track
+ 
+     @merged_track.deleter
+@@ -396,7 +396,7 @@ class MidiFile:
+             else:
+                 delta = 0
+ 
+-            yield msg.copy(time=delta)
++            yield msg.copy(skip_checks=True, time=delta)
+ 
+             if msg.type == 'set_tempo':
+                 tempo = msg.tempo
+diff --git a/mido/midifiles/tracks.py b/mido/midifiles/tracks.py
+index 17caccc..871f9bd 100644
+--- a/mido/midifiles/tracks.py
++++ b/mido/midifiles/tracks.py
+@@ -64,24 +64,24 @@ class MidiTrack(list):
+         return f'{self.__class__.__name__}({messages})'
+ 
+ 
+-def _to_abstime(messages):
++def _to_abstime(messages, skip_checks=False):
+     """Convert messages to absolute time."""
+     now = 0
+     for msg in messages:
+         now += msg.time
+-        yield msg.copy(time=now)
++        yield msg.copy(skip_checks=skip_checks, time=now)
+ 
+ 
+-def _to_reltime(messages):
++def _to_reltime(messages, skip_checks=False):
+     """Convert messages to relative time."""
+     now = 0
+     for msg in messages:
+         delta = msg.time - now
+-        yield msg.copy(time=delta)
++        yield msg.copy(skip_checks=skip_checks, time=delta)
+         now = msg.time
+ 
+ 
+-def fix_end_of_track(messages):
++def fix_end_of_track(messages, skip_checks=False):
+     """Remove all end_of_track messages and add one at the end.
+ 
+     This is used by merge_tracks() and MidiFile.save()."""
+@@ -95,7 +95,7 @@ def fix_end_of_track(messages):
+         else:
+             if accum:
+                 delta = accum + msg.time
+-                yield msg.copy(time=delta)
++                yield msg.copy(skip_checks=skip_checks, time=delta)
+                 accum = 0
+             else:
+                 yield msg
+@@ -103,16 +103,25 @@ def fix_end_of_track(messages):
+     yield MetaMessage('end_of_track', time=accum)
+ 
+ 
+-def merge_tracks(tracks):
++def merge_tracks(tracks, skip_checks=False):
+     """Returns a MidiTrack object with all messages from all tracks.
+ 
+     The messages are returned in playback order with delta times
+     as if they were all in one track.
++
++    Pass skip_checks=True to skip validation of messages before merging.
++    This should ONLY be used when the messages in tracks have already
++    been validated by mido.checks.
+     """
+     messages = []
+     for track in tracks:
+-        messages.extend(_to_abstime(track))
++        messages.extend(_to_abstime(track, skip_checks=skip_checks))
+ 
+     messages.sort(key=lambda msg: msg.time)
+ 
+-    return MidiTrack(fix_end_of_track(_to_reltime(messages)))
++    return MidiTrack(
++        fix_end_of_track(
++            _to_reltime(messages, skip_checks=skip_checks),
++            skip_checks=skip_checks,
++        )
++    )

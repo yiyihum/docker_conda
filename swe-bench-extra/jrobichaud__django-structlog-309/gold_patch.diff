@@ -1,0 +1,160 @@
+diff --git a/django_structlog/app_settings.py b/django_structlog/app_settings.py
+index e54b01b..6f5e914 100644
+--- a/django_structlog/app_settings.py
++++ b/django_structlog/app_settings.py
+@@ -1,3 +1,5 @@
++import logging
++
+ from django.conf import settings
+ 
+ 
+@@ -9,5 +11,9 @@ class AppSettings:
+     def CELERY_ENABLED(self):
+         return getattr(settings, self.PREFIX + "CELERY_ENABLED", False)
+ 
++    @property
++    def STATUS_4XX_LOG_LEVEL(self):
++        return getattr(settings, self.PREFIX + "STATUS_4XX_LOG_LEVEL", logging.WARNING)
++
+ 
+ app_settings = AppSettings()
+diff --git a/django_structlog/middlewares/request.py b/django_structlog/middlewares/request.py
+index bf0375d..5a11f5a 100644
+--- a/django_structlog/middlewares/request.py
++++ b/django_structlog/middlewares/request.py
+@@ -1,3 +1,4 @@
++import logging
+ import uuid
+ 
+ import structlog
+@@ -7,6 +8,7 @@ from django.http import Http404
+ from asgiref import sync
+ 
+ from .. import signals
++from ..app_settings import app_settings
+ 
+ logger = structlog.getLogger(__name__)
+ 
+@@ -31,7 +33,14 @@ class BaseRequestMiddleWare:
+                 logger=logger,
+                 response=response,
+             )
+-            logger.info(
++            if response.status_code >= 500:
++                level = logging.ERROR
++            elif response.status_code >= 400:
++                level = app_settings.STATUS_4XX_LOG_LEVEL
++            else:
++                level = logging.INFO
++            logger.log(
++                level,
+                 "request_finished",
+                 code=response.status_code,
+                 request=self.format_request(request),
+@@ -112,9 +121,9 @@ class RequestMiddleware(BaseRequestMiddleWare):
+     """``RequestMiddleware`` adds request metadata to ``structlog``'s logger context automatically.
+ 
+     >>> MIDDLEWARE = [
+-        ...     # ...
+-        ...     'django_structlog.middlewares.RequestMiddleware',
+-        ... ]
++    ...     # ...
++    ...     'django_structlog.middlewares.RequestMiddleware',
++    ... ]
+ 
+     """
+ 
+diff --git a/docs/celery.rst b/docs/celery.rst
+index 70a8d07..09c4a67 100644
+--- a/docs/celery.rst
++++ b/docs/celery.rst
+@@ -1,3 +1,5 @@
++.. _celery_integration:
++
+ Celery Integration
+ ==================
+ 
+diff --git a/docs/changelog.rst b/docs/changelog.rst
+index f012f44..1627e28 100644
+--- a/docs/changelog.rst
++++ b/docs/changelog.rst
+@@ -17,6 +17,7 @@ See: :ref:`upgrade_6.0`
+         - :class:`django_structlog.middlewares.SyncRequestMiddleware`
+         - :class:`django_structlog.middlewares.AsyncRequestMiddleware`
+         - :class:`django_structlog.middlewares.request_middleware_router`
++    - ``4XX`` status codes now log by default as ``WARNING`` and ``5XX`` as ``ERROR``. The behaviour of ``4XX`` can be customized with :ref:`configuration`. See `#308 <https://github.com/jrobichaud/django-structlog/issues/308>`_. Special thanks to `@adinhodovic <https://github.com/adinhodovic>`_.
+ 
+ 
+ 5.3.0 (June 30, 2023)
+diff --git a/docs/configuration.rst b/docs/configuration.rst
+new file mode 100644
+index 0000000..7ff608f
+--- /dev/null
++++ b/docs/configuration.rst
+@@ -0,0 +1,25 @@
++.. _configuration:
++
++Configuration
++=============
++
++In your ``settings.py`` you can customize ``django-structlog``.
++
++Example:
++
++.. code-block:: python
++
++    import logging
++    DJANGO_STRUCTLOG_STATUS_4XX_LOG_LEVEL = logging.INFO
++
++
++Settings
++--------
++
+++---------------------------------------+---------+-----------------+-------------------------------+
++| Key                                   | Type    | Default         | Description                   |
+++=======================================+=========+=================+===============================+
++| DJANGO_STRUCTLOG_CELERY_ENABLED       | boolean | False           | See :ref:`celery_integration` |
+++---------------------------------------+---------+-----------------+-------------------------------+
++| DJANGO_STRUCTLOG_STATUS_4XX_LOG_LEVEL | int     | logging.WARNING | Log level of 4XX status codes |
+++---------------------------------------+---------+-----------------+-------------------------------+
+diff --git a/docs/events.rst b/docs/events.rst
+index 5cbce35..90c9e1d 100644
+--- a/docs/events.rst
++++ b/docs/events.rst
+@@ -7,15 +7,15 @@ Django's RequestMiddleware
+ Request Events
+ ^^^^^^^^^^^^^^
+ 
+-+------------------+---------+------------------------------+
+-| Event            | Type    | Description                  |
+-+==================+=========+==============================+
+-| request_started  | INFO    | Django received a request    |
+-+------------------+---------+------------------------------+
+-| request_finished | INFO    | request completed normally   |
+-+------------------+---------+------------------------------+
+-| request_failed   | ERROR   | unhandled exception occurred |
+-+------------------+---------+------------------------------+
+++------------------+--------------------+----------------------------------------------------+
++| Event            | Type               | Description                                        |
+++==================+====================+====================================================+
++| request_started  | INFO               | Django received a request                          |
+++------------------+--------------------+----------------------------------------------------+
++| request_finished | INFO/WARNING/ERROR | request completed with status (2XX or 3XX)/4XX/5XX |
+++------------------+--------------------+----------------------------------------------------+
++| request_failed   | ERROR              | unhandled exception occurred                       |
+++------------------+--------------------+----------------------------------------------------+
+ 
+ Request Bound Metadata
+ ^^^^^^^^^^^^^^^^^^^^^^
+diff --git a/docs/index.rst b/docs/index.rst
+index dd8bdd6..2c4c189 100644
+--- a/docs/index.rst
++++ b/docs/index.rst
+@@ -11,6 +11,7 @@ Contents, indices and tables
+ 
+   getting_started
+   celery
++  configuration
+   api_documentation
+   events
+   example_outputs

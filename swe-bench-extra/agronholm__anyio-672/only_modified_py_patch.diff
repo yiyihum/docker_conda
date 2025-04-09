@@ -1,0 +1,123 @@
+diff --git a/src/anyio/_backends/_asyncio.py b/src/anyio/_backends/_asyncio.py
+index e884f56..2699bf8 100644
+--- a/src/anyio/_backends/_asyncio.py
++++ b/src/anyio/_backends/_asyncio.py
+@@ -918,6 +918,7 @@ class StreamReaderWrapper(abc.ByteReceiveStream):
+ 
+     async def aclose(self) -> None:
+         self._stream.feed_eof()
++        await AsyncIOBackend.checkpoint()
+ 
+ 
+ @dataclass(eq=False)
+@@ -930,6 +931,7 @@ class StreamWriterWrapper(abc.ByteSendStream):
+ 
+     async def aclose(self) -> None:
+         self._stream.close()
++        await AsyncIOBackend.checkpoint()
+ 
+ 
+ @dataclass(eq=False)
+@@ -940,14 +942,22 @@ class Process(abc.Process):
+     _stderr: StreamReaderWrapper | None
+ 
+     async def aclose(self) -> None:
+-        if self._stdin:
+-            await self._stdin.aclose()
+-        if self._stdout:
+-            await self._stdout.aclose()
+-        if self._stderr:
+-            await self._stderr.aclose()
+-
+-        await self.wait()
++        with CancelScope(shield=True):
++            if self._stdin:
++                await self._stdin.aclose()
++            if self._stdout:
++                await self._stdout.aclose()
++            if self._stderr:
++                await self._stderr.aclose()
++
++        try:
++            await self.wait()
++        except BaseException:
++            self.kill()
++            with CancelScope(shield=True):
++                await self.wait()
++
++            raise
+ 
+     async def wait(self) -> int:
+         return await self._process.wait()
+diff --git a/src/anyio/_backends/_trio.py b/src/anyio/_backends/_trio.py
+index 13b960f..1a47192 100644
+--- a/src/anyio/_backends/_trio.py
++++ b/src/anyio/_backends/_trio.py
+@@ -283,14 +283,21 @@ class Process(abc.Process):
+     _stderr: abc.ByteReceiveStream | None
+ 
+     async def aclose(self) -> None:
+-        if self._stdin:
+-            await self._stdin.aclose()
+-        if self._stdout:
+-            await self._stdout.aclose()
+-        if self._stderr:
+-            await self._stderr.aclose()
+-
+-        await self.wait()
++        with CancelScope(shield=True):
++            if self._stdin:
++                await self._stdin.aclose()
++            if self._stdout:
++                await self._stdout.aclose()
++            if self._stderr:
++                await self._stderr.aclose()
++
++        try:
++            await self.wait()
++        except BaseException:
++            self.kill()
++            with CancelScope(shield=True):
++                await self.wait()
++            raise
+ 
+     async def wait(self) -> int:
+         return await self._process.wait()
+diff --git a/src/anyio/_core/_subprocesses.py b/src/anyio/_core/_subprocesses.py
+index c161029..5d5d7b7 100644
+--- a/src/anyio/_core/_subprocesses.py
++++ b/src/anyio/_core/_subprocesses.py
+@@ -65,20 +65,18 @@ async def run_process(
+         start_new_session=start_new_session,
+     ) as process:
+         stream_contents: list[bytes | None] = [None, None]
+-        try:
+-            async with create_task_group() as tg:
+-                if process.stdout:
+-                    tg.start_soon(drain_stream, process.stdout, 0)
+-                if process.stderr:
+-                    tg.start_soon(drain_stream, process.stderr, 1)
+-                if process.stdin and input:
+-                    await process.stdin.send(input)
+-                    await process.stdin.aclose()
+-
+-                await process.wait()
+-        except BaseException:
+-            process.kill()
+-            raise
++        async with create_task_group() as tg:
++            if process.stdout:
++                tg.start_soon(drain_stream, process.stdout, 0)
++
++            if process.stderr:
++                tg.start_soon(drain_stream, process.stderr, 1)
++
++            if process.stdin and input:
++                await process.stdin.send(input)
++                await process.stdin.aclose()
++
++            await process.wait()
+ 
+     output, errors = stream_contents
+     if check and process.returncode != 0:
+

@@ -1,0 +1,443 @@
+diff --git a/dvc/cache.py b/dvc/cache.py
+--- a/dvc/cache.py
++++ b/dvc/cache.py
+@@ -46,6 +46,7 @@ def __init__(self, repo):
+             cache_dir = config.get(Config.SECTION_CACHE_DIR, default_cache_dir)
+             cache_type = config.get(Config.SECTION_CACHE_TYPE)
+             protected = config.get(Config.SECTION_CACHE_PROTECTED)
++            shared = config.get(Config.SECTION_CACHE_SHARED)
+ 
+             settings = {
+                 Config.PRIVATE_CWD: config.get(
+@@ -54,6 +55,7 @@ def __init__(self, repo):
+                 Config.SECTION_REMOTE_URL: cache_dir,
+                 Config.SECTION_CACHE_TYPE: cache_type,
+                 Config.SECTION_CACHE_PROTECTED: protected,
++                Config.SECTION_CACHE_SHARED: shared,
+             }
+ 
+         self.local = Remote(repo, **settings)
+diff --git a/dvc/config.py b/dvc/config.py
+--- a/dvc/config.py
++++ b/dvc/config.py
+@@ -160,6 +160,8 @@ class Config(object):  # pylint: disable=too-many-instance-attributes
+     SECTION_CACHE_TYPE = "type"
+     SECTION_CACHE_TYPE_SCHEMA = supported_cache_type
+     SECTION_CACHE_PROTECTED = "protected"
++    SECTION_CACHE_SHARED = "shared"
++    SECTION_CACHE_SHARED_SCHEMA = And(Use(str.lower), Choices("group"))
+     SECTION_CACHE_LOCAL = "local"
+     SECTION_CACHE_S3 = "s3"
+     SECTION_CACHE_GS = "gs"
+@@ -177,6 +179,7 @@ class Config(object):  # pylint: disable=too-many-instance-attributes
+         Optional(SECTION_CACHE_DIR): str,
+         Optional(SECTION_CACHE_TYPE, default=None): SECTION_CACHE_TYPE_SCHEMA,
+         Optional(SECTION_CACHE_PROTECTED, default=False): BOOL_SCHEMA,
++        Optional(SECTION_CACHE_SHARED): SECTION_CACHE_SHARED_SCHEMA,
+         Optional(PRIVATE_CWD): str,
+         Optional(SECTION_CACHE_SLOW_LINK_WARNING, default=True): BOOL_SCHEMA,
+     }
+diff --git a/dvc/remote/base.py b/dvc/remote/base.py
+--- a/dvc/remote/base.py
++++ b/dvc/remote/base.py
+@@ -1,7 +1,7 @@
+ from __future__ import unicode_literals
+ 
+ from dvc.ignore import DvcIgnore
+-from dvc.utils.compat import str, basestring, urlparse, fspath_py35, makedirs
++from dvc.utils.compat import str, basestring, urlparse
+ 
+ import os
+ import json
+@@ -20,7 +20,14 @@
+     DvcIgnoreInCollectedDirError,
+ )
+ from dvc.progress import progress, ProgressCallback
+-from dvc.utils import LARGE_DIR_SIZE, tmp_fname, to_chunks, move, relpath
++from dvc.utils import (
++    LARGE_DIR_SIZE,
++    tmp_fname,
++    to_chunks,
++    move,
++    relpath,
++    makedirs,
++)
+ from dvc.state import StateNoop
+ from dvc.path_info import PathInfo, URLInfo
+ 
+@@ -202,6 +209,7 @@ def get_dir_checksum(self, path_info):
+         checksum, tmp_info = self._get_dir_info_checksum(dir_info)
+         new_info = self.cache.checksum_to_path_info(checksum)
+         if self.cache.changed_cache_file(checksum):
++            self.cache.makedirs(new_info.parent)
+             self.cache.move(tmp_info, new_info)
+ 
+         self.state.save(path_info, checksum)
+@@ -348,7 +356,7 @@ def changed(self, path_info, checksum_info):
+         logger.debug("'{}' hasn't changed.".format(path_info))
+         return False
+ 
+-    def link(self, from_info, to_info, link_type=None):
++    def link(self, from_info, to_info):
+         self.copy(from_info, to_info)
+ 
+     def _save_file(self, path_info, checksum, save_link=True):
+@@ -356,6 +364,7 @@ def _save_file(self, path_info, checksum, save_link=True):
+ 
+         cache_info = self.checksum_to_path_info(checksum)
+         if self.changed_cache(checksum):
++            self.makedirs(cache_info.parent)
+             self.move(path_info, cache_info)
+         else:
+             self.remove(path_info)
+@@ -456,7 +465,15 @@ def upload(self, from_info, to_info, name=None, no_progress_bar=False):
+ 
+         return 0
+ 
+-    def download(self, from_info, to_info, name=None, no_progress_bar=False):
++    def download(
++        self,
++        from_info,
++        to_info,
++        name=None,
++        no_progress_bar=False,
++        file_mode=None,
++        dir_mode=None,
++    ):
+         if not hasattr(self, "_download"):
+             raise RemoteActionNotImplemented("download", self.scheme)
+ 
+@@ -479,7 +496,7 @@ def download(self, from_info, to_info, name=None, no_progress_bar=False):
+             # lets at least show start and finish
+             progress.update_target(name, 0, None)
+ 
+-        makedirs(fspath_py35(to_info.parent), exist_ok=True)
++        makedirs(to_info.parent, exist_ok=True, mode=dir_mode)
+         tmp_file = tmp_fname(to_info)
+ 
+         try:
+@@ -491,7 +508,7 @@ def download(self, from_info, to_info, name=None, no_progress_bar=False):
+             logger.exception(msg.format(from_info, to_info))
+             return 1  # 1 fail
+ 
+-        move(tmp_file, fspath_py35(to_info))
++        move(tmp_file, to_info, mode=file_mode)
+ 
+         if not no_progress_bar:
+             progress.finish_target(name)
+@@ -756,7 +773,7 @@ def checkout(
+         msg = "Checking out '{}' with cache '{}'."
+         logger.debug(msg.format(str(path_info), checksum))
+ 
+-        return self._checkout(path_info, checksum, force, progress_callback)
++        self._checkout(path_info, checksum, force, progress_callback)
+ 
+     def _checkout(
+         self, path_info, checksum, force=False, progress_callback=None
+@@ -786,5 +803,5 @@ def extract_used_local_checksums(self, cinfos):
+     def _changed_unpacked_dir(self, checksum):
+         return True
+ 
+-    def _update_unpacked_dir(self, checksum, progress_callback=None):
++    def _update_unpacked_dir(self, checksum):
+         pass
+diff --git a/dvc/remote/local/__init__.py b/dvc/remote/local/__init__.py
+--- a/dvc/remote/local/__init__.py
++++ b/dvc/remote/local/__init__.py
+@@ -4,13 +4,15 @@
+ 
+ from dvc.scheme import Schemes
+ from dvc.remote.local.slow_link_detection import slow_link_guard
+-from dvc.utils.compat import str, makedirs, fspath_py35
++from dvc.utils.compat import str, fspath_py35
+ 
+ import os
+ import stat
++import errno
+ from shortuuid import uuid
+ import shutil
+ import logging
++from functools import partial
+ 
+ from dvc.system import System
+ from dvc.remote.base import (
+@@ -29,6 +31,7 @@
+     walk_files,
+     relpath,
+     dvc_walk,
++    makedirs,
+ )
+ from dvc.config import Config
+ from dvc.exceptions import DvcException
+@@ -56,10 +59,19 @@ class RemoteLOCAL(RemoteBASE):
+         "reflink": System.reflink,
+     }
+ 
++    SHARED_MODE_MAP = {None: (0o644, 0o755), "group": (0o664, 0o775)}
++
+     def __init__(self, repo, config):
+         super(RemoteLOCAL, self).__init__(repo, config)
+         self.protected = config.get(Config.SECTION_CACHE_PROTECTED, False)
+ 
++        shared = config.get(Config.SECTION_CACHE_SHARED)
++        self._file_mode, self._dir_mode = self.SHARED_MODE_MAP[shared]
++
++        if self.protected:
++            # cache files are set to be read-only for everyone
++            self._file_mode = stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH
++
+         types = config.get(Config.SECTION_CACHE_TYPE, None)
+         if types:
+             if isinstance(types, str):
+@@ -119,10 +131,12 @@ def exists(self, path_info):
+         return os.path.lexists(fspath_py35(path_info))
+ 
+     def makedirs(self, path_info):
+-        if not self.exists(path_info):
+-            os.makedirs(fspath_py35(path_info))
++        makedirs(path_info, exist_ok=True, mode=self._dir_mode)
+ 
+-    def link(self, from_info, to_info, link_type=None):
++    def link(self, from_info, to_info):
++        self._link(from_info, to_info, self.cache_types)
++
++    def _link(self, from_info, to_info, link_types):
+         from_path = from_info.fspath
+         to_path = to_info.fspath
+ 
+@@ -140,11 +154,6 @@ def link(self, from_info, to_info, link_type=None):
+             logger.debug(msg)
+             return
+ 
+-        if not link_type:
+-            link_types = self.cache_types
+-        else:
+-            link_types = [link_type]
+-
+         self._try_links(from_info, to_info, link_types)
+ 
+     @classmethod
+@@ -156,7 +165,7 @@ def _get_link_method(cls, link_type):
+                 "Cache type: '{}' not supported!".format(link_type)
+             )
+ 
+-    def _link(self, from_info, to_info, link_method):
++    def _do_link(self, from_info, to_info, link_method):
+         if self.exists(to_info):
+             raise DvcException("Link '{}' already exists!".format(to_info))
+         else:
+@@ -179,7 +188,7 @@ def _try_links(self, from_info, to_info, link_types):
+         while i > 0:
+             link_method = self._get_link_method(link_types[0])
+             try:
+-                self._link(from_info, to_info, link_method)
++                self._do_link(from_info, to_info, link_method)
+                 return
+ 
+             except DvcException as exc:
+@@ -234,20 +243,17 @@ def move(self, from_info, to_info):
+         if from_info.scheme != "local" or to_info.scheme != "local":
+             raise NotImplementedError
+ 
+-        inp = from_info.fspath
+-        outp = to_info.fspath
++        if self.isfile(from_info):
++            mode = self._file_mode
++        else:
++            mode = self._dir_mode
+ 
+-        # moving in two stages to make the whole operation atomic in
+-        # case inp and outp are in different filesystems and actual
+-        # physical copying of data is happening
+-        tmp = "{}.{}".format(outp, str(uuid()))
+-        move(inp, tmp)
+-        move(tmp, outp)
++        move(from_info, to_info, mode=mode)
+ 
+-    def cache_exists(self, md5s, jobs=None):
++    def cache_exists(self, checksums, jobs=None):
+         return [
+             checksum
+-            for checksum in progress(md5s)
++            for checksum in progress(checksums)
+             if not self.changed_cache_file(checksum)
+         ]
+ 
+@@ -373,7 +379,11 @@ def _process(
+         )
+ 
+         if download:
+-            func = remote.download
++            func = partial(
++                remote.download,
++                dir_mode=self._dir_mode,
++                file_mode=self._file_mode,
++            )
+             status = STATUS_DELETED
+         else:
+             func = remote.upload
+@@ -487,9 +497,20 @@ def unprotect(self, path_info):
+ 
+     @staticmethod
+     def protect(path_info):
+-        os.chmod(
+-            fspath_py35(path_info), stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH
+-        )
++        path = fspath_py35(path_info)
++        mode = stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH
++
++        try:
++            os.chmod(path, mode)
++        except OSError as exc:
++            # In share cache scenario, we might not own the cache file, so we
++            # need to check if cache file is already protected.
++            if exc.errno not in [errno.EPERM, errno.EACCES]:
++                raise
++
++            actual = os.stat(path).st_mode
++            if actual & mode != mode:
++                raise
+ 
+     def _get_unpacked_dir_path_info(self, checksum):
+         info = self.checksum_to_path_info(checksum)
+@@ -524,8 +545,13 @@ def _create_unpacked_dir(self, checksum, dir_info, unpacked_dir_info):
+                 entry[self.PARAM_CHECKSUM]
+             )
+             relative_path = entry[self.PARAM_RELPATH]
+-            self.link(
+-                entry_cache_info, unpacked_dir_info / relative_path, "hardlink"
++            # In shared cache mode some cache files might not be owned by the
++            # user, so we need to use symlinks because, unless
++            # /proc/sys/fs/protected_hardlinks is disabled, the user is not
++            # allowed to create hardlinks to files that he doesn't own.
++            link_types = ["hardlink", "symlink"]
++            self._link(
++                entry_cache_info, unpacked_dir_info / relative_path, link_types
+             )
+ 
+         self.state.save(unpacked_dir_info, checksum)
+diff --git a/dvc/utils/__init__.py b/dvc/utils/__init__.py
+--- a/dvc/utils/__init__.py
++++ b/dvc/utils/__init__.py
+@@ -9,8 +9,9 @@
+     cast_bytes_py2,
+     StringIO,
+     fspath_py35,
++    fspath,
++    makedirs as _makedirs,
+ )
+-from dvc.utils.compat import fspath
+ 
+ import os
+ import sys
+@@ -26,6 +27,7 @@
+ import re
+ import logging
+ 
++from shortuuid import uuid
+ from ruamel.yaml import YAML
+ 
+ 
+@@ -78,8 +80,8 @@ def file_md5(fname):
+             progress.finish_target(name)
+ 
+         return (hash_md5.hexdigest(), hash_md5.digest())
+-    else:
+-        return (None, None)
++
++    return (None, None)
+ 
+ 
+ def bytes_md5(byts):
+@@ -99,14 +101,13 @@ def fix_key(k):
+     if isinstance(d, list):
+         return [dict_filter(e, exclude) for e in d]
+ 
+-    elif isinstance(d, dict):
++    if isinstance(d, dict):
+         items = ((fix_key(k), v) for k, v in d.items())
+         return {
+             k: dict_filter(v, exclude) for k, v in items if k not in exclude
+         }
+ 
+-    else:
+-        return d
++    return d
+ 
+ 
+ def dict_md5(d, exclude=()):
+@@ -145,18 +146,44 @@ def copyfile(src, dest, no_progress_bar=False, name=None):
+         progress.finish_target(name)
+ 
+ 
+-def move(src, dst):
++def makedirs(path, exist_ok=False, mode=None):
++    path = fspath_py35(path)
++
++    if mode is None:
++        _makedirs(path, exist_ok=exist_ok)
++        return
++
++    umask = os.umask(0)
++    try:
++        _makedirs(path, exist_ok=exist_ok, mode=mode)
++    finally:
++        os.umask(umask)
++
++
++def move(src, dst, mode=None):
++    """Atomically move src to dst and chmod it with mode.
++
++    Moving is performed in two stages to make the whole operation atomic in
++    case src and dst are on different filesystems and actual physical copying
++    of data is happening.
++    """
++
++    src = fspath_py35(src)
++    dst = fspath_py35(dst)
++
+     dst = os.path.abspath(dst)
+-    dname = os.path.dirname(dst)
+-    if not os.path.exists(dname):
+-        os.makedirs(dname)
++    tmp = "{}.{}".format(dst, str(uuid()))
+ 
+     if os.path.islink(src):
+-        shutil.copy(os.readlink(src), dst)
++        shutil.copy(os.readlink(src), tmp)
+         os.unlink(src)
+-        return
++    else:
++        shutil.move(src, tmp)
++
++    if mode is not None:
++        os.chmod(tmp, mode)
+ 
+-    shutil.move(src, dst)
++    shutil.move(tmp, dst)
+ 
+ 
+ def _chmod(func, p, excinfo):
+@@ -244,18 +271,15 @@ def fix_env(env=None):
+ def convert_to_unicode(data):
+     if isinstance(data, builtin_str):
+         return str(data)
+-    elif isinstance(data, dict):
++    if isinstance(data, dict):
+         return dict(map(convert_to_unicode, data.items()))
+-    elif isinstance(data, list) or isinstance(data, tuple):
++    if isinstance(data, (list, tuple)):
+         return type(data)(map(convert_to_unicode, data))
+-    else:
+-        return data
++    return data
+ 
+ 
+ def tmp_fname(fname):
+     """ Temporary name for a partial download """
+-    from shortuuid import uuid
+-
+     return fspath(fname) + "." + str(uuid()) + ".tmp"
+ 
+ 
+

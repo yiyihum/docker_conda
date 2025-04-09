@@ -1,0 +1,274 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 18dbb93..5a22e5b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 3.1.37 Jan 13, 2020
++
++Add final `genome-protein-summary.py` script.
++
+ ## 3.1.35 Jan 13, 2020
+ 
+ Drop Python 3.8 from Travis and tox checking.
+diff --git a/bin/genome-protein-summary.py b/bin/genome-protein-summary.py
+index cb0608d..71ce8b4 100755
+--- a/bin/genome-protein-summary.py
++++ b/bin/genome-protein-summary.py
+@@ -14,22 +14,19 @@ from dark.genbank import GenomeRanges
+ from dark.genomes import GenomeProteinInfo
+ from dark.reads import Reads
+ from dark.sam import SAMFilter, samReferences
++from dark.utils import pct
+ 
+ 
+-def pct(a, b):
+-    assert a <= b
+-    if b:
+-        return ('%d/%d (%.3f%%)' %
+-                (a, b, (a / b if b else 0.0) * 100.0))
+-    else:
+-        return '0/0 (0.00%)'
+-
+-
+-def summarize(gpi, sortOn):
++def summarize(gpi, sortOn, minReadOffsetCount):
+     """
+     Print a summary of the genome proteins.
+ 
+     @param gpi: A C{GenomeProteinInfo} instance.
++    @param sortOn: How to sort proteins for output. One of 'coverage',
++        'depth', 'name', 'offset', or 'readCount'.
++    @param minReadOffsetCount: The minimum number of reads offsets that must
++        overlap a protein for the read to be considered as sufficiently
++        intersecting the protein.
+     """
+     genome = gpi.genome
+ 
+@@ -48,9 +45,9 @@ def summarize(gpi, sortOn):
+ 
+     print('  Whole genome coverage (not just proteins):')
+     print('    Reads matching genome: %d' % len(gpi.readIdsMatchingGenome))
+-    print('    Covered offsets: %s' % (
++    print('    Covered genome offsets: %s' % (
+         pct(len(gpi.coveredOffsetCount), genome['length'])))
+-    print('    Average depth: %.3f' % (
++    print('    Average depth across genome: %.3f' % (
+         sum(gpi.coveredOffsetCount.values()) / genome['length']))
+ 
+     coveredProteinOffsetCount = coveredProteinBasesCount = 0
+@@ -58,16 +55,15 @@ def summarize(gpi, sortOn):
+         coveredProteinOffsetCount += bool(gpi.coveredOffsetCount[offset])
+         coveredProteinBasesCount += gpi.coveredOffsetCount[offset]
+ 
+-    print('  Total protein coverage:')
++    print('  Total protein coverage (irrespective of minReadOffsetCount):')
+     print('    Reads matching proteins: %d' % len(gpi.readIdsForAllProteins()))
+-    print('    Covered offsets: %s' % (
++    print('    Proteins with any coverage: %s' %
++          pct(len(gpi.coveredProteins), genome['proteinCount']))
++    print('    Covered protein offsets: %s' % (
+         pct(coveredProteinOffsetCount, len(gpi.offsets))))
+-    print('    Average depth: %.3f' % (
++    print('    Average depth across proteins: %.3f' % (
+         coveredProteinBasesCount / len(gpi.offsets)))
+ 
+-    print('  Proteins matched: %s (sorted by %s):' % (
+-        pct(len(gpi.coveredProteins), genome['proteinCount']), sortOn))
+-
+     if sortOn == 'name':
+         def key(proteinAccession):
+             return gpi.proteins[proteinAccession]['name']
+@@ -93,25 +89,41 @@ def summarize(gpi, sortOn):
+             return coverage['totalBases'] / coverage['ntLength']
+         reverse = True
+ 
+-    for i, proteinAccession in enumerate(
+-            sorted(gpi.coveredProteins, key=key, reverse=reverse),
+-            start=1):
++    if minReadOffsetCount is None:
++        print('  Proteins covered (no minReadOffsetCount):')
++    else:
++        print('  Proteins covered (minReadOffsetCount=%d):' %
++              minReadOffsetCount)
++
++    proteinCount = 0
++    for proteinAccession in sorted(gpi.coveredProteins, key=key,
++                                   reverse=reverse):
+         protein = gpi.proteins[proteinAccession]
+-        print('    %d: %s (%d AA, %d nt with stop codon, %s)' %
+-              (i, protein['product'], protein['length'],
+-               protein['length'] * 3 + 3, protein['accession']))
+ 
+-        coverage = gpi.proteinCoverageInfo(proteinAccession)
++        coverage = gpi.proteinCoverageInfo(proteinAccession,
++                                           minReadOffsetCount)
++
++        readCount = len(coverage['readIds'])
+ 
+-        print('      Read count: %d' % len(coverage['readIds']))
++        if readCount:
++            proteinCount += 1
+ 
+-        print('      Covered offsets: %s' % (
+-            pct(coverage['coveredOffsets'], coverage['ntLength'])))
++            print('    %d: %s (%d AA, %d nt with stop codon, %s)' %
++                  (proteinCount, protein['product'], protein['length'],
++                   protein['length'] * 3 + 3, protein['accession']))
+ 
+-        print('      Average depth: %.3f' % (
+-            coverage['totalBases'] / coverage['ntLength']))
++            print('      Read count: %d' % readCount)
+ 
+-        print('      Offsets: %s' % protein['offsets'])
++            print('      Covered offsets: %s' % (
++                pct(coverage['coveredOffsets'], coverage['ntLength'])))
++
++            print('      Average depth: %.3f' % (
++                coverage['totalBases'] / coverage['ntLength']))
++
++            print('      Offsets: %s' % protein['offsets'])
++
++    print('  Proteins matched: %s (sorted by %s):' % (
++        pct(proteinCount, genome['proteinCount']), sortOn))
+ 
+ 
+ if __name__ == '__main__':
+@@ -124,11 +136,23 @@ if __name__ == '__main__':
+         help=('The filename of an Sqlite3 database holding protein and '
+               'genome information, as built by make-protein-database.py'))
+ 
++    parser.add_argument(
++        '--progress', default=False, action='store_true',
++        help='Print progress info to standard error.')
++
+     parser.add_argument(
+         '--sortOn', default='readCount',
+         choices=('coverage', 'depth', 'name', 'offset', 'readCount'),
+         help='How to sort proteins for output.')
+ 
++    parser.add_argument(
++        '--minReadOffsetCount', type=int,
++        help=('The minimum number of reads offsets that must overlap a '
++              'protein for the read to be considered as sufficiently '
++              'intersecting the protein. Use this to prevent reads that '
++              'just overlap the protein in a very small number offsets '
++              'from being counted.'))
++
+     parser.add_argument(
+         '--skipTranslationChecks', dest='checkTranslations',
+         action='store_false', default=True,
+@@ -184,11 +208,13 @@ if __name__ == '__main__':
+                   referenceId, file=sys.stderr)
+         else:
+             if samfiles:
+-                print('Processing %d SAM file%s for matches with %r:' %
+-                      (len(samfiles), '' if len(samfiles) == 1 else 's',
+-                       referenceId), file=sys.stderr)
++                if args.progress:
++                    print('Processing %d SAM file%s for matches with %r:' %
++                          (len(samfiles), '' if len(samfiles) == 1 else 's',
++                           referenceId), file=sys.stderr)
+                 for i, filename in enumerate(samfiles, start=1):
+-                    print('  %d: %s' % (i, filename), file=sys.stderr)
++                    if args.progress:
++                        print('  %d: %s' % (i, filename), file=sys.stderr)
+                     gpInfo.addSAM(filename, filterAlignment)
+ 
+-            summarize(gpInfo, args.sortOn)
++            summarize(gpInfo, args.sortOn, args.minReadOffsetCount)
+diff --git a/dark/__init__.py b/dark/__init__.py
+index 7336433..8aacdfa 100644
+--- a/dark/__init__.py
++++ b/dark/__init__.py
+@@ -7,4 +7,4 @@ if sys.version_info < (2, 7):
+ # will not be found by the version() function in ../setup.py
+ #
+ # Remember to update ../CHANGELOG.md describing what's new in each version.
+-__version__ = '3.1.36'
++__version__ = '3.1.37'
+diff --git a/dark/genomes.py b/dark/genomes.py
+index 63b642b..e920d56 100644
+--- a/dark/genomes.py
++++ b/dark/genomes.py
+@@ -24,10 +24,11 @@ class GenomeProteinInfo(object):
+         # self.proteins is keyed by protein accession number.
+         self.proteins = {}
+         self.coveredProteins = set()
+-        # self.offsets is keyed by offset, values are dicts that contain a list
+-        # of protein accession numbers that overlap that offset and a set of
+-        # read ids (if any) that match at that offset. The offsets keys are
+-        # only those that correspond to a protein.
++        # self.offsets is keyed by genome offset, values are dicts that
++        # contain a list of protein accession numbers that overlap that
++        # offset and a set of read ids (if any) that match at that offset.
++        # The offsets keys are only those that correspond to one or more
++        # proteins in the genome.
+         self.offsets = {}
+         # self.coveredOffsetCount holds the read counts for all offsets covered
+         # by reads, regardless of whether the offsets correspond to proteins or
+@@ -123,11 +124,17 @@ class GenomeProteinInfo(object):
+                                 offsetInfo['proteinAccessions'])
+                             offsetInfo['readIds'].add(readId)
+ 
+-    def proteinCoverageInfo(self, proteinAccession):
++    def proteinCoverageInfo(self, proteinAccession, minReadOffsetCount=None):
+         """
+         Calculate coverage information for a protein.
+ 
+         @param proteinAccession: A C{str} accession number.
++        @param minReadOffsetCount: An C{int}, specifying the minimum number of
++            reads offsets that must overlap the protein for the read to be
++            considered as sufficiently intersecting the protein. Use this to
++            prevent reads that just overlap the protein in a very small number
++            offsets from being counted. Or C{None} to indicate that no such
++            filtering should be applied.
+         @raises KeyError: If C{proteinAccession} is not known.
+         @return: A C{dict} containing
+                 * the number of covered offsets,
+@@ -143,6 +150,13 @@ class GenomeProteinInfo(object):
+         offsetsSeen = set()
+         proteinLength = 0
+ 
++        if minReadOffsetCount is not None and minReadOffsetCount < 2:
++            # Zero or one is equivalent to not giving a value.
++            minReadOffsetCount = None
++
++        if minReadOffsetCount:
++            readOffsetCounts = Counter()
++
+         for (start, stop, forward) in GenomeRanges(protein['offsets']).ranges:
+             proteinLength += stop - start
+             for offset in range(start, stop):
+@@ -153,10 +167,15 @@ class GenomeProteinInfo(object):
+                     coveredOffsets += 1
+                     totalBases += len(readIds)
+                     allReadIds.update(readIds)
+-
+-        # The +3 in the following is because the database holds the AA length,
+-        # not including the stop codon. But the database range covers the stop
+-        # codon.
++                    if minReadOffsetCount:
++                        readOffsetCounts.update(readIds)
++
++        # Sanity check that the sum of the range lengths is the same as the
++        # overall length given in the database.
++        #
++        # The +3 in the following is because the database holds the AA
++        # length, not including the stop codon. But the database range
++        # covers the stop codon.
+         dbProteinLength = self.proteins[proteinAccession]['length'] * 3 + 3
+         if proteinLength != dbProteinLength:
+             raise ValueError(
+@@ -164,6 +183,12 @@ class GenomeProteinInfo(object):
+                 'database protein length (%d) for protein %s!' %
+                 (proteinLength, dbProteinLength, proteinAccession))
+ 
++        # Do not report on reads whose overlapping offset count is too low.
++        if minReadOffsetCount:
++            unwanted = set(readId for readId in readOffsetCounts
++                           if readOffsetCounts[readId] < minReadOffsetCount)
++            allReadIds.symmetric_difference_update(unwanted)
++
+         return {
+             'coveredOffsets': coveredOffsets,
+             'totalBases': totalBases,

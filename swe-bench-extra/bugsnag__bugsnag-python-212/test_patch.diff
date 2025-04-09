@@ -1,0 +1,112 @@
+diff --git a/tests/integrations/conftest.py b/tests/integrations/conftest.py
+index 7edb31b..9425c21 100644
+--- a/tests/integrations/conftest.py
++++ b/tests/integrations/conftest.py
+@@ -11,4 +11,5 @@ def bugsnag_server():
+ 
+     yield server
+ 
++    bugsnag.configure(app_type=None)
+     server.shutdown()
+diff --git a/tests/test_configuration.py b/tests/test_configuration.py
+index 47d0603..be9b29c 100644
+--- a/tests/test_configuration.py
++++ b/tests/test_configuration.py
+@@ -138,6 +138,21 @@ class TestConfiguration(unittest.TestCase):
+             assert len(record) == 1
+             assert c.endpoint == 'https://notify.example.com'
+ 
++    def test_validate_app_type(self):
++        c = Configuration()
++        assert c.app_type is None
++        with pytest.warns(RuntimeWarning) as record:
++            c.configure(app_type=[])
++
++            assert len(record) == 1
++            assert str(record[0].message) == 'app_type should be str, got list'
++            assert c.app_type is None
++
++            c.configure(app_type='rq')
++
++            assert len(record) == 1
++            assert c.app_type == 'rq'
++
+     def test_validate_app_version(self):
+         c = Configuration()
+         with pytest.warns(RuntimeWarning) as record:
+diff --git a/tests/test_notification.py b/tests/test_notification.py
+index 20b10c6..3997dee 100644
+--- a/tests/test_notification.py
++++ b/tests/test_notification.py
+@@ -159,3 +159,26 @@ class TestNotification(unittest.TestCase):
+         device = payload['events'][0]['device']
+         self.assertEqual('test_host_name', device['hostname'])
+         self.assertEqual('9.9.9', device['runtimeVersions']['python'])
++
++    def test_default_app_type(self):
++        """
++        app_type is None by default
++        """
++        config = Configuration()
++        notification = Notification(Exception("oops"), config, {})
++        payload = json.loads(notification._payload())
++        app = payload['events'][0]['app']
++
++        assert app['type'] is None
++
++    def test_configured_app_type(self):
++        """
++        It should include app type if specified
++        """
++        config = Configuration()
++        config.configure(app_type='rq')
++        notification = Notification(Exception("oops"), config, {})
++        payload = json.loads(notification._payload())
++        app = payload['events'][0]['app']
++
++        assert app['type'] == 'rq'
+diff --git a/tests/test_notify.py b/tests/test_notify.py
+index 185b0a8..9b90d9c 100644
+--- a/tests/test_notify.py
++++ b/tests/test_notify.py
+@@ -80,7 +80,7 @@ class TestBugsnag(IntegrationTest):
+         bugsnag.notify(ScaryException('unexpected failover'))
+         json_body = self.server.received[0]['json_body']
+         event = json_body['events'][0]
+-        self.assertEqual('343.2.10', event['appVersion'])
++        self.assertEqual('343.2.10', event['app']['version'])
+ 
+     def test_notify_override_context(self):
+         bugsnag.notify(ScaryException('unexpected failover'),
+@@ -189,6 +189,31 @@ class TestBugsnag(IntegrationTest):
+         bugsnag.notify(ScaryException('unexpected failover'))
+         self.assertEqual(0, len(self.server.received))
+ 
++    def test_notify_custom_app_type(self):
++        bugsnag.notify(ScaryException('unexpected failover'), app_type='work')
++        json_body = self.server.received[0]['json_body']
++        event = json_body['events'][0]
++        self.assertEqual('work', event['app']['type'])
++
++    def test_notify_callback_app_type(self):
++
++        def callback(report):
++            report.app_type = 'whopper'
++
++        bugsnag.configure(app_type='rq')
++        bugsnag.before_notify(callback)
++        bugsnag.notify(ScaryException('unexpected failover'))
++        json_body = self.server.received[0]['json_body']
++        event = json_body['events'][0]
++        self.assertEqual('whopper', event['app']['type'])
++
++    def test_notify_configured_app_type(self):
++        bugsnag.configure(app_type='rq')
++        bugsnag.notify(ScaryException('unexpected failover'))
++        json_body = self.server.received[0]['json_body']
++        event = json_body['events'][0]
++        self.assertEqual('rq', event['app']['type'])
++
+     def test_notify_sends_when_before_notify_throws(self):
+ 
+         def callback(report):

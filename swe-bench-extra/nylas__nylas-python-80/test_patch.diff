@@ -1,0 +1,124 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index af96ba9..e8b3efc 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -560,10 +560,13 @@ def mock_draft_saved_response(mocked_responses, api_url):
+             }
+         ],
+         "unread": False,
+-        "version": 0
++        "version": 0,
+     }
+ 
+-    def request_callback(request):
++    def create_callback(_request):
++        return (200, {}, json.dumps(draft_json))
++
++    def update_callback(request):
+         try:
+             payload = json.loads(request.body)
+         except ValueError:
+@@ -574,20 +577,21 @@ def mock_draft_saved_response(mocked_responses, api_url):
+         }
+         updated_draft_json = copy.copy(draft_json)
+         updated_draft_json.update(stripped_payload)
++        updated_draft_json["version"] += 1
+         return (200, {}, json.dumps(updated_draft_json))
+ 
+     mocked_responses.add_callback(
+         responses.POST,
+         api_url + '/drafts/',
+         content_type='application/json',
+-        callback=request_callback,
++        callback=create_callback,
+     )
+ 
+     mocked_responses.add_callback(
+         responses.PUT,
+         api_url + '/drafts/2h111aefv8pzwzfykrn7hercj',
+         content_type='application/json',
+-        callback=request_callback,
++        callback=update_callback,
+     )
+ 
+ 
+@@ -638,7 +642,6 @@ def mock_draft_sent_response(mocked_responses, api_url):
+     def callback(request):
+         payload = json.loads(request.body)
+         assert payload['draft_id'] == '2h111aefv8pzwzfykrn7hercj'
+-        assert payload['version'] == 0
+         return values.pop()
+ 
+     mocked_responses.add_callback(
+diff --git a/tests/test_client.py b/tests/test_client.py
+index 2e7a75b..f7c2f97 100644
+--- a/tests/test_client.py
++++ b/tests/test_client.py
+@@ -185,3 +185,47 @@ def test_call_resource_method(mocked_responses, api_client, api_url):
+     )
+     assert isinstance(contact, Contact)
+     assert len(mocked_responses.calls) == 1
++
++
++def test_201_response(mocked_responses, api_client, api_url):
++    contact_data = {
++        "id": 1,
++        "name": "first",
++        "email": "first@example.com",
++    }
++    mocked_responses.add(
++        responses.POST,
++        api_url + "/contacts/",
++        content_type='application/json',
++        status=201,  # This HTTP status still indicates success,
++                     # even though it's not 200.
++        body=json.dumps(contact_data),
++    )
++    contact = api_client.contacts.create()
++    contact.save()
++    assert len(mocked_responses.calls) == 1
++
++
++def test_301_response(mocked_responses, api_client, api_url):
++    contact_data = {
++        "id": 1,
++        "name": "first",
++        "email": "first@example.com",
++    }
++    mocked_responses.add(
++        responses.GET,
++        api_url + "/contacts/first",
++        status=301,
++        headers={"Location": api_url + "/contacts/1"}
++    )
++    mocked_responses.add(
++        responses.GET,
++        api_url + "/contacts/1",
++        content_type='application/json',
++        status=200,
++        body=json.dumps(contact_data),
++    )
++    contact = api_client.contacts.find("first")
++    assert contact["id"] == 1
++    assert contact["name"] == "first"
++    assert len(mocked_responses.calls) == 2
+diff --git a/tests/test_drafts.py b/tests/test_drafts.py
+index f8747c3..bfd84d7 100644
+--- a/tests/test_drafts.py
++++ b/tests/test_drafts.py
+@@ -62,3 +62,15 @@ def test_delete_draft(api_client):
+     draft.save()
+     # ... and delete it for real.
+     draft.delete()
++
++
++@pytest.mark.usefixtures("mock_draft_saved_response")
++def test_draft_version(api_client):
++    draft = api_client.drafts.create()
++    assert 'version' not in draft
++    draft.save()
++    assert draft['version'] == 0
++    draft.update()
++    assert draft['version'] == 1
++    draft.update()
++    assert draft['version'] == 2

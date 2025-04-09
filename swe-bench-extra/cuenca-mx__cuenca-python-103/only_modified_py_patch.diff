@@ -1,0 +1,187 @@
+diff --git a/cuenca/__init__.py b/cuenca/__init__.py
+index b7a01ba..441c121 100644
+--- a/cuenca/__init__.py
++++ b/cuenca/__init__.py
+@@ -4,6 +4,7 @@ __all__ = [
+     'Account',
+     'BalanceEntry',
+     'BillPayment',
++    'Card',
+     'CardTransaction',
+     'Commission',
+     'Deposit',
+@@ -20,6 +21,7 @@ from .resources import (
+     ApiKey,
+     BalanceEntry,
+     BillPayment,
++    Card,
+     CardTransaction,
+     Commission,
+     Deposit,
+diff --git a/cuenca/resources/base.py b/cuenca/resources/base.py
+index ae28f77..d477d24 100644
+--- a/cuenca/resources/base.py
++++ b/cuenca/resources/base.py
+@@ -11,7 +11,7 @@ from cuenca_validations.types import (
+ )
+ 
+ from ..exc import MultipleResultsFound, NoResultFound
+-from ..http import session
++from ..http import Session, session as global_session
+ 
+ 
+ @dataclass
+@@ -46,19 +46,21 @@ class Resource:
+ 
+ class Retrievable(Resource):
+     @classmethod
+-    def retrieve(cls, id: str) -> Resource:
++    def retrieve(
++        cls, id: str, *, session: Session = global_session
++    ) -> Resource:
+         resp = session.get(f'/{cls._resource}/{id}')
+         return cls._from_dict(resp)
+ 
+-    def refresh(self):
+-        new = self.retrieve(self.id)
++    def refresh(self, *, session: Session = global_session):
++        new = self.retrieve(self.id, session=session)
+         for attr, value in new.__dict__.items():
+             setattr(self, attr, value)
+ 
+ 
+ class Creatable(Resource):
+     @classmethod
+-    def _create(cls, **data) -> Resource:
++    def _create(cls, *, session: Session = global_session, **data) -> Resource:
+         resp = session.post(cls._resource, data)
+         return cls._from_dict(resp)
+ 
+@@ -68,7 +70,9 @@ class Updateable(Resource):
+     updated_at: dt.datetime
+ 
+     @classmethod
+-    def _update(cls, id: str, **data) -> Resource:
++    def _update(
++        cls, id: str, *, session: Session = global_session, **data
++    ) -> Resource:
+         resp = session.patch(f'/{cls._resource}/{id}', data)
+         return cls._from_dict(resp)
+ 
+@@ -80,7 +84,9 @@ class Queryable(Resource):
+     created_at: dt.datetime
+ 
+     @classmethod
+-    def one(cls, **query_params) -> Resource:
++    def one(
++        cls, *, session: Session = global_session, **query_params
++    ) -> Resource:
+         q = cls._query_params(limit=2, **query_params)
+         resp = session.get(cls._resource, q.dict())
+         items = resp['items']
+@@ -92,7 +98,9 @@ class Queryable(Resource):
+         return cls._from_dict(items[0])
+ 
+     @classmethod
+-    def first(cls, **query_params) -> Optional[Resource]:
++    def first(
++        cls, *, session: Session = global_session, **query_params
++    ) -> Optional[Resource]:
+         q = cls._query_params(limit=1, **query_params)
+         resp = session.get(cls._resource, q.dict())
+         try:
+@@ -104,13 +112,18 @@ class Queryable(Resource):
+         return rv
+ 
+     @classmethod
+-    def count(cls, **query_params) -> int:
++    def count(
++        cls, *, session: Session = global_session, **query_params
++    ) -> int:
+         q = cls._query_params(count=True, **query_params)
+         resp = session.get(cls._resource, q.dict())
+         return resp['count']
+ 
+     @classmethod
+-    def all(cls, **query_params) -> Generator[Resource, None, None]:
++    def all(
++        cls, *, session: Session = global_session, **query_params
++    ) -> Generator[Resource, None, None]:
++        session = session or global_session
+         q = cls._query_params(**query_params)
+         next_page_uri = f'{cls._resource}?{urlencode(q.dict())}'
+         while next_page_uri:
+diff --git a/cuenca/resources/cards.py b/cuenca/resources/cards.py
+index f20d35d..2c4ea77 100644
+--- a/cuenca/resources/cards.py
++++ b/cuenca/resources/cards.py
+@@ -7,7 +7,7 @@ from pydantic.dataclasses import dataclass
+ 
+ from cuenca.resources.base import Creatable, Queryable, Retrievable, Updateable
+ 
+-from ..http import session
++from ..http import Session, session as global_session
+ 
+ 
+ @dataclass
+@@ -25,7 +25,13 @@ class Card(Retrievable, Queryable, Creatable, Updateable):
+     status: CardStatus
+ 
+     @classmethod
+-    def create(cls, ledger_account_id: str, user_id: str) -> 'Card':
++    def create(
++        cls,
++        ledger_account_id: str,
++        user_id: str,
++        *,
++        session: Session = global_session,
++    ) -> 'Card':
+         """
+         Assigns user_id and ledger_account_id to a existing card
+ 
+@@ -34,7 +40,7 @@ class Card(Retrievable, Queryable, Creatable, Updateable):
+         :return: New assigned card
+         """
+         req = CardRequest(ledger_account_id=ledger_account_id, user_id=user_id)
+-        return cast('Card', cls._create(**req.dict()))
++        return cast('Card', cls._create(session=session, **req.dict()))
+ 
+     @classmethod
+     def update(
+@@ -43,6 +49,8 @@ class Card(Retrievable, Queryable, Creatable, Updateable):
+         user_id: Optional[str] = None,
+         ledger_account_id: Optional[str] = None,
+         status: Optional[CardStatus] = None,
++        *,
++        session: Session = global_session,
+     ):
+         """
+         Updates card properties that are not sensitive or fixed data. It allows
+@@ -57,11 +65,15 @@ class Card(Retrievable, Queryable, Creatable, Updateable):
+         req = CardUpdateRequest(
+             user_id=user_id, ledger_account_id=ledger_account_id, status=status
+         )
+-        resp = cls._update(card_id, **req.dict(exclude_none=True))
++        resp = cls._update(
++            card_id, session=session, **req.dict(exclude_none=True)
++        )
+         return cast('Card', resp)
+ 
+     @classmethod
+-    def deactivate(cls, card_id: str) -> 'Card':
++    def deactivate(
++        cls, card_id: str, *, session: Session = global_session
++    ) -> 'Card':
+         """
+         Deactivates a card
+         """
+diff --git a/cuenca/version.py b/cuenca/version.py
+index ef205ef..6603bec 100644
+--- a/cuenca/version.py
++++ b/cuenca/version.py
+@@ -1,3 +1,3 @@
+-__version__ = '0.4.1'
++__version__ = '0.4.2'
+ CLIENT_VERSION = __version__
+ API_VERSION = '2020-03-19'
+

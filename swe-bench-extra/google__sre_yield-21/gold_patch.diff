@@ -1,0 +1,181 @@
+diff --git a/README.rst b/README.rst
+index 06ca7b0..f2a7f90 100644
+--- a/README.rst
++++ b/README.rst
+@@ -110,6 +110,42 @@ This even works for simplistic backreferences, in this case to have matching quo
+     '000'
+ 
+ 
++Anchors and Lookaround
++======================
++
++Some very simple anchors are supported out of the box, to enable parsing
++patterns where the anchors are actually redundant with it being fullmatch, such
++as ``^foo$``.  More complex anchoring should raise an exception at parse time,
++as will any use of lookaround.  (``\b`` is supported at beginning/end despite
++this being not quite correct.)
++
++.. code-block:: pycon
++
++    >>> list(sre_yield.AllStrings('foo$'))
++    ['foo']
++    >>> list(sre_yield.AllStrings('^$'))
++    ['']
++    >>> list(sre_yield.AllStrings('.\\b.'))  # doctest: +IGNORE_EXCEPTION_DETAIL
++    Traceback (most recent call last):
++    ...
++    ParseError: Non-end-anchor None found at END state
++
++Supporting these in a limited way is possible, but I haven't found the time in
++6+ years to implement it, because I don't have a need.  Instead if you need
++these and don't mind (potentially many) extra matches, provide ``relaxed=True`` to
++pretend these don't exist, at which point the values returned by ``sre_yield``
++will be a superset of the true matches, and you can postprocess them yourself.
++
++.. code-block:: pycon
++
++    >>> pattern = '.\\b.'
++    >>> values = list(sre_yield.AllStrings(pattern, charset='a-', relaxed=True))
++    >>> values
++    ['aa', '-a', 'a-', '--']
++    >>> [v for v in values if re.fullmatch(pattern, v)]
++    ['-a', 'a-']
++
++
+ Reporting Bugs, etc.
+ ====================
+ 
+@@ -201,15 +237,3 @@ other exceptions:
+   yet this appears to work fine.
+ - Order does not depend on greediness.
+ - The regex is treated as fullmatch.
+-- ``sre_yield`` is confused by complex uses of anchors, but support simple ones:
+-
+-  .. code-block:: pycon
+-
+-      >>> list(sre_yield.AllStrings('foo$'))
+-      ['foo']
+-      >>> list(sre_yield.AllStrings('^$'))
+-      ['']
+-      >>> list(sre_yield.AllStrings('.\\b.'))  # doctest: +IGNORE_EXCEPTION_DETAIL
+-      Traceback (most recent call last):
+-      ...
+-      ParseError: Non-end-anchor None found at END state
+diff --git a/sre_yield/__init__.py b/sre_yield/__init__.py
+index 6cb16c4..4ccf2da 100644
+--- a/sre_yield/__init__.py
++++ b/sre_yield/__init__.py
+@@ -27,6 +27,7 @@ __all__ = ["Values", "AllStrings", "AllMatches", "ParseError"]
+ 
+ import bisect
+ import re
++import sre_compile
+ import sre_constants
+ import sre_parse
+ import string
+@@ -402,6 +403,11 @@ class RegexMembershipSequence(WrappedSequence):
+     def nothing_added(self, *_):
+         return [""]
+ 
++    def lookaround_parse_error(self, *_):
++        raise ParseError(
++            "Lookarounds are not supported, try relaxed=True and postprocess"
++        )
++
+     def branch_values(self, _, items):
+         """Converts SRE parser data into literals and merges those lists."""
+         return ConcatenatedSequence(*[self.sub_values(parsed) for parsed in items])
+@@ -456,7 +462,8 @@ class RegexMembershipSequence(WrappedSequence):
+             if not isinstance(arguments, tuple):
+                 arguments = (arguments,)
+             if matcher in self.backends:
+-                self.check_anchor_state(matcher, arguments)
++                if not self.relaxed:
++                    self.check_anchor_state(matcher, arguments)
+                 return self.backends[matcher](*arguments)
+         # No idea what to do here
+         raise ParseError(repr(parsed))  # pragma: no cover
+@@ -524,12 +531,17 @@ class RegexMembershipSequence(WrappedSequence):
+                 # All others (AT_END, AT_END_STRING, AT_BOUNDARY) advance to END.
+                 self.state = STATE_END
+ 
+-    def __init__(self, pattern, flags=0, charset=CHARSET, max_count=None):
++    def __init__(
++        self, pattern, flags=0, charset=CHARSET, max_count=None, relaxed=False
++    ):
+         # If the RE module cannot compile it, we give up quickly
+-        self.matcher = re.compile(r"(?:%s)\Z" % pattern, flags)
++        if not isinstance(pattern, sre_parse.SubPattern):
++            pattern = sre_parse.parse(pattern, flags)
++        self.matcher = sre_compile.compile(pattern, flags)
+         if not flags & re.DOTALL:
+             charset = "".join(c for c in charset if c != "\n")
+         self.charset = charset
++        self.relaxed = relaxed
+ 
+         self.named_group_lookup = self.matcher.groupindex
+ 
+@@ -563,23 +575,31 @@ class RegexMembershipSequence(WrappedSequence):
+             sre_constants.MIN_REPEAT: self.max_repeat_values,
+             sre_constants.MAX_REPEAT: self.max_repeat_values,
+             sre_constants.AT: self.nothing_added,
+-            sre_constants.ASSERT: self.empty_list,
+-            sre_constants.ASSERT_NOT: self.empty_list,
++            sre_constants.ASSERT: self.lookaround_parse_error,
++            sre_constants.ASSERT_NOT: self.lookaround_parse_error,
+             sre_constants.ANY: lambda _: self.in_values(((sre_constants.NEGATE,),)),
+             sre_constants.IN: self.in_values,
+             sre_constants.NOT_LITERAL: self.not_literal,
+             sre_constants.CATEGORY: self.category,
+             sre_constants.GROUPREF: self.groupref,
+         }
++        if self.relaxed:
++            self.backends.update(
++                {
++                    sre_constants.ASSERT: self.nothing_added,
++                    sre_constants.ASSERT_NOT: self.nothing_added,
++                }
++            )
++
+         self.state = STATE_START
+         # Now build a generator that knows all possible patterns
+-        self.raw = self.sub_values(sre_parse.parse(pattern, flags))
++        self.raw = self.sub_values(pattern)
+         # Configure this class instance to know about that result
+         self.length = self.raw.__len__()
+ 
+     def __contains__(self, item):
+         # Since we have a regex, we can search the list really cheaply
+-        return self.matcher.match(item) is not None
++        return self.matcher.fullmatch(item) is not None
+ 
+ 
+ class RegexMembershipSequenceMatches(RegexMembershipSequence):
+@@ -596,9 +616,11 @@ class RegexMembershipSequenceMatches(RegexMembershipSequence):
+         return Match(s, d, self.named_group_lookup)
+ 
+ 
+-def AllStrings(regex, flags=0, charset=CHARSET, max_count=None):
++def AllStrings(regex, flags=0, charset=CHARSET, max_count=None, relaxed=False):
+     """Constructs an object that will generate all matching strings."""
+-    return RegexMembershipSequence(regex, flags, charset, max_count=max_count)
++    return RegexMembershipSequence(
++        regex, flags, charset, max_count=max_count, relaxed=relaxed
++    )
+ 
+ 
+ Values = AllStrings
+@@ -632,9 +654,11 @@ class Match(object):
+         raise NotImplementedError()
+ 
+ 
+-def AllMatches(regex, flags=0, charset=CHARSET, max_count=None):
++def AllMatches(regex, flags=0, charset=CHARSET, max_count=None, relaxed=False):
+     """Constructs an object that will generate all matching strings."""
+-    return RegexMembershipSequenceMatches(regex, flags, charset, max_count=max_count)
++    return RegexMembershipSequenceMatches(
++        regex, flags, charset, max_count=max_count, relaxed=relaxed
++    )
+ 
+ 
+ def main(argv=None):

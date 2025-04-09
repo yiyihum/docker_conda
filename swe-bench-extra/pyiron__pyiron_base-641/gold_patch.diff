@@ -1,0 +1,212 @@
+diff --git a/.ci_support/environment.yml b/.ci_support/environment.yml
+index beac99e4..ade41f2b 100644
+--- a/.ci_support/environment.yml
++++ b/.ci_support/environment.yml
+@@ -15,8 +15,7 @@ dependencies:
+ - pint =0.18
+ - psutil =5.9.0
+ - pyfileindex =0.0.6
+-- pysqa =0.0.15
++- pysqa =0.0.16
+ - pytables =3.6.1
+ - sqlalchemy =1.4.31
+ - tqdm =4.62.3
+-- openssl <2
+diff --git a/pyiron_base/job/generic.py b/pyiron_base/job/generic.py
+index 16317797..959a0d8f 100644
+--- a/pyiron_base/job/generic.py
++++ b/pyiron_base/job/generic.py
+@@ -737,6 +737,12 @@ class GenericJob(JobCore):
+         if self.server.cores == 1 or not self.executable.mpi:
+             executable = str(self.executable)
+             shell = True
++        elif isinstance(self.executable.executable_path, list):
++            executable = self.executable.executable_path[:] + [
++                str(self.server.cores),
++                str(self.server.threads),
++            ]
++            shell = False
+         else:
+             executable = [
+                 self.executable.executable_path,
+diff --git a/pyiron_base/job/script.py b/pyiron_base/job/script.py
+index 8121aefa..cba7abf2 100644
+--- a/pyiron_base/job/script.py
++++ b/pyiron_base/job/script.py
+@@ -218,6 +218,7 @@ class ScriptJob(GenericJob):
+         self.__name__ = "Script"
+         self._script_path = None
+         self.input = DataContainer(table_name="custom_dict")
++        self._enable_mpi4py = False
+ 
+     @property
+     def script_path(self):
+@@ -240,13 +241,40 @@ class ScriptJob(GenericJob):
+         if isinstance(path, str):
+             self._script_path = self._get_abs_path(path)
+             self.executable = self._executable_command(
+-                working_directory=self.working_directory, script_path=self._script_path
++                working_directory=self.working_directory,
++                script_path=self._script_path,
++                enable_mpi4py=self._enable_mpi4py,
++                cores=self.server.cores,
+             )
++            if self._enable_mpi4py:
++                self.executable._mpi = True
+         else:
+             raise TypeError(
+                 "path should be a string, but ", path, " is a ", type(path), " instead."
+             )
+ 
++    def enable_mpi4py(self):
++        if not self._enable_mpi4py:
++            self.executable = self._executable_command(
++                working_directory=self.working_directory,
++                script_path=self._script_path,
++                enable_mpi4py=True,
++                cores=self.server.cores,
++            )
++            self.executable._mpi = True
++        self._enable_mpi4py = True
++
++    def disable_mpi4py(self):
++        if self._enable_mpi4py:
++            self.executable = self._executable_command(
++                working_directory=self.working_directory,
++                script_path=self._script_path,
++                enable_mpi4py=False,
++                cores=self.server.cores,
++            )
++            self.executable._mpi = False
++        self._enable_mpi4py = False
++
+     def validate_ready_to_run(self):
+         if self.script_path is None:
+             raise TypeError(
+@@ -346,13 +374,17 @@ class ScriptJob(GenericJob):
+         pass
+ 
+     @staticmethod
+-    def _executable_command(working_directory, script_path):
++    def _executable_command(
++        working_directory, script_path, enable_mpi4py=False, cores=1
++    ):
+         """
+         internal function to generate the executable command to either use jupyter or python
+ 
+         Args:
+             working_directory (str): working directory of the current job
+             script_path (str): path to the script which should be executed in the working directory
++            enable_mpi4py (bool): flag to enable mpi4py
++            cores (int): number of cores to use
+ 
+         Returns:
+             str: executable command
+@@ -364,8 +396,10 @@ class ScriptJob(GenericJob):
+                 "jupyter nbconvert --ExecutePreprocessor.timeout=9999999 --to notebook --execute "
+                 + path
+             )
+-        elif file_name[-3:] == ".py":
++        elif file_name[-3:] == ".py" and not enable_mpi4py:
+             return "python " + path
++        elif file_name[-3:] == ".py" and enable_mpi4py:
++            return ["mpirun", "-np", str(cores), "python", path]
+         else:
+             raise ValueError("Filename not recognized: ", path)
+ 
+diff --git a/pyiron_base/job/util.py b/pyiron_base/job/util.py
+index 7b4642c6..e7e32ec4 100644
+--- a/pyiron_base/job/util.py
++++ b/pyiron_base/job/util.py
+@@ -160,6 +160,7 @@ def _rename_job(job, new_job_name):
+         job.project.db.item_update(
+             {"job": new_job_name, "subjob": new_location.h5_path}, job.job_id
+         )
++    old_job_name = job.name
+     job._name = new_job_name
+     job.project_hdf5.copy_to(destination=new_location, maintain_name=False)
+     job.project_hdf5.remove_file()
+@@ -167,6 +168,11 @@ def _rename_job(job, new_job_name):
+     if os.path.exists(old_working_directory):
+         shutil.move(old_working_directory, job.working_directory)
+         os.rmdir("/".join(old_working_directory.split("/")[:-1]))
++    if os.path.exists(os.path.join(job.working_directory, old_job_name + ".tar.bz2")):
++        os.rename(
++            os.path.join(job.working_directory, old_job_name + ".tar.bz2"),
++            os.path.join(job.working_directory, job.job_name + ".tar.bz2"),
++        )
+ 
+ 
+ def _is_valid_job_name(job_name):
+diff --git a/pyiron_base/job/worker.py b/pyiron_base/job/worker.py
+index 068dd82b..3a85adaa 100644
+--- a/pyiron_base/job/worker.py
++++ b/pyiron_base/job/worker.py
+@@ -5,6 +5,7 @@
+ Worker Class to execute calculation in an asynchronous way
+ """
+ import os
++import psutil
+ import time
+ from datetime import datetime
+ from multiprocessing import Pool
+@@ -181,6 +182,7 @@ class WorkerJob(PythonTemplateJob):
+         self.project_hdf5.create_working_directory()
+         log_file = os.path.join(self.working_directory, "worker.log")
+         active_job_ids = []
++        process = psutil.Process(os.getpid())
+         with Pool(processes=int(self.server.cores / self.cores_per_job)) as pool:
+             while True:
+                 # Check the database if there are more calculation to execute
+@@ -238,6 +240,9 @@ class WorkerJob(PythonTemplateJob):
+                         + str(len(df))
+                         + " "
+                         + str(len(df_sub))
++                        + " "
++                        + str(process.memory_info().rss / 1024 / 1024 / 1024)
++                        + "GB"
+                         + "\n"
+                     )
+ 
+@@ -256,6 +261,7 @@ class WorkerJob(PythonTemplateJob):
+         working_directory = self.working_directory
+         log_file = os.path.join(working_directory, "worker.log")
+         file_memory_lst = []
++        process = psutil.Process(os.getpid())
+         with Pool(processes=int(self.server.cores / self.cores_per_job)) as pool:
+             while True:
+                 file_lst = [
+@@ -282,6 +288,9 @@ class WorkerJob(PythonTemplateJob):
+                         + str(len(file_memory_lst))
+                         + " "
+                         + str(len(file_lst))
++                        + " "
++                        + str(process.memory_info().rss / 1024 / 1024 / 1024)
++                        + "GB"
+                         + "\n"
+                     )
+ 
+@@ -329,5 +338,10 @@ class WorkerJob(PythonTemplateJob):
+                     )
+                 log_str += "\n"
+                 f.write(log_str)
++            if (
++                not state.database.database_is_disabled
++                and state.database.get_job_status(job_id=self.job_id) == "aborted"
++            ):
++                raise ValueError("The worker job was aborted.")
+             time.sleep(interval_in_s)
+         self.status.collect = True
+diff --git a/setup.py b/setup.py
+index 5a36179a..f468ca83 100644
+--- a/setup.py
++++ b/setup.py
+@@ -39,7 +39,7 @@ setup(
+         'pint==0.18',
+         'psutil==5.9.0',
+         'pyfileindex==0.0.6',
+-        'pysqa==0.0.15',
++        'pysqa==0.0.16',
+         'sqlalchemy==1.4.31',
+         'tables==3.6.1',
+         'tqdm==4.62.3'

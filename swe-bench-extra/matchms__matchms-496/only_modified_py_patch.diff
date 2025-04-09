@@ -1,0 +1,234 @@
+diff --git a/matchms/Pipeline.py b/matchms/Pipeline.py
+index baf579bb..32214b4e 100644
+--- a/matchms/Pipeline.py
++++ b/matchms/Pipeline.py
+@@ -214,24 +214,25 @@ class Pipeline:
+         self.__workflow = workflow
+         self.check_workflow()
+ 
+-        self.write_to_logfile("--- Processing pipeline: ---")
+         self._initialize_spectrum_processor_queries()
+         if self.is_symmetric is False:
+             self._initialize_spectrum_processor_references()
+ 
+     def _initialize_spectrum_processor_queries(self):
+         """Initialize spectrum processing workflow for the query spectra."""
++        self.write_to_logfile("--- Processing pipeline query spectra: ---")
+         self.processing_queries = initialize_spectrum_processor(
+             None,
+             self.__workflow["query_filters"]
+             )
+-
+         self.write_to_logfile(str(self.processing_queries))
+         if self.processing_queries.processing_steps != self.__workflow["query_filters"]:
+             logger.warning("The order of the filters has been changed compared to the Yaml file.")
+ 
+     def _initialize_spectrum_processor_references(self):
+         """Initialize spectrum processing workflow for the reference spectra."""
++        self.write_to_logfile("--- Processing pipeline reference spectra: ---")
++
+         self.processing_references = initialize_spectrum_processor(
+             None,
+             self.__workflow["reference_filters"]
+diff --git a/matchms/Scores.py b/matchms/Scores.py
+index c35bafb8..274983f9 100644
+--- a/matchms/Scores.py
++++ b/matchms/Scores.py
+@@ -111,6 +111,9 @@ class Scores:
+         self._index = 0
+         raise StopIteration
+ 
++    def __repr__(self):
++        return self._scores.__repr__()
++
+     def __str__(self):
+         return self._scores.__str__()
+ 
+diff --git a/matchms/Spectrum.py b/matchms/Spectrum.py
+index cdbb3230..a125d4c7 100644
+--- a/matchms/Spectrum.py
++++ b/matchms/Spectrum.py
+@@ -27,9 +27,11 @@ class Spectrum:
+ 
+         spectrum = Spectrum(mz=np.array([100, 150, 200.]),
+                             intensities=np.array([0.7, 0.2, 0.1]),
+-                            metadata={'id': 'spectrum1',
++                            metadata={"id": 'spectrum1',
++                                      "precursor_mz": 222.333,
+                                       "peak_comments": {200.: "the peak at 200 m/z"}})
+ 
++        print(spectrum)
+         print(spectrum.peaks.mz[0])
+         print(spectrum.peaks.intensities[0])
+         print(spectrum.get('id'))
+@@ -39,6 +41,7 @@ class Spectrum:
+ 
+     .. testoutput::
+ 
++        Spectrum(precursor m/z=222.33, 3 fragments between 100.0 and 200.0)
+         100.0
+         0.7
+         spectrum1
+@@ -101,6 +104,16 @@ class Spectrum:
+         combined_hash = self.metadata_hash() + self.spectrum_hash()
+         return int.from_bytes(bytearray(combined_hash, 'utf-8'), 'big')
+ 
++    def __repr__(self):
++        num_peaks = len(self.peaks)
++        min_mz = min(self.peaks.mz)
++        max_mz = max(self.peaks.mz)
++        precursor_mz = self.get("precursor_mz")
++        return f"Spectrum(precursor m/z={precursor_mz:.2f}, {num_peaks} fragments between {min_mz:.1f} and {max_mz:.1f})"
++
++    def __str__(self):
++        return self.__repr__()
++
+     def spectrum_hash(self):
+         """Return a (truncated) sha256-based hash which is generated
+         based on the spectrum peaks (mz:intensity pairs).
+diff --git a/matchms/SpectrumProcessor.py b/matchms/SpectrumProcessor.py
+index 51964296..090c3f4b 100644
+--- a/matchms/SpectrumProcessor.py
++++ b/matchms/SpectrumProcessor.py
+@@ -1,6 +1,7 @@
++import inspect
+ from collections import defaultdict
+ from functools import partial
+-from typing import Optional, Tuple, Union
++from typing import Dict, Optional, Tuple, Union
+ import numpy as np
+ import pandas as pd
+ from tqdm import tqdm
+@@ -30,10 +31,10 @@ class SpectrumProcessor:
+                 raise ValueError("Predefined pipeline parameter should be a string")
+             if predefined_pipeline not in PREDEFINED_PIPELINES:
+                 raise ValueError(f"Unknown processing pipeline '{predefined_pipeline}'. Available pipelines: {list(PREDEFINED_PIPELINES.keys())}")
+-            for fname in PREDEFINED_PIPELINES[predefined_pipeline]:
+-                self.add_matchms_filter(fname)
++            for filter_name in PREDEFINED_PIPELINES[predefined_pipeline]:
++                self.add_matchms_filter(filter_name)
+ 
+-    def add_filter(self, filter_function: Union[Tuple[str], str]):
++    def add_filter(self, filter_function: Union[Tuple[str, Dict[str, any]], str]):
+         """Add a filter to the processing pipeline. Takes both matchms filter names (and parameters)
+         as well as custom-made functions.
+         """
+@@ -44,7 +45,7 @@ class SpectrumProcessor:
+         else:
+             self.add_custom_filter(filter_function[0], filter_function[1])
+ 
+-    def add_matchms_filter(self, filter_spec: Union[Tuple[str], str]):
++    def add_matchms_filter(self, filter_spec: Union[Tuple[str, Dict[str, any]], str]):
+         """
+         Add a filter to the processing pipeline.
+ 
+@@ -66,7 +67,7 @@ class SpectrumProcessor:
+             filter_func.__name__ = FILTER_FUNCTIONS[filter_name].__name__
+         else:
+             raise TypeError("filter_spec should be a string or a tuple or list")
+-
++        check_all_parameters_given(filter_func)
+         self.filters.append(filter_func)
+         # Sort filters according to their order in self.filter_order
+         self.filters.sort(key=lambda f: self.filter_order.index(f.__name__))
+@@ -93,12 +94,12 @@ class SpectrumProcessor:
+             if filter_func.__name__ in self.filter_order:
+                 filter_position = self.filter_order.index(filter_func.__name__)
+         self.filter_order.insert(filter_position + 1, filter_function.__name__)
+-        if filter_params is None:
+-            self.filters.append(filter_function)
+-        else:
+-            filter_func = partial(filter_function, **filter_params)
+-            filter_func.__name__ = filter_function.__name__
+-            self.filters.append(filter_func)
++        if filter_params is not None:
++            partial_filter_func = partial(filter_function, **filter_params)
++            partial_filter_func.__name__ = filter_function.__name__
++            filter_function = partial_filter_func
++        check_all_parameters_given(filter_function)
++        self.filters.append(filter_function)
+ 
+     def process_spectrum(self, spectrum,
+                          processing_report: Optional["ProcessingReport"] = None):
+@@ -171,11 +172,54 @@ class SpectrumProcessor:
+ 
+     @property
+     def processing_steps(self):
+-        return [x.__name__ for x in self.filters]
++        filter_list = []
++        for filter_step in self.filters:
++            parameter_settings = get_parameter_settings(filter_step)
++            if parameter_settings is not None:
++                filter_list.append((filter_step.__name__, parameter_settings))
++            else:
++                filter_list.append(filter_step.__name__)
++        return filter_list
+ 
+     def __str__(self):
+-        summary_string = "SpectrumProcessor\nProcessing steps:\n - "
+-        return summary_string + "\n - ".join(self.processing_steps)
++        summary_string = "SpectrumProcessor\nProcessing steps:"
++        for processing_step in self.processing_steps:
++            if isinstance(processing_step, str):
++                summary_string += "\n- " + processing_step
++            elif isinstance(processing_step, tuple):
++                filter_name = processing_step[0]
++                summary_string += "\n- - " + filter_name
++                filter_params = processing_step[1]
++                for filter_param in filter_params:
++                    summary_string += "\n  - " + str(filter_param)
++        return summary_string
++
++
++def check_all_parameters_given(func):
++    """Asserts that all added parameters for a function are given (except spectrum_in)"""
++    signature = inspect.signature(func)
++    parameters_without_value = []
++    for parameter, value in signature.parameters.items():
++        if value.default is inspect.Parameter.empty:
++            parameters_without_value.append(parameter)
++    assert len(parameters_without_value) == 1, \
++        f"More than one parameter of the function {func.__name__} is not specified, " \
++        f"the parameters not specified are {parameters_without_value}"
++
++
++def get_parameter_settings(func):
++    """Returns all parameters and parameter values for a function
++
++    This includes default parameter settings and, but also the settings stored in partial"""
++    signature = inspect.signature(func)
++    parameter_settings = {
++            parameter: value.default
++            for parameter, value in signature.parameters.items()
++            if value.default is not inspect.Parameter.empty
++        }
++    if parameter_settings == {}:
++        return None
++    return parameter_settings
+ 
+ 
+ # List all filters in a functionally working order
+@@ -246,7 +290,6 @@ DEFAULT_FILTERS = BASIC_FILTERS \
+        "harmonize_undefined_inchi",
+        "harmonize_undefined_smiles",
+        "repair_inchi_inchikey_smiles",
+-       "repair_parent_mass_match_smiles_wrapper",
+        "normalize_intensities",
+     ]
+ FULLY_ANNOTATED_PROCESSING = DEFAULT_FILTERS \
+diff --git a/readthedocs/conf.py b/readthedocs/conf.py
+index fcf34b61..46c6e91d 100644
+--- a/readthedocs/conf.py
++++ b/readthedocs/conf.py
+@@ -23,8 +23,8 @@ import matchms
+ # -- Project information -----------------------------------------------------
+ 
+ project = "matchms"
+-copyright = "2020, Netherlands eScience Center"
+-author = "Netherlands eScience Center"
++copyright = "2023, Düsseldorf University of Applied Sciences & Netherlands eScience Center"
++author = "matchms development team"
+ 
+ 
+ # -- General configuration ---------------------------------------------------
+

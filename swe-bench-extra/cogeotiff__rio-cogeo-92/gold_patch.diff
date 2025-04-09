@@ -1,0 +1,306 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index e40dabd..bf7a6c8 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,3 +1,16 @@
++1.1.1 (2019-09-10)
++------------------
++
++- add safeguard to keep datatype from input to output files (#85)
++
++CLI Changes:
++- add `-t, --dtype` datatype option.
++
++API Changes:
++- add datatype option
++- update for rasterio>=1.0.28
++- allow rasterio.io.DatasetReader input (#89)
++
+ 1.1.0 (2019-07-16)
+ ------------------
+ 
+diff --git a/README.md b/README.md
+index 5d5b5a9..f812c9a 100644
+--- a/README.md
++++ b/README.md
+@@ -65,6 +65,8 @@ $ rio cogeo create --help
+     -p, --cog-profile [jpeg|webp|zstd|lzw|deflate|packbits|raw] CloudOptimized GeoTIFF profile (default: deflate).
+     --nodata NUMBER|nan             Set nodata masking values for input dataset.
+     --add-mask                      Force output dataset creation with an internal mask (convert alpha band or nodata to mask).
++    -t, --dtype [ubyte|uint8|uint16|int16|uint32|int32|float32|float64]
++                                    Output data type.
+     --overview-level INTEGER        Overview level (if not provided, appropriate overview level will be selected
+                                     until the smallest overview is smaller than the value of the internal blocksize)
+     --overview-resampling [nearest|bilinear|cubic|cubic_spline|lanczos|average|mode|gauss] Overview creation resampling algorithm.
+diff --git a/requirements.txt b/requirements.txt
+index df1980e..2e8aae4 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,5 @@
+ click
+ numpy~=1.15
+-rasterio>=1.0.9
++rasterio>=1.0.28
++supermercado
++mercantile
+\ No newline at end of file
+diff --git a/rio_cogeo/cogeo.py b/rio_cogeo/cogeo.py
+index a41bf77..a560c58 100644
+--- a/rio_cogeo/cogeo.py
++++ b/rio_cogeo/cogeo.py
+@@ -10,7 +10,7 @@ from contextlib import contextmanager
+ import click
+ 
+ import rasterio
+-from rasterio.io import MemoryFile
++from rasterio.io import DatasetReader, MemoryFile
+ from rasterio.env import GDALVersion
+ from rasterio.vrt import WarpedVRT
+ from rasterio.warp import transform_bounds
+@@ -20,7 +20,6 @@ from rasterio.transform import Affine
+ 
+ import mercantile
+ from supermercado.burntiles import tile_extrema
+-
+ from rio_cogeo.errors import LossyCompression, IncompatibleBlockRasterSize
+ from rio_cogeo.utils import (
+     get_maximum_overview_level,
+@@ -52,11 +51,12 @@ def TemporaryRasterFile(dst_path, suffix=".tif"):
+ 
+ 
+ def cog_translate(
+-    src_path,
++    source,
+     dst_path,
+     dst_kwargs,
+     indexes=None,
+     nodata=None,
++    dtype=None,
+     add_mask=None,
+     overview_level=None,
+     overview_resampling="nearest",
+@@ -72,8 +72,9 @@ def cog_translate(
+ 
+     Parameters
+     ----------
+-    src_path : str or PathLike object
+-        A dataset path or URL. Will be opened in "r" mode.
++    source : str, PathLike object or rasterio.io.DatasetReader
++        A dataset path, URL or rasterio.io.DatasetReader object.
++        Will be opened in "r" mode.
+     dst_path : str or Path-like object
+         An output dataset path or or PathLike object.
+         Will be opened in "w" mode.
+@@ -83,6 +84,8 @@ def cog_translate(
+         Raster band indexes to copy.
+     nodata, int, optional
+         Overwrite nodata masking values for input dataset.
++    dtype: str, optional
++        Overwrite output data type. Default will be the input data type.
+     add_mask, bool, optional
+         Force output dataset creation with a mask.
+     overview_level : int, optional (default: 6)
+@@ -106,10 +109,16 @@ def cog_translate(
+     config = config or {}
+ 
+     with rasterio.Env(**config):
+-        with rasterio.open(src_path) as src_dst:
++        with ExitStack() as ctx:
++            if isinstance(source, DatasetReader):
++                src_dst = ctx.enter_context(source)
++            else:
++                src_dst = ctx.enter_context(rasterio.open(source))
++
+             meta = src_dst.meta
+             indexes = indexes if indexes else src_dst.indexes
+             nodata = nodata if nodata is not None else src_dst.nodata
++            dtype = dtype if dtype else src_dst.dtypes[0]
+             alpha = has_alpha_band(src_dst)
+             mask = has_mask_band(src_dst)
+ 
+@@ -147,7 +156,7 @@ def cog_translate(
+                     dst_kwargs["blockxsize"] = tilesize
+                     dst_kwargs["blockysize"] = tilesize
+ 
+-            vrt_params = dict(add_alpha=True)
++            vrt_params = dict(add_alpha=True, dtype=dtype)
+ 
+             if nodata is not None:
+                 vrt_params.update(
+@@ -204,62 +213,59 @@ def cog_translate(
+                 if in_memory is None:
+                     in_memory = vrt_dst.width * vrt_dst.height < IN_MEMORY_THRESHOLD
+ 
+-                with ExitStack() as ctx:
+-                    if in_memory:
+-                        tmpfile = ctx.enter_context(MemoryFile())
+-                        tmp_dst = ctx.enter_context(tmpfile.open(**meta))
+-                    else:
+-                        tmpfile = ctx.enter_context(TemporaryRasterFile(dst_path))
+-                        tmp_dst = ctx.enter_context(
+-                            rasterio.open(tmpfile.name, "w", **meta)
+-                        )
++                if in_memory:
++                    tmpfile = ctx.enter_context(MemoryFile())
++                    tmp_dst = ctx.enter_context(tmpfile.open(**meta))
++                else:
++                    tmpfile = ctx.enter_context(TemporaryRasterFile(dst_path))
++                    tmp_dst = ctx.enter_context(
++                        rasterio.open(tmpfile.name, "w", **meta)
++                    )
+ 
+-                    wind = list(tmp_dst.block_windows(1))
++                wind = list(tmp_dst.block_windows(1))
+ 
+-                    if not quiet:
+-                        click.echo("Reading input: {}".format(src_path), err=True)
+-                    fout = os.devnull if quiet else sys.stderr
+-                    with click.progressbar(
+-                        wind, length=len(wind), file=fout, show_percent=True
+-                    ) as windows:
+-                        for ij, w in windows:
+-                            matrix = vrt_dst.read(window=w, indexes=indexes)
+-                            tmp_dst.write(matrix, window=w)
++                if not quiet:
++                    click.echo("Reading input: {}".format(source), err=True)
++                fout = os.devnull if quiet else sys.stderr
++                with click.progressbar(
++                    wind, length=len(wind), file=fout, show_percent=True
++                ) as windows:
++                    for ij, w in windows:
++                        matrix = vrt_dst.read(window=w, indexes=indexes)
++                        tmp_dst.write(matrix, window=w)
+ 
+-                            if add_mask or mask:
+-                                mask_value = vrt_dst.dataset_mask(window=w)
+-                                tmp_dst.write_mask(mask_value, window=w)
++                        if add_mask or mask:
++                            mask_value = vrt_dst.dataset_mask(window=w)
++                            tmp_dst.write_mask(mask_value, window=w)
+ 
+-                    if overview_level is None:
+-                        overview_level = get_maximum_overview_level(vrt_dst, tilesize)
++                if overview_level is None:
++                    overview_level = get_maximum_overview_level(vrt_dst, tilesize)
+ 
+-                    if not quiet and overview_level:
+-                        click.echo("Adding overviews...", err=True)
++                if not quiet and overview_level:
++                    click.echo("Adding overviews...", err=True)
+ 
+-                    overviews = [2 ** j for j in range(1, overview_level + 1)]
+-                    tmp_dst.build_overviews(
+-                        overviews, ResamplingEnums[overview_resampling]
+-                    )
++                overviews = [2 ** j for j in range(1, overview_level + 1)]
++                tmp_dst.build_overviews(overviews, ResamplingEnums[overview_resampling])
+ 
+-                    if not quiet:
+-                        click.echo("Updating dataset tags...", err=True)
++                if not quiet:
++                    click.echo("Updating dataset tags...", err=True)
+ 
+-                    for i, b in enumerate(indexes):
+-                        tmp_dst.set_band_description(i + 1, src_dst.descriptions[b - 1])
++                for i, b in enumerate(indexes):
++                    tmp_dst.set_band_description(i + 1, src_dst.descriptions[b - 1])
+ 
+-                    tags = src_dst.tags()
+-                    tags.update(
+-                        dict(
+-                            OVR_RESAMPLING_ALG=ResamplingEnums[
+-                                overview_resampling
+-                            ].name.upper()
+-                        )
++                tags = src_dst.tags()
++                tags.update(
++                    dict(
++                        OVR_RESAMPLING_ALG=ResamplingEnums[
++                            overview_resampling
++                        ].name.upper()
+                     )
+-                    tmp_dst.update_tags(**tags)
++                )
++                tmp_dst.update_tags(**tags)
+ 
+-                    if not quiet:
+-                        click.echo("Writing output to: {}".format(dst_path), err=True)
+-                    copy(tmp_dst, dst_path, copy_src_overviews=True, **dst_kwargs)
++                if not quiet:
++                    click.echo("Writing output to: {}".format(dst_path), err=True)
++                copy(tmp_dst, dst_path, copy_src_overviews=True, **dst_kwargs)
+ 
+ 
+ def cog_validate(src_path):
+diff --git a/rio_cogeo/scripts/cli.py b/rio_cogeo/scripts/cli.py
+index 7f73cbe..75c1034 100644
+--- a/rio_cogeo/scripts/cli.py
++++ b/rio_cogeo/scripts/cli.py
+@@ -84,6 +84,7 @@ def cogeo():
+     help="Force output dataset creation with an internal mask (convert alpha "
+     "band or nodata to mask).",
+ )
++@options.dtype_opt
+ @click.option(
+     "--overview-level",
+     type=int,
+@@ -141,6 +142,7 @@ def create(
+     bidx,
+     cogeo_profile,
+     nodata,
++    dtype,
+     add_mask,
+     overview_level,
+     overview_resampling,
+@@ -175,17 +177,18 @@ def create(
+         input,
+         output,
+         output_profile,
+-        bidx,
+-        nodata,
+-        add_mask,
+-        overview_level,
+-        overview_resampling,
+-        web_optimized,
+-        latitude_adjustment,
+-        resampling,
+-        in_memory,
+-        config,
+-        quiet,
++        indexes=bidx,
++        nodata=nodata,
++        dtype=dtype,
++        add_mask=add_mask,
++        overview_level=overview_level,
++        overview_resampling=overview_resampling,
++        web_optimized=web_optimized,
++        latitude_adjustment=latitude_adjustment,
++        resampling=resampling,
++        in_memory=in_memory,
++        config=config,
++        quiet=quiet,
+     )
+ 
+ 
+diff --git a/setup.py b/setup.py
+index bd2f07d..944254d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -9,7 +9,7 @@ with open("README.md") as f:
+ # Runtime requirements.
+ inst_reqs = [
+     "click",
+-    "rasterio[s3]>=1.0.1",
++    "rasterio[s3]>=1.0.28",
+     "numpy~=1.15",
+     "supermercado",
+     "mercantile",
+@@ -29,7 +29,7 @@ if sys.version_info >= (3, 6):
+ 
+ setup(
+     name="rio-cogeo",
+-    version="1.1.0",
++    version="1.1.1",
+     description=u"CloudOptimized GeoTIFF (COGEO) creation plugin for rasterio",
+     long_description=readme,
+     long_description_content_type="text/markdown",

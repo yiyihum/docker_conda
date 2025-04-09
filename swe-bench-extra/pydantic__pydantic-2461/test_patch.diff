@@ -1,0 +1,167 @@
+diff --git a/tests/test_annotated.py b/tests/test_annotated.py
+--- a/tests/test_annotated.py
++++ b/tests/test_annotated.py
+@@ -2,12 +2,10 @@
+ from typing import get_type_hints
+ 
+ import pytest
++from typing_extensions import Annotated
+ 
+ from pydantic import BaseModel, Field
+ from pydantic.fields import Undefined
+-from pydantic.typing import Annotated
+-
+-pytestmark = pytest.mark.skipif(not Annotated, reason='typing_extensions not installed')
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -26,12 +24,12 @@
+         ),
+         # Test valid Annotated Field uses
+         pytest.param(
+-            lambda: Annotated[int, Field(description='Test')],
++            lambda: Annotated[int, Field(description='Test')],  # noqa: F821
+             5,
+             id='annotated-field-value-default',
+         ),
+         pytest.param(
+-            lambda: Annotated[int, Field(default_factory=lambda: 5, description='Test')],
++            lambda: Annotated[int, Field(default_factory=lambda: 5, description='Test')],  # noqa: F821
+             Undefined,
+             id='annotated-field-default_factory',
+         ),
+@@ -132,3 +130,15 @@ class AnnotatedModel(BaseModel):
+         one: Annotated[int, field]
+ 
+     assert AnnotatedModel(one=1).dict() == {'one': 1}
++
++
++def test_config_field_info():
++    class Foo(BaseModel):
++        a: Annotated[int, Field(foobar='hello')]  # noqa: F821
++
++        class Config:
++            fields = {'a': {'description': 'descr'}}
++
++    assert Foo.schema(by_alias=True)['properties'] == {
++        'a': {'title': 'A', 'description': 'descr', 'foobar': 'hello', 'type': 'integer'},
++    }
+diff --git a/tests/test_create_model.py b/tests/test_create_model.py
+--- a/tests/test_create_model.py
++++ b/tests/test_create_model.py
+@@ -1,6 +1,6 @@
+ import pytest
+ 
+-from pydantic import BaseModel, Extra, ValidationError, create_model, errors, validator
++from pydantic import BaseModel, Extra, Field, ValidationError, create_model, errors, validator
+ 
+ 
+ def test_create_model():
+@@ -194,3 +194,14 @@ class A(BaseModel):
+ 
+     for field_name in ('x', 'y', 'z'):
+         assert A.__fields__[field_name].default == DynamicA.__fields__[field_name].default
++
++
++def test_config_field_info_create_model():
++    class Config:
++        fields = {'a': {'description': 'descr'}}
++
++    m1 = create_model('M1', __config__=Config, a=(str, ...))
++    assert m1.schema()['properties'] == {'a': {'title': 'A', 'description': 'descr', 'type': 'string'}}
++
++    m2 = create_model('M2', __config__=Config, a=(str, Field(...)))
++    assert m2.schema()['properties'] == {'a': {'title': 'A', 'description': 'descr', 'type': 'string'}}
+diff --git a/tests/test_dataclasses.py b/tests/test_dataclasses.py
+--- a/tests/test_dataclasses.py
++++ b/tests/test_dataclasses.py
+@@ -901,3 +901,22 @@ class Config:
+     # ensure the restored dataclass is still a pydantic dataclass
+     with pytest.raises(ValidationError, match='value\n +value is not a valid integer'):
+         restored_obj.dataclass.value = 'value of a wrong type'
++
++
++def test_config_field_info_create_model():
++    # works
++    class A1(BaseModel):
++        a: str
++
++        class Config:
++            fields = {'a': {'description': 'descr'}}
++
++    assert A1.schema()['properties'] == {'a': {'title': 'A', 'description': 'descr', 'type': 'string'}}
++
++    @pydantic.dataclasses.dataclass(config=A1.Config)
++    class A2:
++        a: str
++
++    assert A2.__pydantic_model__.schema()['properties'] == {
++        'a': {'title': 'A', 'description': 'descr', 'type': 'string'}
++    }
+diff --git a/tests/test_edge_cases.py b/tests/test_edge_cases.py
+--- a/tests/test_edge_cases.py
++++ b/tests/test_edge_cases.py
+@@ -1779,3 +1779,63 @@ class MyModel(BaseModel):
+         y: str = 'a'
+ 
+     assert list(MyModel()._iter(by_alias=True)) == [('x', 1), ('y', 'a')]
++
++
++def test_config_field_info():
++    class Foo(BaseModel):
++        a: str = Field(...)
++
++        class Config:
++            fields = {'a': {'description': 'descr'}}
++
++    assert Foo.schema(by_alias=True)['properties'] == {'a': {'title': 'A', 'description': 'descr', 'type': 'string'}}
++
++
++def test_config_field_info_alias():
++    class Foo(BaseModel):
++        a: str = Field(...)
++
++        class Config:
++            fields = {'a': {'alias': 'b'}}
++
++    assert Foo.schema(by_alias=True)['properties'] == {'b': {'title': 'B', 'type': 'string'}}
++
++
++def test_config_field_info_merge():
++    class Foo(BaseModel):
++        a: str = Field(..., foo='Foo')
++
++        class Config:
++            fields = {'a': {'bar': 'Bar'}}
++
++    assert Foo.schema(by_alias=True)['properties'] == {
++        'a': {'bar': 'Bar', 'foo': 'Foo', 'title': 'A', 'type': 'string'}
++    }
++
++
++def test_config_field_info_allow_mutation():
++    class Foo(BaseModel):
++        a: str = Field(...)
++
++        class Config:
++            validate_assignment = True
++
++    assert Foo.__fields__['a'].field_info.allow_mutation is True
++
++    f = Foo(a='x')
++    f.a = 'y'
++    assert f.dict() == {'a': 'y'}
++
++    class Bar(BaseModel):
++        a: str = Field(...)
++
++        class Config:
++            fields = {'a': {'allow_mutation': False}}
++            validate_assignment = True
++
++    assert Bar.__fields__['a'].field_info.allow_mutation is False
++
++    b = Bar(a='x')
++    with pytest.raises(TypeError):
++        b.a = 'y'
++    assert b.dict() == {'a': 'x'}

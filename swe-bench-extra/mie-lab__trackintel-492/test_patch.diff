@@ -1,0 +1,125 @@
+diff --git a/tests/io/test_file.py b/tests/io/test_file.py
+index fc78e63..01a50f0 100644
+--- a/tests/io/test_file.py
++++ b/tests/io/test_file.py
+@@ -2,6 +2,7 @@ import filecmp
+ import os
+ import pytest
+ import pandas as pd
++from pandas.testing import assert_frame_equal
+ 
+ import trackintel as ti
+ 
+@@ -312,6 +313,25 @@ class TestTrips:
+         assert gdf.index.name is None
+ 
+ 
++@pytest.fixture
++def example_tours():
++    """Tours to load into the database."""
++    t1 = pd.Timestamp("1971-01-01 00:00:00", tz="utc")
++    t2 = pd.Timestamp("1971-01-01 05:00:00", tz="utc")
++    t3 = pd.Timestamp("1971-01-02 07:00:00", tz="utc")
++    h = pd.Timedelta(hours=1)
++
++    list_dict = [
++        {"user_id": 0, "started_at": t1, "finished_at": t1 + h, "trips": [0, 1, 2]},
++        {"user_id": 0, "started_at": t2, "finished_at": t2 + h, "trips": [2, 3, 4]},
++        {"user_id": 1, "started_at": t3, "finished_at": t3 + h, "trips": [4, 5, 6]},
++    ]
++    tours = pd.DataFrame(data=list_dict)
++    tours.index.name = "id"
++    tours.as_tours
++    return tours
++
++
+ class TestTours:
+     """Test for 'read_tours_csv' and 'write_tours_csv' functions."""
+ 
+@@ -325,6 +345,14 @@ class TestTours:
+         assert filecmp.cmp(orig_file, tmp_file, shallow=False)
+         os.remove(tmp_file)
+ 
++    def test_to_from_csv(self, example_tours):
++        """Test writing then reading functionality."""
++        tmp_file = os.path.join("tests", "data", "tours_test.csv")
++        example_tours.as_tours.to_csv(tmp_file)
++        read_tours = ti.read_tours_csv(tmp_file, index_col="id")
++        os.remove(tmp_file)
++        assert_frame_equal(example_tours, read_tours)
++
+     def test_to_csv_accessor(self):
+         """Test basic reading and writing functions."""
+         orig_file = os.path.join("tests", "data", "geolife_long", "tours.csv")
+@@ -334,7 +362,3 @@ class TestTours:
+         tours.as_tours.to_csv(tmp_file)
+         assert filecmp.cmp(orig_file, tmp_file, shallow=False)
+         os.remove(tmp_file)
+-
+-    def test_from_to_postgis(self):
+-        # TODO Implement some tests for reading and writing tours.
+-        pass
+diff --git a/tests/io/test_postgis.py b/tests/io/test_postgis.py
+index 021b2b3..74c59cb 100644
+--- a/tests/io/test_postgis.py
++++ b/tests/io/test_postgis.py
+@@ -312,7 +312,7 @@ class TestPositionfixes:
+         try:
+             pfs.as_positionfixes.to_postgis(table, conn_string)
+             with pytest.warns(UserWarning):
+-                pfs_db = ti.io.read_positionfixes_postgis(sql, conn, geom_col, index_col="id", **rename_dict)
++                pfs_db = ti.io.read_positionfixes_postgis(sql, conn, geom_col, index_col="id", read_gpd_kws=rename_dict)
+             assert_geodataframe_equal(example_positionfixes, pfs_db)
+         finally:
+             del_table(conn, table)
+@@ -406,7 +406,7 @@ class TestTriplegs:
+         try:
+             tpls.as_triplegs.to_postgis(table, conn_string)
+             with pytest.warns(UserWarning):
+-                tpls_db = ti.io.read_triplegs_postgis(sql, conn, geom_col, index_col="id", **rename_dict)
++                tpls_db = ti.io.read_triplegs_postgis(sql, conn, geom_col, index_col="id", read_gpd_kws=rename_dict)
+             assert_geodataframe_equal(example_triplegs, tpls_db)
+         finally:
+             del_table(conn, table)
+@@ -571,7 +571,7 @@ class TestLocations:
+         try:
+             locs.as_locations.to_postgis(table, conn_string)
+             with pytest.warns(UserWarning):
+-                tpls_db = ti.io.read_locations_postgis(sql, conn, geom_col, index_col="id", **rename_dict)
++                tpls_db = ti.io.read_locations_postgis(sql, conn, geom_col, index_col="id", read_gpd_kws=rename_dict)
+             assert_geodataframe_equal(example_locations, tpls_db)
+         finally:
+             del_table(conn, table)
+@@ -624,7 +624,7 @@ class TestTrips:
+         try:
+             trips.as_trips.to_postgis(table, create_engine(conn_string))
+             with pytest.warns(UserWarning):
+-                tpls_db = ti.io.read_trips_postgis(sql, conn, index_col="id", **rename_dict)
++                tpls_db = ti.io.read_trips_postgis(sql, conn, index_col="id", read_gpd_kws=rename_dict)
+             assert_frame_equal(example_trips, tpls_db)
+         finally:
+             del_table(conn, table)
+@@ -716,6 +716,23 @@ class TestTours:
+         finally:
+             del_table(conn, table)
+ 
++    def test_trips_column(self, example_tours, conn_postgis):
++        """Test if list of trips is read correctly."""
++        tours = example_tours
++        tours["trips"] = [[1 + i, 10 + i, 100 + i] for i in range(len(tours))]
++        conn_string, conn = conn_postgis
++        table = "tours"
++        sql = f"SELECT * FROM {table}"
++
++        engine = create_engine(conn_string)
++        try:
++            tours.as_tours.to_postgis(table, engine)
++            with pytest.warns(UserWarning):
++                tours_db = ti.io.read_tours_postgis(sql, conn, index_col="id")
++            assert_frame_equal(tours, tours_db)
++        finally:
++            del_table(conn, table)
++
+ 
+ class TestGetSrid:
+     def test_srid(self, example_positionfixes):

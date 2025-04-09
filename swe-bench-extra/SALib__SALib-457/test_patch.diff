@@ -1,0 +1,134 @@
+diff --git a/src/SALib/test_functions/lake_problem.py b/src/SALib/test_functions/lake_problem.py
+index 88cf0e2..a0792d9 100644
+--- a/src/SALib/test_functions/lake_problem.py
++++ b/src/SALib/test_functions/lake_problem.py
+@@ -55,7 +55,7 @@ def lake_problem(X: FLOAT_OR_ARRAY, a: FLOAT_OR_ARRAY = 0.1, q: FLOAT_OR_ARRAY =
+     return X_t1
+ 
+ 
+-def evaluate_lake(values: np.ndarray) -> np.ndarray:
++def evaluate_lake(values: np.ndarray, seed=101) -> np.ndarray:
+     """Evaluate the Lake Problem with an array of parameter values.
+ 
+     .. [1] Hadka, D., Herman, J., Reed, P., Keller, K., (2015).
+@@ -86,15 +86,17 @@ def evaluate_lake(values: np.ndarray) -> np.ndarray:
+     -------
+     np.ndarray, of Phosphorus pollution over time `t`
+     """
++    rng = np.random.default_rng(seed)
++
+     nvars = values.shape[0]
+ 
+     a, q, b, mean, stdev = values.T
+ 
+     sq_mean = mean**2
+     sq_std = stdev**2
+-    eps = np.random.lognormal(log(sq_mean / sqrt(sq_std + sq_mean)),
+-                              sqrt(log(1.0 + sq_std / sq_mean)),
+-                              size=nvars)
++    eps = rng.lognormal(log(sq_mean / sqrt(sq_std + sq_mean)),
++                        sqrt(log(1.0 + sq_std / sq_mean)),
++                        size=nvars)
+ 
+     Y = np.zeros((nvars, nvars))
+     for t in range(nvars):
+@@ -104,7 +106,7 @@ def evaluate_lake(values: np.ndarray) -> np.ndarray:
+     return Y
+ 
+ 
+-def evaluate(values: np.ndarray, nvars: int = 100):
++def evaluate(values: np.ndarray, nvars: int = 100, seed=101):
+     """Evaluate the Lake Problem with an array of parameter values.
+ 
+     Parameters
+@@ -126,7 +128,7 @@ def evaluate(values: np.ndarray, nvars: int = 100):
+     nsamples = len(a)
+     Y = np.empty((nsamples, 4))
+     for i in range(nsamples):
+-        tmp = evaluate_lake(values[i, :5])
++        tmp = evaluate_lake(values[i, :5], seed=seed)
+ 
+         a_i = a[i]
+         q_i = q[i]
+diff --git a/tests/test_cli_analyze.py b/tests/test_cli_analyze.py
+index 411a3fc..1c4f01b 100644
+--- a/tests/test_cli_analyze.py
++++ b/tests/test_cli_analyze.py
+@@ -243,7 +243,7 @@ def test_sobol():
+     result = subprocess.check_output(analyze_cmd, universal_newlines=True)
+     result = re.sub(r'[\n\t\s]*', '', result)
+ 
+-    expected_output = 'STST_confx10.5579470.084460x20.4421890.044082x30.2414020.028068S1S1_confx10.3105760.060494x20.4436530.054648x3-0.0129620.054765S2S2_conf(x1,x2)-0.0143970.084384(x1,x3)0.2462310.103131(x2,x3)0.0005390.064658'
++    expected_output = "STST_confx10.5579470.085851x20.4421890.041396x30.2414020.028607S1S1_confx10.3105760.059615x20.4436530.053436x3-0.0129620.053891S2S2_conf(x1,x2)-0.0143970.083679(x1,x3)0.2462310.103117(x2,x3)0.0005390.064169"
+     assert len(result) > 0 and result == expected_output, \
+         "Results did not match expected values:\n\n Expected: \n{} \n\n Got: \n{}".format(
+             expected_output, result)
+diff --git a/tests/test_problem_spec.py b/tests/test_problem_spec.py
+index c826646..fc8226b 100644
+--- a/tests/test_problem_spec.py
++++ b/tests/test_problem_spec.py
+@@ -1,4 +1,5 @@
+ import pytest
++import copy
+ 
+ import numpy as np
+ 
+@@ -83,6 +84,56 @@ def test_sp_setters():
+        .analyze_sobol(calc_second_order=True, conf_level=0.95))
+ 
+ 
+-if __name__ == '__main__':
+-    test_sp_setters()
++def test_parallel_single_output():
++    # Create the SALib Problem specification
++    sp = ProblemSpec({
++        'names': ['x1', 'x2', 'x3'],
++        'groups': None,
++        'bounds': [[-np.pi, np.pi]]*3,
++        'outputs': ['Y']
++    })
++
++    # Single core example
++    (sp.sample_saltelli(2**8)
++        .evaluate(Ishigami.evaluate)
++        .analyze_sobol(calc_second_order=True, conf_level=0.95, seed=101))
++
++    # Parallel example
++    psp = copy.deepcopy(sp)
++    (psp.sample_saltelli(2**8)
++        .evaluate_parallel(Ishigami.evaluate, nprocs=2)
++        .analyze_sobol(calc_second_order=True, conf_level=0.95, nprocs=2, seed=101))
++
++    assert np.testing.assert_equal(sp.results, psp.results) is None, "Model results not equal!"
++    assert np.testing.assert_equal(sp.analysis, psp.analysis) is None, "Analysis results not equal!"
++
++
++def test_parallel_multi_output():
++    from SALib.test_functions import lake_problem
++
++    # Create the SALib Problem specification
++    sp = ProblemSpec({
++        'names': ['a', 'q', 'b', 'mean', 'stdev', 'delta', 'alpha'],
++        'bounds': [[0.0, 0.1],
++                   [2.0, 4.5],
++                   [0.1, 0.45],
++                   [0.01, 0.05],
++                   [0.001, 0.005],
++                   [0.93, 0.99],
++                   [0.2, 0.5]],
++        'outputs': ['max_P', 'Utility', 'Inertia', 'Reliability']
++    })
++
++    # Single core example
++    (sp.sample_saltelli(2**8)
++        .evaluate(lake_problem.evaluate)
++        .analyze_sobol(calc_second_order=True, conf_level=0.95, seed=101))
++
++    # Parallel example
++    psp = copy.deepcopy(sp)
++    (psp.sample_saltelli(2**8)
++        .evaluate_parallel(lake_problem.evaluate, nprocs=2)
++        .analyze_sobol(calc_second_order=True, conf_level=0.95, nprocs=2, seed=101))
+ 
++    assert np.testing.assert_equal(sp.results, psp.results) is None, "Model results not equal!"
++    assert np.testing.assert_equal(sp.analysis, psp.analysis) is None, "Analysis results not equal!"

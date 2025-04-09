@@ -1,0 +1,283 @@
+diff --git a/hutch_python/tests/conftest.py b/hutch_python/tests/conftest.py
+index cb5c5460..df37175a 100644
+--- a/hutch_python/tests/conftest.py
++++ b/hutch_python/tests/conftest.py
+@@ -1,6 +1,32 @@
+ import os
+ import sys
++import logging
++from copy import copy
++from contextlib import contextmanager
+ 
+ # We need to have the tests directory importable to match what we'd have in a
+ # real hutch-python install
+ sys.path.insert(0, os.path.dirname(__file__))
++
++
++@contextmanager
++def cli_args(args):
++    """
++    Context manager for running a block of code with a specific set of
++    command-line arguments.
++    """
++    prev_args = sys.argv
++    sys.argv = args
++    yield
++    sys.argv = prev_args
++
++
++@contextmanager
++def restore_logging():
++    """
++    Context manager for reverting our logging config after testing a function
++    that configures the logging.
++    """
++    prev_handlers = copy(logging.root.handlers)
++    yield
++    logging.root.handlers = prev_handlers
+diff --git a/hutch_python/tests/sample_module_1.py b/hutch_python/tests/sample_module_1.py
+index 5e3713e9..3a9a45da 100644
+--- a/hutch_python/tests/sample_module_1.py
++++ b/hutch_python/tests/sample_module_1.py
+@@ -1,3 +1,7 @@
+ hey = '4horses'
+ milk = 'cows'
+ some_int = 5
++
++
++def some_func():
++    return 4
+diff --git a/hutch_python/tests/test_base_plugin.py b/hutch_python/tests/test_base_plugin.py
+new file mode 100644
+index 00000000..d0f594fa
+--- /dev/null
++++ b/hutch_python/tests/test_base_plugin.py
+@@ -0,0 +1,13 @@
++import logging
++
++from hutch_python.base_plugin import BasePlugin
++
++logger = logging.getLogger(__name__)
++
++
++def test_base_plugin():
++    logger.debug('test_base_plugin')
++    plugin = BasePlugin({})
++    plugin.get_objects()
++    plugin.future_object_hook('name', 'obj')
++    plugin.future_plugin_hook('source', {})
+diff --git a/hutch_python/tests/test_cli.py b/hutch_python/tests/test_cli.py
+new file mode 100644
+index 00000000..25c8ee90
+--- /dev/null
++++ b/hutch_python/tests/test_cli.py
+@@ -0,0 +1,18 @@
++import os
++import logging
++
++from hutch_python.cli import setup_cli_env
++
++from conftest import cli_args, restore_logging
++
++logger = logging.getLogger(__name__)
++
++
++def test_setup_cli():
++    logger.debug('test_setup_cli')
++
++    cfg = os.path.dirname(__file__) + '/conf.yaml'
++
++    with cli_args(['hutch_python', '--cfg', cfg]):
++        with restore_logging():
++            setup_cli_env()
+diff --git a/hutch_python/tests/test_load_conf.py b/hutch_python/tests/test_load_conf.py
+index 39618f56..049ad85d 100644
+--- a/hutch_python/tests/test_load_conf.py
++++ b/hutch_python/tests/test_load_conf.py
+@@ -1,7 +1,8 @@
+ import logging
+ import os.path
+ 
+-from hutch_python.load_conf import load, read_conf
++from hutch_python.base_plugin import BasePlugin
++from hutch_python.load_conf import load, read_conf, run_plugins
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -27,10 +28,38 @@ def test_read_empty():
+ def test_read_duplicate():
+     logger.debug('test_read_duplicate')
+     objs = read_conf({'load': ['sample_module_1.py', 'sample_module_1.py']})
+-    assert len(objs) == 3
++    assert len(objs) == 4
+ 
+ 
+ def test_read_only_namespaces():
+     logger.debug('test_read_only_namespaces')
+     objs = read_conf({'namespace': {'class': {'float': ['text', 'words']}}})
+     assert len(objs) == 2
++
++
++class BadGetObjects(BasePlugin):
++    name = 'broken'
++
++    def get_objects(self):
++        raise RuntimeError('I am broken for the test')
++
++
++class SimplePlugin(BasePlugin):
++    name = 'simple'
++
++    def get_objects(self):
++        return {'name': 'text'}
++
++
++class BadFutureHook(SimplePlugin):
++    name = 'broken'
++
++    def future_plugin_hook(self, *args, **kwargs):
++        raise RuntimeError('I am broken for the test')
++
++
++def test_skip_failures():
++    logger.debug('test_skip_failures')
++    bad_plugins = {0: [BadGetObjects({}), BadFutureHook({}), SimplePlugin({})]}
++    objs = run_plugins(bad_plugins)
++    assert objs['name'] == 'text'
+diff --git a/hutch_python/tests/test_log_setup.py b/hutch_python/tests/test_log_setup.py
+new file mode 100644
+index 00000000..2e4e289a
+--- /dev/null
++++ b/hutch_python/tests/test_log_setup.py
+@@ -0,0 +1,16 @@
++import logging
++
++from hutch_python.log_setup import DEFAULT_YAML, DIR_LOGS, setup_logging
++
++from conftest import restore_logging
++
++logger = logging.getLogger(__name__)
++
++
++def test_setup_logging():
++    logger.debug('test_setup_logging')
++
++    with restore_logging():
++        setup_logging(path_yaml=DEFAULT_YAML)
++
++    assert DIR_LOGS.exists()
+diff --git a/hutch_python/tests/test_plugins/test_experiment.py b/hutch_python/tests/test_plugins/test_experiment.py
+index e02c808b..27e391a8 100644
+--- a/hutch_python/tests/test_plugins/test_experiment.py
++++ b/hutch_python/tests/test_plugins/test_experiment.py
+@@ -1,5 +1,7 @@
+ import logging
+ 
++import pytest
++
+ from hutch_python.plugins.experiment import Plugin
+ 
+ logger = logging.getLogger(__name__)
+@@ -40,3 +42,13 @@ def test_experiment_plugin():
+     objs = plugin.get_objects()
+     assert 'x' in objs
+     assert 'y' in objs
++
++
++def test_experiment_auto():
++    logger.debug('test_experiment_auto')
++
++    info = {'name': 'automatic',
++            'import': 'experiment'}
++    plugin = Plugin(info)
++    with pytest.raises(NotImplementedError):
++        plugin.get_objects()
+diff --git a/hutch_python/tests/test_plugins/test_namespace.py b/hutch_python/tests/test_plugins/test_namespace.py
+index e8e86b50..e6eab894 100644
+--- a/hutch_python/tests/test_plugins/test_namespace.py
++++ b/hutch_python/tests/test_plugins/test_namespace.py
+@@ -1,15 +1,28 @@
+ import logging
++from types import SimpleNamespace
+ 
+-from hutch_python.plugins.namespace import Plugin
++import pytest
++
++from hutch_python.plugins.namespace import Plugin, NamespaceManager
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def test_namespace_plugin_manager():
++    logger.debug('test_namespace_plugin_base')
++
++    space = SimpleNamespace()
++    manager = NamespaceManager(space, 'test')
++    with pytest.raises(NotImplementedError):
++        manager.should_include('name', 'obj')
++
++
+ def test_namespace_plugin_class():
+     logger.debug('test_namespace_plugin_class')
+     objs = {'one': 1, 'two': 2.0, 'three': '3'}
+     info = {'class': {'float': ['flt'],
++                      'skip_bad': ['skip_me'],
+                       'str': ['text', 'words']}}
+     plugin = Plugin(info)
+     namespaces = plugin.get_objects()
+diff --git a/hutch_python/tests/test_utils.py b/hutch_python/tests/test_utils.py
+index 79af2764..ee66bd41 100644
+--- a/hutch_python/tests/test_utils.py
++++ b/hutch_python/tests/test_utils.py
+@@ -9,15 +9,19 @@ def test_extract_objs():
+     logger.debug('test_extract_objs')
+     # Has no __all__ keyword
+     objs = utils.extract_objs('sample_module_1')
+-    assert objs == dict(hey='4horses',
+-                        milk='cows',
+-                        some_int=5)
++    assert objs['hey'] == '4horses'
++    assert objs['milk'] == 'cows'
++    assert objs['some_int'] == 5
+     # Has an __all__ keyword
+     objs = utils.extract_objs('sample_module_2.py')
+     assert objs == dict(just_this=5.0)
+     # Doesn't exist
+     objs = utils.extract_objs('fake_module_243esd')
+     assert objs == {}
++    objs = utils.extract_objs('sample_module_1.hey')
++    assert objs['hey'] == '4horses'
++    objs = utils.extract_objs('sample_module_1.some_func()')
++    assert objs['some_func'] == 4
+ 
+ 
+ def test_find_class():
+diff --git a/run_tests.py b/run_tests.py
+index d3a3d031..f2000c6c 100644
+--- a/run_tests.py
++++ b/run_tests.py
+@@ -1,11 +1,12 @@
+ #!/usr/bin/env python
+ import os
+ import sys
+-import pytest
+-from pathlib import Path
+ import logging
++from pathlib import Path
+ from logging.handlers import RotatingFileHandler
+ 
++import pytest
++
+ if __name__ == '__main__':
+     # Show output results from every test function
+     # Show the message output for skipped and expected failures
+@@ -36,7 +37,7 @@ if __name__ == '__main__':
+     if do_rollover:
+         handler.doRollover()
+     formatter = logging.Formatter(fmt=('%(asctime)s.%(msecs)03d '
+-                                       '%(module)-10s '
++                                       '%(module)-15s '
+                                        '%(levelname)-8s '
+                                        '%(threadName)-10s '
+                                        '%(message)s'),

@@ -1,0 +1,243 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index 270d30c..e90c25b 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -5,6 +5,8 @@
+ ## [0.17.1] UNRELEASED
+ ### Fixed
+ - Allow semicolons if the line is disabled.
++- Fix issue where subsequent comments at decreasing levels of indentation
++  were improperly aligned and/or caused output with invalid syntax.
+ 
+ ## [0.17.0] 2017-08-20
+ ### Added
+diff --git a/plugins/README.rst b/plugins/README.rst
+index b6a3e0c..56d3217 100644
+--- a/plugins/README.rst
++++ b/plugins/README.rst
+@@ -40,7 +40,23 @@ The plugin can be easily installed by using *Sublime Package Control*.
+ Check the project page of the plugin for more information:
+ https://github.com/jason-kane/PyYapf
+ 
++===================
++git Pre-Commit Hook
++===================
+ 
++The ``git`` pre-commit hook automatically formats your Python files before they
++are committed to your local repository. Any changes ``yapf`` makes to the files
++will stay unstaged so that you can diff them manually.
++
++To install, simply download the raw file and copy it into your git hooks directory:
++
++.. code-block:: bash
++
++    # From the root of your git project.
++    curl -o https://raw.githubusercontent.com/google/yapf/master/plugins/pre-commit.sh
++    mv pre-commit.sh .git/hooks/pre-commit
++
++==========
+ Textmate 2
+ ==========
+ 
+diff --git a/plugins/pre-commit.sh b/plugins/pre-commit.sh
+new file mode 100644
+index 0000000..24976b5
+--- /dev/null
++++ b/plugins/pre-commit.sh
+@@ -0,0 +1,58 @@
++#!/bin/bash
++
++# Git pre-commit hook to check staged Python files for formatting issues with yapf.
++#
++# INSTALLING: Copy this script into `.git/hooks/pre-commit`, and mark it as executable.
++#
++# This requires that yapf is installed and runnable in the environment running the pre-commit hook.
++#
++# When running, this first checks for unstaged changes to staged files, and if there are any, it
++# will exit with an error. Files with unstaged changes will be printed.
++#
++# If all staged files have no unstaged changes, it will run yapf against them, leaving the
++# formatting changes unstaged. Changed files will be printed.
++#
++# BUGS: This does not leave staged changes alone when used with the -a flag to git commit, due to
++# the fact that git stages ALL unstaged files when that flag is used.
++
++# Find all staged Python files, and exit early if there aren't any.
++PYTHON_FILES=(`git diff --name-only --cached --diff-filter=AM | grep --color=never '.py$'`)
++if [ ! "$PYTHON_FILES" ]; then
++  exit 0
++fi
++
++# Verify that yapf is installed; if not, warn and exit.
++if [ -z $(which yapf) ]; then
++  echo 'yapf not on path; can not format. Please install yapf:'
++  echo '    pip install yapf'
++  exit 2
++fi
++
++# Check for unstaged changes to files in the index.
++CHANGED_FILES=(`git diff --name-only ${PYTHON_FILES[@]}`)
++if [ "$CHANGED_FILES" ]; then
++  echo 'You have unstaged changes to some files in your commit; skipping auto-format.'
++  echo 'Please stage, stash, or revert these changes.'
++  echo 'You may find `git stash -k` helpful here.'
++  echo
++  echo 'Files with unstaged changes:'
++  for file in ${CHANGED_FILES[@]}; do
++    echo "  $file"
++  done
++  exit 1
++fi
++# Format all staged files, then exit with an error code if any have uncommitted changes.
++echo 'Formatting staged Python files . . .'
++yapf -i -r ${PYTHON_FILES[@]}
++CHANGED_FILES=(`git diff --name-only ${PYTHON_FILES[@]}`)
++if [ "$CHANGED_FILES" ]; then
++  echo 'Some staged files were reformatted. Please review the changes and stage them.'
++  echo
++  echo 'Files updated:'
++  for file in ${CHANGED_FILES[@]}; do
++    echo "  $file"
++  done
++  exit 1
++else
++  exit 0
++fi
+diff --git a/yapf/yapflib/comment_splicer.py b/yapf/yapflib/comment_splicer.py
+index 7c79e80..32997b7 100644
+--- a/yapf/yapflib/comment_splicer.py
++++ b/yapf/yapflib/comment_splicer.py
+@@ -71,8 +71,7 @@ def SpliceComments(tree):
+             # We can't just insert it before the NEWLINE node, because as a
+             # result of the way pytrees are organized, this node can be under
+             # an inappropriate parent.
+-            comment_column -= len(comment_prefix)
+-            comment_column += len(comment_prefix) - len(comment_prefix.lstrip())
++            comment_column -= len(comment_prefix.lstrip())
+             pytree_utils.InsertNodesAfter(
+                 _CreateCommentsFromPrefix(
+                     comment_prefix,
+@@ -83,63 +82,53 @@ def SpliceComments(tree):
+             # Comment prefixes on DEDENT nodes also deserve special treatment,
+             # because their final placement depends on their prefix.
+             # We'll look for an ancestor of this child with a matching
+-            # indentation, and insert the comment after it.
+-            ancestor_at_indent = _FindAncestorAtIndent(child, prefix_indent)
+-            if ancestor_at_indent.type == token.DEDENT:
+-              comments = comment_prefix.split('\n')
+-
+-              # lib2to3 places comments that should be separated into the same
+-              # DEDENT node. For example, "comment 1" and "comment 2" will be
+-              # combined.
+-              #
+-              #   def _():
+-              #     for x in y:
+-              #       pass
+-              #       # comment 1
+-              #
+-              #     # comment 2
+-              #     pass
+-              #
+-              # In this case, we need to split them up ourselves.
+-              before = []
+-              after = []
+-              after_lineno = comment_lineno
+-
+-              index = 0
+-              while index < len(comments):
+-                cmt = comments[index]
+-                if not cmt.strip() or cmt.startswith(prefix_indent + '#'):
+-                  before.append(cmt)
+-                else:
+-                  after_lineno += index
+-                  after.extend(comments[index:])
+-                  break
+-                index += 1
+-
+-              # Special case where the comment is inserted in the same
+-              # indentation level as the DEDENT it was originally attached to.
+-              pytree_utils.InsertNodesBefore(
+-                  _CreateCommentsFromPrefix(
+-                      '\n'.join(before) + '\n',
+-                      comment_lineno,
+-                      comment_column,
+-                      standalone=True), ancestor_at_indent)
+-              if after:
+-                after_column = len(after[0]) - len(after[0].lstrip())
+-                comment_column -= comment_column - after_column
+-                pytree_utils.InsertNodesAfter(
+-                    _CreateCommentsFromPrefix(
+-                        '\n'.join(after) + '\n',
+-                        after_lineno,
+-                        comment_column,
+-                        standalone=True), _FindNextAncestor(ancestor_at_indent))
+-            else:
+-              pytree_utils.InsertNodesAfter(
++            # indentation, and insert the comment before it if the ancestor is
++            # on a DEDENT node and after it otherwise.
++            #
++            # lib2to3 places comments that should be separated into the same
++            # DEDENT node. For example, "comment 1" and "comment 2" will be
++            # combined.
++            #
++            #   def _():
++            #     for x in y:
++            #       pass
++            #       # comment 1
++            #
++            #     # comment 2
++            #     pass
++            #
++            # In this case, we need to split them up ourselves.
++
++            # Split into groups of comments at decreasing levels of indentation
++            comment_groups = []
++            comment_column = None
++            for cmt in comment_prefix.split('\n'):
++              col = cmt.find('#')
++              if col < 0:
++                if comment_column is None:
++                  # Skip empty lines at the top of the first comment group
++                  comment_lineno += 1
++                  continue
++              elif comment_column is None or col < comment_column:
++                comment_column = col
++                comment_indent = cmt[:comment_column]
++                comment_groups.append((comment_column, comment_indent, []))
++              comment_groups[-1][-1].append(cmt)
++
++            # Insert a node for each group
++            for comment_column, comment_indent, comment_group in comment_groups:
++              ancestor_at_indent = _FindAncestorAtIndent(child, comment_indent)
++              if ancestor_at_indent.type == token.DEDENT:
++                InsertNodes = pytree_utils.InsertNodesBefore
++              else:
++                InsertNodes = pytree_utils.InsertNodesAfter
++              InsertNodes(
+                   _CreateCommentsFromPrefix(
+-                      comment_prefix,
++                      '\n'.join(comment_group) + '\n',
+                       comment_lineno,
+                       comment_column,
+                       standalone=True), ancestor_at_indent)
++              comment_lineno += len(comment_group)
+           else:
+             # Otherwise there are two cases.
+             #
+@@ -337,16 +326,6 @@ def _FindAncestorAtIndent(node, indent):
+     return _FindAncestorAtIndent(node.parent, indent)
+ 
+ 
+-def _FindNextAncestor(node):
+-  if node.parent is None:
+-    return node
+-
+-  if node.parent.next_sibling is not None:
+-    return node.parent.next_sibling
+-
+-  return _FindNextAncestor(node.parent)
+-
+-
+ def _AnnotateIndents(tree):
+   """Annotate the tree with child_indent annotations.
+ 

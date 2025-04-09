@@ -1,0 +1,179 @@
+diff --git a/pyteal/ast/gload_test.py b/pyteal/ast/gload_test.py
+new file mode 100644
+index 0000000..7d58037
+--- /dev/null
++++ b/pyteal/ast/gload_test.py
+@@ -0,0 +1,57 @@
++import pytest
++
++from .. import *
++# this is not necessary but mypy complains if it's not included
++from .. import MAX_GROUP_SIZE, NUM_SLOTS, CompileOptions
++
++teal3Options = CompileOptions(version=3)
++teal4Options = CompileOptions(version=4)
++
++def test_gload_teal_3():
++    with pytest.raises(TealInputError):
++        ImportScratchValue(0, 1).__teal__(teal3Options)
++
++    with pytest.raises(TealInputError):
++        ImportScratchValue(Int(0), 1).__teal__(teal3Options)
++
++def test_gload():
++    expr = ImportScratchValue(0, 1)
++    assert expr.type_of() == TealType.anytype
++
++    expected = TealSimpleBlock([
++        TealOp(expr, Op.gload, 0, 1)
++    ])
++    
++    actual, _ = expr.__teal__(teal4Options)
++
++    assert actual == expected
++
++def test_gload_dynamic():
++    arg = Int(1)
++    expr = ImportScratchValue(arg, 0)
++    assert expr.type_of() == TealType.anytype
++
++    expected = TealSimpleBlock([
++        TealOp(arg, Op.int, 1),
++        TealOp(expr, Op.gloads, 0)
++    ])
++    
++    actual, _ = expr.__teal__(teal4Options)
++    actual.addIncoming()
++    actual = TealBlock.NormalizeBlocks(actual)
++
++    assert actual == expected
++
++def test_gload_invalid():
++    with pytest.raises(TealInputError):
++        ImportScratchValue(-1, 0)
++
++    with pytest.raises(TealInputError):
++        ImportScratchValue(MAX_GROUP_SIZE, 0)
++
++    with pytest.raises(TealInputError):
++        ImportScratchValue(0, -1)
++
++    with pytest.raises(TealInputError):
++        ImportScratchValue(0, NUM_SLOTS)
++    
+\ No newline at end of file
+diff --git a/pyteal/ast/scratch_test.py b/pyteal/ast/scratch_test.py
+index 9236182..dd78053 100644
+--- a/pyteal/ast/scratch_test.py
++++ b/pyteal/ast/scratch_test.py
+@@ -75,3 +75,23 @@ def test_scratch_stack_store():
+     actual, _ = expr.__teal__(options)
+ 
+     assert actual == expected
++
++def test_scratch_assign_id():
++    slot = ScratchSlot(255)
++    expr = ScratchStackStore(slot)
++    assert expr.type_of() == TealType.none
++    
++    expected = TealSimpleBlock([
++        TealOp(expr, Op.store, slot)
++    ])
++
++    actual, _ = expr.__teal__(options)
++
++    assert actual == expected
++
++def test_scratch_assign_id_invalid():
++    with pytest.raises(TealInputError):
++        slot = ScratchSlot(-1)
++
++    with pytest.raises(TealInputError):
++        slot = ScratchSlot(NUM_SLOTS)
+diff --git a/pyteal/ast/scratchvar_test.py b/pyteal/ast/scratchvar_test.py
+index 519202c..0f9b0c0 100644
+--- a/pyteal/ast/scratchvar_test.py
++++ b/pyteal/ast/scratchvar_test.py
+@@ -66,3 +66,35 @@ def test_scratchvar_load():
+     actual = TealBlock.NormalizeBlocks(actual)
+ 
+     assert actual == expected
++
++def test_scratchvar_assign_store():
++    slotId = 2
++    myvar = ScratchVar(TealType.uint64, slotId)
++    arg = Int(10)
++    expr = myvar.store(arg)
++
++    expected = TealSimpleBlock([
++        TealOp(arg, Op.int, 10),
++        TealOp(expr, Op.store, myvar.slot),
++    ])
++
++    actual, _ = expr.__teal__(options)
++    actual.addIncoming()
++    actual = TealBlock.NormalizeBlocks(actual)
++
++    assert actual == expected
++
++def test_scratchvar_assign_load():
++    slotId = 5
++    myvar = ScratchVar(slotId=slotId)
++    expr = myvar.load()
++
++    expected = TealSimpleBlock([
++        TealOp(expr, Op.load, myvar.slot)
++    ])
++
++    actual, _ = expr.__teal__(options)
++    actual.addIncoming()
++    actual = TealBlock.NormalizeBlocks(actual)
++
++    assert actual == expected
+diff --git a/pyteal/compiler/compiler_test.py b/pyteal/compiler/compiler_test.py
+index b68eb67..f10e8c9 100644
+--- a/pyteal/compiler/compiler_test.py
++++ b/pyteal/compiler/compiler_test.py
+@@ -139,6 +139,42 @@ def test_slot_load_before_store():
+     with pytest.raises(TealInternalError):
+         compileTeal(program, Mode.Application, version=2)
+ 
++def test_assign_scratch_slots():
++    myScratch       = ScratchVar(TealType.uint64)
++    otherScratch    = ScratchVar(TealType.uint64, 1)
++    anotherScratch  = ScratchVar(TealType.uint64, 0)
++    lastScratch     = ScratchVar(TealType.uint64)
++    prog            = Seq([
++                        myScratch.store(Int(5)),      # Slot 2
++                        otherScratch.store(Int(0)),   # Slot 1
++                        anotherScratch.store(Int(7)), # Slot 0
++                        lastScratch.store(Int(9)),    # Slot 3
++                      ])
++
++    expected = """
++#pragma version 4
++int 5
++store 2
++int 0
++store 1
++int 7
++store 0
++int 9
++store 3
++""".strip()
++    actual = compileTeal(prog, mode=Mode.Signature, version=4) 
++    assert actual == expected
++
++def test_scratchvar_double_assign_invalid():
++    myvar    = ScratchVar(TealType.uint64, 10)
++    otherVar = ScratchVar(TealType.uint64, 10)
++    prog  = Seq([
++                myvar.store(Int(5)),
++                otherVar.store(Int(0))
++            ])
++    with pytest.raises(TealInternalError):
++        compileTeal(prog, mode=Mode.Signature, version=4) 
++
+ def test_assembleConstants():
+     program = Itob(Int(1) + Int(1) + Tmpl.Int("TMPL_VAR")) == Concat(Bytes("test"), Bytes("test"), Bytes("test2"))
+ 

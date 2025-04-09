@@ -1,0 +1,295 @@
+diff --git a/doc/conf.py b/doc/conf.py
+index ac53cf6..773afba 100644
+--- a/doc/conf.py
++++ b/doc/conf.py
+@@ -345,6 +345,8 @@ sphinx_gallery_conf = {
+                'repo': 'sphinx-gallery.github.io',
+                'url': 'https://mybinder.org',
+                'branch': 'master',
+-               'dependencies': './binder/requirements.txt'
++               'dependencies': './binder/requirements.txt',
++               'notebooks_dir': 'notebooks',
++               'use_jupyter_lab': True,
+                }
+ }
+diff --git a/sphinx_gallery/binder.py b/sphinx_gallery/binder.py
+index 961a2be..7dced88 100644
+--- a/sphinx_gallery/binder.py
++++ b/sphinx_gallery/binder.py
+@@ -15,7 +15,7 @@ change in the future.
+ 
+ """
+ 
+-import shutil as sh
++import shutil
+ import os
+ 
+ try:
+@@ -25,9 +25,13 @@ except NameError:
+     unicode = str
+ 
+ from .utils import replace_py_ipynb
++from . import sphinx_compatibility
+ 
+ 
+-def gen_binder_url(fname, binder_conf):
++logger = sphinx_compatibility.getLogger('sphinx-gallery')
++
++
++def gen_binder_url(fname, binder_conf, gallery_conf):
+     """Generate a Binder URL according to the configuration in conf.py.
+ 
+     Parameters
+@@ -45,20 +49,36 @@ def gen_binder_url(fname, binder_conf):
+     """
+     # Build the URL
+     fpath_prefix = binder_conf.get('filepath_prefix')
+-    binder_fpath = '_downloads/{}'.format(replace_py_ipynb(fname))
++    link_base = binder_conf.get('notebooks_dir')
++
++    # We want to keep the relative path to sub-folders
++    relative_link = os.path.relpath(fname, gallery_conf['src_dir'])
++    path_link = os.path.join(
++        link_base, replace_py_ipynb(relative_link))
++
++    # In case our website is hosted in a sub-folder
+     if fpath_prefix is not None:
+-        binder_fpath = '/'.join([fpath_prefix.strip('/'), binder_fpath])
++        path_link = '/'.join([fpath_prefix.strip('/'), path_link])
++
++    # Make sure we have the right slashes (in case we're on Windows)
++    path_link = path_link.replace(os.path.sep, '/')
++
++    # Create the URL
+     binder_url = binder_conf['url']
+     binder_url = '/'.join([binder_conf['url'],
+                            'v2', 'gh',
+                            binder_conf['org'],
+                            binder_conf['repo'],
+                            binder_conf['branch']])
+-    binder_url += '?filepath={}'.format(binder_fpath)
++
++    if binder_conf.get('use_jupyter_lab', False) is True:
++        binder_url += '?urlpath=lab/tree/{}'.format(path_link)
++    else:
++        binder_url += '?filepath={}'.format(path_link)
+     return binder_url
+ 
+ 
+-def gen_binder_rst(fname, binder_conf):
++def gen_binder_rst(fname, binder_conf, gallery_conf):
+     """Generate the RST + link for the Binder badge.
+ 
+     Parameters
+@@ -84,7 +104,8 @@ def gen_binder_rst(fname, binder_conf):
+     rst : str
+         The reStructuredText for the Binder badge that links to this file.
+     """
+-    binder_url = gen_binder_url(fname, binder_conf)
++    binder_conf = check_binder_conf(binder_conf)
++    binder_url = gen_binder_url(fname, binder_conf, gallery_conf)
+ 
+     rst = (
+         "\n"
+@@ -95,17 +116,75 @@ def gen_binder_rst(fname, binder_conf):
+     return rst
+ 
+ 
+-def copy_binder_reqs(app):
++def copy_binder_files(app, exception):
++    """Copy all Binder requirements and notebooks files."""
++    if exception is not None:
++        return
++
++    if app.builder.name not in ['html', 'readthedocs']:
++        return
++
++    gallery_conf = app.config.sphinx_gallery_conf
++    binder_conf = check_binder_conf(gallery_conf.get('binder'))
++
++    if not len(binder_conf) > 0:
++        return
++
++    logger.info('copying binder requirements...', color='white')
++    _copy_binder_reqs(app, binder_conf)
++    _copy_binder_notebooks(app)
++
++
++def _copy_binder_reqs(app, binder_conf):
+     """Copy Binder requirements files to a "binder" folder in the docs."""
+-    binder_conf = app.config.sphinx_gallery_conf['binder']
+     path_reqs = binder_conf.get('dependencies')
+ 
+-    binder_folder = os.path.join(app.builder.outdir, 'binder')
++    binder_folder = os.path.join(app.outdir, 'binder')
+     if not os.path.isdir(binder_folder):
+         os.makedirs(binder_folder)
+     for path in path_reqs:
+-        sh.copy(os.path.join(app.builder.srcdir, path),
+-                binder_folder)
++        shutil.copy(os.path.join(app.srcdir, path), binder_folder)
++
++
++def _remove_ipynb_files(path, contents):
++    """Given a list of files in `contents`, remove all files named `ipynb` or
++    directories named `images` and return the result.
++
++    Used with the `shutil` "ignore" keyword to filter out non-ipynb files."""
++    contents_return = []
++    for entry in contents:
++        if entry.endswith('.ipynb'):
++            # Don't include ipynb files
++            pass
++        elif (entry != "images") and os.path.isdir(os.path.join(path, entry)):
++            # Don't include folders not called "images"
++            pass
++        else:
++            # Keep everything else
++            contents_return.append(entry)
++    return contents_return
++
++
++def _copy_binder_notebooks(app):
++    """Copy Jupyter notebooks to the binder notebooks directory.
++
++    Copy each output gallery directory structure but only including the
++    Jupyter notebook files."""
++
++    gallery_conf = app.config.sphinx_gallery_conf
++    gallery_dirs = gallery_conf.get('gallery_dirs')
++    binder_conf = gallery_conf.get('binder')
++    notebooks_dir = os.path.join(app.outdir, binder_conf.get('notebooks_dir'))
++    shutil.rmtree(notebooks_dir, ignore_errors=True)
++    os.makedirs(notebooks_dir)
++
++    iterator = sphinx_compatibility.status_iterator(
++        gallery_dirs, 'copying binder notebooks...', length=len(gallery_dirs))
++
++    for i_folder in iterator:
++        shutil.copytree(os.path.join(app.srcdir, i_folder),
++                        os.path.join(notebooks_dir, i_folder),
++                        ignore=_remove_ipynb_files)
+ 
+ 
+ def check_binder_conf(binder_conf):
+@@ -119,7 +198,7 @@ def check_binder_conf(binder_conf):
+ 
+     # Ensure all fields are populated
+     req_values = ['url', 'org', 'repo', 'branch', 'dependencies']
+-    optional_values = ['filepath_prefix']
++    optional_values = ['filepath_prefix', 'notebooks_dir', 'use_jupyter_lab']
+     missing_values = []
+     for val in req_values:
+         if binder_conf.get(val) is None:
+@@ -150,6 +229,8 @@ def check_binder_conf(binder_conf):
+         raise ValueError("`dependencies` value should be a list of strings. "
+                          "Got type {}.".format(type(path_reqs)))
+ 
++    binder_conf['notebooks_dir'] = binder_conf.get('notebooks_dir',
++                                                   'notebooks')
+     path_reqs_filenames = [os.path.basename(ii) for ii in path_reqs]
+     if not any(ii in path_reqs_filenames for ii in required_reqs_files):
+         raise ValueError(
+diff --git a/sphinx_gallery/docs_resolv.py b/sphinx_gallery/docs_resolv.py
+index 5fb2c8f..cdc726b 100644
+--- a/sphinx_gallery/docs_resolv.py
++++ b/sphinx_gallery/docs_resolv.py
+@@ -117,7 +117,14 @@ def parse_sphinx_docopts(index):
+         elif value == 'true':
+             value = True
+         else:
+-            value = int(value)
++            try:
++                value = int(value)
++            except ValueError:
++                # In Sphinx 1.7.5, URL_ROOT is a JavaScript fragment.
++                # Ignoring this entry since URL_ROOT is not used
++                # elsewhere.
++                # https://github.com/sphinx-gallery/sphinx-gallery/issues/382
++                continue
+ 
+         docopts[key] = value
+ 
+diff --git a/sphinx_gallery/gen_gallery.py b/sphinx_gallery/gen_gallery.py
+index 0864dba..c857bce 100644
+--- a/sphinx_gallery/gen_gallery.py
++++ b/sphinx_gallery/gen_gallery.py
+@@ -21,7 +21,7 @@ from .gen_rst import generate_dir_rst, SPHX_GLR_SIG
+ from .docs_resolv import embed_code_links
+ from .downloads import generate_zipfiles
+ from .sorting import NumberOfCodeLinesSortKey
+-from .binder import copy_binder_reqs, check_binder_conf
++from .binder import copy_binder_files, check_binder_conf
+ 
+ try:
+     FileNotFoundError
+@@ -236,12 +236,6 @@ def generate_gallery_rst(app):
+             else:
+                 logger.info("\t- %s: not run", fname)
+ 
+-    # Copy the requirements files for binder
+-    binder_conf = check_binder_conf(gallery_conf.get('binder'))
+-    if len(binder_conf) > 0:
+-        logger.info("copying binder requirements...")
+-        copy_binder_reqs(app)
+-
+ 
+ def touch_empty_backreferences(app, what, name, obj, options, lines):
+     """Generate empty back-reference example files
+@@ -367,6 +361,7 @@ def setup(app):
+ 
+     app.connect('builder-inited', generate_gallery_rst)
+ 
++    app.connect('build-finished', copy_binder_files)
+     app.connect('build-finished', sumarize_failing_examples)
+     app.connect('build-finished', embed_code_links)
+     metadata = {'parallel_read_safe': True,
+diff --git a/sphinx_gallery/gen_rst.py b/sphinx_gallery/gen_rst.py
+index 74893eb..11879a0 100644
+--- a/sphinx_gallery/gen_rst.py
++++ b/sphinx_gallery/gen_rst.py
+@@ -30,6 +30,7 @@ from distutils.version import LooseVersion
+ from .utils import replace_py_ipynb
+ 
+ 
++
+ # Try Python 2 first, otherwise load from Python 3
+ try:
+     # textwrap indent only exists in python 3
+@@ -83,7 +84,7 @@ from .downloads import CODE_DOWNLOAD
+ from .py_source_parser import split_code_and_text_blocks
+ 
+ from .notebook import jupyter_notebook, save_notebook
+-from .binder import check_binder_conf, copy_binder_reqs, gen_binder_rst
++from .binder import check_binder_conf, gen_binder_rst
+ 
+ try:
+     basestring
+@@ -385,7 +386,7 @@ def scale_image(in_fname, out_fname, max_width, max_height):
+     # width_sc, height_sc = img.size  # necessary if using thumbnail
+ 
+     # insert centered
+-    thumb = Image.new('RGB', (max_width, max_height), (255, 255, 255))
++    thumb = Image.new('RGBA', (max_width, max_height), (255, 255, 255, 255))
+     pos_insert = ((max_width - width_sc) // 2, (max_height - height_sc) // 2)
+     thumb.paste(img, pos_insert)
+ 
+@@ -710,6 +711,7 @@ def generate_file_rst(fname, target_dir, src_dir, gallery_conf):
+     time_m, time_s = divmod(time_elapsed, 60)
+     example_nb = jupyter_notebook(script_blocks)
+     save_notebook(example_nb, replace_py_ipynb(example_file))
++
+     with codecs.open(os.path.join(target_dir, base_image_name + '.rst'),
+                      mode='w', encoding='utf-8') as f:
+         if time_elapsed >= gallery_conf["min_reported_time"]:
+@@ -719,7 +721,8 @@ def generate_file_rst(fname, target_dir, src_dir, gallery_conf):
+         # Generate a binder URL if specified
+         binder_badge_rst = ''
+         if len(binder_conf) > 0:
+-            binder_badge_rst += gen_binder_rst(fname, binder_conf)
++            binder_badge_rst += gen_binder_rst(example_file, binder_conf,
++                                               gallery_conf)
+ 
+         example_rst += CODE_DOWNLOAD.format(fname,
+                                             replace_py_ipynb(fname),
+

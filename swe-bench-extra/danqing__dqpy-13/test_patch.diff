@@ -1,0 +1,191 @@
+diff --git a/tests/test_cache.py b/tests/test_cache.py
+new file mode 100644
+index 0000000..0221d26
+--- /dev/null
++++ b/tests/test_cache.py
+@@ -0,0 +1,45 @@
++import unittest
++
++from dq import cache
++
++
++class TestCache(unittest.TestCase):
++
++    def test_cache_none(self):
++        redis = cache._redis
++        cache._redis = None
++
++        def key_func():
++            return ''
++
++        @cache.cache(key_func=key_func)
++        def some_func():
++            return 'hello'
++
++        assert some_func() == 'hello'
++
++        cache._redis = redis
++
++        @cache.cache()
++        def some_func_2():
++            return 'hello2'
++
++        assert some_func_2() == 'hello2'
++
++    def test_cache_fresh(self):
++        value = 'hello'
++
++        def key_func(fresh=False, raw=False):
++            return 'cache-fresh-key'
++
++        @cache.cache(key_func=key_func)
++        def some_func(fresh=False, raw=False):
++            nonlocal value
++            if value == 'hello':
++                value = 'world'
++                return 'hello'
++            return value
++
++        assert some_func(fresh=True) == 'hello'
++        assert some_func(raw=True) == b'hello'
++        assert some_func(fresh=True) == 'world'
+diff --git a/tests/test_orm.py b/tests/test_orm.py
+index a437675..036d0e1 100644
+--- a/tests/test_orm.py
++++ b/tests/test_orm.py
+@@ -1,6 +1,5 @@
+ import ast
+ import json
+-import mock
+ import unittest
+ from contextlib import suppress
+ from uuid import uuid4
+@@ -8,7 +7,6 @@ from uuid import uuid4
+ import arrow
+ 
+ from dq.database import commit_scope, save_to_database
+-from dq.orm import Cache
+ from tests.models import Table2, User, UserType
+ 
+ 
+@@ -18,8 +16,6 @@ class TestORM(unittest.TestCase):
+         with suppress(Exception), commit_scope() as session:
+             session.query(Table2).delete()
+             session.query(User).delete()
+-            if Cache._instance:
+-                Cache._instance.flushall()
+ 
+     def test_string(self):
+         t2 = Table2(id=1, key=1, key2=1, user_type=UserType.admin,
+@@ -34,56 +30,6 @@ class TestORM(unittest.TestCase):
+             'created_at': 1508544000,
+         }
+ 
+-    def test_cache_key(self):
+-        assert Table2.cache_key('uuid', '123') == 'dqpy.cache.table2.uuid.123'
+-        k2 = Table2.cache_key('id', 123, contains_deleted=True,
+-                              contains_empty=True)
+-        assert k2 == 'dqpy.cache.table2.id.123.del.empty'
+-
+-    def test_cached(self):
+-        t2 = Table2(id=999, user_uuid=str(uuid4()), key=1, key2=1,
+-                    user_type=UserType.regular)
+-        save_to_database(t2)
+-
+-        key = 'dqpy.cache.table2.id.999'
+-        assert not Cache.get(key)
+-
+-        t2 = Table2.get(999)
+-        assert t2.key == 1
+-        assert Cache.get(key)
+-        with commit_scope() as session:
+-            session.query(Table2).delete()
+-        t2 = Table2.get(999)
+-        assert t2.key == 1
+-
+-    def test_cache_error(self):
+-        Cache._instance = 123
+-        assert not Cache.get('cornell')
+-        Cache.set('cornell', '#1', 123)
+-        Cache._instance = None
+-
+-    @mock.patch('dq.config.Config.get')
+-    def test_cache_broken(self, mock_cfg):
+-        mock_cfg.return_value = {'port': 1234}
+-        Cache._instance = None
+-        Cache._attempted = None
+-        assert not Cache.instance()
+-        assert Cache._attempted
+-        assert not Cache.get('cornell')
+-        Cache.set('cornell', '#1', 123)
+-        Cache._attempted = None
+-
+-    @mock.patch('dq.config.Config.get')
+-    def test_cache_none(self, mock_cfg):
+-        mock_cfg.return_value = None
+-        Cache._instance = None
+-        Cache._attempted = None
+-        assert not Cache.instance()
+-        assert Cache._attempted
+-        assert not Cache.get('cornell')
+-        Cache.set('cornell', '#1', 123)
+-        Cache._attempted = None
+-
+     def test_to_dict(self):
+         uuid = str(uuid4())
+         now = arrow.get()
+@@ -146,7 +92,7 @@ class TestORM(unittest.TestCase):
+         assert t2.id == 1
+         t2.key2 = 10
+         save_to_database(t2)
+-        t2 = Table2.get_by('user_uuid', uuid, fresh=True)
++        t2 = Table2.get_by('user_uuid', uuid)
+         assert t2.key2 == 10
+ 
+     def test_get_by_empty(self):
+diff --git a/tests/test_redis.py b/tests/test_redis.py
+index 472f1ed..d385f87 100644
+--- a/tests/test_redis.py
++++ b/tests/test_redis.py
+@@ -3,11 +3,16 @@ import unittest
+ from time import sleep
+ from uuid import uuid4
+ 
+-from dq.redis import Redis
++from dq.redis import init_redis, Redis
+ 
+ 
+ class TestRedis(unittest.TestCase):
+ 
++    def test_init(self):
++        assert init_redis('redis')
++        assert not init_redis('none')
++        assert not init_redis('faulty_redis')
++
+     def test_exists(self):
+         key = 'dqtest-{}'.format(uuid4())
+         assert not Redis.exists(key)
+@@ -24,7 +29,7 @@ class TestRedis(unittest.TestCase):
+         assert Redis.delete(key)
+         assert not Redis.get(key)
+ 
+-    def test_get_json(self):
++    def test_get_json_string(self):
+         key = 'dqtest-{}'.format(uuid4())
+         assert not Redis.get(key)
+         Redis.setex(key, [1, '2', True], 1)
+@@ -32,6 +37,14 @@ class TestRedis(unittest.TestCase):
+         Redis.setex(key, {'cornell': '#1'}, 1)
+         assert Redis.get(key) == '{"cornell": "#1"}'
+ 
++    def test_get_json(self):
++        key = 'dqtest-{}'.format(uuid4())
++        assert not Redis.get(key)
++        Redis.setex(key, [1, '2', True], 1)
++        assert Redis.get_json(key) == [1, '2', True]
++        Redis.setex(key, {'cornell': '#1'}, 1)
++        assert Redis.get_json(key) == {'cornell': '#1'}
++
+     def test_expire(self):
+         key = 'dqtest-{}'.format(uuid4())
+         assert Redis.set(key, '1')

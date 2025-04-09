@@ -1,0 +1,135 @@
+diff --git a/changes/382.feature.rst b/changes/382.feature.rst
+new file mode 100644
+index 00000000..3cc4e55e
+--- /dev/null
++++ b/changes/382.feature.rst
+@@ -0,0 +1,1 @@
++Windows MSI installers can now be configured to ask the user whether they want a per-user or per-machine install.
+diff --git a/changes/688.bugfix.rst b/changes/688.bugfix.rst
+new file mode 100644
+index 00000000..a7f2db90
+--- /dev/null
++++ b/changes/688.bugfix.rst
+@@ -0,0 +1,1 @@
++Windows MSI installers now install in ``Program Files``, rather than ``Program Files (x86)``.
+diff --git a/changes/774.feature.rst b/changes/774.feature.rst
+new file mode 100644
+index 00000000..246c2e4b
+--- /dev/null
++++ b/changes/774.feature.rst
+@@ -0,0 +1,1 @@
++Temporary docker containers are now cleaned up after use. The wording of Docker progress messages has also been improved.
+diff --git a/docs/reference/platforms/windows/msi.rst b/docs/reference/platforms/windows/msi.rst
+index 870611e6..d767d4ae 100644
+--- a/docs/reference/platforms/windows/msi.rst
++++ b/docs/reference/platforms/windows/msi.rst
+@@ -43,7 +43,8 @@ installer; however, they are installed once and shared between all users on a
+ computer.
+ 
+ If ``true`` the installer will attempt to install the app as a per-machine app,
+-available to all users. Defaults to a per-user install.
++available to all users. If ``false``, the installer will install as a per-user
++app. If undefined the installer will ask the user for their preference.
+ 
+ ``version_triple``
+ ------------------
+diff --git a/src/briefcase/integrations/docker.py b/src/briefcase/integrations/docker.py
+index a05cd19b..90a921f5 100644
+--- a/src/briefcase/integrations/docker.py
++++ b/src/briefcase/integrations/docker.py
+@@ -202,14 +202,15 @@ class Docker:
+     def prepare(self):
+         try:
+             self.command.logger.info(
+-                "Building Docker container image...", prefix=self.app.app_name
++                "Building Docker container image...",
++                prefix=self.app.app_name,
+             )
+             try:
+                 system_requires = " ".join(self.app.system_requires)
+             except AttributeError:
+                 system_requires = ""
+ 
+-            with self.command.input.wait_bar("Building container..."):
++            with self.command.input.wait_bar("Building Docker image..."):
+                 self._subprocess.run(
+                     [
+                         "docker",
+@@ -237,23 +238,24 @@ class Docker:
+                 )
+         except subprocess.CalledProcessError as e:
+             raise BriefcaseCommandError(
+-                f"Error building Docker container for {self.app.app_name}."
++                f"Error building Docker image for {self.app.app_name}."
+             ) from e
+ 
+     def run(self, args, env=None, **kwargs):
+-        """Run a process inside the Docker container."""
+-        # Set up the `docker run` invocation in interactive mode,
+-        # with volume mounts for the platform and .briefcase directories.
+-        # The :z suffix allows SELinux to modify the host mount; it is ignored
+-        # on non-SELinux platforms.
++        """Run a process inside a Docker container."""
++        # Set up the `docker run` with volume mounts for the platform &
++        # .briefcase directories and to delete the temporary container
++        # after running the command.
++        # The :z suffix allows SELinux to modify the host mount; it is
++        # ignored on non-SELinux platforms.
+         docker_args = [
+             "docker",
+             "run",
+-            "--tty",
+             "--volume",
+             f"{self.command.platform_path}:/app:z",
+             "--volume",
+             f"{self.command.dot_briefcase_path}:/home/brutus/.briefcase:z",
++            "--rm",
+         ]
+ 
+         # If any environment variables have been defined, pass them in
+@@ -262,10 +264,10 @@ class Docker:
+             for key, value in env.items():
+                 docker_args.extend(["--env", f"{key}={value}"])
+ 
+-        # ... then the image name.
++        # ... then the image name to create the temporary container with
+         docker_args.append(self.command.docker_image_tag(self.app))
+ 
+-        # ... then add all the arguments
++        # ... then add the command (and its arguments) to run in the container
+         for arg in args:
+             arg = str(arg)
+             if arg == sys.executable:
+diff --git a/src/briefcase/platforms/windows/msi.py b/src/briefcase/platforms/windows/msi.py
+index 0023f89d..204a48f7 100644
+--- a/src/briefcase/platforms/windows/msi.py
++++ b/src/briefcase/platforms/windows/msi.py
+@@ -77,13 +77,17 @@ class WindowsMSICreateCommand(WindowsMSIMixin, CreateCommand):
+         try:
+             install_scope = "perMachine" if app.system_installer else "perUser"
+         except AttributeError:
+-            # system_installer not defined in config; default to perUser install.
+-            install_scope = "perUser"
++            # system_installer not defined in config; default to asking the user
++            install_scope = None
+ 
+         return {
+             "version_triple": version_triple,
+             "guid": str(guid),
+             "install_scope": install_scope,
++            # Template forward compatibility flags
++            # 2022-06-29: #775 added the need to pass for -arch 64 to candle.exe;
++            # Briefcase v0.3.8 didn't use that flag.
++            "_use_arch64": True,
+         }
+ 
+     def install_app_support_package(self, app: BaseConfig):
+@@ -187,6 +191,8 @@ class WindowsMSIPackageCommand(WindowsMSIMixin, PackageCommand):
+                         "WixUtilExtension",
+                         "-ext",
+                         "WixUIExtension",
++                        "-arch",
++                        "x64",
+                         "-dSourceDir=src",
+                         f"{app.app_name}.wxs",
+                         f"{app.app_name}-manifest.wxs",

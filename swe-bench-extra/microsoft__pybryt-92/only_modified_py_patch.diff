@@ -1,0 +1,264 @@
+diff --git a/pybryt/execution/__init__.py b/pybryt/execution/__init__.py
+index 1c70931..4ab61aa 100644
+--- a/pybryt/execution/__init__.py
++++ b/pybryt/execution/__init__.py
+@@ -24,7 +24,8 @@ NBFORMAT_VERSION = 4
+ 
+ 
+ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: List[str] = [], 
+-        output: Optional[str] = None) -> Tuple[int, List[Tuple[Any, int]], nbformat.NotebookNode]:
++        output: Optional[str] = None) -> Tuple[int, List[Tuple[Any, int]], List[Tuple[str, str]], \
++        nbformat.NotebookNode]:
+     """
+     Executes a submission using ``nbconvert`` and returns the memory footprint.
+ 
+@@ -41,8 +42,9 @@ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: Li
+         output (``str``, optional): a file path at which to write the executed notebook
+ 
+     Returns:
+-        ``tuple[int, list[tuple[object, int]], nbformat.NotebookNode]``: the number of execution steps,
+-        the memory footprint, and the executed notebook
++        ``tuple[int, list[tuple[object, int]], list[tuple[str, str]], nbformat.NotebookNode]``: the 
++        number of execution steps, the memory footprint, the list of function calls, and the 
++        executed notebook
+     """
+     nb = deepcopy(nb)
+     preprocessor = IntermediateVariablePreprocessor()
+@@ -55,7 +57,7 @@ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: Li
+     first_cell = nbformat.v4.new_code_cell(dedent(f"""\
+         import sys
+         from pybryt.execution import create_collector
+-        observed_{secret}, cir = create_collector(addl_filenames={addl_filenames})
++        cir_results_{secret}, cir = create_collector(addl_filenames={addl_filenames})
+         sys.settrace(cir)
+         {TRACING_VARNAME} = True
+         %cd {nb_dir}
+@@ -65,9 +67,9 @@ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: Li
+         sys.settrace(None)
+         import dill
+         from pybryt.utils import filter_picklable_list
+-        filter_picklable_list(observed_{secret})
++        filter_picklable_list(cir_results_{secret}[0])
+         with open("{observed_fp}", "wb+") as f:
+-            dill.dump(observed_{secret}, f)
++            dill.dump(cir_results_{secret}, f)
+     """))
+ 
+     nb['cells'].insert(0, first_cell)
+@@ -82,10 +84,10 @@ def execute_notebook(nb: nbformat.NotebookNode, nb_path: str, addl_filenames: Li
+             nbformat.write(nb, f)
+ 
+     with open(observed_fp, "rb") as f:
+-        observed = dill.load(f)
++        observed, calls = dill.load(f)
+ 
+     os.remove(observed_fp)
+ 
+     n_steps = max([t[1] for t in observed])
+ 
+-    return n_steps, observed, nb
++    return n_steps, observed, calls, nb
+diff --git a/pybryt/execution/tracing.py b/pybryt/execution/tracing.py
+index 7aab9f4..03b44f3 100644
+--- a/pybryt/execution/tracing.py
++++ b/pybryt/execution/tracing.py
+@@ -17,7 +17,7 @@ TRACING_FUNC = None
+ 
+ 
+ def create_collector(skip_types: List[type] = [type, type(len), ModuleType, FunctionType], addl_filenames: List[str] = []) -> \
+-        Tuple[List[Tuple[Any, int]], Callable[[FrameType, str, Any], Callable]]:
++        Tuple[Tuple[List[Tuple[Any, int]], List[Tuple[str, str]]], Callable[[FrameType, str, Any], Callable]]:
+     """
+     Creates a list to collect observed values and a trace function.
+ 
+@@ -32,11 +32,14 @@ def create_collector(skip_types: List[type] = [type, type(len), ModuleType, Func
+             IPython
+         
+     Returns:
+-        ``tuple[list[tuple[object, int]], callable[[frame, str, object], callable]]``: the list
+-        of tuples of observed objects and their timestamps, and the trace function
++        ``tuple[tuple[list[tuple[object, int]], list[tuple[str, str]]], callable[[frame, str, 
++        object], callable]]``: a 2-tuple containing a 2-tuple with the list of tuples of observed 
++        objects and their timestamps and the list of call filenames andfunction names, and the trace 
++        function
+     """
+     global _COLLECTOR_RET
+     observed = []
++    calls = []
+     vars_not_found = {}
+     hashes = set()
+     counter = [0]
+@@ -68,6 +71,15 @@ def create_collector(skip_types: List[type] = [type, type(len), ModuleType, Func
+         except:
+             return
+ 
++    def track_call(frame):
++        """
++        Tracks a call in ``calls`` as a tuple of ``(filename, function name)``.
++
++        Args:
++            frame (``types.FrameType``): the frame of the call
++        """
++        calls.append((frame.f_code.co_filename, frame.f_code.co_name))
++
+     # TODO: a way to track the cell of execution
+     def collect_intermidiate_results(frame: FrameType, event: str, arg: Any):
+         """
+@@ -76,6 +88,10 @@ def create_collector(skip_types: List[type] = [type, type(len), ModuleType, Func
+         if frame.f_code.co_filename.startswith("<ipython") or frame.f_code.co_filename in addl_filenames:
+             counter[0] += 1 # increment student code step counter
+ 
++        if event == "call":
++            track_call(frame)
++            return collect_intermidiate_results
++
+         # return if tracking is disabled by a compelxity check
+         from .complexity import _TRACKING_DISABLED
+         if _TRACKING_DISABLED:
+@@ -137,7 +153,7 @@ def create_collector(skip_types: List[type] = [type, type(len), ModuleType, Func
+         return collect_intermidiate_results
+ 
+     _COLLECTOR_RET = (observed, counter, collect_intermidiate_results)
+-    return observed, collect_intermidiate_results
++    return (observed, calls), collect_intermidiate_results
+ 
+ 
+ def _get_tracing_frame():
+diff --git a/pybryt/student.py b/pybryt/student.py
+index 996dbd9..456a839 100644
+--- a/pybryt/student.py
++++ b/pybryt/student.py
+@@ -49,6 +49,9 @@ class StudentImplementation(Serializable):
+     values: List[Tuple[Any, int]]
+     """the memory footprint (a list of tuples of objects and their timestamps)"""
+ 
++    calls: List[Tuple[str, str]]
++    """the list of all function calls from the student code"""
++
+     steps: int
+     """number of execution steps"""
+ 
+@@ -59,7 +62,7 @@ class StudentImplementation(Serializable):
+         self, path_or_nb: Optional[Union[str, nbformat.NotebookNode]], addl_filenames: List[str] = [],
+         output: Optional[str] = None
+     ):
+-        self .executed_nb = None
++        self.executed_nb = None
+         if path_or_nb is None:
+             self.nb = None
+             self.nb_path = None
+@@ -84,7 +87,7 @@ class StudentImplementation(Serializable):
+                 execution
+             output (``str``, optional): a path at which to write executed notebook
+         """
+-        self.steps, self.values, self.executed_nb = execute_notebook(
++        self.steps, self.values, self.calls, self.executed_nb = execute_notebook(
+             self.nb, self.nb_path, addl_filenames=addl_filenames, output=output
+         )
+ 
+@@ -105,14 +108,17 @@ class StudentImplementation(Serializable):
+ 
+         errors = []
+         for cell in self.executed_nb['cells']:
+-            for out in cell['outputs']:
+-                if out['output_type'] == "error":
+-                    errors.append(out)
++            if cell['cell_type'] == "code":
++                for out in cell['outputs']:
++                    if out['output_type'] == "error":
++                        errors.append(out)
+ 
+         return errors
+ 
+     @classmethod
+-    def from_footprint(cls, footprint: List[Tuple[Any, int]], steps: int) -> 'StudentImplementation':
++    def from_footprint(
++        cls, footprint: List[Tuple[Any, int]], calls: List[Tuple[str, str]], steps: int
++    ) -> 'StudentImplementation':
+         """
+         Create a student implementation object from a memory footprint directly, rather than by
+         executing a notebook. Leaves the ``nb`` and ``nb_path`` instance variables of the resulting 
+@@ -120,11 +126,13 @@ class StudentImplementation(Serializable):
+ 
+         Args:
+             footprint (``list[tuple[object, int]]``): the memory footprint
++            calls (``list[tuple[str, str]]``): the list of function calls
+             steps (``int``): the number of execution steps
+         """
+         stu = cls(None)
+         stu.steps = steps
+         stu.values = footprint
++        stu.calls = calls
+         return stu
+ 
+     @classmethod
+@@ -145,10 +153,12 @@ class StudentImplementation(Serializable):
+         Returns:
+             ``StudentImplementation``: the combined implementation
+         """
+-        new_mfp = []  # the new memory footprint
+-        seen = set()  # set to track which values we've seen
++        new_mfp = []    # the new memory footprint
++        new_calls = []  # the new list of calls
++        seen = set()    # set to track which values we've seen
+         timestamp_offset = 0  # offset for timestamps in the new memory footprint
+         for impl in impls:
++            new_calls.extend(impl.calls)
+             for obj, ts in impl.values:
+                 h = pickle_and_hash(obj)
+                 if h not in seen:
+@@ -156,7 +166,7 @@ class StudentImplementation(Serializable):
+                     new_mfp.append((obj, ts))
+                     seen.add(h)
+             timestamp_offset += impl.steps
+-        return cls.from_footprint(new_mfp, timestamp_offset)
++        return cls.from_footprint(new_mfp, new_calls, timestamp_offset)
+ 
+     @classmethod
+     def from_cache(cls, cache_dir=CACHE_DIR_NAME, combine=True) -> \
+@@ -191,7 +201,7 @@ class StudentImplementation(Serializable):
+         footprint, the same number of steps, and the same source notebook.
+         """
+         return isinstance(other, type(self)) and self.values == other.values and \
+-            self.steps == other.steps and self.nb == other.nb
++            self.steps == other.steps and self.nb == other.nb and self.calls == other.calls
+ 
+     @property
+     def _default_dump_dest(self) -> str:
+@@ -337,6 +347,9 @@ class check:
+     _observed: Optional[List[Tuple[Any, int]]]
+     """the memory footprint"""
+ 
++    _calls: Optional[List[Tuple[str, str]]]
++    """the list of calls from tracing"""
++
+     _cache: bool
+     """whether to cache the memory footprint and results"""
+ 
+@@ -366,6 +379,7 @@ class check:
+         self._show_only = show_only
+         self._frame = None
+         self._observed = None
++        self._calls = None
+         self._report_on_error = report_on_error
+         self._cache = cache
+ 
+@@ -396,7 +410,7 @@ class check:
+             return  # if already tracing, no action required
+ 
+         else:
+-            self._observed, cir = create_collector(**self._kwargs)
++            (self._observed, self._calls), cir = create_collector(**self._kwargs)
+             self._frame = inspect.currentframe().f_back
+             self._frame.f_globals[TRACING_VARNAME] = True
+ 
+@@ -409,7 +423,7 @@ class check:
+             self._frame.f_globals[TRACING_VARNAME] = False
+ 
+             if exc_type is None or self._report_on_error:
+-                stu = StudentImplementation.from_footprint(self._observed, max(t[1] for t in self._observed))
++                stu = StudentImplementation.from_footprint(self._observed, self._calls, max(t[1] for t in self._observed))
+                 res = stu.check(self._ref)
+                 report = generate_report(res, show_only=self._show_only)
+                 if report:
+

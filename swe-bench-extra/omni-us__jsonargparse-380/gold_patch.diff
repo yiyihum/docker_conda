@@ -1,0 +1,234 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 137d475..b3165af 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -19,6 +19,9 @@ Added
+ ^^^^^
+ - Support for user-defined generic types (`#366
+   <https://github.com/omni-us/jsonargparse/issues/366>`__).
++- New function ``extend_base_type`` for easy creation and registering of custom
++  types that extend a base type (`#195
++  <https://github.com/omni-us/jsonargparse/issue/195>`__).
+ - Support for Python 3.12.
+ 
+ Fixed
+@@ -38,6 +41,8 @@ Changed
+ - ``add_subclass_arguments`` now shows a better error message when an empty
+   tuple is given (`lightning#18546
+   <https://github.com/Lightning-AI/lightning/issues/18546>`__).
++- Document the requirements for creating and using custom types (`#195
++  <https://github.com/omni-us/jsonargparse/issue/195>`__).
+ - Removed support for python 3.6.
+ 
+ 
+diff --git a/DOCUMENTATION.rst b/DOCUMENTATION.rst
+index 46dc308..7363c17 100644
+--- a/DOCUMENTATION.rst
++++ b/DOCUMENTATION.rst
+@@ -331,6 +331,24 @@ Having a CLI function this could be easily implemented with
+     :func:`.CLI` is by using :func:`.capture_parser`.
+ 
+ 
++Functions as type
++-----------------
++
++Using a function as a type, like ``int_or_off`` below, is supported though
++discouraged. A basic requirement is that the function be idempotent, i.e.,
++applying the function two or more times should not modify the value. Instead of
++a function, it is recommended to implement a type, see :ref:`custom-types`.
++
++.. testcode::
++
++    # either int larger than zero or 'off' string
++    def int_or_off(x):
++        return x if x == "off" else int(x)
++
++
++    parser.add_argument("--int_or_off", type=int_or_off)
++
++
+ .. _type-hints:
+ 
+ Type hints
+@@ -448,14 +466,6 @@ are:
+     parser.add_argument("--op2", type=from_0_to_10)
+ 
+ 
+-    # either int larger than zero or 'off' string
+-    def int_or_off(x):
+-        return x if x == "off" else PositiveInt(x)
+-
+-
+-    parser.add_argument("--op3", type=int_or_off)
+-
+-
+ .. _restricted-strings:
+ 
+ Restricted strings
+@@ -1090,6 +1100,66 @@ requires to give both a serializer and a deserializer as seen below.
+     :func:`.register_type` then the sub-class option is no longer available.
+ 
+ 
++.. _custom-types:
++
++Creating custom types
++---------------------
++
++It is possible to create new types and use them for parsing. Even though types
++can be created for specific CLI behaviors, it is recommended to create them such
++that they make sense independent of parsing. This is so that they can be used as
++type hints in functions and classes in order to improve the code in a more
++general sense.
++
++There are a few ways for creating types, the most simple being to implement a
++class. When creating a type, take as reference how basic types work, e.g.
++``int``. Properties of basic types are:
++
++- Casting a string creates an instance of the type, if the value is valid, e.g.
++  ``int("1")``.
++- Casting a string raises a ``ValueError``, if the value is not valid, e.g.
++  ``int("a")``.
++- Casting an instance of the type to string gives back the string representation
++  of the value, e.g. ``str(1) == "1"``.
++- Types are idempotent, i.e. casting an instance of the type to the type gives
++  back the same value, e.g. ``int(1) == int(int(1))``.
++
++Once a type is created, it can be registered with :func:`.register_type`. If the
++type follows the properties above, then there is no need to provide more
++parameters, just do ``register_type(MyType)``.
++
++The :func:`.extend_base_type` function can be useful for creating and
++registering new types in a single call. For example, creating a type for even
++integers could be done as:
++
++.. testcode::
++
++    from jsonargparse.typing import extend_base_type
++
++    def is_even(type_class, value):
++        if int(value) % 2 != 0:
++            raise ValueError(f"{value} is not even")
++
++    EvenInt = extend_base_type("EvenInt", int, is_even)
++
++Then this type can be used in a parser as:
++
++.. doctest::
++
++    >>> parser = ArgumentParser()
++    >>> parser.add_argument("--even_int", type=EvenInt)  # doctest: +IGNORE_RESULT
++    >>> parser.parse_args(["--even_int=2"])
++    Namespace(even_int=2)
++
++When using custom types as a type hint, defaults must be casted so that static
++type checkers don't complain. For example:
++
++.. testcode::
++
++    def fn(value: EvenInt = EvenInt(2)):
++        ...
++
++
+ .. _nested-namespaces:
+ 
+ Nested namespaces
+diff --git a/jsonargparse/typing.py b/jsonargparse/typing.py
+index 33e40a6..9bf65c0 100644
+--- a/jsonargparse/typing.py
++++ b/jsonargparse/typing.py
+@@ -15,6 +15,7 @@ __all__ = [
+     "final",
+     "is_final_class",
+     "register_type",
++    "extend_base_type",
+     "restricted_number_type",
+     "restricted_string_type",
+     "path_type",
+@@ -49,14 +50,28 @@ registered_type_handlers: Dict[type, "RegisteredType"] = {}
+ registration_pending: Dict[str, Callable] = {}
+ 
+ 
+-def create_type(
++def extend_base_type(
+     name: str,
+     base_type: type,
+-    check_value: Callable,
+-    register_key: Optional[Tuple] = None,
++    validation_fn: Callable,
+     docstring: Optional[str] = None,
+     extra_attrs: Optional[dict] = None,
++    register_key: Optional[Tuple] = None,
+ ) -> type:
++    """Creates and registers an extension of base type.
++
++    Args:
++        name: How the new type will be called.
++        base_type: The type from which the created type is extended.
++        validation_fn: Function that validates the value on instantiation/casting. Gets two arguments: type_class and
++            value.
++        docstring: The __doc__ attribute value for the created type.
++        extra_attrs: Attributes set to the type class that the validation_fn can access.
++        register_key: Used to determine the uniqueness of registered types.
++
++    Raises:
++        ValueError: If the type has already been registered with a different name.
++    """
+     if register_key in registered_types:
+         registered_type = registered_types[register_key]
+         if registered_type.__name__ != name:
+@@ -64,11 +79,12 @@ def create_type(
+         return registered_type
+ 
+     class TypeCore:
+-        _check_value = check_value
++        _validation_fn = validation_fn
++        _type = base_type
+ 
+         def __new__(cls, v):
+-            cls._check_value(cls, v)
+-            return super().__new__(cls, v)
++            cls._validation_fn(cls, v)
++            return super().__new__(cls, cls._type(v))
+ 
+     if extra_attrs is not None:
+         for key, value in extra_attrs.items():
+@@ -133,7 +149,7 @@ def restricted_number_type(
+         "_type": base_type,
+     }
+ 
+-    def check_value(cls, v):
++    def validation_fn(cls, v):
+         if isinstance(v, bool):
+             raise ValueError(f"{v} not a number")
+         if cls._type == int and isinstance(v, float) and not float.is_integer(v):
+@@ -143,10 +159,10 @@ def restricted_number_type(
+         if (cls._join == "and" and not all(check)) or (cls._join == "or" and not any(check)):
+             raise ValueError(f"{v} does not conform to restriction {cls._expression}")
+ 
+-    return create_type(
++    return extend_base_type(
+         name=name,
+         base_type=base_type,
+-        check_value=check_value,
++        validation_fn=validation_fn,
+         register_key=register_key,
+         docstring=docstring,
+         extra_attrs=extra_attrs,
+@@ -178,14 +194,14 @@ def restricted_string_type(
+         "_type": str,
+     }
+ 
+-    def check_value(cls, v):
++    def validation_fn(cls, v):
+         if not cls._regex.match(v):
+             raise ValueError(f"{v} does not match regular expression {cls._regex.pattern}")
+ 
+-    return create_type(
++    return extend_base_type(
+         name=name,
+         base_type=str,
+-        check_value=check_value,
++        validation_fn=validation_fn,
+         register_key=(expression, str),
+         docstring=docstring,
+         extra_attrs=extra_attrs,

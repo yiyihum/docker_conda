@@ -1,0 +1,261 @@
+diff --git a/sceptre/config/graph.py b/sceptre/config/graph.py
+index 34d6b79..1ad11da 100644
+--- a/sceptre/config/graph.py
++++ b/sceptre/config/graph.py
+@@ -90,14 +90,18 @@ class StackGraph(object):
+         :param stack: A Sceptre Stack
+         :param dependencies: a collection of dependency paths
+         """
+-        self.logger.debug("Generate dependencies for stack {0}".format(stack))
++        self.logger.debug(f"Generate dependencies for stack {stack}")
+         for dependency in set(dependencies):
+             self.graph.add_edge(dependency, stack)
+-            if not nx.is_directed_acyclic_graph(self.graph):
++            try:
++                cycle = nx.find_cycle(self.graph, orientation="original")
++                cycle_str = ", ".join([f"{edge[0]} -> {edge[1]}" for edge in cycle])
+                 raise CircularDependenciesError(
+-                    f"Dependency cycle detected: {stack} {dependency}"
++                    f"Dependency cycle detected: {cycle_str}"
+                 )
+-            self.logger.debug("  Added dependency: {}".format(dependency))
++            except nx.NetworkXNoCycle:
++                pass  # No cycle, continue
++            self.logger.debug(f"  Added dependency: {dependency}")
+ 
+         if not dependencies:
+             self.graph.add_node(stack)
+diff --git a/sceptre/config/reader.py b/sceptre/config/reader.py
+index c1a1018..fc74217 100644
+--- a/sceptre/config/reader.py
++++ b/sceptre/config/reader.py
+@@ -39,16 +39,30 @@ from sceptre.config import strategies
+ 
+ ConfigAttributes = collections.namedtuple("Attributes", "required optional")
+ 
++
++CONFIG_MERGE_STRATEGY_OVERRIDES = {
++    "dependencies": strategies.LIST_STRATEGIES,
++    "hooks": strategies.LIST_STRATEGIES,
++    "notifications": strategies.LIST_STRATEGIES,
++    "parameters": strategies.DICT_STRATEGIES,
++    "sceptre_user_data": strategies.DICT_STRATEGIES,
++    "stack_tags": strategies.DICT_STRATEGIES,
++}
++
+ CONFIG_MERGE_STRATEGIES = {
+     "dependencies": strategies.list_join,
++    "dependencies_inheritance": strategies.child_or_parent,
+     "hooks": strategies.child_wins,
++    "hooks_inheritance": strategies.child_or_parent,
+     "iam_role": strategies.child_wins,
+     "sceptre_role": strategies.child_wins,
+     "iam_role_session_duration": strategies.child_wins,
+     "sceptre_role_session_duration": strategies.child_wins,
+     "notifications": strategies.child_wins,
++    "notifications_inheritance": strategies.child_or_parent,
+     "on_failure": strategies.child_wins,
+     "parameters": strategies.child_wins,
++    "parameters_inheritance": strategies.child_or_parent,
+     "profile": strategies.child_wins,
+     "project_code": strategies.child_wins,
+     "protect": strategies.child_wins,
+@@ -57,8 +71,10 @@ CONFIG_MERGE_STRATEGIES = {
+     "role_arn": strategies.child_wins,
+     "cloudformation_service_role": strategies.child_wins,
+     "sceptre_user_data": strategies.child_wins,
++    "sceptre_user_data_inheritance": strategies.child_or_parent,
+     "stack_name": strategies.child_wins,
+     "stack_tags": strategies.child_wins,
++    "stack_tags_inheritance": strategies.child_or_parent,
+     "stack_timeout": strategies.child_wins,
+     "template_bucket_name": strategies.child_wins,
+     "template_key_value": strategies.child_wins,
+@@ -68,6 +84,7 @@ CONFIG_MERGE_STRATEGIES = {
+     "obsolete": strategies.child_wins,
+ }
+ 
++
+ STACK_GROUP_CONFIG_ATTRIBUTES = ConfigAttributes(
+     {"project_code", "region"},
+     {
+@@ -84,7 +101,9 @@ STACK_CONFIG_ATTRIBUTES = ConfigAttributes(
+         "template_path",
+         "template",
+         "dependencies",
++        "dependencies_inheritance",
+         "hooks",
++        "hooks_inheritance",
+         "iam_role",
+         "sceptre_role",
+         "iam_role_session_duration",
+@@ -92,13 +111,16 @@ STACK_CONFIG_ATTRIBUTES = ConfigAttributes(
+         "notifications",
+         "on_failure",
+         "parameters",
++        "parameters_inheritance",
+         "profile",
+         "protect",
+         "role_arn",
+         "cloudformation_service_role",
+         "sceptre_user_data",
++        "sceptre_user_data_inheritance",
+         "stack_name",
+         "stack_tags",
++        "stack_tags_inheritance",
+         "stack_timeout",
+     },
+ )
+@@ -352,11 +374,8 @@ class ConfigReader(object):
+ 
+         # Parse and read in the config files.
+         this_config = self._recursive_read(directory_path, filename, config)
+-
+-        if "dependencies" in config or "dependencies" in this_config:
+-            this_config["dependencies"] = CONFIG_MERGE_STRATEGIES["dependencies"](
+-                this_config.get("dependencies"), config.get("dependencies")
+-            )
++        # Apply merge strategies with the config that includes base_config values.
++        this_config.update(self._get_merge_with_stratgies(config, this_config))
+         config.update(this_config)
+ 
+         self._check_version(config)
+@@ -395,16 +414,39 @@ class ConfigReader(object):
+ 
+         # Read config file and overwrite inherited properties
+         child_config = self._render(directory_path, filename, config_group) or {}
++        child_config.update(self._get_merge_with_stratgies(config, child_config))
++        config.update(child_config)
++        return config
+ 
+-        for config_key, strategy in CONFIG_MERGE_STRATEGIES.items():
+-            value = strategy(config.get(config_key), child_config.get(config_key))
++    def _get_merge_with_stratgies(self, left: dict, right: dict) -> dict:
++        """
++        Returns a new dict with only the merge values of the two inputs, using the
++        merge strategies defined for each key.
++        """
++        merge = {}
++
++        # Then apply the merge strategies to each item
++        for config_key, default_strategy in CONFIG_MERGE_STRATEGIES.items():
++            strategy = default_strategy
++            override_key = f"{config_key}_inheritance"
++            if override_key in CONFIG_MERGE_STRATEGIES:
++                name = CONFIG_MERGE_STRATEGIES[override_key](
++                    left.get(override_key), right.get(override_key)
++                )
++                if not name:
++                    pass
++                elif name not in CONFIG_MERGE_STRATEGY_OVERRIDES[config_key]:
++                    raise SceptreException(
++                        f"{name} is not a valid inheritance strategy for {config_key}"
++                    )
++                else:
++                    strategy = CONFIG_MERGE_STRATEGY_OVERRIDES[config_key][name]
+ 
++            value = strategy(left.get(config_key), right.get(config_key))
+             if value:
+-                child_config[config_key] = value
++                merge[config_key] = value
+ 
+-        config.update(child_config)
+-
+-        return config
++        return merge
+ 
+     def _render(self, directory_path, basename, stack_group_config):
+         """
+diff --git a/sceptre/config/strategies.py b/sceptre/config/strategies.py
+index 29b37d9..b0dc989 100644
+--- a/sceptre/config/strategies.py
++++ b/sceptre/config/strategies.py
+@@ -71,3 +71,26 @@ def child_wins(a, b):
+     :returns: b
+     """
+     return b
++
++
++def child_or_parent(a, b):
++    """
++    Returns the second arg if it is not empty, else the first.
++
++    :param a: An object.
++    :type a: object
++    :param b: An object.
++    :type b: object
++    :returns: b
++    """
++    return b or a
++
++
++LIST_STRATEGIES = {
++    "merge": list_join,
++    "override": child_wins,
++}
++DICT_STRATEGIES = {
++    "merge": dict_merge,
++    "override": child_wins,
++}
+diff --git a/sceptre/stack.py b/sceptre/stack.py
+index 8a63309..fa5639a 100644
+--- a/sceptre/stack.py
++++ b/sceptre/stack.py
+@@ -9,7 +9,7 @@ This module implements a Stack class, which stores a Stack's data.
+ 
+ import logging
+ 
+-from typing import List, Any, Optional
++from typing import List, Dict, Union, Any, Optional
+ from deprecation import deprecated
+ 
+ from sceptre import __version__
+@@ -26,6 +26,7 @@ from sceptre.resolvers import (
+     ResolvableValueProperty,
+     RecursiveResolve,
+     PlaceholderType,
++    Resolver,
+ )
+ from sceptre.template import Template
+ 
+@@ -262,7 +263,7 @@ class Stack:
+         )
+ 
+         self.s3_details = s3_details
+-        self.parameters = parameters or {}
++        self.parameters = self._ensure_parameters(parameters or {})
+         self.sceptre_user_data = sceptre_user_data or {}
+         self.notifications = notifications or []
+ 
+@@ -275,6 +276,30 @@ class Stack:
+             )
+         return value
+ 
++    def _ensure_parameters(
++        self, parameters: Dict[str, Any]
++    ) -> Dict[str, Union[str, List[Union[str, Resolver]], Resolver]]:
++        """Ensure CloudFormation parameters are of valid types"""
++
++        def is_valid(value: Any) -> bool:
++            return (
++                isinstance(value, str)
++                or (
++                    isinstance(value, list)
++                    and all(
++                        isinstance(item, str) or isinstance(item, Resolver)
++                        for item in value
++                    )
++                )
++                or isinstance(value, Resolver)
++            )
++
++        if not all(is_valid(value) for value in parameters.values()):
++            raise InvalidConfigFileError(
++                f"{self.name}: Values for parameters must be strings, lists or resolvers, got {parameters}"
++            )
++        return parameters
++
+     def __repr__(self):
+         return (
+             "sceptre.stack.Stack("
+

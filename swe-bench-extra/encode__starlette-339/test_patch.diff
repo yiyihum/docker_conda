@@ -1,0 +1,122 @@
+diff --git a/tests/test_datastructures.py b/tests/test_datastructures.py
+index 51c9ba8..bcf1535 100644
+--- a/tests/test_datastructures.py
++++ b/tests/test_datastructures.py
+@@ -1,7 +1,10 @@
++import io
++
+ from starlette.datastructures import (
+     URL,
+     CommaSeparatedStrings,
+     DatabaseURL,
++    FormData,
+     Headers,
+     MutableHeaders,
+     QueryParams,
+@@ -201,3 +204,30 @@ def test_queryparams():
+ 
+     q = QueryParams(items=[("a", "123"), ("a", "456")])
+     assert QueryParams(q) == q
++
++
++def test_formdata():
++    upload = io.BytesIO(b"test")
++    form = FormData(items=[("a", "123"), ("a", "456"), ("b", upload)])
++    assert "a" in form
++    assert "A" not in form
++    assert "c" not in form
++    assert form["a"] == "456"
++    assert form.get("a") == "456"
++    assert form.get("nope", default=None) is None
++    assert form.getlist("a") == ["123", "456"]
++    assert form.keys() == ["a", "b"]
++    assert form.values() == ["456", upload]
++    assert form.items() == [("a", "456"), ("b", upload)]
++    assert len(form) == 2
++    assert list(form) == ["a", "b"]
++    assert dict(form) == {"a": "456", "b": upload}
++    assert (
++        repr(form)
++        == "FormData(items=[('a', '123'), ('a', '456'), ('b', " + repr(upload) + ")])"
++    )
++    assert FormData(form) == form
++    assert FormData({"a": "123", "b": "789"}) == FormData(
++        items=[("a", "123"), ("b", "789")]
++    )
++    assert FormData({"a": "123", "b": "789"}) != {"a": "123", "b": "789"}
+diff --git a/tests/test_formparsers.py b/tests/test_formparsers.py
+index 1d533ce..2f263fd 100644
+--- a/tests/test_formparsers.py
++++ b/tests/test_formparsers.py
+@@ -33,6 +33,28 @@ def app(scope):
+     return asgi
+ 
+ 
++def multi_items_app(scope):
++    async def asgi(receive, send):
++        request = Request(scope, receive)
++        data = await request.form()
++        output = {}
++        for key, value in data.multi_items():
++            if key not in output:
++                output[key] = []
++            if isinstance(value, UploadFile):
++                content = await value.read()
++                output[key].append(
++                    {"filename": value.filename, "content": content.decode()}
++                )
++            else:
++                output[key].append(value)
++        await request.close()
++        response = JSONResponse(output)
++        await response(receive, send)
++
++    return asgi
++
++
+ def app_read_body(scope):
+     async def asgi(receive, send):
+         request = Request(scope, receive)
+@@ -86,6 +108,29 @@ def test_multipart_request_multiple_files(tmpdir):
+         }
+ 
+ 
++def test_multi_items(tmpdir):
++    path1 = os.path.join(tmpdir, "test1.txt")
++    with open(path1, "wb") as file:
++        file.write(b"<file1 content>")
++
++    path2 = os.path.join(tmpdir, "test2.txt")
++    with open(path2, "wb") as file:
++        file.write(b"<file2 content>")
++
++    client = TestClient(multi_items_app)
++    with open(path1, "rb") as f1, open(path2, "rb") as f2:
++        response = client.post(
++            "/", data=[("test1", "abc")], files=[("test1", f1), ("test1", f2)]
++        )
++        assert response.json() == {
++            "test1": [
++                "abc",
++                {"filename": "test1.txt", "content": "<file1 content>"},
++                {"filename": "test2.txt", "content": "<file2 content>"},
++            ]
++        }
++
++
+ def test_multipart_request_mixed_files_and_data(tmpdir):
+     client = TestClient(app)
+     response = client.post(
+diff --git a/tests/test_requests.py b/tests/test_requests.py
+index 32d0ab6..8e3f368 100644
+--- a/tests/test_requests.py
++++ b/tests/test_requests.py
+@@ -130,7 +130,7 @@ def test_request_form_urlencoded():
+         async def asgi(receive, send):
+             request = Request(scope, receive)
+             form = await request.form()
+-            response = JSONResponse({"form": form})
++            response = JSONResponse({"form": dict(form)})
+             await response(receive, send)
+ 
+         return asgi

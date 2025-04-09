@@ -1,0 +1,120 @@
+diff --git a/setup.py b/setup.py
+index b57f9cd0..79e45eb0 100644
+--- a/setup.py
++++ b/setup.py
+@@ -21,9 +21,10 @@ setup(
+         # ConfigUpdater does not manage its minimum requirements correctly.
+         "setuptools>=38.3",
+         "execnet>=1.8.1",
+-        "pyyaml",
+         "importlib_metadata",
+-        "py",],
++        "py",
++        "pyyaml",
++        'remote-pdb',],
+     extras_require={
+         "test": [
+             "mock",
+diff --git a/src/batou/__init__.py b/src/batou/__init__.py
+index b1fb3171..b2eaf5bb 100644
+--- a/src/batou/__init__.py
++++ b/src/batou/__init__.py
+@@ -1,5 +1,6 @@
+ # This code must not cause non-stdlib imports to support self-bootstrapping.
+ import os.path
++import os
+ import traceback
+ 
+ from ._output import output
+@@ -7,6 +8,13 @@ from ._output import output
+ with open(os.path.dirname(__file__) + "/version.txt") as f:
+     __version__ = f.read().strip()
+ 
++# Configure `remote-pdb` to be used with `breakpoint()` in Python 3.7+:
++os.environ['PYTHONBREAKPOINT'] = "remote_pdb.set_trace"
++if not os.environ.get('REMOTE_PDB_HOST', None):
++    os.environ['REMOTE_PDB_HOST'] = "127.0.0.1"
++if not os.environ.get('REMOTE_PDB_PORT', None):
++    os.environ['REMOTE_PDB_PORT'] = "4444"
++
+ 
+ class ReportingException(Exception):
+     """Exceptions that support user-readable reporting."""
+diff --git a/src/batou/host.py b/src/batou/host.py
+index ce232734..aa7c2e52 100644
+--- a/src/batou/host.py
++++ b/src/batou/host.py
+@@ -8,6 +8,12 @@ import yaml
+ from batou import (DeploymentError, SilentConfigurationError, output,
+                    remote_core)
+ 
++# Keys in os.environ which get propagated to the remote side:
++REMOTE_OS_ENV_KEYS = (
++    'REMOTE_PDB_HOST',
++    'REMOTE_PDB_PORT',
++)
++
+ # Monkeypatch execnet to support 'vagrant ssh' and 'kitchen exec'.
+ # 'vagrant' support has been added to 'execnet' release 1.4.
+ 
+@@ -285,9 +291,19 @@ pre=\"\"; else pre=\"sudo -ni -u {user}\"; fi; $pre\
+         # know about locally)
+         self.rpc.setup_output()
+ 
+-        self.rpc.setup_deployment(env.name, self.name, env.overrides,
+-                                  env.secret_files, env.secret_data,
+-                                  env._host_data(), env.timeout, env.platform)
++        self.rpc.setup_deployment(
++            env.name,
++            self.name,
++            env.overrides,
++            env.secret_files,
++            env.secret_data,
++            env._host_data(),
++            env.timeout,
++            env.platform,
++            {
++                key: os.environ.get(key)
++                for key in REMOTE_OS_ENV_KEYS if os.environ.get(key)},
++        )
+ 
+     def disconnect(self):
+         if self.gateway is not None:
+diff --git a/src/batou/remote_core.py b/src/batou/remote_core.py
+index 8b7856b4..1cb0555a 100644
+--- a/src/batou/remote_core.py
++++ b/src/batou/remote_core.py
+@@ -129,8 +129,16 @@ class Deployment(object):
+ 
+     environment = None
+ 
+-    def __init__(self, env_name, host_name, overrides, secret_files,
+-                 secret_data, host_data, timeout, platform):
++    def __init__(self,
++                 env_name,
++                 host_name,
++                 overrides,
++                 secret_files,
++                 secret_data,
++                 host_data,
++                 timeout,
++                 platform,
++                 os_env=None):
+         self.env_name = env_name
+         self.host_name = host_name
+         self.overrides = overrides
+@@ -139,10 +147,13 @@ class Deployment(object):
+         self.secret_data = secret_data
+         self.timeout = timeout
+         self.platform = platform
++        self.os_env = os_env
+ 
+     def load(self):
+         from batou.environment import Environment
+ 
++        if self.os_env:
++            os.environ.update(self.os_env)
+         self.environment = Environment(self.env_name, self.timeout,
+                                        self.platform)
+         self.environment.deployment = self
+

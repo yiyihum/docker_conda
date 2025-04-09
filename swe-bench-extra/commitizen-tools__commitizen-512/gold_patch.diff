@@ -1,0 +1,177 @@
+diff --git a/commitizen/cli.py b/commitizen/cli.py
+index bf751b44..d9f1025b 100644
+--- a/commitizen/cli.py
++++ b/commitizen/cli.py
+@@ -240,6 +240,12 @@ data = {
+                         "help": "commit message that needs to be checked",
+                         "exclusive_group": "group1",
+                     },
++                    {
++                        "name": ["--allow-abort"],
++                        "action": "store_true",
++                        "default": False,
++                        "help": "allow empty commit messages, which typically abort a commit",
++                    },
+                 ],
+             },
+             {
+diff --git a/commitizen/commands/check.py b/commitizen/commands/check.py
+index a32613e7..fb79e805 100644
+--- a/commitizen/commands/check.py
++++ b/commitizen/commands/check.py
+@@ -26,6 +26,9 @@ class Check:
+         self.commit_msg_file: Optional[str] = arguments.get("commit_msg_file")
+         self.commit_msg: Optional[str] = arguments.get("message")
+         self.rev_range: Optional[str] = arguments.get("rev_range")
++        self.allow_abort: bool = bool(
++            arguments.get("allow_abort", config.settings["allow_abort"])
++        )
+ 
+         self._valid_command_argument()
+ 
+@@ -33,15 +36,16 @@ class Check:
+         self.cz = factory.commiter_factory(self.config)
+ 
+     def _valid_command_argument(self):
+-        number_args_provided = (
+-            bool(self.commit_msg_file) + bool(self.commit_msg) + bool(self.rev_range)
++        num_exclusive_args_provided = sum(
++            arg is not None
++            for arg in (self.commit_msg_file, self.commit_msg, self.rev_range)
+         )
+-        if number_args_provided == 0 and not os.isatty(0):
++        if num_exclusive_args_provided == 0 and not os.isatty(0):
+             self.commit_msg: Optional[str] = sys.stdin.read()
+-        elif number_args_provided != 1:
++        elif num_exclusive_args_provided != 1:
+             raise InvalidCommandArgumentError(
+                 (
+-                    "One and only one argument is required for check command! "
++                    "Only one of --rev-range, --message, and --commit-msg-file is permitted by check command! "
+                     "See 'cz check -h' for more information"
+                 )
+             )
+@@ -60,7 +64,7 @@ class Check:
+         ill_formated_commits = [
+             commit
+             for commit in commits
+-            if not Check.validate_commit_message(commit.message, pattern)
++            if not self.validate_commit_message(commit.message, pattern)
+         ]
+         displayed_msgs_content = "\n".join(
+             [
+@@ -79,7 +83,8 @@ class Check:
+ 
+     def _get_commits(self):
+         # Get commit message from file (--commit-msg-file)
+-        if self.commit_msg_file:
++        if self.commit_msg_file is not None:
++            # Enter this branch if commit_msg_file is "".
+             with open(self.commit_msg_file, "r", encoding="utf-8") as commit_file:
+                 msg = commit_file.read()
+             msg = self._filter_comments(msg)
+@@ -87,7 +92,8 @@ class Check:
+             commit_title = msg.split("\n")[0]
+             commit_body = "\n".join(msg.split("\n")[1:])
+             return [git.GitCommit(rev="", title=commit_title, body=commit_body)]
+-        elif self.commit_msg:
++        elif self.commit_msg is not None:
++            # Enter this branch if commit_msg is "".
+             self.commit_msg = self._filter_comments(self.commit_msg)
+             return [git.GitCommit(rev="", title="", body=self.commit_msg)]
+ 
+@@ -98,8 +104,9 @@ class Check:
+         lines = [line for line in msg.split("\n") if not line.startswith("#")]
+         return "\n".join(lines)
+ 
+-    @staticmethod
+-    def validate_commit_message(commit_msg: str, pattern: str) -> bool:
++    def validate_commit_message(self, commit_msg: str, pattern: str) -> bool:
++        if not commit_msg:
++            return self.allow_abort
+         if (
+             commit_msg.startswith("Merge")
+             or commit_msg.startswith("Revert")
+diff --git a/commitizen/cz/__init__.py b/commitizen/cz/__init__.py
+index f141e1c2..e14cb9f7 100644
+--- a/commitizen/cz/__init__.py
++++ b/commitizen/cz/__init__.py
+@@ -20,7 +20,7 @@ def discover_plugins(path: Iterable[str] = None) -> Dict[str, Type[BaseCommitize
+         Dict[str, Type[BaseCommitizen]]: Registry with found plugins
+     """
+     plugins = {}
+-    for finder, name, ispkg in pkgutil.iter_modules(path):
++    for _finder, name, _ispkg in pkgutil.iter_modules(path):
+         try:
+             if name.startswith("cz_"):
+                 plugins[name] = importlib.import_module(name).discover_this
+diff --git a/commitizen/defaults.py b/commitizen/defaults.py
+index 0b217bf7..35a518ad 100644
+--- a/commitizen/defaults.py
++++ b/commitizen/defaults.py
+@@ -31,6 +31,7 @@ class Settings(TypedDict, total=False):
+     version_files: List[str]
+     tag_format: Optional[str]
+     bump_message: Optional[str]
++    allow_abort: bool
+     changelog_file: str
+     changelog_incremental: bool
+     changelog_start_rev: Optional[str]
+@@ -56,6 +57,7 @@ DEFAULT_SETTINGS: Settings = {
+     "version_files": [],
+     "tag_format": None,  # example v$version
+     "bump_message": None,  # bumped v$current_version to $new_version
++    "allow_abort": False,
+     "changelog_file": "CHANGELOG.md",
+     "changelog_incremental": False,
+     "changelog_start_rev": None,
+diff --git a/docs/check.md b/docs/check.md
+index e1f0344e..759d60d9 100644
+--- a/docs/check.md
++++ b/docs/check.md
+@@ -7,7 +7,11 @@ If you want to setup an automatic check before every git commit, please refer to
+ [Automatically check message before commit](auto_check.md).
+ 
+ ## Usage
+-There are three arguments that you can use one of them to check commit message.
++There are three mutually exclusive ways to use `cz check`:
++
++- with `--rev-range` to check a range of pre-existing commits
++- with `--message` or by piping the message to it to check a given string
++- or with `--commit-msg-file` to read the commit message from a file
+ 
+ ### Git Rev Range
+ If you'd like to check a commit's message after it has already been created, then you can specify the range of commits to check with `--rev-range REV_RANGE`.
+@@ -46,3 +50,12 @@ $ cz check --commit-msg-file COMMIT_MSG_FILE
+ 
+ In this option, COMMIT_MSG_FILE is the path of the temporal file that contains the commit message.
+ This argument can be useful when cooperating with git hook, please check [Automatically check message before commit](auto_check.md) for more information about how to use this argument with git hook.
++
++### Allow Abort
++
++```bash
++cz check --message MESSAGE --allow-abort
++```
++
++Empty commit messages typically instruct Git to abort a commit, so you can pass `--allow-abort` to
++permit them. Since `git commit` accepts an `--allow-empty-message` flag (primarily for wrapper scripts), you may wish to disallow such commits in CI. `--allow-abort` may be used in conjunction with any of the other options.
+diff --git a/docs/config.md b/docs/config.md
+index 119db6f7..6a7838e2 100644
+--- a/docs/config.md
++++ b/docs/config.md
+@@ -131,6 +131,7 @@ commitizen:
+ | `update_changelog_on_bump` | `bool` | `false`                     | Create changelog when running `cz bump`                                                                                                                                                         |
+ | `annotated_tag`            | `bool` | `false`                     | Use annotated tags instead of lightweight tags. [See difference][annotated-tags-vs-lightweight]                                                                                                 |
+ | `bump_message`             | `str`  | `None`                      | Create custom commit message, useful to skip ci. [See more][bump_message]                                                                                                                       |
++| `allow_abort`              | `bool` | `false`                     | Disallow empty commit messages, useful in ci. [See more][allow_abort]                                                                                                                           |
+ | `changelog_file`           | `str`  | `CHANGELOG.md`              | filename of exported changelog                                                                                                                                                                  |
+ | `changelog_incremental`    | `bool` | `false`                     | Update changelog with the missing versions. This is good if you don't want to replace previous versions in the file. Note: when doing `cz bump --changelog` this is automatically set to `true` |
+ | `changelog_start_rev`      | `str`  | `None`                      | Start from a given git rev to generate the changelog                                                                                                                                            |
+@@ -141,6 +142,7 @@ commitizen:
+ [version_files]: bump.md#version_files
+ [tag_format]: bump.md#tag_format
+ [bump_message]: bump.md#bump_message
++[allow_abort]: check.md#allow-abort
+ [additional-features]: https://github.com/tmbo/questionary#additional-features
+ [customization]: customization.md
+ [shortcuts]: customization.md#shortcut-keys

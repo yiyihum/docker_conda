@@ -1,0 +1,199 @@
+diff --git a/docs/user/integrate/build.md b/docs/user/integrate/build.md
+index ba3b908..9f25c26 100644
+--- a/docs/user/integrate/build.md
++++ b/docs/user/integrate/build.md
+@@ -125,10 +125,14 @@ It's easy set and get environment variables in the FDF, DSC, Settings file, and
+ 
+ | **Type**      | **Set**                  | **Get**                         |
+ |---------------|--------------------------|---------------------------------|
+-| Command Line  | VAR=Value                | N/A                             |
++| Command Line  | VAR [= Value]            | N/A                             |
+ | FDF/DSC       | DEFINE VAR = Value       | $(VAR)                          |
+ | Settings File | env.SetValue(Var, Value) | env.GetValue(Var, DefaultValue) |
+ 
++To support parity with Edk2's build command line option -D/--define, variables passed via the command line are not
++required to have a value associated with them. Variables defined this way are considered non-valued variable defines
++and should be checked for existence rather then value (i.e. `if env.GetValue(var):` or `if not env.GetValue(var)`).
++
+ While you can set and get variables anywhere in the `UefiBuilder` portion of the settings file, we provide the following
+ two methods to set environment variables, ensuring they are available everywhere that you are allowed to customize:
+ 
+@@ -155,16 +159,16 @@ value of profile during `SetPlatformEnv()` and make our build customizations fro
+ 
+ def __init__(self):
+     self.profiles = {
+-        "DEV" : {"TARGET" : "DEBUG", "EDK_SHELL": "TRUE"},
+-        "SELFHOST" : {"TARGET" : "RELEASE", "EDK_SHELL": "TRUE"},
+-        "RELEASE" : {"TARGET" : "RELEASE", "EDK_SHELL": "FALSE"}
++        "DEV" : {"TARGET" : "DEBUG", "EDK_SHELL": ""},
++        "SELFHOST" : {"TARGET" : "RELEASE", "EDK_SHELL": ""},
++        "RELEASE" : {"TARGET" : "RELEASE"}
+     }
+ ...
+ 
+ def SetPlatformEnv(self):
+-    profile = self.env.GetValue("PROFILE", "DEV") # Default DEV
+-    if profile in self.profiles:
+-        for key, value in profile.items():
++    build_profile = self.env.GetValue("PROFILE", "DEV") # Default DEV
++    if build_profile in self.profiles:
++        for key, value in self.profile[build_profile].items():
+             self.env.SetValue(key, value, "PROFILE VALUE")
+ ...
+ ```
+@@ -173,7 +177,7 @@ The environment variables are set, whats next? The target is automatically picke
+ needs to be done is to add the logic of including the Edk shell or not. This can be done in the platform fdf as seen below:
+ 
+ ``` shell
+-!if $(EDK_SHELL= TRUE)
++!if $(EDK_SHELL)
+ FILE APPLICATION = PCD(gPcBdsPkgTokenSpaceGuid.PcdShellFile) {
+   SECTION PE32 = <SomePath>/Shell.efi
+   SECTION UI = "EdkShell"
+diff --git a/docs/user/using/build.md b/docs/user/using/build.md
+index 651f861..6fafe79 100644
+--- a/docs/user/using/build.md
++++ b/docs/user/using/build.md
+@@ -68,14 +68,18 @@ stuart_build -c path/to/SettingsFile.py
+ Yes! Build values can be set and passed to the build command via the command
+ line or from within your platform build file
+ [Read More](/integrate/build#setting-getting-environment-variables).
+-You define a build value via `BLD_*_<Value>` for all builds,
+-`BLD_DEBUG_<Value>` for debug builds, and `BLD_RELEASE_<Value>` for release
++You define a build value via `BLD_*_<VAR>=<VALUE>` for all builds,
++`BLD_DEBUG_<VAR>=VALUE` for debug builds, and `BLD_RELEASE_<VAR>=VALUE` for release
+ builds.
+ 
++Non-valued build defines are also supported! Simply follow the above nomenclature
++without providing a value i.e. `VLD_*_<VAR>`
++
+ From the command line:
+ 
+ ```cmd
+-\> stuart_build -c Platform/QemuQ35Pkg/PlatformBuild.py BLD_*_SHIP_MODE=FALSE
++\> stuart_build -c Platforms/QemuQ35Pkg/PlatformBuild.py BLD_*_SHIP_MODE=FALSE
++\> stuart_build -c Platforms/QemuQ35Pkg/PlatformBuild.py BLD_*_E1000_ENABLE
+ ```
+ 
+ From within the Platform build file:
+@@ -84,5 +88,6 @@ From within the Platform build file:
+ def SetPlatformEnv(self):
+     ...
+     self.env.SetValue("BLD_*_SHIP_MODE", "FALSE", "Default")
++    self.env.SetValue("BLD_*_E1000", None, "Default")
+     ...
+ ```
+diff --git a/edk2toolext/edk2_invocable.py b/edk2toolext/edk2_invocable.py
+index c41fbe3..3b36927 100644
+--- a/edk2toolext/edk2_invocable.py
++++ b/edk2toolext/edk2_invocable.py
+@@ -22,6 +22,8 @@
+ import inspect
+ import pkg_resources
+ import argparse
++from random import choice
++from string import ascii_letters
+ from typing import Iterable, Tuple
+ from textwrap import dedent
+ from edk2toolext.environment import shell_environment
+@@ -331,10 +333,13 @@ def ParseCommandLineOptions(self):
+         epilog = dedent('''\
+             positional arguments:
+               <key>=<value>              - Set an env variable for the pre/post build process
++              <key>                      - Set a non-valued env variable for the pre/post build process
+               BLD_*_<key>=<value>        - Set a build flag for all build types
+                                            (key=value will get passed to build process)
++              BLD_*_<key>                - Set a non-valued build flag for all build types
+               BLD_<TARGET>_<key>=<value> - Set a build flag for build type of <target>
+                                            (key=value will get passed to build process for given build type)
++              BLD_<TARGET>_<key>         - Set a non-valued build flag for a build type of <target>
+             ''')
+ 
+         parserObj = argparse.ArgumentParser(epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter,)
+@@ -414,18 +419,29 @@ def ParseCommandLineOptions(self):
+         self.PlatformSettings.RetrieveCommandLineOptions(args)
+ 
+         #
+-        # Look through unknown_args and BuildConfig for strings that are x=y,
+-        # set env.SetValue(x, y),
+-        # then remove this item from the list.
++        # Look through unknown_args and BuildConfig for strings that are:
++        # 1. x=y, -> set env.SetValue(x, y),
++        # 2. x, -> set env.SetValue(x, random_string)
++        # then remove these items from the list.
+         #
++        # Non valued build variables (#2) set the value to a random string
++        # as the expectation is that any developer using this functionality
++        # check for the existence of the build variable rather then the value
++        # of the variable. This is to have parity between edk2's build -D
++        # flag and stuart.
+         env = shell_environment.GetBuildVars()
+         BuildConfig = os.path.abspath(args.build_config)
+ 
+         for argument in unknown_args:
+-            if argument.count("=") != 1:
++            if argument.count("=") == 1:
++                tokens = argument.strip().split("=")
++                env.SetValue(tokens[0].strip().upper(), tokens[1].strip(), "From CmdLine")
++            elif argument.count("=") == 0:
++                env.SetValue(argument.strip().upper(),
++                             ''.join(choice(ascii_letters) for _ in range(20)),
++                             "Non valued variable set From cmdLine")
++            else:
+                 raise RuntimeError(f"Unknown variable passed in via CLI: {argument}")
+-            tokens = argument.strip().split("=")
+-            env.SetValue(tokens[0].strip().upper(), tokens[1].strip(), "From CmdLine")
+ 
+         unknown_args.clear()  # remove the arguments we've already consumed
+ 
+@@ -438,7 +454,12 @@ def ParseCommandLineOptions(self):
+                     unknown_args.append(stripped_line)
+ 
+         for argument in unknown_args:
+-            if argument.count("=") != 1:
++            if argument.count("=") == 1:
++                tokens = argument.strip().split("=")
++                env.SetValue(tokens[0].strip().upper(), tokens[1].strip(), "From BuildConf")
++            elif argument.count("=") == 0:
++                env.SetValue(argument.strip().upper(),
++                             ''.join(choice(ascii_letters) for _ in range(20)),
++                             "Non valued variable set from BuildConfig")
++            else:
+                 raise RuntimeError(f"Unknown variable passed in via BuildConfig: {argument}")
+-            tokens = argument.strip().split("=")
+-            env.SetValue(tokens[0].strip().upper(), tokens[1].strip(), "From BuildConf")
+diff --git a/edk2toolext/environment/var_dict.py b/edk2toolext/environment/var_dict.py
+index 73f9033..dc3befc 100644
+--- a/edk2toolext/environment/var_dict.py
++++ b/edk2toolext/environment/var_dict.py
+@@ -15,6 +15,8 @@
+ """
+ 
+ import logging
++from random import choice
++from string import ascii_letters
+ 
+ 
+ class EnvEntry(object):
+@@ -140,7 +142,8 @@ def SetValue(self, k, v, comment, overridable=False):
+ 
+         Args:
+             k (str): The key to store the value under
+-            v (varied): The value to store
++            v (varied | None): The value to store as a string, or None to store
++                a non valued build variable
+             comment (str): A comment to show where / how the variable was stored.
+                 Useful for debugging
+             overridable (bool): Specifies if the variable is allowed to be override
+@@ -151,7 +154,10 @@ def SetValue(self, k, v, comment, overridable=False):
+         """
+         key = k.upper()
+         en = self.GetEntry(key)
+-        value = str(v)
++        if not v:
++            value = ''.join(choice(ascii_letters) for _ in range(20))
++        else:
++            value = str(v)
+         self.Logger.debug("Trying to set key %s to value %s" % (k, v))
+         if (en is None):
+             # new entry

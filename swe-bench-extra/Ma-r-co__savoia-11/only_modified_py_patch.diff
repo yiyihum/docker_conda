@@ -1,0 +1,154 @@
+diff --git a/src/savoia/datafeed/datafeed.py b/src/savoia/datafeed/datafeed.py
+index 1fd53f0..942ca41 100644
+--- a/src/savoia/datafeed/datafeed.py
++++ b/src/savoia/datafeed/datafeed.py
+@@ -11,7 +11,7 @@ from savoia.event.event import Event, TickEvent
+ from savoia.types.types import Pair
+ 
+ from logging import getLogger, Logger
+-from typing import List, Dict, Iterator
++from typing import List, Iterator, Tuple
+ from queue import Queue
+ from abc import ABCMeta, abstractmethod
+ import time
+@@ -57,7 +57,7 @@ class HistoricCSVDataFeeder(DataFeeder):
+     pairs: List[Pair]
+     feed_q: 'Queue[Event]'
+     csv_dir: str
+-    pair_frames: Dict[Pair, pd.DataFrame]
++    pair_frames: List[str]
+     file_dates: List[str]
+     cur_date_idx: int
+     cur_date_pairs: pd.DataFrame
+@@ -82,7 +82,6 @@ class HistoricCSVDataFeeder(DataFeeder):
+         self.pairs = pairs
+         self.feed_q = feed_q
+         self.csv_dir = csv_dir
+-        self.pair_frames = {}
+         self.file_dates = self._list_all_file_dates()
+         self.continue_backtest = True
+         self.cur_date_idx = 0
+@@ -111,7 +110,7 @@ class HistoricCSVDataFeeder(DataFeeder):
+         return de_dup_csv
+ 
+     def _open_convert_csv_files_for_day(self, date_str: str) \
+-            -> Iterator[pd.DataFrame]:
++            -> Iterator[Tuple[str, str, str, str]]:
+         """
+         Opens the CSV files from the data directory, converting
+         them into pandas DataFrames within a pairs dictionary.
+@@ -121,20 +120,40 @@ class HistoricCSVDataFeeder(DataFeeder):
+         ordered, allowing tick data events to be added to the queue
+         in a chronological fashion.
+         """
++        # for p in self.pairs:
++        #    pair_path = os.path.join(self.csv_dir, '%s_%s.csv' % (p, date_str))
++        #     self.logger.info("start read: %s", str(pair_path))
++        #     with open(pair_path, 'r') as f:
++
++        #     self.pair_frames[p] = pd.read_csv(
++        #         pair_path,
++        #         header=0,
++        #         index_col=0,
++        #         parse_dates=["Time"],
++        #         dayfirst=True,
++        #         names=("Time", "Ask", "Bid", "AskVolume", "BidVolume")
++        #     )
++        #     self.pair_frames[p]["Pair"] = p
++        #     self.logger.info("end read: %s", str(pair_path))
++        # return pd.concat(self.pair_frames.values()).sort_index().iterrows()
++        self.pair_frames = []
+         for p in self.pairs:
+             pair_path = os.path.join(self.csv_dir, '%s_%s.csv' % (p, date_str))
+             self.logger.info("start read: %s", str(pair_path))
+-            self.pair_frames[p] = pd.io.parsers.read_csv(
+-                pair_path,
+-                header=0,
+-                index_col=0,
+-                parse_dates=["Time"],
+-                dayfirst=True,
+-                names=("Time", "Ask", "Bid", "AskVolume", "BidVolume")
+-            )
++            with open(pair_path, 'r') as f:
++                f.__next__()
++                for line in f:
++                    self.pair_frames.append(line + f',{p}')
+             self.logger.info("end read: %s", str(pair_path))
+-            self.pair_frames[p]["Pair"] = p
+-        return pd.concat(self.pair_frames.values()).sort_index().iterrows()
++        self.logger.info('start sort')
++        self.pair_frames.sort()
++
++        def _gen() -> Iterator[Tuple[str, str, str, str]]:
++            for row in self.pair_frames:
++                date, ask, bid, ask_volume, bid_volume, pair = row.split(',')
++                yield date, ask, bid, pair
++
++        return _gen()
+ 
+     def _update_csv_for_day(self) -> bool:
+         try:
+@@ -148,19 +167,19 @@ class HistoricCSVDataFeeder(DataFeeder):
+ 
+     def _stream_next_tick(self) -> None:
+         try:
+-            index, row = next(self.cur_date_pairs)
++            date, ask, bid, pair = next(self.cur_date_pairs)
+         except StopIteration:
+             # End of the current days data
+             if self._update_csv_for_day():
+-                index, row = next(self.cur_date_pairs)
++                date, ask, bid, pair = next(self.cur_date_pairs)
+             else:  # End of the data
+                 self.continue_backtest = False
+                 return
+-        pair = row["Pair"]
+-        bid = Decimal(str(row["Bid"])).quantize(DECIMAL_PLACES)
+-        ask = Decimal(str(row["Ask"])).quantize(DECIMAL_PLACES)
++        date = pd.Timestamp(date)
++        bid = Decimal(bid).quantize(DECIMAL_PLACES)
++        ask = Decimal(ask).quantize(DECIMAL_PLACES)
+ 
+-        tev = TickEvent(pair, index, bid, ask)
++        tev = TickEvent(pair, date, bid, ask)
+         self.feed_q.put(tev)
+ 
+     def run(self) -> None:
+diff --git a/src/savoia/performance/performance.py b/src/savoia/performance/performance.py
+index 49b1d68..a5dfa8b 100644
+--- a/src/savoia/performance/performance.py
++++ b/src/savoia/performance/performance.py
+@@ -26,7 +26,7 @@ def create_drawdowns(pnl: pd.Series) -> Tuple[pd.Series, float, int]:
+ 
+     # Loop over the index range
+     for t in range(1, len(idx)):
+-        hwm.append(max(hwm[t - 1], pnl.ix[t]))
+-        drawdown.ix[t] = (hwm[t] - pnl.ix[t])
+-        duration.ix[t] = (0 if drawdown.ix[t] == 0 else duration.ix[t - 1] + 1)
++        hwm.append(max(hwm[t - 1], pnl.iloc[t]))
++        drawdown.iloc[t] = (hwm[t] - pnl.iloc[t])
++        duration.iloc[t] = (0 if drawdown.iloc[t] == 0 else duration.iloc[t - 1] + 1)
+     return drawdown, drawdown.max(), duration.max()
+diff --git a/src/savoia/portfolio/portfolio.py b/src/savoia/portfolio/portfolio.py
+index 1d9ad1a..c7b668f 100644
+--- a/src/savoia/portfolio/portfolio.py
++++ b/src/savoia/portfolio/portfolio.py
+@@ -54,7 +54,7 @@ class Portfolio(object):
+     def _create_equity_file(self) -> TextIO:
+         filename: str = "backtest.csv"
+         out_file: TextIO = open(os.path.join(OUTPUT_RESULTS_DIR, filename), "w")
+-        header: str = "Timestamp,Balance"
++        header: str = "Timestamp,Equity"
+         for pair in self.ticker.pairs:
+             header += ",%s" % pair
+         header += "\n"
+@@ -102,7 +102,7 @@ class Portfolio(object):
+         if self.isBacktest:
+             out_line = f'{event.time}, {self.equity}'
+             for pair in self.ticker.pairs:
+-                out_line += ",{self.positions[pair].upl}"
++                out_line += f",{self.positions[pair].upl}"
+             out_line += "\n"
+             self.backtest_file.write(out_line)
+ 
+

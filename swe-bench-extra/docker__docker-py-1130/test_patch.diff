@@ -1,0 +1,191 @@
+diff --git a/tests/helpers.py b/tests/helpers.py
+index 21036ace..94ea3887 100644
+--- a/tests/helpers.py
++++ b/tests/helpers.py
+@@ -1,9 +1,6 @@
+-import errno
+ import os
+ import os.path
+-import select
+ import shutil
+-import struct
+ import tarfile
+ import tempfile
+ import unittest
+@@ -54,7 +51,7 @@ def exec_driver_is_native():
+         c = docker_client()
+         EXEC_DRIVER = c.info()['ExecutionDriver']
+         c.close()
+-    return EXEC_DRIVER.startswith('native')
++    return EXEC_DRIVER.startswith('native') or EXEC_DRIVER == ''
+ 
+ 
+ def docker_client(**kwargs):
+@@ -67,49 +64,6 @@ def docker_client_kwargs(**kwargs):
+     return client_kwargs
+ 
+ 
+-def read_socket(socket, n=4096):
+-    """ Code stolen from dockerpty to read the socket """
+-    recoverable_errors = (errno.EINTR, errno.EDEADLK, errno.EWOULDBLOCK)
+-
+-    # wait for data to become available
+-    select.select([socket], [], [])
+-
+-    try:
+-        if hasattr(socket, 'recv'):
+-            return socket.recv(n)
+-        return os.read(socket.fileno(), n)
+-    except EnvironmentError as e:
+-        if e.errno not in recoverable_errors:
+-            raise
+-
+-
+-def next_packet_size(socket):
+-    """ Code stolen from dockerpty to get the next packet size """
+-    data = six.binary_type()
+-    while len(data) < 8:
+-        next_data = read_socket(socket, 8 - len(data))
+-        if not next_data:
+-            return 0
+-        data = data + next_data
+-
+-    if data is None:
+-        return 0
+-
+-    if len(data) == 8:
+-        _, actual = struct.unpack('>BxxxL', data)
+-        return actual
+-
+-
+-def read_data(socket, packet_size):
+-    data = six.binary_type()
+-    while len(data) < packet_size:
+-        next_data = read_socket(socket, packet_size - len(data))
+-        if not next_data:
+-            assert False, "Failed trying to read in the dataz"
+-        data += next_data
+-    return data
+-
+-
+ class BaseTestCase(unittest.TestCase):
+     tmp_imgs = []
+     tmp_containers = []
+diff --git a/tests/integration/container_test.py b/tests/integration/container_test.py
+index 56b648a3..61b33983 100644
+--- a/tests/integration/container_test.py
++++ b/tests/integration/container_test.py
+@@ -3,6 +3,8 @@ import signal
+ import tempfile
+ 
+ import docker
++from docker.utils.socket import next_frame_size
++from docker.utils.socket import read_exactly
+ import pytest
+ import six
+ 
+@@ -1025,9 +1027,9 @@ class AttachContainerTest(helpers.BaseTestCase):
+ 
+         self.client.start(ident)
+ 
+-        next_size = helpers.next_packet_size(pty_stdout)
++        next_size = next_frame_size(pty_stdout)
+         self.assertEqual(next_size, len(line))
+-        data = helpers.read_data(pty_stdout, next_size)
++        data = read_exactly(pty_stdout, next_size)
+         self.assertEqual(data.decode('utf-8'), line)
+ 
+ 
+diff --git a/tests/integration/exec_test.py b/tests/integration/exec_test.py
+index 9f548080..8bf2762a 100644
+--- a/tests/integration/exec_test.py
++++ b/tests/integration/exec_test.py
+@@ -1,5 +1,8 @@
+ import pytest
+ 
++from docker.utils.socket import next_frame_size
++from docker.utils.socket import read_exactly
++
+ from .. import helpers
+ 
+ BUSYBOX = helpers.BUSYBOX
+@@ -107,9 +110,9 @@ class ExecTest(helpers.BaseTestCase):
+         socket = self.client.exec_start(exec_id, socket=True)
+         self.addCleanup(socket.close)
+ 
+-        next_size = helpers.next_packet_size(socket)
++        next_size = next_frame_size(socket)
+         self.assertEqual(next_size, len(line))
+-        data = helpers.read_data(socket, next_size)
++        data = read_exactly(socket, next_size)
+         self.assertEqual(data.decode('utf-8'), line)
+ 
+     def test_exec_inspect(self):
+diff --git a/tests/unit/api_test.py b/tests/unit/api_test.py
+index 23fd1913..34bf14f6 100644
+--- a/tests/unit/api_test.py
++++ b/tests/unit/api_test.py
+@@ -93,6 +93,10 @@ def fake_put(self, url, *args, **kwargs):
+ def fake_delete(self, url, *args, **kwargs):
+     return fake_request('DELETE', url, *args, **kwargs)
+ 
++
++def fake_read_from_socket(self, response, stream):
++    return six.binary_type()
++
+ url_base = 'http+docker://localunixsocket/'
+ url_prefix = '{0}v{1}/'.format(
+     url_base,
+@@ -103,7 +107,8 @@ class DockerClientTest(base.Cleanup, base.BaseTestCase):
+     def setUp(self):
+         self.patcher = mock.patch.multiple(
+             'docker.Client', get=fake_get, post=fake_post, put=fake_put,
+-            delete=fake_delete
++            delete=fake_delete,
++            _read_from_socket=fake_read_from_socket
+         )
+         self.patcher.start()
+         self.client = docker.Client()
+diff --git a/tests/unit/exec_test.py b/tests/unit/exec_test.py
+index 3007799c..6ba2a3dd 100644
+--- a/tests/unit/exec_test.py
++++ b/tests/unit/exec_test.py
+@@ -51,8 +51,36 @@ class ExecTest(DockerClientTest):
+             }
+         )
+ 
+-        self.assertEqual(args[1]['headers'],
+-                         {'Content-Type': 'application/json'})
++        self.assertEqual(
++            args[1]['headers'], {
++                'Content-Type': 'application/json',
++                'Connection': 'Upgrade',
++                'Upgrade': 'tcp'
++            }
++        )
++
++    def test_exec_start_detached(self):
++        self.client.exec_start(fake_api.FAKE_EXEC_ID, detach=True)
++
++        args = fake_request.call_args
++        self.assertEqual(
++            args[0][1], url_prefix + 'exec/{0}/start'.format(
++                fake_api.FAKE_EXEC_ID
++            )
++        )
++
++        self.assertEqual(
++            json.loads(args[1]['data']), {
++                'Tty': False,
++                'Detach': True
++            }
++        )
++
++        self.assertEqual(
++            args[1]['headers'], {
++                'Content-Type': 'application/json'
++            }
++        )
+ 
+     def test_exec_inspect(self):
+         self.client.exec_inspect(fake_api.FAKE_EXEC_ID)

@@ -1,0 +1,325 @@
+diff --git a/.travis.yml b/.travis.yml
+index 8f51de3..8ccd240 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -33,6 +33,7 @@ script:
+   - tox
+ 
+ before_install:
++  - pip install --upgrade pip
+   - pip install coveralls
+ 
+ after_success:
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 56a7a94..effa251 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
+ 
+-_There are no unreleased changes at this time._
++- Fix resolution order in variable expansion with `override=False` (#? by [@bbc2]).
+ 
+ ## [0.15.0] - 2020-10-28
+ 
+diff --git a/README.md b/README.md
+index 5c9aeaf..36f3b2b 100644
+--- a/README.md
++++ b/README.md
+@@ -41,13 +41,22 @@ export SECRET_KEY=YOURSECRETKEYGOESHERE
+ 
+ Python-dotenv can interpolate variables using POSIX variable expansion.
+ 
+-The value of a variable is the first of the values defined in the following list:
++With `load_dotenv(override=True)` or `dotenv_values()`, the value of a variable is the
++first of the values defined in the following list:
+ 
+ - Value of that variable in the `.env` file.
+ - Value of that variable in the environment.
+ - Default value, if provided.
+ - Empty string.
+ 
++With `load_dotenv(override=False)`, the value of a variable is the first of the values
++defined in the following list:
++
++- Value of that variable in the environment.
++- Value of that variable in the `.env` file.
++- Default value, if provided.
++- Empty string.
++
+ Ensure that variables are surrounded with `{}` like `${HOME}` as bare
+ variables such as `$HOME` are not expanded.
+ 
+diff --git a/src/dotenv/main.py b/src/dotenv/main.py
+index 58a23f3..b366b18 100644
+--- a/src/dotenv/main.py
++++ b/src/dotenv/main.py
+@@ -4,7 +4,6 @@ from __future__ import absolute_import, print_function, unicode_literals
+ import io
+ import logging
+ import os
+-import re
+ import shutil
+ import sys
+ import tempfile
+@@ -13,13 +12,13 @@ from contextlib import contextmanager
+ 
+ from .compat import IS_TYPE_CHECKING, PY2, StringIO, to_env
+ from .parser import Binding, parse_stream
++from .variables import parse_variables
+ 
+ logger = logging.getLogger(__name__)
+ 
+ if IS_TYPE_CHECKING:
+-    from typing import (
+-        Dict, Iterable, Iterator, Match, Optional, Pattern, Union, Text, IO, Tuple
+-    )
++    from typing import (IO, Dict, Iterable, Iterator, Mapping, Optional, Text,
++                        Tuple, Union)
+     if sys.version_info >= (3, 6):
+         _PathLike = os.PathLike
+     else:
+@@ -30,18 +29,6 @@ if IS_TYPE_CHECKING:
+     else:
+         _StringIO = StringIO[Text]
+ 
+-__posix_variable = re.compile(
+-    r"""
+-    \$\{
+-        (?P<name>[^\}:]*)
+-        (?::-
+-            (?P<default>[^\}]*)
+-        )?
+-    \}
+-    """,
+-    re.VERBOSE,
+-)  # type: Pattern[Text]
+-
+ 
+ def with_warn_for_invalid_lines(mappings):
+     # type: (Iterator[Binding]) -> Iterator[Binding]
+@@ -56,13 +43,14 @@ def with_warn_for_invalid_lines(mappings):
+ 
+ class DotEnv():
+ 
+-    def __init__(self, dotenv_path, verbose=False, encoding=None, interpolate=True):
+-        # type: (Union[Text, _PathLike, _StringIO], bool, Union[None, Text], bool) -> None
++    def __init__(self, dotenv_path, verbose=False, encoding=None, interpolate=True, override=True):
++        # type: (Union[Text, _PathLike, _StringIO], bool, Union[None, Text], bool, bool) -> None
+         self.dotenv_path = dotenv_path  # type: Union[Text,_PathLike, _StringIO]
+         self._dict = None  # type: Optional[Dict[Text, Optional[Text]]]
+         self.verbose = verbose  # type: bool
+         self.encoding = encoding  # type: Union[None, Text]
+         self.interpolate = interpolate  # type: bool
++        self.override = override  # type: bool
+ 
+     @contextmanager
+     def _get_stream(self):
+@@ -83,13 +71,14 @@ class DotEnv():
+         if self._dict:
+             return self._dict
+ 
++        raw_values = self.parse()
++
+         if self.interpolate:
+-            values = resolve_nested_variables(self.parse())
++            self._dict = OrderedDict(resolve_variables(raw_values, override=self.override))
+         else:
+-            values = OrderedDict(self.parse())
++            self._dict = OrderedDict(raw_values)
+ 
+-        self._dict = values
+-        return values
++        return self._dict
+ 
+     def parse(self):
+         # type: () -> Iterator[Tuple[Text, Optional[Text]]]
+@@ -98,13 +87,13 @@ class DotEnv():
+                 if mapping.key is not None:
+                     yield mapping.key, mapping.value
+ 
+-    def set_as_environment_variables(self, override=False):
+-        # type: (bool) -> bool
++    def set_as_environment_variables(self):
++        # type: () -> bool
+         """
+         Load the current dotenv as system environemt variable.
+         """
+         for k, v in self.dict().items():
+-            if k in os.environ and not override:
++            if k in os.environ and not self.override:
+                 continue
+             if v is not None:
+                 os.environ[to_env(k)] = to_env(v)
+@@ -217,27 +206,26 @@ def unset_key(dotenv_path, key_to_unset, quote_mode="always"):
+     return removed, key_to_unset
+ 
+ 
+-def resolve_nested_variables(values):
+-    # type: (Iterable[Tuple[Text, Optional[Text]]]) -> Dict[Text, Optional[Text]]
+-    def _replacement(name, default):
+-        # type: (Text, Optional[Text]) -> Text
+-        default = default if default is not None else ""
+-        ret = new_values.get(name, os.getenv(name, default))
+-        return ret  # type: ignore
++def resolve_variables(values, override):
++    # type: (Iterable[Tuple[Text, Optional[Text]]], bool) -> Mapping[Text, Optional[Text]]
+ 
+-    def _re_sub_callback(match):
+-        # type: (Match[Text]) -> Text
+-        """
+-        From a match object gets the variable name and returns
+-        the correct replacement
+-        """
+-        matches = match.groupdict()
+-        return _replacement(name=matches["name"], default=matches["default"])  # type: ignore
++    new_values = {}  # type: Dict[Text, Optional[Text]]
+ 
+-    new_values = {}
++    for (name, value) in values:
++        if value is None:
++            result = None
++        else:
++            atoms = parse_variables(value)
++            env = {}  # type: Dict[Text, Optional[Text]]
++            if override:
++                env.update(os.environ)  # type: ignore
++                env.update(new_values)
++            else:
++                env.update(new_values)
++                env.update(os.environ)  # type: ignore
++            result = "".join(atom.resolve(env) for atom in atoms)
+ 
+-    for (k, v) in values:
+-        new_values[k] = __posix_variable.sub(_re_sub_callback, v) if v is not None else None
++        new_values[name] = result
+ 
+     return new_values
+ 
+@@ -316,10 +304,11 @@ def load_dotenv(dotenv_path=None, stream=None, verbose=False, override=False, in
+                   Defaults to `False`.
+     """
+     f = dotenv_path or stream or find_dotenv()
+-    return DotEnv(f, verbose=verbose, interpolate=interpolate, **kwargs).set_as_environment_variables(override=override)
++    dotenv = DotEnv(f, verbose=verbose, interpolate=interpolate, override=override, **kwargs)
++    return dotenv.set_as_environment_variables()
+ 
+ 
+ def dotenv_values(dotenv_path=None, stream=None, verbose=False, interpolate=True, **kwargs):
+     # type: (Union[Text, _PathLike, None], Optional[_StringIO], bool, bool, Union[None, Text]) -> Dict[Text, Optional[Text]]  # noqa: E501
+     f = dotenv_path or stream or find_dotenv()
+-    return DotEnv(f, verbose=verbose, interpolate=interpolate, **kwargs).dict()
++    return DotEnv(f, verbose=verbose, interpolate=interpolate, override=True, **kwargs).dict()
+diff --git a/src/dotenv/variables.py b/src/dotenv/variables.py
+new file mode 100644
+index 0000000..4828dfc
+--- /dev/null
++++ b/src/dotenv/variables.py
+@@ -0,0 +1,106 @@
++import re
++from abc import ABCMeta
++
++from .compat import IS_TYPE_CHECKING
++
++if IS_TYPE_CHECKING:
++    from typing import Iterator, Mapping, Optional, Pattern, Text
++
++
++_posix_variable = re.compile(
++    r"""
++    \$\{
++        (?P<name>[^\}:]*)
++        (?::-
++            (?P<default>[^\}]*)
++        )?
++    \}
++    """,
++    re.VERBOSE,
++)  # type: Pattern[Text]
++
++
++class Atom():
++    __metaclass__ = ABCMeta
++
++    def __ne__(self, other):
++        # type: (object) -> bool
++        result = self.__eq__(other)
++        if result is NotImplemented:
++            return NotImplemented
++        return not result
++
++    def resolve(self, env):
++        # type: (Mapping[Text, Optional[Text]]) -> Text
++        raise NotImplementedError
++
++
++class Literal(Atom):
++    def __init__(self, value):
++        # type: (Text) -> None
++        self.value = value
++
++    def __repr__(self):
++        # type: () -> str
++        return "Literal(value={})".format(self.value)
++
++    def __eq__(self, other):
++        # type: (object) -> bool
++        if not isinstance(other, self.__class__):
++            return NotImplemented
++        return self.value == other.value
++
++    def __hash__(self):
++        # type: () -> int
++        return hash((self.__class__, self.value))
++
++    def resolve(self, env):
++        # type: (Mapping[Text, Optional[Text]]) -> Text
++        return self.value
++
++
++class Variable(Atom):
++    def __init__(self, name, default):
++        # type: (Text, Optional[Text]) -> None
++        self.name = name
++        self.default = default
++
++    def __repr__(self):
++        # type: () -> str
++        return "Variable(name={}, default={})".format(self.name, self.default)
++
++    def __eq__(self, other):
++        # type: (object) -> bool
++        if not isinstance(other, self.__class__):
++            return NotImplemented
++        return (self.name, self.default) == (other.name, other.default)
++
++    def __hash__(self):
++        # type: () -> int
++        return hash((self.__class__, self.name, self.default))
++
++    def resolve(self, env):
++        # type: (Mapping[Text, Optional[Text]]) -> Text
++        default = self.default if self.default is not None else ""
++        result = env.get(self.name, default)
++        return result if result is not None else ""
++
++
++def parse_variables(value):
++    # type: (Text) -> Iterator[Atom]
++    cursor = 0
++
++    for match in _posix_variable.finditer(value):
++        (start, end) = match.span()
++        name = match.groupdict()["name"]
++        default = match.groupdict()["default"]
++
++        if start > cursor:
++            yield Literal(value=value[cursor:start])
++
++        yield Variable(name=name, default=default)
++        cursor = end
++
++    length = len(value)
++    if cursor < length:
++        yield Literal(value=value[cursor:length])

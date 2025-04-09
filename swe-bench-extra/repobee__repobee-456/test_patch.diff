@@ -1,0 +1,144 @@
+diff --git a/tests/unit_tests/repobee/conftest.py b/tests/unit_tests/repobee/conftest.py
+index 8d004ed..5b8d481 100644
+--- a/tests/unit_tests/repobee/conftest.py
++++ b/tests/unit_tests/repobee/conftest.py
+@@ -21,7 +21,6 @@ import _repobee  # noqa: E402
+ 
+ EXPECTED_ENV_VARIABLES = [
+     _repobee.constants.TOKEN_ENV,
+-    _repobee.constants.TOKEN_ENV_OLD,
+     "REPOBEE_NO_VERIFY_SSL",
+ ]
+ 
+diff --git a/tests/unit_tests/repobee/test_config.py b/tests/unit_tests/repobee/test_config.py
+index 7466b82..7e88fa5 100644
+--- a/tests/unit_tests/repobee/test_config.py
++++ b/tests/unit_tests/repobee/test_config.py
+@@ -55,23 +55,6 @@ class TestGetConfiguredDefaults:
+         defaults = config.get_configured_defaults(str(config_mock))
+         assert defaults["token"] == constants.TOKEN
+ 
+-    @pytest.mark.skipif(
+-        "_repobee.__version__ >= '3.0.0'",
+-        msg="Old token should have been removed",
+-    )
+-    def test_deprecated_token_env(self, config_mock, mock_getenv):
+-        token = "superdupertoken"
+-
+-        def _env(name):
+-            if name == _repobee.constants.TOKEN_ENV_OLD:
+-                return token
+-            return None
+-
+-        mock_getenv.side_effect = _env
+-
+-        defaults = config.get_configured_defaults(str(config_mock))
+-        assert defaults["token"] == token
+-
+     def test_get_configured_defaults_raises_on_invalid_keys(
+         self, empty_config_mock, students_file
+     ):
+diff --git a/tests/unit_tests/repobee/test_main.py b/tests/unit_tests/repobee/test_main.py
+index 5056633..fcbabc0 100644
+--- a/tests/unit_tests/repobee/test_main.py
++++ b/tests/unit_tests/repobee/test_main.py
+@@ -57,7 +57,7 @@ def api_instance_mock(mocker):
+ 
+ @pytest.fixture
+ def init_plugins_mock(mocker):
+-    def init_plugins(plugs=None, allow_qualified=False):
++    def init_plugins(plugs=None, allow_qualified=False, allow_filepath=False):
+         list(map(module, plugs or []))
+ 
+     return mocker.patch(
+@@ -159,7 +159,7 @@ def test_plugins_args(
+ 
+     init_plugins_mock.assert_has_calls(
+         [
+-            call(["javac", "pylint"]),
++            call(["javac", "pylint"], allow_filepath=True),
+             call(DEFAULT_PLUGIN_NAMES, allow_qualified=True),
+         ],
+         any_order=True,
+@@ -223,7 +223,7 @@ def test_configured_plugins_are_loaded(
+ 
+     init_plugins_mock.assert_has_calls(
+         [
+-            call(["javac", "pylint"]),
++            call(["javac", "pylint"], allow_filepath=True),
+             call(DEFAULT_PLUGIN_NAMES, allow_qualified=True),
+         ],
+         any_order=True,
+@@ -245,7 +245,7 @@ def test_plugin_with_subparser_name(
+ 
+     init_plugins_mock.assert_has_calls(
+         [
+-            call(["javac", "clone"]),
++            call(["javac", "clone"], allow_filepath=True),
+             call(DEFAULT_PLUGIN_NAMES, allow_qualified=True),
+         ],
+         any_order=True,
+@@ -287,7 +287,10 @@ def test_invalid_plug_options(dispatch_command_mock, init_plugins_mock):
+         main.main(sys_args)
+ 
+     init_plugins_mock.assert_has_calls(
+-        [call(["javac"]), call(DEFAULT_PLUGIN_NAMES, allow_qualified=True)],
++        [
++            call(["javac"], allow_filepath=True),
++            call(DEFAULT_PLUGIN_NAMES, allow_qualified=True),
++        ],
+         any_order=True,
+     )
+     assert not dispatch_command_mock.called
+diff --git a/tests/unit_tests/repobee/test_plugin.py b/tests/unit_tests/repobee/test_plugin.py
+index 3a2f2ba..9656ae2 100644
+--- a/tests/unit_tests/repobee/test_plugin.py
++++ b/tests/unit_tests/repobee/test_plugin.py
+@@ -6,6 +6,7 @@
+         installed any other plugins, tests in here may fail unexpectedly
+         without anything actually being wrong.
+ """
++import shutil
+ import pathlib
+ import tempfile
+ import types
+@@ -246,3 +247,39 @@ class TestInitializePlugins:
+             plugin.initialize_plugins([qualname])
+ 
+         assert "Qualified names not allowed" in str(exc_info.value)
++
++    def test_raises_on_filepath_by_default(self, tmpdir):
++        plugin_file = pathlib.Path(str(tmpdir)) / "pylint.py"
++        shutil.copy(_repobee.ext.javac.__file__, str(plugin_file))
++
++        with pytest.raises(exception.PluginLoadError) as exc_info:
++            plugin.initialize_plugins([str(plugin_file)])
++
++        assert "Filepaths not allowed" in str(exc_info.value)
++
++    def test_initialize_from_filepath_filepath(self, tmpdir):
++        """Test initializing a plugin that's specified by a filepath."""
++        plugin_file = pathlib.Path(str(tmpdir)) / "pylint.py"
++        shutil.copy(_repobee.ext.pylint.__file__, str(plugin_file))
++
++        initialized_plugins = plugin.initialize_plugins(
++            [str(plugin_file)], allow_filepath=True
++        )
++
++        assert len(initialized_plugins) == 1
++        assert initialized_plugins[0].__file__ == str(plugin_file)
++
++    def test_raises_when_filepath_is_not_python_module(self, tmpdir):
++        not_a_python_module = pathlib.Path(str(tmpdir)) / "some_file.txt"
++        not_a_python_module.write_text(
++            "This is definitely\nnot a Python module"
++        )
++
++        with pytest.raises(exception.PluginLoadError) as exc_info:
++            plugin.initialize_plugins(
++                [str(not_a_python_module)], allow_filepath=True
++            )
++
++        assert f"failed to load plugin module {not_a_python_module}" in str(
++            exc_info.value
++        )

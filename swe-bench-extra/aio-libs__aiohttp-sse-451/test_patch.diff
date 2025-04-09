@@ -1,0 +1,60 @@
+diff --git a/tests/test_sse.py b/tests/test_sse.py
+index 0163c6a..6aae5d6 100644
+--- a/tests/test_sse.py
++++ b/tests/test_sse.py
+@@ -133,19 +133,19 @@ def test_compression_not_implemented() -> None:
+ 
+ 
+ class TestPingProperty:
+-    @pytest.mark.parametrize("value", [25, 0], ids=("int", "zero int"))
+-    def test_success(self, value: int) -> None:
++    @pytest.mark.parametrize("value", (25, 25.0, 0), ids=("int", "float", "zero int"))
++    def test_success(self, value: float) -> None:
+         response = EventSourceResponse()
+         response.ping_interval = value
+         assert response.ping_interval == value
+ 
+     @pytest.mark.parametrize("value", [None, "foo"], ids=("None", "str"))
+-    def test_wrong_type(self, value: int) -> None:
++    def test_wrong_type(self, value: float) -> None:
+         response = EventSourceResponse()
+         with pytest.raises(TypeError) as ctx:
+             response.ping_interval = value
+ 
+-        assert ctx.match("ping interval must be int")
++        assert ctx.match("ping interval must be int or float")
+ 
+     def test_negative_int(self) -> None:
+         response = EventSourceResponse()
+@@ -230,6 +230,31 @@ async def test_ping_reset(
+     assert streamed_data == expected
+ 
+ 
++async def test_ping_auto_close(aiohttp_client: ClientFixture) -> None:
++    """Test ping task automatically closed on send failure."""
++
++    async def handler(request: web.Request) -> EventSourceResponse:
++        async with sse_response(request) as sse:
++            sse.ping_interval = 999
++
++            request.protocol.force_close()
++            with pytest.raises(ConnectionResetError):
++                await sse.send("never-should-be-delivered")
++
++            assert sse._ping_task is not None
++            assert sse._ping_task.cancelled()
++
++        return sse  # pragma: no cover
++
++    app = web.Application()
++    app.router.add_route("GET", "/", handler)
++
++    client = await aiohttp_client(app)
++
++    async with client.get("/") as response:
++        assert 200 == response.status
++
++
+ async def test_context_manager(aiohttp_client: ClientFixture) -> None:
+     async def func(request: web.Request) -> web.StreamResponse:
+         h = {"X-SSE": "aiohttp_sse"}

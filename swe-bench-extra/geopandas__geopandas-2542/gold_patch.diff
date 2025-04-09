@@ -1,0 +1,186 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 582dabe..90e028b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@ New features and improvements:
+   of the GeoParquet specification (geoparquet.org) (#2663).
+ - New ``hilbert_distance()`` method that calculates the distance along a Hilbert curve
+   for each geometry in a GeoSeries/GeoDataFrame (#2297).
++- Added support to fill missing values in `GeoSeries.fillna` via another `GeoSeries` (#2535).
+ - Support for sorting geometries (for example, using ``sort_values()``) based on
+   the distance along the Hilbert curve (#2070).
+ - Added ``minimum_bounding_circle()`` method from shapely to GeoSeries/GeoDataframe (#2621).
+@@ -37,7 +38,7 @@ Bug fixes:
+ - Fix `to_parquet`/`to_feather` to use correct WKB flavor for 3D geometries (#2654)
+ - Fix `read_file` to avoid reading all file bytes prior to calling Fiona or
+   Pyogrio if provided a URL as input (#2796)
+-- Fix `copy()` downcasting GeoDataFrames without an active geometry column to a 
++- Fix `copy()` downcasting GeoDataFrames without an active geometry column to a
+   DataFrame (#2775)
+ 
+ Notes on (optional) dependencies:
+diff --git a/geopandas/array.py b/geopandas/array.py
+index 1474ddf..6a52b20 100644
+--- a/geopandas/array.py
++++ b/geopandas/array.py
+@@ -1009,34 +1009,46 @@ class GeometryArray(ExtensionArray):
+         return GeometryArray(result, crs=self.crs)
+ 
+     def _fill(self, idx, value):
+-        """Fill index locations with value
++        """
++        Fill index locations with ``value``.
+ 
+-        Value should be a BaseGeometry
++        ``value`` should be a BaseGeometry or a GeometryArray.
+         """
+-        if not (_is_scalar_geometry(value) or value is None):
++        if vectorized.isna(value):
++            value = [None]
++        elif _is_scalar_geometry(value):
++            value = [value]
++        elif isinstance(value, GeometryArray):
++            value = value[idx]
++        else:
+             raise TypeError(
+-                "Value should be either a BaseGeometry or None, got %s" % str(value)
++                "'value' parameter must be None, a scalar geometry, or a GeoSeries, "
++                f"but you passed a {type(value).__name__!r}"
+             )
+-        # self._data[idx] = value
+-        value_arr = np.empty(1, dtype=object)
++
++        value_arr = np.empty(len(value), dtype=object)
+         with compat.ignore_shapely2_warnings():
+-            value_arr[:] = [value]
++            value_arr[:] = _shapely_to_geom(value)
++
+         self._data[idx] = value_arr
+         return self
+ 
+     def fillna(self, value=None, method=None, limit=None):
+-        """Fill NA/NaN values using the specified method.
++        """
++        Fill NA values with geometry (or geometries) or using the specified method.
+ 
+         Parameters
+         ----------
+-        value : scalar, array-like
+-            If a scalar value is passed it is used to fill all missing values.
+-            Alternatively, an array-like 'value' can be given. It's expected
+-            that the array-like have the same length as 'self'.
++        value : shapely geometry object or GeometryArray
++            If a geometry value is passed it is used to fill all missing values.
++            Alternatively, an GeometryArray 'value' can be given. It's expected
++            that the GeometryArray has the same length as 'self'.
++
+         method : {'backfill', 'bfill', 'pad', 'ffill', None}, default None
+             Method to use for filling holes in reindexed Series
+             pad / ffill: propagate last valid observation forward to next valid
+             backfill / bfill: use NEXT valid observation to fill gap
++
+         limit : int, default None
+             If method is specified, this is the maximum number of consecutive
+             NaN values to forward/backward fill. In other words, if there is
+@@ -1047,26 +1059,14 @@ class GeometryArray(ExtensionArray):
+ 
+         Returns
+         -------
+-        filled : ExtensionArray with NA/NaN filled
++        GeometryArray
+         """
+         if method is not None:
+             raise NotImplementedError("fillna with a method is not yet supported")
+ 
+         mask = self.isna()
+         new_values = self.copy()
+-
+-        if mask.any():
+-            # fill with value
+-            if vectorized.isna(value):
+-                value = None
+-            elif not isinstance(value, BaseGeometry):
+-                raise NotImplementedError(
+-                    "fillna currently only supports filling with a scalar geometry"
+-                )
+-            value = _shapely_to_geom(value)
+-            new_values = new_values._fill(mask, value)
+-
+-        return new_values
++        return new_values._fill(mask, value) if mask.any() else new_values
+ 
+     def astype(self, dtype, copy=True):
+         """
+diff --git a/geopandas/geoseries.py b/geopandas/geoseries.py
+index 175704c..3c651e8 100644
+--- a/geopandas/geoseries.py
++++ b/geopandas/geoseries.py
+@@ -751,11 +751,27 @@ class GeoSeries(GeoPandasBase, Series):
+         return self.notna()
+ 
+     def fillna(self, value=None, method=None, inplace=False, **kwargs):
+-        """Fill NA values with a geometry (empty polygon by default).
++        """
++        Fill NA values with geometry (or geometries).
++
++        ``method`` is currently not implemented.
++
++        Parameters
++        ----------
++        value : shapely geometry or GeoSeries, default None
++            If None is passed, NA values will be filled with GEOMETRYCOLLECTION EMPTY.
++            If a shapely geometry object is passed, it will be
++            used to fill all missing values. If a ``GeoSeries`` or ``GeometryArray``
++            are passed, missing values will be filled based on the corresponding index
++            locations. If pd.NA or np.nan are passed, values will be filled with
++            ``None`` (not GEOMETRYCOLLECTION EMPTY).
++
++        Returns
++        -------
++        GeoSeries
+ 
+         Examples
+         --------
+-
+         >>> from shapely.geometry import Polygon
+         >>> s = geopandas.GeoSeries(
+         ...     [
+@@ -770,18 +786,38 @@ class GeoSeries(GeoPandasBase, Series):
+         2    POLYGON ((0.00000 0.00000, -1.00000 1.00000, 0...
+         dtype: geometry
+ 
++        Filled with an empty polygon.
++
+         >>> s.fillna()
+         0    POLYGON ((0.00000 0.00000, 1.00000 1.00000, 0....
+         1                             GEOMETRYCOLLECTION EMPTY
+         2    POLYGON ((0.00000 0.00000, -1.00000 1.00000, 0...
+         dtype: geometry
+ 
++        Filled with a specific polygon.
++
+         >>> s.fillna(Polygon([(0, 1), (2, 1), (1, 2)]))
+         0    POLYGON ((0.00000 0.00000, 1.00000 1.00000, 0....
+         1    POLYGON ((0.00000 1.00000, 2.00000 1.00000, 1....
+         2    POLYGON ((0.00000 0.00000, -1.00000 1.00000, 0...
+         dtype: geometry
+ 
++        Filled with another GeoSeries.
++
++        >>> from shapely.geometry import Point
++        >>> s_fill = geopandas.GeoSeries(
++        ...     [
++        ...         Point(0, 0),
++        ...         Point(1, 1),
++        ...         Point(2, 2),
++        ...     ]
++        ... )
++        >>> s.fillna(s_fill)
++        0    POLYGON ((0.00000 0.00000, 1.00000 1.00000, 0....
++        1                              POINT (1.00000 1.00000)
++        2    POLYGON ((0.00000 0.00000, -1.00000 1.00000, 0...
++        dtype: geometry
++
+         See Also
+         --------
+         GeoSeries.isna : detect missing values

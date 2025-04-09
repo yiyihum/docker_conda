@@ -1,0 +1,130 @@
+diff --git a/tests/unit/fake_api.py b/tests/unit/fake_api.py
+index 0524becd..03e53cc6 100644
+--- a/tests/unit/fake_api.py
++++ b/tests/unit/fake_api.py
+@@ -19,6 +19,8 @@ FAKE_VOLUME_NAME = 'perfectcherryblossom'
+ FAKE_NODE_ID = '24ifsmvkjbyhk'
+ FAKE_SECRET_ID = 'epdyrw4tsi03xy3deu8g8ly6o'
+ FAKE_SECRET_NAME = 'super_secret'
++FAKE_CONFIG_ID = 'sekvs771242jfdjnvfuds8232'
++FAKE_CONFIG_NAME = 'super_config'
+ 
+ # Each method is prefixed with HTTP method (get, post...)
+ # for clarity and readability
+@@ -512,6 +514,11 @@ def post_fake_secret():
+     response = {'ID': FAKE_SECRET_ID}
+     return status_code, response
+ 
++def post_fake_config():
++    status_code = 200
++    response = {'ID': FAKE_CONFIG_ID}
++    return status_code, response
++
+ 
+ # Maps real api url to fake response callback
+ prefix = 'http+docker://localhost'
+@@ -630,4 +637,6 @@ fake_responses = {
+     post_fake_network_disconnect,
+     f'{prefix}/{CURRENT_VERSION}/secrets/create':
+     post_fake_secret,
++    f'{prefix}/{CURRENT_VERSION}/configs/create':
++    post_fake_config,
+ }
+diff --git a/tests/unit/fake_api_client.py b/tests/unit/fake_api_client.py
+index 95cf63b4..79799421 100644
+--- a/tests/unit/fake_api_client.py
++++ b/tests/unit/fake_api_client.py
+@@ -37,6 +37,7 @@ def make_fake_api_client(overrides=None):
+         'create_host_config.side_effect': api_client.create_host_config,
+         'create_network.return_value': fake_api.post_fake_network()[1],
+         'create_secret.return_value': fake_api.post_fake_secret()[1],
++        'create_config.return_value': fake_api.post_fake_config()[1],
+         'exec_create.return_value': fake_api.post_fake_exec_create()[1],
+         'exec_start.return_value': fake_api.post_fake_exec_start()[1],
+         'images.return_value': fake_api.get_fake_images()[1],
+diff --git a/tests/unit/models_configs_test.py b/tests/unit/models_configs_test.py
+new file mode 100644
+index 00000000..6960397f
+--- /dev/null
++++ b/tests/unit/models_configs_test.py
+@@ -0,0 +1,10 @@
++import unittest
++
++from .fake_api_client import make_fake_client
++from .fake_api import FAKE_CONFIG_NAME
++
++class CreateConfigsTest(unittest.TestCase):
++    def test_create_config(self):
++        client = make_fake_client()
++        config = client.configs.create(name="super_config", data="config")
++        assert config.__repr__() == "<Config: '{}'>".format(FAKE_CONFIG_NAME)
+diff --git a/tests/unit/utils_build_test.py b/tests/unit/utils_build_test.py
+index fa7d833d..5f1bb1ec 100644
+--- a/tests/unit/utils_build_test.py
++++ b/tests/unit/utils_build_test.py
+@@ -6,11 +6,10 @@ import tarfile
+ import tempfile
+ import unittest
+ 
++import pytest
+ 
+ from docker.constants import IS_WINDOWS_PLATFORM
+-from docker.utils import exclude_paths, tar
+-
+-import pytest
++from docker.utils import exclude_paths, tar, match_tag
+ 
+ from ..helpers import make_tree
+ 
+@@ -489,3 +488,51 @@ class TarTest(unittest.TestCase):
+                 assert member in names
+             assert 'a/c/b' in names
+             assert 'a/c/b/utils.py' not in names
++
++
++# selected test cases from https://github.com/distribution/reference/blob/8507c7fcf0da9f570540c958ea7b972c30eeaeca/reference_test.go#L13-L328
++@pytest.mark.parametrize("tag,expected", [
++    ("test_com", True),
++    ("test.com:tag", True),
++    # N.B. this implicitly means "docker.io/library/test.com:5000"
++    # i.e. the `5000` is a tag, not a port here!
++    ("test.com:5000", True),
++    ("test.com/repo:tag", True),
++    ("test:5000/repo", True),
++    ("test:5000/repo:tag", True),
++    ("test:5000/repo", True),
++    ("", False),
++    (":justtag", False),
++    ("Uppercase:tag", False),
++    ("test:5000/Uppercase/lowercase:tag", False),
++    ("lowercase:Uppercase", True),
++    # length limits not enforced
++    pytest.param("a/"*128 + "a:tag", False, marks=pytest.mark.xfail),
++    ("a/"*127 + "a:tag-puts-this-over-max", True),
++    ("aa/asdf$$^/aa", False),
++    ("sub-dom1.foo.com/bar/baz/quux", True),
++    ("sub-dom1.foo.com/bar/baz/quux:some-long-tag", True),
++    ("b.gcr.io/test.example.com/my-app:test.example.com", True),
++    ("xn--n3h.com/myimage:xn--n3h.com", True),
++    ("foo_bar.com:8080", True),
++    ("foo/foo_bar.com:8080", True),
++    ("192.168.1.1", True),
++    ("192.168.1.1:tag", True),
++    ("192.168.1.1:5000", True),
++    ("192.168.1.1/repo", True),
++    ("192.168.1.1:5000/repo", True),
++    ("192.168.1.1:5000/repo:5050", True),
++    # regex does not properly handle ipv6
++    pytest.param("[2001:db8::1]", False, marks=pytest.mark.xfail),
++    ("[2001:db8::1]:5000", False),
++    pytest.param("[2001:db8::1]/repo", True, marks=pytest.mark.xfail),
++    pytest.param("[2001:db8:1:2:3:4:5:6]/repo:tag", True, marks=pytest.mark.xfail),
++    pytest.param("[2001:db8::1]:5000/repo", True, marks=pytest.mark.xfail),
++    pytest.param("[2001:db8::1]:5000/repo:tag", True, marks=pytest.mark.xfail),
++    pytest.param("[2001:db8::]:5000/repo", True, marks=pytest.mark.xfail),
++    pytest.param("[::1]:5000/repo", True, marks=pytest.mark.xfail),
++    ("[fe80::1%eth0]:5000/repo", False),
++    ("[fe80::1%@invalidzone]:5000/repo", False),
++])
++def test_match_tag(tag: str, expected: bool):
++    assert match_tag(tag) == expected

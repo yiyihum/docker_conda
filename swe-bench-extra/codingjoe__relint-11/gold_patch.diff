@@ -1,0 +1,211 @@
+diff --git a/.github/FUNDING.yml b/.github/FUNDING.yml
+index 8277382..e030a5a 100644
+--- a/.github/FUNDING.yml
++++ b/.github/FUNDING.yml
+@@ -1,1 +1,2 @@
++github: codingjoe
+ custom: https://www.paypal.me/codingjoe
+diff --git a/.relint.yml b/.relint.yml
+index 779fcee..5e508a6 100644
+--- a/.relint.yml
++++ b/.relint.yml
+@@ -1,7 +1,5 @@
+ - name: No ToDo
+-  pattern: "[tT][oO][dD][oO]"
++  pattern: '[tT][oO][dD][oO]'
+   hint: Get it done right away!
+-  filename:
+-    - "*.py"
+-    - "*.js"
++  filePattern: ^(?!.*test_).*\.(py|js)$
+   error: false
+diff --git a/README.rst b/README.rst
+index b434d28..60998da 100644
+--- a/README.rst
++++ b/README.rst
+@@ -20,11 +20,9 @@ You can write your own regular rules in a YAML file, like so:
+ .. code-block:: YAML
+ 
+     - name: No ToDo
+-      pattern: "[tT][oO][dD][oO]"
++      pattern: '[tT][oO][dD][oO]'
+       hint: Get it done right away!
+-      filename:
+-        - "*.py"
+-        - "*.js"
++      filePattern: .*\.(py|js)
+       error: false
+ 
+ The ``name`` attribute is the name of your linter, the ``pattern`` can be
+@@ -32,7 +30,7 @@ any regular expression. The linter does lint entire files, therefore your
+ expressions can match multiple lines and include newlines.
+ 
+ You can narrow down the file types your linter should be working with, by
+-providing the optional ``filename`` attribute. The default is ``*``.
++providing the optional ``filePattern`` attribute. The default is ``.*``.
+ 
+ The optional `error` attribute allows you to only show a warning but not exit
+ with a bad (non-zero) exit code. The default is `true`.
+@@ -56,10 +54,10 @@ If you prefer linting changed files (cached on git) you can use the option
+ This option is useful for pre-commit purposes. Here an example of how to use it
+ with `pre-commit`_ framework:
+ 
+-.. code-block:: YAML
++.. code-block:: yaml
+ 
+     - repo: https://github.com/codingjoe/relint
+-      rev: 0.5.0
++      rev: 1.2.0
+       hooks:
+         - id: relint
+ 
+@@ -71,30 +69,24 @@ Samples
+ .. code-block:: yaml
+ 
+     - name: db fixtures
+-      pattern: "def test_[^(]+\\([^)]*(customer|product)(, |\\))"
++      pattern: 'def test_[^(]+\([^)]*(customer|product)(, |\))'
+       hint: Use model_mommy recipies instead of db fixtures.
+-      filename:
+-        - "**/test_*.py"
++      filePattern: test_.*\.py
+ 
+     - name: model_mommy recipies
+-      pattern: "mommy\\.make\\("
++      pattern: mommy\.make\(
+       hint: Please use mommy.make_recipe instead of mommy.make.
+-      filename:
+-        - "**/test_*.py"
+-        - "conftest.py"
+-        - "**/conftest.py"
++      filePattern: (test_.*|conftest)\.py
+ 
+     - name: the database is lava
+-      pattern: "@pytest.fixture.*\\n[ ]*def [^(]+\\([^)]*(db|transactional_db)(, |\\))"
++      pattern: '@pytest.fixture.*\n[ ]*def [^(]+\([^)]*(db|transactional_db)(, |\))'
+       hint: Please do not create db fixtures but model_mommy recipies instead.
+-      filename:
+-        - "*.py"
++      filePattern: .*\.py
+ 
+     - name: No logger in management commands
+-      pattern: "(logger|import logging)"
+-      hint: "Please write to self.stdout or self.stderr in favor of using a logger."
+-      filename:
+-        - "*/management/commands/*.py"
++      pattern: (logger|import logging)
++      hint: Please write to self.stdout or self.stderr in favor of using a logger.
++      filePattern: \/management\/commands\/.*\.py
+ 
+ .. _`pre-commit`: https://pre-commit.com/
+ .. _`relint-pre-commit.sh`: relint-pre-commit.sh
+diff --git a/relint.py b/relint.py
+index 0000d71..6764264 100644
+--- a/relint.py
++++ b/relint.py
+@@ -3,6 +3,7 @@ import fnmatch
+ import glob
+ import re
+ import sys
++import warnings
+ from collections import namedtuple
+ from itertools import chain
+ 
+@@ -16,10 +17,19 @@ GIT_DIFF_SPLIT_PATTERN = re.compile(
+     r"(?:\n|^)diff --git a\/.* b\/.*(?:\n|$)")
+ 
+ 
+-Test = namedtuple('Test', ('name', 'pattern', 'hint', 'filename', 'error'))
++Test = namedtuple(
++    'Test', (
++        'name',
++        'pattern',
++        'hint',
++        'file_pattern',
++        'filename',
++        'error',
++    )
++)
+ 
+ 
+-def parse_args():
++def parse_args(args):
+     parser = argparse.ArgumentParser()
+     parser.add_argument(
+         'files',
+@@ -42,19 +52,29 @@ def parse_args():
+         action='store_true',
+         help='Analyze content from git diff.'
+     )
+-    return parser.parse_args()
++    return parser.parse_args(args=args)
+ 
+ 
+ def load_config(path):
+     with open(path) as fs:
+         for test in yaml.safe_load(fs):
+-            filename = test.get('filename', ['*'])
+-            if not isinstance(filename, list):
+-                filename = list(filename)
++            filename = test.get('filename')
++            if filename:
++                warnings.warn(
++                    "The glob style 'filename' configuration attribute has been"
++                    " deprecated in favor of a new RegEx based 'filePattern' attribute."
++                    " 'filename' support will be removed in relint version 2.0.",
++                    DeprecationWarning
++                )
++                if not isinstance(filename, list):
++                    filename = list(filename)
++            file_pattern = test.get('filePattern', '.*')
++            file_pattern = re.compile(file_pattern)
+             yield Test(
+                 name=test['name'],
+                 pattern=re.compile(test['pattern'], re.MULTILINE),
+                 hint=test.get('hint'),
++                file_pattern=file_pattern,
+                 filename=filename,
+                 error=test.get('error', True)
+             )
+@@ -68,10 +88,16 @@ def lint_file(filename, tests):
+         pass
+     else:
+         for test in tests:
+-            if any(fnmatch.fnmatch(filename, fp) for fp in test.filename):
+-                for match in test.pattern.finditer(content):
+-                    line_number = match.string[:match.start()].count('\n') + 1
+-                    yield filename, test, match, line_number
++            if test.filename:
++                if any(fnmatch.fnmatch(filename, fp) for fp in test.filename):
++                    for match in test.pattern.finditer(content):
++                        line_number = match.string[:match.start()].count('\n') + 1
++                        yield filename, test, match, line_number
++            else:
++                if test.file_pattern.match(filename):
++                    for match in test.pattern.finditer(content):
++                        line_number = match.string[:match.start()].count('\n') + 1
++                        yield filename, test, match, line_number
+ 
+ 
+ def parse_line_numbers(output):
+@@ -183,8 +209,8 @@ def parse_diff(output):
+     return changed_content
+ 
+ 
+-def main():
+-    args = parse_args()
++def main(args=sys.argv):
++    args = parse_args(args)
+     paths = {
+         path
+         for file in args.files
+@@ -207,5 +233,9 @@ def main():
+     exit(exit_code)
+ 
+ 
++if not sys.warnoptions:
++    warnings.simplefilter('default')
++
++
+ if __name__ == '__main__':
+     main()

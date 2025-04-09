@@ -1,0 +1,169 @@
+diff --git a/README.md b/README.md
+index fa3f47d..a617e78 100644
+--- a/README.md
++++ b/README.md
+@@ -9,6 +9,17 @@ goji is a minimal command line client for JIRA.
+ 
+ ## Usage
+ 
++### login
++
++Authenticate with a JIRA server.
++
++```bash
++$ goji login
++
++Email: delisa@example.com
++Password:
++```
++
+ ### show
+ 
+ Show detailed information about an issue.
+diff --git a/goji/auth.py b/goji/auth.py
+new file mode 100644
+index 0000000..c764a88
+--- /dev/null
++++ b/goji/auth.py
+@@ -0,0 +1,45 @@
++from netrc import netrc
++from os import path, chmod
++import re
++from stat import S_IRUSR, S_IWUSR
++from textwrap import dedent
++
++from requests.compat import urlparse
++
++
++def get_credentials(base_url):
++    hostname = urlparse(base_url).hostname
++    try:
++        hosts = netrc().hosts
++        if hostname in hosts:
++            return (hosts[hostname][0], hosts[hostname][2])
++    except:
++        pass
++
++    return (None, None)
++
++
++def set_credentials(base_url, email, password):
++    hostname = urlparse(base_url).hostname
++    filepath = path.expanduser('~/.netrc')
++    if path.isfile(filepath):
++        rcfile = open(filepath)
++        contents = rcfile.read()
++        rcfile.close()
++        pattern = r'machine {}\n(\s+(login|password).*)+\n?'
++        matcher = re.compile(pattern.format(re.escape(hostname)), re.MULTILINE)
++        contents = matcher.sub('', contents)
++        with open(filepath, 'w') as rcfile:
++            rcfile.write(contents)
++            rcfile.write(dedent("""\n\
++                    machine {}
++                      login {}
++                      password {}""").format(hostname, email, password))
++
++    else:
++        with open(filepath, 'w') as rcfile:
++            rcfile.write(dedent("""\
++                    machine {}
++                      login {}
++                      password {}""").format(hostname, email, password))
++        chmod(filepath, S_IWUSR | S_IRUSR)
+diff --git a/goji/client.py b/goji/client.py
+index 0ba61e8..6733ac3 100644
+--- a/goji/client.py
++++ b/goji/client.py
+@@ -1,24 +1,22 @@
+-from netrc import netrc
+ import json
+ 
+ import requests
+-from requests.compat import urljoin, urlparse
++from requests.compat import urljoin
+ 
+ from goji.models import Issue
++from goji.auth import get_credentials
+ 
+ 
+ class JIRAClient(object):
+     def __init__(self, base_url):
+-        self.base_url = base_url
+-        self.rest_base_url = urljoin(self.base_url, '/rest/api/2/')
++        email, password = get_credentials(base_url)
+ 
+-        hostname = urlparse(self.base_url).hostname
+-        hosts = netrc().hosts
+-
+-        if hostname in hosts:
+-            self.auth = (hosts[hostname][0], hosts[hostname][2])
++        if email is not None and password is not None:
++            self.auth = (email, password)
++            self.base_url = base_url
++            self.rest_base_url = urljoin(self.base_url, '/rest/api/2/')
+         else:
+-            print('== Hostname %s not found in .netrc.' % hostname)
++            print('== Authentication not configured. Run `goji login`')
+             exit()
+ 
+     @property
+diff --git a/goji/commands.py b/goji/commands.py
+index 672df40..047d0c8 100644
+--- a/goji/commands.py
++++ b/goji/commands.py
+@@ -1,9 +1,8 @@
+-from os import environ
+-
+ import click
+ from requests.compat import urljoin
+ 
+ from goji.client import JIRAClient
++from goji.auth import get_credentials, set_credentials
+ 
+ 
+ @click.group()
+@@ -11,13 +10,16 @@ from goji.client import JIRAClient
+ @click.pass_context
+ def cli(ctx, base_url):
+     if not ctx.obj:
+-        ctx.obj = JIRAClient(base_url)
++        if ctx.invoked_subcommand == 'login':
++            ctx.obj = base_url
++        else:
++            ctx.obj = JIRAClient(base_url)
+ 
+ 
+ @click.argument('issue_key')
+-@cli.command()
++@cli.command('open')
+ @click.pass_obj
+-def open(client, issue_key):
++def open_command(client, issue_key):
+     """Open issue in a web browser"""
+     url = urljoin(client.base_url, 'browse/%s' % issue_key)
+     click.launch(url)
+@@ -111,6 +113,23 @@ def edit(client, issue_key):
+             print(description)
+ 
+ 
++@cli.command()
++@click.pass_obj
++def login(base_url):
++    """Authenticate with JIRA server"""
++    email, password = get_credentials(base_url)
++    if email is not None:
++        if not click.confirm('This server is already configured. Override?'):
++            return
++
++    click.echo('Enter your JIRA credentials')
++
++    email = click.prompt('Email', type=str)
++    password = click.prompt('Password', type=str, hide_input=True)
++
++    set_credentials(base_url, email, password)
++
++
+ @click.argument('query')
+ @cli.command()
+ @click.pass_obj

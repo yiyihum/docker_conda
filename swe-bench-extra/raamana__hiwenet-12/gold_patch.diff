@@ -1,0 +1,195 @@
+diff --git a/hiwenet/__init__.py b/hiwenet/__init__.py
+index 07c8a69..98bbb16 100644
+--- a/hiwenet/__init__.py
++++ b/hiwenet/__init__.py
+@@ -4,16 +4,19 @@
+ 
+ """
+ 
++__all__ = ['extract', 'pairwise_dist', 'run_cli', 'more_metrics']
++
+ from sys import version_info
+ 
+ if version_info.major==2 and version_info.minor==7:
+-    from hiwenet import extract, run_cli
++    import more_metrics
++    from pairwise_dist import extract, run_cli
+ elif version_info.major > 2:
+-    from hiwenet.hiwenet import extract, run_cli
++    from hiwenet import more_metrics
++    from hiwenet.pairwise_dist import extract, run_cli
+ else:
+-    raise NotImplementedError('hiwenet supports only 2.7.13 or 3+. Upgrade to Python 3+ is recommended.')
++    raise NotImplementedError('hiwenet supports only 2.7 or 3+. Upgrade to Python 3+ is recommended.')
+ 
+-__all__ = ['extract', 'hiwenet', 'run_cli']
+ from ._version import get_versions
+ __version__ = get_versions()['version']
+ del get_versions
+diff --git a/hiwenet/__main__.py b/hiwenet/__main__.py
+index a764b5b..01b6612 100644
+--- a/hiwenet/__main__.py
++++ b/hiwenet/__main__.py
+@@ -1,9 +1,9 @@
+ from sys import version_info
+ 
+ if version_info.major==2 and version_info.minor==7:
+-    from hiwenet import run_cli
++    from pairwise_dist import run_cli
+ elif version_info.major > 2:
+-    from hiwenet.hiwenet import run_cli
++    from hiwenet.pairwise_dist import run_cli
+ else:
+     raise NotImplementedError('hiwenet supports only 2.7.13 or 3+. Upgrade to Python 3+ is recommended.')
+ 
+diff --git a/hiwenet/more_metrics.py b/hiwenet/more_metrics.py
+new file mode 100644
+index 0000000..4826d5d
+--- /dev/null
++++ b/hiwenet/more_metrics.py
+@@ -0,0 +1,76 @@
++"""
++Module implementing additional metrics for edge weights.
++
++"""
++
++__all__ = ['diff_medians', 'diff_medians_abs']
++
++import numpy as np
++
++def check_array(array):
++    "Converts to flattened numpy arrays and ensures its not empty."
++
++    if len(array) < 1:
++        raise ValueError('Input array is empty! Must have atleast 1 element.')
++
++    return np.array(array).flatten()
++
++
++def diff_medians(array_one, array_two):
++    """
++    Computes the difference medians between two arrays of values.
++
++    Given arrays will be flattened (to 1D array) regardless of dimension,
++        and any bon-finite/NaN values will be ignored.
++
++    Parameters
++    ----------
++    array_one, array_two : iterable
++        Two arrays of values, possibly of different length.
++
++    Returns
++    -------
++    diff_medians : float
++        scalar measuring the difference in medians, ignoring NaNs/non-finite values.
++
++    Raises
++    ------
++    ValueError
++        If one or more of the arrays are empty.
++
++    """
++
++    array_one = check_array(array_one)
++    array_two = check_array(array_two)
++    diff_medians = np.median(array_one) - np.median(array_two)
++
++    return diff_medians
++
++
++def diff_medians_abs(array_one, array_two):
++    """
++    Computes the absolute difference (symmetric) medians between two arrays of values.
++
++    Given arrays will be flattened (to 1D array) regardless of dimension,
++        and any bon-finite/NaN values will be ignored.
++
++    Parameters
++    ----------
++    array_one, array_two : iterable
++        Two arrays of values, possibly of different length.
++
++    Returns
++    -------
++    diff_medians : float
++        scalar measuring the difference in medians, ignoring NaNs/non-finite values.
++
++    Raises
++    ------
++    ValueError
++        If one or more of the arrays are empty.
++
++    """
++
++    abs_diff_medians = np.abs(diff_medians(array_one, array_two))
++
++    return abs_diff_medians
+\ No newline at end of file
+diff --git a/hiwenet/hiwenet.py b/hiwenet/pairwise_dist.py
+similarity index 96%
+rename from hiwenet/hiwenet.py
+rename to hiwenet/pairwise_dist.py
+index 39b2518..67aa786 100644
+--- a/hiwenet/hiwenet.py
++++ b/hiwenet/pairwise_dist.py
+@@ -10,6 +10,14 @@ import logging
+ import networkx as nx
+ import numpy as np
+ from os.path import join as pjoin, exists as pexists
++from sys import version_info
++
++if version_info.major==2 and version_info.minor==7:
++    import more_metrics
++elif version_info.major > 2:
++    from hiwenet import more_metrics
++else:
++    raise NotImplementedError('hiwenet supports only 2.7 or 3+. Upgrade to Python 3+ is recommended.')
+ 
+ list_medpy_histogram_metrics = np.array([
+     'chebyshev', 'chebyshev_neg', 'chi_square',
+@@ -37,7 +45,7 @@ semi_metric_list = [
+     'noelle_1', 'noelle_3',
+     'correlate_1']
+ 
+-metrics_on_original_features = ['diff_medians', ]
++metrics_on_original_features = ['diff_medians', 'diff_medians_abs']
+ 
+ minimum_num_bins = 5
+ 
+@@ -318,6 +326,8 @@ def extract(features, groups,
+         print('All exceptions encountered so far:\n {}'.format('\n'.join(exceptions_list)))
+         raise ValueError('Weights for atleast {:.2f}% of edges could not be computed.'.format(error_thresh * 100))
+ 
++    sys.stdout.write('\n')
++
+     if return_networkx_graph:
+         if out_weights_path is not None:
+             graph.write_graphml(out_weights_path)
+@@ -492,16 +502,23 @@ def check_weight_method(weight_method_spec,
+         raise TypeError('allow_non_symmetric flag must be boolean')
+ 
+     if isinstance(weight_method_spec, str):
++        weight_method_spec = weight_method_spec.lower()
++
+         if weight_method_spec in list_medpy_histogram_metrics:
+             from medpy.metric import histogram as medpy_hist_metrics
+             weight_func = getattr(medpy_hist_metrics, weight_method_spec)
++            if use_orig_distr:
++                raise ValueError('use_original_distribution must be False when using builtin histogram metrics, '
++                                 'which expect histograms as input.')
++
++        elif weight_method_spec in metrics_on_original_features:
++            weight_func = getattr(more_metrics, weight_method_spec)
++            if not use_orig_distr:
++                raise ValueError('use_original_distribution must be True when using builtin non-histogram metrics, '
++                                 'which expect original feature values in ROI/node as input.')
+         else:
+             raise NotImplementedError('Chosen histogram distance/metric not implemented or invalid.')
+ 
+-        if use_orig_distr:
+-            raise ValueError('use_original_distribution must be False when using builtin histogram metrics, '
+-                             'which expect histograms as input.')
+-
+     elif callable(weight_method_spec):
+         # ensure 1) takes two ndarrays
+         try:

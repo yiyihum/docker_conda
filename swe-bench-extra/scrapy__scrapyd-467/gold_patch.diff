@@ -1,0 +1,138 @@
+diff --git a/docs/api.rst b/docs/api.rst
+index 085f345..b896cf7 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -212,7 +212,9 @@ Example response::
+                 "id": "2f16646cfcaf11e1b0090800272a6d06",
+                 "project": "myproject", "spider": "spider3",
+                 "start_time": "2012-09-12 10:14:03.594664",
+-                "end_time": "2012-09-12 10:24:03.594664"
++                "end_time": "2012-09-12 10:24:03.594664",
++                "log_url": "/logs/myproject/spider3/2f16646cfcaf11e1b0090800272a6d06.log",
++                "items_url": "/items/myproject/spider3/2f16646cfcaf11e1b0090800272a6d06.jl"
+             }
+         ]
+     }
+diff --git a/docs/news.rst b/docs/news.rst
+index 1e53ed8..6256801 100644
+--- a/docs/news.rst
++++ b/docs/news.rst
+@@ -9,7 +9,8 @@ Unreleased
+ Added
+ ~~~~~
+ 
+-- Python 3.1 support.
++- Add ``item_url`` and ``log_url`` to the response from the listjobs.json webservice. (@mxdev88)
++- Python 3.11 support.
+ 
+ Removed
+ ~~~~~~~
+@@ -20,9 +21,9 @@ Removed
+ Fixed
+ ~~~~~
+ 
+-- Use ``packaging.version.Version`` instead of ``distutils.LooseVersion``.
+-- Print Scrapyd's version instead of Twisted's version with ``--version`` (``-v``) flag.
+-- Override Scrapy's ``LOG_STDOUT`` to ``False`` to suppress logging output for listspiders.json webservice.
++- Use ``packaging.version.Version`` instead of ``distutils.LooseVersion``. (@pawelmhm)
++- Print Scrapyd's version instead of Twisted's version with ``--version`` (``-v``) flag. (@niuguy)
++- Override Scrapy's ``LOG_STDOUT`` to ``False`` to suppress logging output for listspiders.json webservice. (@Lucioric2000)
+ 
+ 1.3.0 (2022-01-12)
+ ------------------
+diff --git a/scrapyd/jobstorage.py b/scrapyd/jobstorage.py
+index 565b12d..ffaa950 100644
+--- a/scrapyd/jobstorage.py
++++ b/scrapyd/jobstorage.py
+@@ -7,6 +7,14 @@ from scrapyd.interfaces import IJobStorage
+ from scrapyd.sqlite import SqliteFinishedJobs
+ 
+ 
++def job_log_url(job):
++    return f"/logs/{job.project}/{job.spider}/{job.job}.log"
++
++
++def job_items_url(job):
++    return f"/items/{job.project}/{job.spider}/{job.job}.jl"
++
++
+ class Job(object):
+     def __init__(self, project, spider, job=None, start_time=None, end_time=None):
+         self.project = project
+diff --git a/scrapyd/webservice.py b/scrapyd/webservice.py
+index b345bc2..f9c2320 100644
+--- a/scrapyd/webservice.py
++++ b/scrapyd/webservice.py
+@@ -5,6 +5,7 @@ from io import BytesIO
+ 
+ from twisted.python import log
+ 
++from scrapyd.jobstorage import job_items_url, job_log_url
+ from scrapyd.utils import JsonResource, UtilsCache, get_spider_list, native_stringify_dict
+ 
+ 
+@@ -148,7 +149,9 @@ class ListJobs(WsResource):
+                 "project": s.project,
+                 "spider": s.spider, "id": s.job,
+                 "start_time": str(s.start_time),
+-                "end_time": str(s.end_time)
++                "end_time": str(s.end_time),
++                "log_url": job_log_url(s),
++                "items_url": job_items_url(s),
+             } for s in self.root.launcher.finished
+             if project is None or s.project == project
+         ]
+diff --git a/scrapyd/website.py b/scrapyd/website.py
+index 49bf5c6..f71842e 100644
+--- a/scrapyd/website.py
++++ b/scrapyd/website.py
+@@ -7,6 +7,7 @@ from twisted.application.service import IServiceCollection
+ from twisted.web import resource, static
+ 
+ from scrapyd.interfaces import IEggStorage, IPoller, ISpiderScheduler
++from scrapyd.jobstorage import job_items_url, job_log_url
+ 
+ 
+ class Root(resource.Resource):
+@@ -17,15 +18,15 @@ class Root(resource.Resource):
+         self.runner = config.get('runner')
+         logsdir = config.get('logs_dir')
+         itemsdir = config.get('items_dir')
+-        local_items = itemsdir and (urlparse(itemsdir).scheme.lower() in ['', 'file'])
++        self.local_items = itemsdir and (urlparse(itemsdir).scheme.lower() in ['', 'file'])
+         self.app = app
+         self.nodename = config.get('node_name', socket.gethostname())
+-        self.putChild(b'', Home(self, local_items))
++        self.putChild(b'', Home(self, self.local_items))
+         if logsdir:
+             self.putChild(b'logs', static.File(logsdir.encode('ascii', 'ignore'), 'text/plain'))
+-        if local_items:
++        if self.local_items:
+             self.putChild(b'items', static.File(itemsdir, 'text/plain'))
+-        self.putChild(b'jobs', Jobs(self, local_items))
++        self.putChild(b'jobs', Jobs(self, self.local_items))
+         services = config.items('services', ())
+         for servName, servClsName in services:
+             servCls = load_object(servClsName)
+@@ -206,8 +207,8 @@ class Jobs(resource.Resource):
+                 "PID": p.pid,
+                 "Start": microsec_trunc(p.start_time),
+                 "Runtime": microsec_trunc(datetime.now() - p.start_time),
+-                "Log": '<a href="/logs/%s/%s/%s.log">Log</a>' % (p.project, p.spider, p.job),
+-                "Items": '<a href="/items/%s/%s/%s.jl">Items</a>' % (p.project, p.spider, p.job),
++                "Log": f'<a href="{job_log_url(p)}">Log</a>',
++                "Items": f'<a href="{job_items_url(p)}">Items</a>',
+                 "Cancel": self.cancel_button(project=p.project, jobid=p.job),
+             })
+             for p in self.root.launcher.processes.values()
+@@ -222,8 +223,8 @@ class Jobs(resource.Resource):
+                 "Start": microsec_trunc(p.start_time),
+                 "Runtime": microsec_trunc(p.end_time - p.start_time),
+                 "Finish": microsec_trunc(p.end_time),
+-                "Log": '<a href="/logs/%s/%s/%s.log">Log</a>' % (p.project, p.spider, p.job),
+-                "Items": '<a href="/items/%s/%s/%s.jl">Items</a>' % (p.project, p.spider, p.job),
++                "Log": f'<a href="{job_log_url(p)}">Log</a>',
++                "Items": f'<a href="{job_items_url(p)}">Items</a>',
+             })
+             for p in self.root.launcher.finished
+         )

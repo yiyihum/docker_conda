@@ -1,0 +1,132 @@
+diff --git a/web_poet/pages.py b/web_poet/pages.py
+index e53a585..e3cd3dc 100644
+--- a/web_poet/pages.py
++++ b/web_poet/pages.py
+@@ -1,17 +1,21 @@
+ import abc
+ import inspect
+-import typing
+ from contextlib import suppress
+ from functools import wraps
++from typing import Any, Generic, Optional, TypeVar, overload
+ 
+ import attr
+ import parsel
+ 
+-from web_poet._typing import get_item_cls
+ from web_poet.fields import FieldsMixin, item_from_fields
+ from web_poet.mixins import ResponseShortcutsMixin, SelectorShortcutsMixin
+ from web_poet.page_inputs import HttpResponse
+-from web_poet.utils import CallableT, _create_deprecated_class, cached_method
++from web_poet.utils import (
++    CallableT,
++    _create_deprecated_class,
++    cached_method,
++    get_generic_param,
++)
+ 
+ 
+ class Injectable(abc.ABC, FieldsMixin):
+@@ -35,25 +39,40 @@ class Injectable(abc.ABC, FieldsMixin):
+ Injectable.register(type(None))
+ 
+ 
+-def is_injectable(cls: typing.Any) -> bool:
++def is_injectable(cls: Any) -> bool:
+     """Return True if ``cls`` is a class which inherits
+     from :class:`~.Injectable`."""
+     return isinstance(cls, type) and issubclass(cls, Injectable)
+ 
+ 
+-ItemT = typing.TypeVar("ItemT")
++ItemT = TypeVar("ItemT")
+ 
+ 
+-class Returns(typing.Generic[ItemT]):
++class Returns(Generic[ItemT]):
+     """Inherit from this generic mixin to change the item class used by
+     :class:`~.ItemPage`"""
+ 
+     @property
+-    def item_cls(self) -> typing.Type[ItemT]:
++    def item_cls(self) -> type:
+         """Item class"""
+         return get_item_cls(self.__class__, default=dict)
+ 
+ 
++@overload
++def get_item_cls(cls: type, default: type) -> type:
++    ...
++
++
++@overload
++def get_item_cls(cls: type, default: None) -> Optional[type]:
++    ...
++
++
++def get_item_cls(cls: type, default: Optional[type] = None) -> Optional[type]:
++    param = get_generic_param(cls, Returns)
++    return param or default
++
++
+ _NOT_SET = object()
+ 
+ 
+diff --git a/web_poet/rules.py b/web_poet/rules.py
+index 53f3efe..3337bac 100644
+--- a/web_poet/rules.py
++++ b/web_poet/rules.py
+@@ -22,9 +22,8 @@ from typing import (
+ import attrs
+ from url_matcher import Patterns, URLMatcher
+ 
+-from web_poet._typing import get_item_cls
+ from web_poet.page_inputs.url import _Url
+-from web_poet.pages import ItemPage
++from web_poet.pages import ItemPage, get_item_cls
+ from web_poet.utils import _create_deprecated_class, as_list, str_to_pattern
+ 
+ Strings = Union[str, Iterable[str]]
+diff --git a/web_poet/utils.py b/web_poet/utils.py
+index 4eccc99..49d7b8c 100644
+--- a/web_poet/utils.py
++++ b/web_poet/utils.py
+@@ -1,9 +1,10 @@
+ import inspect
+ import weakref
++from collections import deque
+ from collections.abc import Iterable
+ from functools import lru_cache, partial, wraps
+ from types import MethodType
+-from typing import Any, Callable, List, Optional, TypeVar, Union
++from typing import Any, Callable, List, Optional, Tuple, TypeVar, Union, get_args
+ from warnings import warn
+ 
+ import packaging.version
+@@ -273,3 +274,25 @@ def str_to_pattern(url_pattern: Union[str, Patterns]) -> Patterns:
+     if isinstance(url_pattern, Patterns):
+         return url_pattern
+     return Patterns([url_pattern])
++
++
++def get_generic_param(
++    cls: type, expected: Union[type, Tuple[type, ...]]
++) -> Optional[type]:
++    """Search the base classes recursively breadth-first for a generic class and return its param.
++
++    Returns the param of the first found class that is a subclass of ``expected``.
++    """
++    visited = set()
++    queue = deque([cls])
++    while queue:
++        node = queue.popleft()
++        visited.add(node)
++        for base in getattr(node, "__orig_bases__", []):
++            origin = getattr(base, "__origin__", None)
++            if origin and issubclass(origin, expected):
++                result = get_args(base)[0]
++                if not isinstance(result, TypeVar):
++                    return result
++            queue.append(base)
++    return None
+

@@ -1,0 +1,126 @@
+diff --git a/mopidy_local/__init__.py b/mopidy_local/__init__.py
+index d4d881a..225ecd2 100644
+--- a/mopidy_local/__init__.py
++++ b/mopidy_local/__init__.py
+@@ -26,6 +26,7 @@ class Extension(ext.Extension):
+         schema["scan_timeout"] = config.Integer(minimum=1000, maximum=1000 * 60 * 60)
+         schema["scan_flush_threshold"] = config.Integer(minimum=0)
+         schema["scan_follow_symlinks"] = config.Boolean()
++        schema["included_file_extensions"] = config.List(optional=True)
+         schema["excluded_file_extensions"] = config.List(optional=True)
+         schema["directories"] = config.List()
+         schema["timeout"] = config.Integer(optional=True, minimum=1)
+diff --git a/mopidy_local/commands.py b/mopidy_local/commands.py
+index 5dc213d..f195614 100644
+--- a/mopidy_local/commands.py
++++ b/mopidy_local/commands.py
+@@ -81,6 +81,10 @@ class ScanCommand(commands.Command):
+                 media_dir=media_dir,
+                 file_mtimes=file_mtimes,
+                 files_in_library=files_in_library,
++                included_file_exts=[
++                    file_ext.lower()
++                    for file_ext in config["local"]["included_file_extensions"]
++                ],
+                 excluded_file_exts=[
+                     file_ext.lower()
+                     for file_ext in config["local"]["excluded_file_extensions"]
+@@ -143,19 +147,56 @@ class ScanCommand(commands.Command):
+         return files_to_update, files_in_library
+ 
+     def _find_files_to_scan(
+-        self, *, media_dir, file_mtimes, files_in_library, excluded_file_exts
++        self,
++        *,
++        media_dir,
++        file_mtimes,
++        files_in_library,
++        included_file_exts,
++        excluded_file_exts,
+     ):
+         files_to_update = set()
+ 
++        def _is_hidden_file(relative_path, file_uri):
++            if any(p.startswith(".") for p in relative_path.parts):
++                logger.debug(f"Skipped {file_uri}: Hidden directory/file")
++                return True
++            else:
++                return False
++
++        def _extension_filters(
++            relative_path, file_uri, included_file_exts, excluded_file_exts
++        ):
++            if included_file_exts:
++                if relative_path.suffix.lower() in included_file_exts:
++                    logger.debug(f"Added {file_uri}: File extension on included list")
++                    return True
++                else:
++                    logger.debug(
++                        f"Skipped {file_uri}: File extension not on included list"
++                    )
++                    return False
++            else:
++                if relative_path.suffix.lower() in excluded_file_exts:
++                    logger.debug(f"Skipped {file_uri}: File extension on excluded list")
++                    return False
++                else:
++                    logger.debug(
++                        f"Included {file_uri}: File extension not on excluded list"
++                    )
++                    return True
++
+         for absolute_path in file_mtimes:
+             relative_path = absolute_path.relative_to(media_dir)
+             file_uri = absolute_path.as_uri()
+ 
+-            if any(p.startswith(".") for p in relative_path.parts):
+-                logger.debug(f"Skipped {file_uri}: Hidden directory/file")
+-            elif relative_path.suffix.lower() in excluded_file_exts:
+-                logger.debug(f"Skipped {file_uri}: File extension excluded")
+-            elif absolute_path not in files_in_library:
++            if (
++                not _is_hidden_file(relative_path, file_uri)
++                and _extension_filters(
++                    relative_path, file_uri, included_file_exts, excluded_file_exts
++                )
++                and absolute_path not in files_in_library
++            ):
+                 files_to_update.add(absolute_path)
+ 
+         logger.info(f"Found {len(files_to_update)} tracks which need to be updated")
+diff --git a/mopidy_local/library.py b/mopidy_local/library.py
+index e77460e..61ae109 100644
+--- a/mopidy_local/library.py
++++ b/mopidy_local/library.py
+@@ -1,4 +1,3 @@
+-import hashlib
+ import logging
+ import operator
+ import sqlite3
+@@ -203,9 +202,3 @@ class LocalLibraryProvider(backend.LibraryProvider):
+             return [{"album": uri}]
+         else:
+             return []
+-
+-    def _model_uri(self, type, model):
+-        if model.musicbrainz_id and self._config["use_%s_mbid_uri" % type]:
+-            return f"local:{type}:mbid:{model.musicbrainz_id}"
+-        digest = hashlib.md5(str(model)).hexdigest()
+-        return f"local:{type}:md5:{digest}"
+diff --git a/mopidy_local/storage.py b/mopidy_local/storage.py
+index d5b28fd..a8679c3 100644
+--- a/mopidy_local/storage.py
++++ b/mopidy_local/storage.py
+@@ -31,10 +31,7 @@ def get_image_size_gif(data):
+ 
+ 
+ def model_uri(type, model):
+-    # only use valid mbids; TODO: use regex for that?
+-    if model.musicbrainz_id and len(model.musicbrainz_id) == 36:
+-        return f"local:{type}:mbid:{model.musicbrainz_id}"
+-    elif type == "album":
++    if type == "album":
+         # ignore num_tracks for multi-disc albums
+         digest = hashlib.md5(str(model.replace(num_tracks=None)).encode())
+     else:
+

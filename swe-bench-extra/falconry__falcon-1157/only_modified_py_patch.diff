@@ -1,0 +1,203 @@
+diff --git a/falcon/api.py b/falcon/api.py
+index beb4fff..a003f6d 100644
+--- a/falcon/api.py
++++ b/falcon/api.py
+@@ -140,7 +140,8 @@ class API(object):
+     __slots__ = ('_request_type', '_response_type',
+                  '_error_handlers', '_media_type', '_router', '_sinks',
+                  '_serialize_error', 'req_options', 'resp_options',
+-                 '_middleware', '_independent_middleware', '_router_search')
++                 '_middleware', '_independent_middleware', '_router_search',
++                 '_static_routes')
+ 
+     def __init__(self, media_type=DEFAULT_MEDIA_TYPE,
+                  request_type=Request, response_type=Response,
+@@ -148,6 +149,7 @@ class API(object):
+                  independent_middleware=False):
+         self._sinks = []
+         self._media_type = media_type
++        self._static_routes = []
+ 
+         # set middleware
+         self._middleware = helpers.prepare_middleware(
+@@ -350,6 +352,53 @@ class API(object):
+         self._router.add_route(uri_template, method_map, resource, *args,
+                                **kwargs)
+ 
++    def add_static_route(self, prefix, directory, downloadable=False):
++        """Add a route to a directory of static files.
++
++        Static routes provide a way to serve files directly. This
++        feature provides an alternative to serving files at the web server
++        level when you don't have that option, when authorization is
++        required, or for testing purposes.
++
++        Warning:
++            Serving files directly from the web server,
++            rather than through the Python app, will always be more efficient,
++            and therefore should be preferred in production deployments.
++
++        Static routes are matched in LIFO order. Therefore, if the same
++        prefix is used for two routes, the second one will override the
++        first. This also means that more specific routes should be added
++        *after* less specific ones. For example, the following sequence
++        would result in ``'/foo/bar/thing.js'`` being mapped to the
++        ``'/foo/bar'`` route, and ``'/foo/xyz/thing.js'`` being mapped to the
++        ``'/foo'`` route::
++
++            api.add_static_route('/foo', foo_path)
++            api.add_static_route('/foo/bar', foobar_path)
++
++        Args:
++            prefix (str): The path prefix to match for this route. If the
++                path in the requested URI starts with this string, the remainder
++                of the path will be appended to the source directory to
++                determine the file to serve. This is done in a secure manner
++                to prevent an attacker from requesting a file outside the
++                specified directory.
++
++                Note that static routes are matched in LIFO order, and are only
++                attempted after checking dynamic routes and sinks.
++
++            directory (str): The source directory from which to serve files.
++            downloadable (bool): Set to ``True`` to include a
++                Content-Disposition header in the response. The "filename"
++                directive is simply set to the name of the requested file.
++
++        """
++
++        self._static_routes.insert(
++            0,
++            routing.StaticRoute(prefix, directory, downloadable=downloadable)
++        )
++
+     def add_sink(self, sink, prefix=r'/'):
+         """Register a sink method for the API.
+ 
+@@ -563,7 +612,13 @@ class API(object):
+ 
+                     break
+             else:
+-                responder = falcon.responders.path_not_found
++
++                for sr in self._static_routes:
++                    if sr.match(path):
++                        responder = sr
++                        break
++                else:
++                    responder = falcon.responders.path_not_found
+ 
+         return (responder, params, resource, uri_template)
+ 
+diff --git a/falcon/response.py b/falcon/response.py
+index e10d778..9479468 100644
+--- a/falcon/response.py
++++ b/falcon/response.py
+@@ -14,6 +14,8 @@
+ 
+ """Response class."""
+ 
++import mimetypes
++
+ from six import PY2
+ from six import string_types as STRING_TYPES
+ 
+@@ -25,6 +27,7 @@ from six.moves import http_cookies  # NOQA: I202
+ from falcon import DEFAULT_MEDIA_TYPE
+ from falcon.media import Handlers
+ from falcon.response_helpers import (
++    format_content_disposition,
+     format_header_value_list,
+     format_range,
+     header_property,
+@@ -34,6 +37,7 @@ from falcon.util import dt_to_http, TimezoneGMT
+ from falcon.util.uri import encode as uri_encode
+ from falcon.util.uri import encode_value as uri_encode_value
+ 
++
+ SimpleCookie = http_cookies.SimpleCookie
+ CookieError = http_cookies.CookieError
+ 
+@@ -679,6 +683,16 @@ class Response(object):
+         and ``falcon.MEDIA_GIF``.
+         """)
+ 
++    downloadable_as = header_property(
++        'Content-Disposition',
++        """Set the Content-Disposition header using the given filename.
++
++        The value will be used for the "filename" directive. For example,
++        given 'report.pdf', the Content-Disposition header would be set
++        to ``'attachment; filename="report.pdf"'``.
++        """,
++        format_content_disposition)
++
+     etag = header_property(
+         'ETag',
+         'Set the ETag header.')
+@@ -811,24 +825,32 @@ class ResponseOptions(object):
+             not requiring HTTPS. Note, however, that this setting can
+             be overridden via `set_cookie()`'s `secure` kwarg.
+ 
+-        default_media_type (str): The default media-type to use when
+-            deserializing a response. This value is normally set to the media
+-            type provided when a :class:`falcon.API` is initialized; however,
+-            if created independently, this will default to the
++        default_media_type (str): The default Internet media type (RFC 2046) to
++            use when deserializing a response. This value is normally set to the
++            media type provided when a :class:`falcon.API` is initialized;
++            however, if created independently, this will default to the
+             ``DEFAULT_MEDIA_TYPE`` specified by Falcon.
+ 
+         media_handlers (Handlers): A dict-like object that allows you to
+             configure the media-types that you would like to handle.
+             By default, a handler is provided for the ``application/json``
+             media type.
++
++        static_media_types (dict): A mapping of dot-prefixed file extensions to
++            Internet media types (RFC 2046). Defaults to ``mimetypes.types_map``
++            after calling ``mimetypes.init()``.
+     """
+     __slots__ = (
+         'secure_cookies_by_default',
+         'default_media_type',
+         'media_handlers',
++        'static_media_types',
+     )
+ 
+     def __init__(self):
+         self.secure_cookies_by_default = True
+         self.default_media_type = DEFAULT_MEDIA_TYPE
+         self.media_handlers = Handlers()
++
++        mimetypes.init()
++        self.static_media_types = mimetypes.types_map
+diff --git a/falcon/response_helpers.py b/falcon/response_helpers.py
+index 47308c2..602eb5b 100644
+--- a/falcon/response_helpers.py
++++ b/falcon/response_helpers.py
+@@ -77,6 +77,12 @@ def format_range(value):
+     return result
+ 
+ 
++def format_content_disposition(value):
++    """Formats a Content-Disposition header given a filename."""
++
++    return 'attachment; filename="' + value + '"'
++
++
+ if six.PY2:
+     def format_header_value_list(iterable):
+         """Join an iterable of strings with commas."""
+diff --git a/falcon/routing/__init__.py b/falcon/routing/__init__.py
+index abb9c87..51bc7d3 100644
+--- a/falcon/routing/__init__.py
++++ b/falcon/routing/__init__.py
+@@ -20,6 +20,7 @@ routers.
+ """
+ 
+ from falcon.routing.compiled import CompiledRouter, CompiledRouterOptions  # NOQA
++from falcon.routing.static import StaticRoute  # NOQA
+ from falcon.routing.util import create_http_method_map  # NOQA
+ from falcon.routing.util import map_http_methods  # NOQA
+ from falcon.routing.util import set_default_responders  # NOQA

@@ -1,0 +1,554 @@
+diff --git a/dvc/repo/plots/__init__.py b/dvc/repo/plots/__init__.py
+--- a/dvc/repo/plots/__init__.py
++++ b/dvc/repo/plots/__init__.py
+@@ -1,11 +1,80 @@
++import logging
++
++from funcy import first, project
++
++from dvc.exceptions import DvcException, NoPlotsError, OutputNotFoundError
++from dvc.repo.tree import RepoTree
++from dvc.schema import PLOT_PROPS
++
++logger = logging.getLogger(__name__)
++
++
+ class Plots:
+     def __init__(self, repo):
+         self.repo = repo
+ 
+-    def show(self, *args, **kwargs):
+-        from .show import show
++    def collect(self, targets=None, revs=None):
++        """Collects all props and data for plots.
++
++        Returns a structure like:
++            {rev: {plots.csv: {
++                props: {x: ..., "csv_header": ..., ...},
++                data: "...data as a string...",
++            }}}
++        Data parsing is postponed, since it's affected by props.
++        """
++        targets = [targets] if isinstance(targets, str) else targets or []
++        data = {}
++        for rev in self.repo.brancher(revs=revs):
++            # .brancher() adds unwanted workspace
++            if revs is not None and rev not in revs:
++                continue
++            rev = rev or "workspace"
++
++            tree = RepoTree(self.repo)
++            plots = _collect_plots(self.repo, targets, rev)
++            for datafile, props in plots.items():
++                data[rev] = {datafile: {"props": props}}
++
++                # Load data from git or dvc cache
++                try:
++                    with tree.open(datafile) as fd:
++                        data[rev][datafile]["data"] = fd.read()
++                except FileNotFoundError:
++                    # This might happen simply because cache is absent
++                    pass
++
++        return data
++
++    def render(self, data, revs=None, props=None, templates=None):
++        """Renders plots"""
++        props = props or {}
++        templates = templates or self.repo.plot_templates
+ 
+-        return show(self.repo, *args, **kwargs)
++        # Merge data by plot file and apply overriding props
++        plots = _prepare_plots(data, revs, props)
++
++        return {
++            datafile: _render(datafile, desc["data"], desc["props"], templates)
++            for datafile, desc in plots.items()
++        }
++
++    def show(self, targets=None, revs=None, props=None):
++        from .data import NoMetricInHistoryError
++
++        data = self.collect(targets, revs)
++
++        # If any mentioned plot doesn't have any data then that's an error
++        targets = [targets] if isinstance(targets, str) else targets or []
++        for target in targets:
++            if not any("data" in d[target] for d in data.values()):
++                raise NoMetricInHistoryError(target)
++
++        # No data at all is a special error with a special message
++        if not data:
++            raise NoPlotsError()
++
++        return self.render(data, revs, props)
+ 
+     def diff(self, *args, **kwargs):
+         from .diff import diff
+@@ -33,3 +102,113 @@ def modify(self, path, props=None, unset=None):
+ 
+         dvcfile = Dvcfile(self.repo, out.stage.path)
+         dvcfile.dump(out.stage, update_pipeline=True)
++
++
++def _collect_plots(repo, targets=None, rev=None):
++    def _targets_to_outs(targets):
++        for t in targets:
++            try:
++                (out,) = repo.find_outs_by_path(t)
++                yield out
++            except OutputNotFoundError:
++                logger.warning(
++                    "File '{}' was not found at: '{}'. It will not be "
++                    "plotted.".format(t, rev)
++                )
++
++    if targets:
++        outs = _targets_to_outs(targets)
++    else:
++        outs = (out for stage in repo.stages for out in stage.outs if out.plot)
++
++    return {str(out): _plot_props(out) for out in outs}
++
++
++def _plot_props(out):
++    if not out.plot:
++        raise DvcException(
++            f"'{out}' is not a plot. Use `dvc plots modify` to change that."
++        )
++    if isinstance(out.plot, list):
++        raise DvcException("Multiple plots per data file not supported.")
++    if isinstance(out.plot, bool):
++        return {}
++
++    return project(out.plot, PLOT_PROPS)
++
++
++def _prepare_plots(data, revs, props):
++    """Groups data by plot file.
++
++    Also resolves props conflicts between revs and applies global props.
++    """
++    # we go in order revs are supplied on props conflict first ones win.
++    revs = iter(data) if revs is None else revs
++
++    plots, props_revs = {}, {}
++    for rev in revs:
++        # Asked for revision without data
++        if rev not in data:
++            continue
++
++        for datafile, desc in data[rev].items():
++            # props from command line overwrite plot props from out definition
++            full_props = {**desc["props"], **props}
++
++            if datafile in plots:
++                saved = plots[datafile]
++                if saved["props"] != full_props:
++                    logger.warning(
++                        f"Inconsistent plot props for '{datafile}' in "
++                        f"'{props_revs[datafile]}' and '{rev}'. "
++                        f"Going to use ones from '{props_revs[datafile]}'"
++                    )
++
++                saved["data"][rev] = desc["data"]
++            else:
++                plots[datafile] = {
++                    "props": full_props,
++                    "data": {rev: desc["data"]},
++                }
++                # Save rev we got props from
++                props_revs[datafile] = rev
++
++    return plots
++
++
++def _render(datafile, datas, props, templates):
++    from .data import plot_data, PlotData
++
++    # Copy it to not modify a passed value
++    props = props.copy()
++
++    # Add x and y to fields if set
++    fields = props.get("fields")
++    if fields is not None:
++        fields = {*fields, props.get("x"), props.get("y")} - {None}
++
++    template = templates.load(props.get("template") or "default")
++
++    # If x is not set add index field
++    if not props.get("x") and template.has_anchor("x"):
++        props["append_index"] = True
++        props["x"] = PlotData.INDEX_FIELD
++
++    # Parse all data, preprocess it and collect as a list of dicts
++    data = []
++    for rev, datablob in datas.items():
++        rev_data = plot_data(datafile, rev, datablob).to_datapoints(
++            fields=fields,
++            path=props.get("path"),
++            csv_header=props.get("csv_header", True),
++            append_index=props.get("append_index", False),
++        )
++        data.extend(rev_data)
++
++    # If y is not set then use last field not used yet
++    if not props.get("y") and template.has_anchor("y"):
++        fields = list(first(data))
++        skip = (PlotData.REVISION_FIELD, props.get("x"))
++        props["y"] = first(f for f in reversed(fields) if f not in skip)
++
++    return template.render(data, props=props)
+diff --git a/dvc/repo/plots/data.py b/dvc/repo/plots/data.py
+--- a/dvc/repo/plots/data.py
++++ b/dvc/repo/plots/data.py
+@@ -1,7 +1,6 @@
+ import csv
+ import io
+ import json
+-import logging
+ import os
+ from collections import OrderedDict
+ from copy import copy
+@@ -10,9 +9,7 @@
+ from funcy import first
+ from yaml import SafeLoader
+ 
+-from dvc.exceptions import DvcException, PathMissingError
+-
+-logger = logging.getLogger(__name__)
++from dvc.exceptions import DvcException
+ 
+ 
+ class PlotMetricTypeError(DvcException):
+@@ -31,21 +28,6 @@ def __init__(self):
+         )
+ 
+ 
+-class JsonParsingError(DvcException):
+-    def __init__(self, file):
+-        super().__init__(
+-            "Failed to infer data structure from '{}'. Did you forget "
+-            "to specify JSONpath?".format(file)
+-        )
+-
+-
+-class NoMetricOnRevisionError(DvcException):
+-    def __init__(self, path, revision):
+-        self.path = path
+-        self.revision = revision
+-        super().__init__(f"Could not find '{path}' on revision '{revision}'")
+-
+-
+ class NoMetricInHistoryError(DvcException):
+     def __init__(self, path):
+         super().__init__(f"Could not find '{path}'.")
+@@ -77,7 +59,7 @@ def _filter_fields(data_points, filename, revision, fields=None, **kwargs):
+         if keys & fields != fields:
+             raise DvcException(
+                 "Could not find fields: '{}' for '{}' at '{}'.".format(
+-                    ", " "".join(fields), filename, revision
++                    ", ".join(fields), filename, revision
+                 )
+             )
+ 
+@@ -240,47 +222,3 @@ def construct_mapping(loader, node):
+     def _processors(self):
+         parent_processors = super()._processors()
+         return [_find_data] + parent_processors
+-
+-
+-def _load_from_revision(repo, datafile, revision):
+-    from dvc.repo.tree import RepoTree
+-
+-    tree = RepoTree(repo)
+-
+-    try:
+-        with tree.open(datafile) as fobj:
+-            datafile_content = fobj.read()
+-
+-    except (FileNotFoundError, PathMissingError):
+-        raise NoMetricOnRevisionError(datafile, revision)
+-
+-    return plot_data(datafile, revision, datafile_content)
+-
+-
+-def _load_from_revisions(repo, datafile, revisions):
+-    data = []
+-    exceptions = []
+-
+-    for rev in repo.brancher(revs=revisions):
+-        if rev == "workspace" and rev not in revisions:
+-            continue
+-
+-        try:
+-            data.append(_load_from_revision(repo, datafile, rev))
+-        except NoMetricOnRevisionError as e:
+-            exceptions.append(e)
+-        except PlotMetricTypeError:
+-            raise
+-        except (yaml.error.YAMLError, json.decoder.JSONDecodeError, csv.Error):
+-            logger.error(f"Failed to parse '{datafile}' at '{rev}'.")
+-            raise
+-
+-    if not data and exceptions:
+-        raise NoMetricInHistoryError(datafile)
+-    else:
+-        for e in exceptions:
+-            logger.warning(
+-                "File '{}' was not found at: '{}'. It will not be "
+-                "plotted.".format(e.path, e.revision)
+-            )
+-    return data
+diff --git a/dvc/repo/plots/template.py b/dvc/repo/plots/template.py
+--- a/dvc/repo/plots/template.py
++++ b/dvc/repo/plots/template.py
+@@ -1,28 +1,17 @@
+ import json
+-import logging
+ import os
+-import re
+ 
+ from funcy import cached_property
+ 
+ from dvc.exceptions import DvcException
+ from dvc.utils.fs import makedirs
+ 
+-logger = logging.getLogger(__name__)
+-
+ 
+ class TemplateNotFoundError(DvcException):
+     def __init__(self, path):
+         super().__init__(f"Template '{path}' not found.")
+ 
+ 
+-class NoDataForTemplateError(DvcException):
+-    def __init__(self, template_path):
+-        super().__init__(
+-            "No data provided for '{}'.".format(os.path.relpath(template_path))
+-        )
+-
+-
+ class NoFieldInDataError(DvcException):
+     def __init__(self, field_name):
+         super().__init__(
+@@ -34,6 +23,7 @@ class Template:
+     INDENT = 4
+     SEPARATORS = (",", ": ")
+     EXTENSION = ".json"
++    ANCHOR = '"<DVC_METRIC_{}>"'
+     METRIC_DATA_ANCHOR = "<DVC_METRIC_DATA>"
+     X_ANCHOR = "<DVC_METRIC_X>"
+     Y_ANCHOR = "<DVC_METRIC_Y>"
+@@ -41,125 +31,60 @@ class Template:
+     X_LABEL_ANCHOR = "<DVC_METRIC_X_LABEL>"
+     Y_LABEL_ANCHOR = "<DVC_METRIC_Y_LABEL>"
+ 
+-    def __init__(self, templates_dir):
+-        self.plot_templates_dir = templates_dir
+-
+-    def dump(self):
+-        makedirs(self.plot_templates_dir, exist_ok=True)
+-
+-        with open(
+-            os.path.join(
+-                self.plot_templates_dir, self.TEMPLATE_NAME + self.EXTENSION
+-            ),
+-            "w",
+-        ) as fobj:
+-            json.dump(
+-                self.DEFAULT_CONTENT,
+-                fobj,
+-                indent=self.INDENT,
+-                separators=self.SEPARATORS,
+-            )
+-            fobj.write("\n")
+-
+-    @staticmethod
+-    def get_data_anchor(template_content):
+-        regex = re.compile('"<DVC_METRIC_DATA[^>"]*>"')
+-        return regex.findall(template_content)
++    def __init__(self, content=None, name=None):
++        self.content = self.DEFAULT_CONTENT if content is None else content
++        self.name = name or self.DEFAULT_NAME
++        self.filename = self.name + self.EXTENSION
+ 
+-    @staticmethod
+-    def parse_data_anchors(template_content):
+-        data_files = {
+-            Template.get_datafile(m)
+-            for m in Template.get_data_anchor(template_content)
+-        }
+-        return {df for df in data_files if df}
+-
+-    @staticmethod
+-    def get_datafile(anchor_string):
+-        return (
+-            anchor_string.replace("<", "")
+-            .replace(">", "")
+-            .replace('"', "")
+-            .replace("DVC_METRIC_DATA", "")
+-            .replace(",", "")
+-        )
+-
+-    @staticmethod
+-    def fill(
+-        template_path, data, priority_datafile=None, props=None,
+-    ):
++    def render(self, data, props=None):
+         props = props or {}
+ 
+-        with open(template_path) as fobj:
+-            result_content = fobj.read()
+-
+         if props.get("x"):
+             Template._check_field_exists(data, props.get("x"))
+         if props.get("y"):
+             Template._check_field_exists(data, props.get("y"))
+ 
+-        result_content = Template._replace_data_anchors(
+-            result_content, data, priority_datafile
+-        )
++        content = self._fill_anchor(self.content, "data", data)
++        content = self._fill_metadata(content, props)
+ 
+-        result_content = Template._replace_metadata_anchors(
+-            result_content, props
+-        )
++        return content
+ 
+-        return result_content
++    def has_anchor(self, name):
++        return self._anchor(name) in self.content
+ 
+-    @staticmethod
+-    def _check_field_exists(data, field):
+-        for file, data_points in data.items():
+-            if not any(
+-                field in data_point.keys() for data_point in data_points
+-            ):
+-                raise NoFieldInDataError(field)
++    @classmethod
++    def _fill_anchor(cls, content, name, value):
++        value_str = json.dumps(
++            value, indent=cls.INDENT, separators=cls.SEPARATORS, sort_keys=True
++        )
++        return content.replace(cls._anchor(name), value_str)
+ 
+-    @staticmethod
+-    def _replace_metadata_anchors(result_content, props):
++    @classmethod
++    def _anchor(cls, name):
++        return cls.ANCHOR.format(name.upper())
++
++    @classmethod
++    def _fill_metadata(cls, content, props):
+         props.setdefault("title", "")
+         props.setdefault("x_label", props.get("x"))
+         props.setdefault("y_label", props.get("y"))
+ 
+-        replace_pairs = [
+-            (Template.TITLE_ANCHOR, "title"),
+-            (Template.X_ANCHOR, "x"),
+-            (Template.Y_ANCHOR, "y"),
+-            (Template.X_LABEL_ANCHOR, "x_label"),
+-            (Template.Y_LABEL_ANCHOR, "y_label"),
+-        ]
+-        for anchor, key in replace_pairs:
+-            value = props.get(key)
+-            if anchor in result_content and value is not None:
+-                result_content = result_content.replace(anchor, value)
++        names = ["title", "x", "y", "x_label", "y_label"]
++        for name in names:
++            value = props.get(name)
++            if value is not None:
++                content = cls._fill_anchor(content, name, value)
+ 
+-        return result_content
++        return content
+ 
+     @staticmethod
+-    def _replace_data_anchors(result_content, data, priority_datafile):
+-        for anchor in Template.get_data_anchor(result_content):
+-            file = Template.get_datafile(anchor)
+-
+-            if not file or priority_datafile:
+-                key = priority_datafile
+-            else:
+-                key = file
+-
+-            result_content = result_content.replace(
+-                anchor,
+-                json.dumps(
+-                    data[key],
+-                    indent=Template.INDENT,
+-                    separators=Template.SEPARATORS,
+-                    sort_keys=True,
+-                ),
+-            )
+-        return result_content
++    def _check_field_exists(data, field):
++        if not any(field in row for row in data):
++            raise NoFieldInDataError(field)
+ 
+ 
+ class DefaultLinearTemplate(Template):
+-    TEMPLATE_NAME = "default"
++    DEFAULT_NAME = "default"
+ 
+     DEFAULT_CONTENT = {
+         "$schema": "https://vega.github.io/schema/vega-lite/v4.json",
+@@ -184,7 +109,7 @@ class DefaultLinearTemplate(Template):
+ 
+ 
+ class DefaultConfusionTemplate(Template):
+-    TEMPLATE_NAME = "confusion"
++    DEFAULT_NAME = "confusion"
+     DEFAULT_CONTENT = {
+         "$schema": "https://vega.github.io/schema/vega-lite/v4.json",
+         "data": {"values": Template.METRIC_DATA_ANCHOR},
+@@ -210,7 +135,7 @@ class DefaultConfusionTemplate(Template):
+ 
+ 
+ class DefaultScatterTemplate(Template):
+-    TEMPLATE_NAME = "scatter"
++    DEFAULT_NAME = "scatter"
+     DEFAULT_CONTENT = {
+         "$schema": "https://vega.github.io/schema/vega-lite/v4.json",
+         "data": {"values": Template.METRIC_DATA_ANCHOR},
+@@ -253,6 +178,9 @@ def default_template(self):
+         return default_plot_path
+ 
+     def get_template(self, path):
++        if os.path.exists(path):
++            return path
++
+         t_path = os.path.join(self.templates_dir, path)
+         if os.path.exists(t_path):
+             return t_path
+@@ -279,4 +207,23 @@ def __init__(self, dvc_dir):
+         if not os.path.exists(self.templates_dir):
+             makedirs(self.templates_dir, exist_ok=True)
+             for t in self.TEMPLATES:
+-                t(self.templates_dir).dump()
++                self.dump(t())
++
++    def dump(self, template):
++        path = os.path.join(self.templates_dir, template.filename)
++        with open(path, "w") as fd:
++            json.dump(
++                template.content,
++                fd,
++                indent=template.INDENT,
++                separators=template.SEPARATORS,
++            )
++            fd.write("\n")
++
++    def load(self, name):
++        path = self.get_template(name)
++
++        with open(path) as fd:
++            content = fd.read()
++
++        return Template(content, name=name)
+

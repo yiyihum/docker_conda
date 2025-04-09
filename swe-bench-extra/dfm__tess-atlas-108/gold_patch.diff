@@ -1,0 +1,145 @@
+diff --git a/setup.py b/setup.py
+index 0a7c68b..dabe2f7 100644
+--- a/setup.py
++++ b/setup.py
+@@ -31,15 +31,17 @@ INSTALL_REQUIRES = [
+     "lightkurve>=2.0.11",
+     "plotly>=4.9.0",
+     "arviz>=0.10.0",
+-    "corner",
++    "corner>=2.2.1",
+     "pandas",
+     "jupyter",
+     "ipykernel",
+-    "jupytext",
++    "jupytext<1.11,>=1.8",  # pinned for jypyter-book
+     "kaleido",
+     "aesara-theano-fallback",
+     "theano-pymc>=1.1.2",
+     "jupyter-book",
++    "seaborn",
++    "jupyter_client==6.1.12",  # pinned beacuse of nbconvert bug https://github.com/jupyter/nbconvert/pull/1549#issuecomment-818734169
+ ]
+ EXTRA_REQUIRE = {"test": ["pytest>=3.6", "testbook>=0.2.3"]}
+ EXTRA_REQUIRE["dev"] = EXTRA_REQUIRE["test"] + [
+@@ -101,6 +103,7 @@ if __name__ == "__main__":
+                 "run_tois=tess_atlas.notebook_preprocessors.run_tois:main",
+                 "runs_stats_plotter=tess_atlas.analysis.stats_plotter:main",
+                 "make_webpages=tess_atlas.webbuilder.build_pages:main",
++                "make_slurm_job=tess_atlas.batch_job_generator.slurm_job_generator:main",
+             ]
+         },
+     )
+diff --git a/src/tess_atlas/batch_job_generator/__init__.py b/src/tess_atlas/batch_job_generator/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/tess_atlas/batch_job_generator/slurm_job_generator.py b/src/tess_atlas/batch_job_generator/slurm_job_generator.py
+new file mode 100644
+index 0000000..a1ed5a4
+--- /dev/null
++++ b/src/tess_atlas/batch_job_generator/slurm_job_generator.py
+@@ -0,0 +1,67 @@
++import argparse
++import os
++import shutil
++from typing import List
++
++import pandas as pd
++
++TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "slurm_template.sh")
++
++
++def make_slurm_file(outdir: str, toi_numbers: List[int], module_loads: str):
++    with open(TEMPLATE_FILE, "r") as f:
++        file_contents = f.read()
++    outdir = os.path.abspath(outdir)
++    logfile_name = os.path.join(outdir, "toi_slurm_jobs.log")
++    jobfile_name = os.path.join(outdir, "slurm_job.sh")
++    path_to_python = shutil.which("python")
++    path_to_env_activate = path_to_python.replace("python", "activate")
++    file_contents = file_contents.replace(
++        "{{{TOTAL NUM}}}", str(len(toi_numbers) - 1)
++    )
++    file_contents = file_contents.replace("{{{MODULE LOADS}}}", module_loads)
++    file_contents = file_contents.replace("{{{OUTDIR}}}", outdir)
++    file_contents = file_contents.replace(
++        "{{{LOAD ENV}}}", f"source {path_to_env_activate}"
++    )
++    file_contents = file_contents.replace("{{{LOG FILE}}}", logfile_name)
++    toi_str = " ".join([str(toi) for toi in toi_numbers])
++    file_contents = file_contents.replace("{{{TOI NUMBERS}}}", toi_str)
++    with open(jobfile_name, "w") as f:
++        f.write(file_contents)
++    print(f"Jobfile created, to run job: \nsbatch {jobfile_name}")
++
++
++def get_toi_numbers(toi_csv: str):
++    df = pd.read_csv(toi_csv)
++    return list(df.toi_numbers.values)
++
++
++def get_cli_args():
++    parser = argparse.ArgumentParser(
++        description="Create slurm job for analysing TOIs"
++    )
++    parser.add_argument(
++        "--toi_csv",
++        help="CSV with the toi numbers to analyse (csv needs a column with `toi_numbers`)",
++    )
++    parser.add_argument(
++        "--outdir", help="outdir for jobs", default="notebooks"
++    )
++    parser.add_argument(
++        "--module_loads",
++        help="String containing all module loads in one line (each module separated by a space)",
++    )
++    args = parser.parse_args()
++    return args.toi_csv, args.outdir, args.module_loads
++
++
++def main():
++    toi_csv, outdir, module_loads = get_cli_args()
++    os.makedirs(outdir, exist_ok=True)
++    toi_numbers = get_toi_numbers(toi_csv)
++    make_slurm_file(outdir, toi_numbers, module_loads)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/tess_atlas/batch_job_generator/slurm_template.sh b/src/tess_atlas/batch_job_generator/slurm_template.sh
+new file mode 100644
+index 0000000..250c930
+--- /dev/null
++++ b/src/tess_atlas/batch_job_generator/slurm_template.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++#
++#SBATCH --job-name=run_tois
++#SBATCH --output={{{LOG FILE}}}
++#
++#SBATCH --ntasks=1
++#SBATCH --time=300:00
++#SBATCH --mem-per-cpu=500MB
++#
++#SBATCH --array=0-{{{TOTAL NUM}}}
++
++module load {{{MODULE LOADS}}}
++{{{LOAD ENV}}}
++
++
++TOI_NUMBERS=({{{TOI NUMBERS}}})
++
++srun run_toi ${TOI_NUMBERS[$SLURM_ARRAY_TASK_ID]} --outdir {{{OUTDIR}}}
+diff --git a/src/tess_atlas/notebook_preprocessors/run_toi.py b/src/tess_atlas/notebook_preprocessors/run_toi.py
+index 1f17ba7..a76c4f5 100644
+--- a/src/tess_atlas/notebook_preprocessors/run_toi.py
++++ b/src/tess_atlas/notebook_preprocessors/run_toi.py
+@@ -87,7 +87,7 @@ def execute_toi_notebook(notebook_filename):
+ 
+ def get_cli_args():
+     """Get the TOI number from the CLI and return it"""
+-    parser = argparse.ArgumentParser(prog="run_toi_in_pool")
++    parser = argparse.ArgumentParser(prog="run_toi")
+     default_outdir = os.path.join(os.getcwd(), "notebooks")
+     parser.add_argument(
+         "toi_number", type=int, help="The TOI number to be analysed (e.g. 103)"

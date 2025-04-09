@@ -1,0 +1,130 @@
+diff --git a/src/ZODB/FileStorage/tests.py b/src/ZODB/FileStorage/tests.py
+index 64d08287..fb564d41 100644
+--- a/src/ZODB/FileStorage/tests.py
++++ b/src/ZODB/FileStorage/tests.py
+@@ -113,15 +113,15 @@ def pack_with_repeated_blob_records():
+     fixed by the time you read this, but there might still be
+     transactions in the wild that have duplicate records.
+ 
+-    >>> fs = ZODB.FileStorage.FileStorage('t', blob_dir='bobs')
+-    >>> db = ZODB.DB(fs)
++    >>> db = ZODB.DB(ZODB.FileStorage.FileStorage('t', blob_dir='bobs'))
+     >>> conn = db.open()
+     >>> conn.root()[1] = ZODB.blob.Blob()
+     >>> transaction.commit()
+     >>> tm = transaction.TransactionManager()
+     >>> oid = conn.root()[1]._p_oid
+-    >>> from ZODB.utils import load_current
+-    >>> blob_record, oldserial = load_current(fs, oid)
++    >>> fs = db._mvcc_storage.new_instance()
++    >>> _ = fs.poll_invalidations()
++    >>> blob_record, oldserial = fs.load(oid)
+ 
+     Now, create a transaction with multiple saves:
+ 
+diff --git a/src/ZODB/tests/testConnection.py b/src/ZODB/tests/testConnection.py
+index 88276b9c..2fe003eb 100644
+--- a/src/ZODB/tests/testConnection.py
++++ b/src/ZODB/tests/testConnection.py
+@@ -14,6 +14,7 @@
+ """Unit tests for the Connection class."""
+ from __future__ import print_function
+ 
++from contextlib import contextmanager
+ import doctest
+ import re
+ import six
+@@ -535,13 +536,13 @@ class InvalidationTests(unittest.TestCase):
+ 
+         >>> mvcc_storage.invalidate(p64(1), {p1._p_oid: 1})
+ 
+-        Transaction start times are based on storage's last
+-        transaction. (Previousely, they were based on the first
+-        invalidation seen in a transaction.)
++        Transaction start times are based on storage's last transaction,
++        which is known from invalidations. (Previousely, they were
++        based on the first invalidation seen in a transaction.)
+ 
+         >>> mvcc_instance.poll_invalidations() == [p1._p_oid]
+         True
+-        >>> mvcc_instance._start == p64(u64(db.storage.lastTransaction()) + 1)
++        >>> mvcc_instance._start == p64(2)
+         True
+ 
+         >>> mvcc_storage.invalidate(p64(10), {p2._p_oid: 1, p64(76): 1})
+@@ -570,6 +571,36 @@ class InvalidationTests(unittest.TestCase):
+         >>> db.close()
+         """
+ 
++    def test_mvccadapterNewTransactionVsInvalidations(self):
++        """
++        Check that polled invalidations are consistent with the TID at which
++        the transaction operates. Otherwise, it's like we miss invalidations.
++        """
++        db = databaseFromString("<zodb>\n<mappingstorage/>\n</zodb>")
++        try:
++            t1 = transaction.TransactionManager()
++            c1 = db.open(t1)
++            r1 = c1.root()
++            r1['a'] = 1
++            t1.commit()
++            t2 = transaction.TransactionManager()
++            c2 = db.open(t2)
++            c2.root()['b'] = 1
++            s1 = c1._storage
++            l1 = s1._lock
++            @contextmanager
++            def beforeLock1():
++                s1._lock = l1
++                t2.commit()
++                with l1:
++                    yield
++            s1._lock = beforeLock1()
++            t1.begin()
++            self.assertIs(s1._lock, l1)
++            self.assertIn('b', r1)
++        finally:
++            db.close()
++
+ def doctest_invalidateCache():
+     """The invalidateCache method invalidates a connection's cache.
+ 
+@@ -1395,4 +1426,5 @@ def test_suite():
+     s.addTest(doctest.DocTestSuite(checker=checker))
+     s.addTest(unittest.makeSuite(TestConnection))
+     s.addTest(unittest.makeSuite(EstimatedSizeTests))
++    s.addTest(unittest.makeSuite(InvalidationTests))
+     return s
+diff --git a/src/ZODB/tests/testmvcc.py b/src/ZODB/tests/testmvcc.py
+index ff52af5c..4316e0e5 100644
+--- a/src/ZODB/tests/testmvcc.py
++++ b/src/ZODB/tests/testmvcc.py
+@@ -85,13 +85,14 @@ storage has seen.
+ 
+ >>> cn = db.open()
+ 
+->>> cn._storage._start == p64(u64(st.lastTransaction()) + 1)
++>>> ltid = u64(st.lastTransaction())
++>>> cn._storage._start == p64(ltid + 1)
+ True
+->>> cn.db()._mvcc_storage.invalidate(100, dict.fromkeys([1, 2]))
+->>> cn._storage._start == p64(u64(st.lastTransaction()) + 1)
++>>> cn.db()._mvcc_storage.invalidate(p64(ltid+100), dict.fromkeys([1, 2]))
++>>> cn._storage._start == p64(ltid + 1)
+ True
+->>> cn.db()._mvcc_storage.invalidate(200, dict.fromkeys([1, 2]))
+->>> cn._storage._start == p64(u64(st.lastTransaction()) + 1)
++>>> cn.db()._mvcc_storage.invalidate(p64(ltid+200), dict.fromkeys([1, 2]))
++>>> cn._storage._start == p64(ltid + 1)
+ True
+ 
+ A connection's high-water mark is set to the transaction id taken from
+@@ -105,7 +106,7 @@ but that doesn't work unless an object is modified.  sync() will abort
+ a transaction and process invalidations.
+ 
+ >>> cn.sync()
+->>> cn._storage._start == p64(u64(st.lastTransaction()) + 1)
++>>> cn._storage._start == p64(ltid + 201)
+ True
+ 
+ Basic functionality

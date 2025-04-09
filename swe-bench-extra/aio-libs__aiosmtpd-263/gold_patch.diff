@@ -1,0 +1,164 @@
+diff --git a/aiosmtpd/__init__.py b/aiosmtpd/__init__.py
+index 7403d8e..2124ae5 100644
+--- a/aiosmtpd/__init__.py
++++ b/aiosmtpd/__init__.py
+@@ -1,4 +1,4 @@
+ # Copyright 2014-2021 The aiosmtpd Developers
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-__version__ = "1.4.1"
++__version__ = "1.4.2a1"
+diff --git a/aiosmtpd/controller.py b/aiosmtpd/controller.py
+index 9dee79d..2258c54 100644
+--- a/aiosmtpd/controller.py
++++ b/aiosmtpd/controller.py
+@@ -27,6 +27,8 @@ from aiosmtpd.smtp import SMTP
+ 
+ AsyncServer = asyncio.base_events.Server
+ 
++DEFAULT_READY_TIMEOUT: float = 5.0
++
+ 
+ @public
+ class IP6_IS:
+@@ -106,7 +108,7 @@ class BaseThreadedController(metaclass=ABCMeta):
+         handler,
+         loop=None,
+         *,
+-        ready_timeout: float = 1.0,
++        ready_timeout: float,
+         ssl_context: Optional[ssl.SSLContext] = None,
+         # SMTP parameters
+         server_hostname: Optional[str] = None,
+@@ -207,7 +209,11 @@ class BaseThreadedController(metaclass=ABCMeta):
+                 # See comment about WSL1.0 in the _run() method
+                 raise self._thread_exception
+             else:
+-                raise TimeoutError("SMTP server failed to start within allotted time")
++                raise TimeoutError(
++                    "SMTP server failed to start within allotted time. "
++                    "This might happen if the system is too busy. "
++                    "Try increasing the `ready_timeout` parameter."
++                )
+         respond_timeout = self.ready_timeout - (time.monotonic() - start)
+ 
+         # Apparently create_server invokes factory() "lazily", so exceptions in
+@@ -222,7 +228,11 @@ class BaseThreadedController(metaclass=ABCMeta):
+             # Raise other exceptions though
+             raise
+         if not self._factory_invoked.wait(respond_timeout):
+-            raise TimeoutError("SMTP server not responding within allotted time")
++            raise TimeoutError(
++                "SMTP server started, but not responding within allotted time. "
++                "This might happen if the system is too busy. "
++                "Try increasing the `ready_timeout` parameter."
++            )
+         if self._thread_exception is not None:
+             raise self._thread_exception
+ 
+@@ -265,7 +275,7 @@ class Controller(BaseThreadedController):
+         port: int = 8025,
+         loop=None,
+         *,
+-        ready_timeout: float = 1.0,
++        ready_timeout: float = DEFAULT_READY_TIMEOUT,
+         ssl_context: ssl.SSLContext = None,
+         # SMTP parameters
+         server_hostname: Optional[str] = None,
+@@ -317,8 +327,8 @@ class UnixSocketController(BaseThreadedController):  # pragma: on-win32 on-cygwi
+         unix_socket: Optional[Union[str, Path]],
+         loop=None,
+         *,
+-        ready_timeout=1.0,
+-        ssl_context=None,
++        ready_timeout: float = DEFAULT_READY_TIMEOUT,
++        ssl_context: ssl.SSLContext = None,
+         # SMTP parameters
+         server_hostname: str = None,
+         **SMTP_parameters,
+diff --git a/aiosmtpd/docs/NEWS.rst b/aiosmtpd/docs/NEWS.rst
+index cb38f44..0e6aff2 100644
+--- a/aiosmtpd/docs/NEWS.rst
++++ b/aiosmtpd/docs/NEWS.rst
+@@ -3,6 +3,22 @@
+ ###################
+ 
+ 
++1.4.2 (aiosmtpd-next)
++=====================
++
++Fixed/Improved
++--------------
++* Controller's ``ready_timeout`` parameter increased from ``1.0`` to ``5.0``.
++  This won't slow down Controller startup because it's just a timeout limit
++  (instead of a sleep delay),
++  but this should help prevent Controller from giving up too soon,
++  especially during situations where system/network is a bit busy causing slowdowns.
++  (See #262)
++* Timeout messages in ``Controller.start()`` gets more details and a mention about the
++  ``ready_timeout`` parameter. (See #262)
++
++
++
+ 1.4.1 (2021-03-04)
+ ==================
+ 
+diff --git a/aiosmtpd/docs/controller.rst b/aiosmtpd/docs/controller.rst
+index 06a0f3b..d3e08ed 100644
+--- a/aiosmtpd/docs/controller.rst
++++ b/aiosmtpd/docs/controller.rst
+@@ -283,7 +283,7 @@ Controller API
+    handler, \
+    loop=None, \
+    *, \
+-   ready_timeout=1.0, \
++   ready_timeout, \
+    ssl_context=None, \
+    server_hostname=None, server_kwargs=None, **SMTP_parameters)
+ 
+@@ -292,6 +292,7 @@ Controller API
+       If not given, :func:`asyncio.new_event_loop` will be called to create the event loop.
+    :param ready_timeout: How long to wait until server starts.
+       The :envvar:`AIOSMTPD_CONTROLLER_TIMEOUT` takes precedence over this parameter.
++      See :attr:`ready_timeout` for more information.
+    :type ready_timeout: float
+    :param ssl_context: SSL Context to wrap the socket in.
+        Will be passed-through to  :meth:`~asyncio.loop.create_server` method
+@@ -330,7 +331,6 @@ Controller API
+ 
+    .. attribute:: ready_timeout
+       :type: float
+-      :noindex:
+ 
+       The timeout value used to wait for the server to start.
+ 
+@@ -338,6 +338,11 @@ Controller API
+       the :envvar:`AIOSMTPD_CONTROLLER_TIMEOUT` environment variable (converted to float),
+       or the :attr:`ready_timeout` parameter.
+ 
++      Setting this to a high value will NOT slow down controller startup,
++      because it's a timeout limit rather than a sleep delay.
++      However, you may want to reduce the default value to something 'just enough'
++      so you don't have to wait too long for an exception, if problem arises.
++
+       If this timeout is breached, a :class:`TimeoutError` exception will be raised.
+ 
+    .. attribute:: server
+@@ -430,7 +435,7 @@ Controller API
+    hostname=None, port=8025, \
+    loop=None, \
+    *, \
+-   ready_timeout=1.0, \
++   ready_timeout=3.0, \
+    ssl_context=None, \
+    server_hostname=None, server_kwargs=None, **SMTP_parameters)
+ 
+@@ -488,7 +493,7 @@ Controller API
+    unix_socket, \
+    loop=None, \
+    *, \
+-   ready_timeout=1.0, \
++   ready_timeout=3.0, \
+    ssl_context=None, \
+    server_hostname=None,\
+    **SMTP_parameters)

@@ -1,0 +1,242 @@
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 86d24d9..4dc843c 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -1,3 +1,50 @@
++import inspect
++
++import pytest
++
++from lektor.environment.config import Config
++
++
+ def test_custom_attachment_types(env):
+     attachment_types = env.load_config().values["ATTACHMENT_TYPES"]
+     assert attachment_types[".foo"] == "text"
++
++
++@pytest.fixture(scope="function")
++def config(tmp_path, project_url):
++    projectfile = tmp_path / "scratch.lektorproject"
++    projectfile.write_text(
++        inspect.cleandoc(
++            f"""
++            [project]
++            url = {project_url}
++            """
++        )
++    )
++    return Config(projectfile)
++
++
++@pytest.mark.parametrize(
++    "project_url, expected",
++    [
++        ("", None),
++        ("/path/", None),
++        ("https://example.org", "https://example.org/"),
++    ],
++)
++def test_base_url(config, expected):
++    assert config.base_url == expected
++
++
++@pytest.mark.parametrize(
++    "project_url, expected",
++    [
++        ("", "/"),
++        ("/path", "/path/"),
++        ("/path/", "/path/"),
++        ("https://example.org", "/"),
++        ("https://example.org/pth", "/pth/"),
++    ],
++)
++def test_base_path(config, expected):
++    assert config.base_path == expected
+diff --git a/tests/test_db.py b/tests/test_db.py
+index 10d01ec..4a7f8ce 100644
+--- a/tests/test_db.py
++++ b/tests/test_db.py
+@@ -487,3 +487,30 @@ def test_Page_url_path_raise_error_if_paginated_and_dotted(scratch_pad):
+ def test_Attachment_url_path_is_for_primary_alt(scratch_pad, alt):
+     attachment = scratch_pad.get("/test.txt")
+     assert attachment.url_path == "/en/test.txt"
++
++
++@pytest.mark.parametrize(
++    "url, base_url, absolute, external, project_url, expected",
++    [
++        ("/a/b.html", "/a/", None, None, None, "b.html"),
++        ("/a/b/", "/a/", None, None, None, "b/"),
++        ("/a/b/", "/a", None, None, None, "a/b/"),
++        ("/a/b/", "/a", True, None, None, "/a/b/"),
++        ("/a/b/", "/a", True, None, "https://example.net/pfx/", "/pfx/a/b/"),
++        ("/a/b/", "/a", None, True, "https://example.org", "https://example.org/a/b/"),
++    ],
++)
++def test_Pad_make_url(url, base_url, absolute, external, project_url, expected, pad):
++    if project_url is not None:
++        pad.db.config.values["PROJECT"]["url"] = project_url
++    assert pad.make_url(url, base_url, absolute, external) == expected
++
++
++def test_Pad_make_url_raises_runtime_error_if_no_project_url(pad):
++    with pytest.raises(RuntimeError, match="(?i)configure the url in the project"):
++        pad.make_url("/a/b", external=True)
++
++
++def test_Pad_make_url_raises_runtime_error_if_no_base_url(pad):
++    with pytest.raises(RuntimeError, match="(?i)no base url"):
++        pad.make_url("/a/b")
+diff --git a/tests/test_deploy.py b/tests/test_deploy.py
+index c73e96f..9654298 100644
+--- a/tests/test_deploy.py
++++ b/tests/test_deploy.py
+@@ -9,6 +9,9 @@ from lektor.publisher import GithubPagesPublisher
+ from lektor.publisher import RsyncPublisher
+ 
+ 
++pytestmark = pytest.mark.filterwarnings(r"ignore:'werkzeug\.urls:DeprecationWarning")
++
++
+ def test_get_server(env):
+     server = env.load_config().get_server("production")
+     assert server.name == "Production"
+diff --git a/tests/test_publisher.py b/tests/test_publisher.py
+index c4cca1a..d3b4fc1 100644
+--- a/tests/test_publisher.py
++++ b/tests/test_publisher.py
+@@ -42,6 +42,7 @@ def test_Command_triggers_no_warnings():
+     which("rsync") is None, reason="rsync is not available on this system"
+ )
+ @pytest.mark.parametrize("delete", ["yes", "no"])
++@pytest.mark.filterwarnings(r"ignore:'werkzeug\.urls:DeprecationWarning")
+ def test_RsyncPublisher_integration(env, tmp_path, delete):
+     # Integration test of local rsync deployment
+     # Ensures that RsyncPublisher can successfully invoke rsync
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index 0f62384..bdae109 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -1,4 +1,7 @@
+ # coding: utf-8
++from dataclasses import dataclass
++from urllib.parse import urlsplit
++
+ import pytest
+ 
+ from lektor.utils import build_url
+@@ -7,7 +10,9 @@ from lektor.utils import join_path
+ from lektor.utils import magic_split_ext
+ from lektor.utils import make_relative_url
+ from lektor.utils import parse_path
++from lektor.utils import secure_url
+ from lektor.utils import slugify
++from lektor.utils import Url
+ 
+ 
+ def test_join_path():
+@@ -70,6 +75,103 @@ def test_slugify():
+     assert slugify("slashed/slug") == "slashed/slug"
+ 
+ 
++@dataclass
++class SampleUrl:
++    uri: str
++    iri: str
++
++    @property
++    def split_uri(self):
++        return urlsplit(self.uri)
++
++    @property
++    def split_iri(self):
++        return urlsplit(self.iri)
++
++
++SAMPLE_URLS = [
++    SampleUrl("https://example.org/foo", "https://example.org/foo"),
++    SampleUrl("https://example.org:8001/f%C3%BC", "https://example.org:8001/fü"),
++    SampleUrl(
++        "https://xn--wgv71a119e.idn.icann.org/%E5%A4%A7",
++        "https://日本語.idn.icann.org/大",
++    ),
++    SampleUrl("/?q=sch%C3%B6n#gru%C3%9F", "/?q=schön#gruß"),
++]
++
++
++@pytest.fixture(params=SAMPLE_URLS, ids=lambda sample: sample.uri)
++def sample_url(request):
++    sample_url = request.param
++    # sanity checks
++    assert sample_url.split_uri.scheme == sample_url.split_iri.scheme
++    assert sample_url.split_uri.port == sample_url.split_iri.port
++    return sample_url
++
++
++def test_Url_str(sample_url):
++    assert str(Url(sample_url.iri)) == sample_url.iri
++    assert str(Url(sample_url.uri)) == sample_url.uri
++
++
++def test_Url_ascii_url(sample_url):
++    assert Url(sample_url.iri).ascii_url == sample_url.uri
++    assert Url(sample_url.uri).ascii_url == sample_url.uri
++
++
++def test_Url_ascii_host(sample_url):
++    assert Url(sample_url.iri).ascii_host == sample_url.split_uri.hostname
++    assert Url(sample_url.uri).ascii_host == sample_url.split_uri.hostname
++
++
++def test_Url_scheme(sample_url):
++    assert Url(sample_url.iri).scheme == sample_url.split_uri.scheme
++    assert Url(sample_url.uri).scheme == sample_url.split_uri.scheme
++
++
++def test_Url_host(sample_url):
++    assert Url(sample_url.iri).host == sample_url.split_iri.hostname
++    assert Url(sample_url.uri).host == sample_url.split_iri.hostname
++
++
++def test_Url_port(sample_url):
++    assert Url(sample_url.iri).port == sample_url.split_uri.port
++    assert Url(sample_url.uri).port == sample_url.split_uri.port
++
++
++def test_Url_path(sample_url):
++    assert Url(sample_url.iri).path == sample_url.split_iri.path
++    assert Url(sample_url.uri).path == sample_url.split_iri.path
++
++
++def test_Url_query(sample_url):
++    try:
++        assert Url(sample_url.iri).query == sample_url.split_iri.query
++        assert Url(sample_url.uri).query == sample_url.split_iri.query
++    except AssertionError:
++        # This is the behavior prior to Lektor 3.4.x
++        assert Url(sample_url.iri).query == sample_url.split_iri.query
++        assert Url(sample_url.uri).query == sample_url.split_uri.query
++        pytest.xfail("Url.query is weird in Lektor<3.4")
++
++
++def test_Url_anchor(sample_url):
++    assert Url(sample_url.iri).anchor == sample_url.split_iri.fragment
++    assert Url(sample_url.uri).anchor == sample_url.split_iri.fragment
++
++
++@pytest.mark.parametrize(
++    "url, expected",
++    [
++        ("https://user:pw@example.org/p", "https://user@example.org/p"),
++        ("https://user:pw@example.org:8000", "https://user@example.org:8000"),
++        ("https://user@example.org/b", "https://user@example.org/b"),
++    ],
++)
++def test_secure_url(url, expected):
++    assert secure_url(url) == expected
++
++
+ def test_url_builder():
+ 
+     assert build_url([]) == "/"

@@ -1,0 +1,145 @@
+diff --git a/tardis/adapters/sites/htcondor.py b/tardis/adapters/sites/htcondor.py
+index fa4a7bb..604ed16 100644
+--- a/tardis/adapters/sites/htcondor.py
++++ b/tardis/adapters/sites/htcondor.py
+@@ -7,7 +7,7 @@ from ...utilities.asynccachemap import AsyncCacheMap
+ from ...utilities.attributedict import AttributeDict
+ from ...utilities.staticmapping import StaticMapping
+ from ...utilities.executors.shellexecutor import ShellExecutor
+-from ...utilities.utils import csv_parser
++from ...utilities.utils import csv_parser, machine_meta_data_translation
+ 
+ from contextlib import contextmanager
+ from datetime import datetime
+@@ -58,6 +58,10 @@ htcondor_status_codes = {
+ 
+ 
+ class HTCondorAdapter(SiteAdapter):
++    htcondor_machine_meta_data_translation_mapping = AttributeDict(
++        Cores=1, Memory=1024, Disk=1024 * 1024
++    )
++
+     def __init__(self, machine_type: str, site_name: str):
+         self._machine_type = machine_type
+         self._site_name = site_name
+@@ -99,11 +103,14 @@ class HTCondorAdapter(SiteAdapter):
+ 
+         drone_environment = self.drone_environment(
+             resource_attributes.drone_uuid,
+-            resource_attributes.machine_meta_data_translation_mapping,
++            resource_attributes.obs_machine_meta_data_translation_mapping,
+         )
+ 
+         submit_jdl = jdl_template.substitute(
+-            drone_environment,
++            machine_meta_data_translation(
++                self.machine_meta_data,
++                self.htcondor_machine_meta_data_translation_mapping,
++            ),
+             Environment=";".join(
+                 f"TardisDrone{key}={value}" for key, value in drone_environment.items()
+             ),
+diff --git a/tardis/adapters/sites/slurm.py b/tardis/adapters/sites/slurm.py
+index 7f79d10..72b4f69 100644
+--- a/tardis/adapters/sites/slurm.py
++++ b/tardis/adapters/sites/slurm.py
+@@ -110,7 +110,7 @@ class SlurmAdapter(SiteAdapter):
+         sbatch_cmdline_option_string = submit_cmd_option_formatter(
+             self.sbatch_cmdline_options(
+                 resource_attributes.drone_uuid,
+-                resource_attributes.machine_meta_data_translation_mapping,
++                resource_attributes.obs_machine_meta_data_translation_mapping,
+             )
+         )
+ 
+diff --git a/tardis/interfaces/siteadapter.py b/tardis/interfaces/siteadapter.py
+index 42e91c8..e3b98e7 100644
+--- a/tardis/interfaces/siteadapter.py
++++ b/tardis/interfaces/siteadapter.py
+@@ -1,5 +1,6 @@
+ from ..configuration.configuration import Configuration
+ from ..utilities.attributedict import AttributeDict
++from ..utilities.utils import machine_meta_data_translation
+ 
+ from abc import ABCMeta, abstractmethod
+ from cobald.utility.primitives import infinity as inf
+@@ -92,16 +93,10 @@ class SiteAdapter(metaclass=ABCMeta):
+         :return: Translated
+         :rtype: dict
+         """
+-        try:
+-            drone_environment = {
+-                key: meta_data_translation_mapping[key] * value
+-                for key, value in self.machine_meta_data.items()
+-            }
+-        except KeyError as ke:
+-            logger.critical(f"drone_environment failed: no translation known for {ke}")
+-            raise
+-        else:
+-            drone_environment["Uuid"] = drone_uuid
++        drone_environment = machine_meta_data_translation(
++            self.machine_meta_data, meta_data_translation_mapping
++        )
++        drone_environment["Uuid"] = drone_uuid
+ 
+         return drone_environment
+ 
+diff --git a/tardis/resources/drone.py b/tardis/resources/drone.py
+index 2cb7bbf..95cd783 100644
+--- a/tardis/resources/drone.py
++++ b/tardis/resources/drone.py
+@@ -40,7 +40,7 @@ class Drone(Pool):
+         self.resource_attributes = AttributeDict(
+             site_name=self._site_agent.site_name,
+             machine_type=self.site_agent.machine_type,
+-            machine_meta_data_translation_mapping=self.batch_system_agent.machine_meta_data_translation_mapping,  # noqa B950
++            obs_machine_meta_data_translation_mapping=self.batch_system_agent.machine_meta_data_translation_mapping,  # noqa B950
+             remote_resource_uuid=remote_resource_uuid,
+             created=created or datetime.now(),
+             updated=updated or datetime.now(),
+diff --git a/tardis/utilities/utils.py b/tardis/utilities/utils.py
+index b4ba112..20d21ea 100644
+--- a/tardis/utilities/utils.py
++++ b/tardis/utilities/utils.py
+@@ -7,6 +7,9 @@ from io import StringIO
+ from typing import List, Tuple
+ 
+ import csv
++import logging
++
++logger = logging.getLogger("cobald.runtime.tardis.utilities.utils")
+ 
+ 
+ async def async_run_command(
+@@ -82,6 +85,30 @@ def csv_parser(
+             }
+ 
+ 
++def machine_meta_data_translation(
++    machine_meta_data: AttributeDict, meta_data_translation_mapping: AttributeDict
++):
++    """
++    Helper function to translate units of the machine_meta_data to match the
++    units required by the overlay batch system
++    :param machine_meta_data: Machine Meta Data (Cores, Memory, Disk)
++    :param meta_data_translation_mapping: Map used for the translation of meta
++           data, contains conversion factors
++    :return:
++    :rtype: dict
++    """
++    try:
++        return {
++            key: meta_data_translation_mapping[key] * value
++            for key, value in machine_meta_data.items()
++        }
++    except KeyError as ke:
++        logger.critical(
++            f"machine_meta_data_translation failed: no translation known for {ke}"
++        )
++        raise
++
++
+ def submit_cmd_option_formatter(options: AttributeDict) -> str:
+     option_prefix = dict(short="-", long="--")
+     option_separator = dict(short=" ", long="=")
+

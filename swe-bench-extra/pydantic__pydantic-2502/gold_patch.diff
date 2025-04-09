@@ -1,0 +1,161 @@
+diff --git a/pydantic/decorator.py b/pydantic/decorator.py
+--- a/pydantic/decorator.py
++++ b/pydantic/decorator.py
+@@ -1,23 +1,10 @@
+ from functools import wraps
+-from typing import (
+-    TYPE_CHECKING,
+-    Any,
+-    Callable,
+-    Dict,
+-    List,
+-    Mapping,
+-    Optional,
+-    Tuple,
+-    Type,
+-    TypeVar,
+-    Union,
+-    get_type_hints,
+-    overload,
+-)
++from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple, Type, TypeVar, Union, overload
+ 
+ from . import validator
+ from .errors import ConfigError
+ from .main import BaseModel, Extra, create_model
++from .typing import get_all_type_hints
+ from .utils import to_camel
+ 
+ __all__ = ('validate_arguments',)
+@@ -87,17 +74,17 @@ def __init__(self, function: 'AnyCallableT', config: 'ConfigType'):  # noqa C901
+         self.v_args_name = 'args'
+         self.v_kwargs_name = 'kwargs'
+ 
+-        type_hints = get_type_hints(function)
++        type_hints = get_all_type_hints(function)
+         takes_args = False
+         takes_kwargs = False
+         fields: Dict[str, Tuple[Any, Any]] = {}
+         for i, (name, p) in enumerate(parameters.items()):
+-            if p.annotation == p.empty:
++            if p.annotation is p.empty:
+                 annotation = Any
+             else:
+                 annotation = type_hints[name]
+ 
+-            default = ... if p.default == p.empty else p.default
++            default = ... if p.default is p.empty else p.default
+             if p.kind == Parameter.POSITIONAL_ONLY:
+                 self.arg_mapping[i] = name
+                 fields[name] = annotation, default
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -169,7 +169,7 @@ def update_from_config(self, from_config: Dict[str, Any]) -> None:
+                     setattr(self, attr_name, value)
+ 
+     def _validate(self) -> None:
+-        if self.default not in (Undefined, Ellipsis) and self.default_factory is not None:
++        if self.default is not Undefined and self.default_factory is not None:
+             raise ValueError('cannot specify both default and default_factory')
+ 
+ 
+@@ -370,9 +370,10 @@ def _get_field_info(
+             field_info = next(iter(field_infos), None)
+             if field_info is not None:
+                 field_info.update_from_config(field_info_from_config)
+-                if field_info.default not in (Undefined, Ellipsis):
++                if field_info.default is not Undefined:
+                     raise ValueError(f'`Field` default cannot be set in `Annotated` for {field_name!r}')
+-                if value not in (Undefined, Ellipsis):
++                if value is not Undefined and value is not Required:
++                    # check also `Required` because of `validate_arguments` that sets `...` as default value
+                     field_info.default = value
+ 
+         if isinstance(value, FieldInfo):
+@@ -450,7 +451,6 @@ def prepare(self) -> None:
+         self._type_analysis()
+         if self.required is Undefined:
+             self.required = True
+-            self.field_info.default = Required
+         if self.default is Undefined and self.default_factory is None:
+             self.default = None
+         self.populate_validators()
+diff --git a/pydantic/generics.py b/pydantic/generics.py
+--- a/pydantic/generics.py
++++ b/pydantic/generics.py
+@@ -15,13 +15,14 @@
+     TypeVar,
+     Union,
+     cast,
+-    get_type_hints,
+ )
+ 
++from typing_extensions import Annotated
++
+ from .class_validators import gather_all_validators
+ from .fields import DeferredType
+ from .main import BaseModel, create_model
+-from .typing import display_as_type, get_args, get_origin, typing_base
++from .typing import display_as_type, get_all_type_hints, get_args, get_origin, typing_base
+ from .utils import all_identical, lenient_issubclass
+ 
+ _generic_types_cache: Dict[Tuple[Type[Any], Union[Any, Tuple[Any, ...]]], Type[BaseModel]] = {}
+@@ -73,7 +74,7 @@ def __class_getitem__(cls: Type[GenericModelT], params: Union[Type[Any], Tuple[T
+         model_name = cls.__concrete_name__(params)
+         validators = gather_all_validators(cls)
+ 
+-        type_hints = get_type_hints(cls).items()
++        type_hints = get_all_type_hints(cls).items()
+         instance_type_hints = {k: v for k, v in type_hints if get_origin(v) is not ClassVar}
+ 
+         fields = {k: (DeferredType(), cls.__fields__[k].field_info) for k in instance_type_hints if k in cls.__fields__}
+@@ -159,6 +160,10 @@ def replace_types(type_: Any, type_map: Mapping[Any, Any]) -> Any:
+     type_args = get_args(type_)
+     origin_type = get_origin(type_)
+ 
++    if origin_type is Annotated:
++        annotated_type, *annotations = type_args
++        return Annotated[replace_types(annotated_type, type_map), tuple(annotations)]
++
+     # Having type args is a good indicator that this is a typing module
+     # class instantiation or a generic alias of some sort.
+     if type_args:
+diff --git a/pydantic/typing.py b/pydantic/typing.py
+--- a/pydantic/typing.py
++++ b/pydantic/typing.py
+@@ -18,6 +18,7 @@
+     Union,
+     _eval_type,
+     cast,
++    get_type_hints,
+ )
+ 
+ from typing_extensions import Annotated, Literal
+@@ -70,6 +71,18 @@ def evaluate_forwardref(type_: ForwardRef, globalns: Any, localns: Any) -> Any:
+         return cast(Any, type_)._evaluate(globalns, localns, set())
+ 
+ 
++if sys.version_info < (3, 9):
++    # Ensure we always get all the whole `Annotated` hint, not just the annotated type.
++    # For 3.6 to 3.8, `get_type_hints` doesn't recognize `typing_extensions.Annotated`,
++    # so it already returns the full annotation
++    get_all_type_hints = get_type_hints
++
++else:
++
++    def get_all_type_hints(obj: Any, globalns: Any = None, localns: Any = None) -> Any:
++        return get_type_hints(obj, globalns, localns, include_extras=True)
++
++
+ if sys.version_info < (3, 7):
+     from typing import Callable as Callable
+ 
+@@ -225,6 +238,7 @@ def get_args(tp: Type[Any]) -> Tuple[Any, ...]:
+     'get_args',
+     'get_origin',
+     'typing_base',
++    'get_all_type_hints',
+ )
+ 
+ 

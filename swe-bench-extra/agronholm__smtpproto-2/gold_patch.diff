@@ -1,0 +1,113 @@
+diff --git a/docs/versionhistory.rst b/docs/versionhistory.rst
+index 2bc4d25..459ca8b 100644
+--- a/docs/versionhistory.rst
++++ b/docs/versionhistory.rst
+@@ -7,6 +7,8 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
+ 
+ - Added missing ``authorization_id`` parameter to ``PlainAuthenticator`` (also fixes ``PLAIN``
+   authentication not working since this field was missing from the encoded output)
++- Fixed sender/recipient addresses (in ``MAIL``/``RCPT`` commands) not being UTF-8 encoded in the
++  presence of the ``SMTPUTF8`` extension
+ 
+ **1.0.0**
+ 
+diff --git a/setup.cfg b/setup.cfg
+index 98ba6a2..32510b1 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -18,6 +18,7 @@ classifiers =
+     Programming Language :: Python :: 3.6
+     Programming Language :: Python :: 3.7
+     Programming Language :: Python :: 3.8
++    Programming Language :: Python :: 3.9
+ 
+ [options]
+ package_dir=
+@@ -26,7 +27,7 @@ packages = find:
+ python_requires = >= 3.6.2
+ zip_safe = False
+ install_requires =
+-    anyio ~= 2.0.0b2
++    anyio ~= 2.0
+     dataclasses; python_version < "3.7"
+ 
+ [options.packages.find]
+diff --git a/src/smtpproto/protocol.py b/src/smtpproto/protocol.py
+index 4f5dcc2..e4ce01f 100644
+--- a/src/smtpproto/protocol.py
++++ b/src/smtpproto/protocol.py
+@@ -64,7 +64,7 @@ class SMTPClientProtocol:
+     _response_code: Optional[int] = field(init=False, default=None)
+     _response_lines: List[str] = field(init=False, default_factory=list)
+     _command_sent: Optional[str] = field(init=False, default=None)
+-    _args_sent: Optional[Tuple[str, ...]] = field(init=False, default=None)
++    _args_sent: Optional[Tuple[bytes, ...]] = field(init=False, default=None)
+     _extensions: FrozenSet[str] = field(init=False, default_factory=frozenset)
+     _auth_mechanisms: FrozenSet[str] = field(init=False, default_factory=frozenset)
+     _max_message_size: Optional[int] = field(init=False, default=None)
+@@ -85,18 +85,36 @@ class SMTPClientProtocol:
+             raise SMTPUnsupportedAuthMechanism(
+                 f'{mechanism} is not a supported authentication mechanism on this server')
+ 
+-    def _send_command(self, command: str, *args: str) -> None:
++    def _encode_address(self, address: Union[str, Address]) -> bytes:
++        if isinstance(address, Address):
++            address_str = f'{address.username}@{address.domain}'
++        else:
++            address_str = address
++
++        if 'SMTPUTF8' in self._extensions:
++            return address_str.encode('utf-8')
++
++        # If SMPTUTF8 is not supported, the address must be ASCII compatible
++        try:
++            return address_str.encode('ascii')
++        except UnicodeEncodeError:
++            raise SMTPProtocolViolation(
++                f'The address {address_str!r} requires UTF-8 encoding but the server does not '
++                f'support the SMTPUTF8 extension')
++
++    def _send_command(self, command: str, *args: Union[str, bytes]) -> None:
+         if self._command_sent is not None:
+             raise SMTPProtocolViolation('Tried to send a command before the previous one received '
+                                         'a response')
+ 
+-        line = command
+-        if args:
+-            line += ' ' + ' '.join(args)
++        line = command.encode('ascii')
++        args_encoded = tuple(arg.encode('ascii') if isinstance(arg, str) else arg for arg in args)
++        if args_encoded:
++            line += b' ' + b' '.join(args_encoded)
+ 
+-        self._out_buffer += line.encode('ascii') + b'\r\n'
++        self._out_buffer += line + b'\r\n'
+         self._command_sent = command
+-        self._args_sent = args
++        self._args_sent = args_encoded
+ 
+     def _parse_extensions(self, lines: Iterable[str]) -> None:
+         auth_mechanisms: List[str] = []
+@@ -291,9 +309,10 @@ class SMTPClientProtocol:
+         args = []
+         if '8BITMIME' in self._extensions:
+             args.append('BODY=8BITMIME')
++        if 'SMTPUTF8' in self._extensions:
++            args.append('SMTPUTF8')
+ 
+-        address = sender.addr_spec if isinstance(sender, Address) else sender
+-        self._send_command('MAIL', 'FROM:<' + address + '>', *args)
++        self._send_command('MAIL', b'FROM:<' + self._encode_address(sender) + b'>', *args)
+ 
+     def recipient(self, recipient: Union[str, Address]) -> None:
+         """
+@@ -305,8 +324,7 @@ class SMTPClientProtocol:
+ 
+         """
+         self._require_state(ClientState.mailtx, ClientState.recipient_sent)
+-        address = recipient.addr_spec if isinstance(recipient, Address) else recipient
+-        self._send_command('RCPT', f'TO:<{address}>')
++        self._send_command('RCPT', b'TO:<' + self._encode_address(recipient) + b'>')
+ 
+     def start_data(self) -> None:
+         """

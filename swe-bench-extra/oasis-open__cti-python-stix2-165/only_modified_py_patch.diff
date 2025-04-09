@@ -1,0 +1,145 @@
+diff --git a/stix2/base.py b/stix2/base.py
+index 898f489..3219007 100644
+--- a/stix2/base.py
++++ b/stix2/base.py
+@@ -6,9 +6,9 @@ import datetime as dt
+ 
+ import simplejson as json
+ 
+-from .exceptions import (AtLeastOnePropertyError, DependentPropertiesError,
+-                         ExtraPropertiesError, ImmutableError,
+-                         InvalidObjRefError, InvalidValueError,
++from .exceptions import (AtLeastOnePropertyError, CustomContentError,
++                         DependentPropertiesError, ExtraPropertiesError,
++                         ImmutableError, InvalidObjRefError, InvalidValueError,
+                          MissingPropertiesError,
+                          MutuallyExclusivePropertiesError)
+ from .markings.utils import validate
+@@ -61,6 +61,8 @@ class _STIXBase(collections.Mapping):
+             try:
+                 kwargs[prop_name] = prop.clean(kwargs[prop_name])
+             except ValueError as exc:
++                if self.__allow_custom and isinstance(exc, CustomContentError):
++                    return
+                 raise InvalidValueError(self.__class__, prop_name, reason=str(exc))
+ 
+     # interproperty constraint methods
+@@ -97,6 +99,7 @@ class _STIXBase(collections.Mapping):
+ 
+     def __init__(self, allow_custom=False, **kwargs):
+         cls = self.__class__
++        self.__allow_custom = allow_custom
+ 
+         # Use the same timestamp for any auto-generated datetimes
+         self.__now = get_timestamp()
+diff --git a/stix2/exceptions.py b/stix2/exceptions.py
+index 841a8e9..79c5a81 100644
+--- a/stix2/exceptions.py
++++ b/stix2/exceptions.py
+@@ -163,6 +163,13 @@ class ParseError(STIXError, ValueError):
+         super(ParseError, self).__init__(msg)
+ 
+ 
++class CustomContentError(STIXError, ValueError):
++    """Custom STIX Content (SDO, Observable, Extension, etc.) detected."""
++
++    def __init__(self, msg):
++        super(CustomContentError, self).__init__(msg)
++
++
+ class InvalidSelectorError(STIXError, AssertionError):
+     """Granular Marking selector violation. The selector must resolve into an existing STIX object property."""
+ 
+diff --git a/stix2/properties.py b/stix2/properties.py
+index ca7f04c..41841b6 100644
+--- a/stix2/properties.py
++++ b/stix2/properties.py
+@@ -129,6 +129,8 @@ class ListProperty(Property):
+                 # constructor again
+                 result.append(valid)
+                 continue
++            elif type(self.contained) is DictionaryProperty:
++                obj_type = dict
+             else:
+                 obj_type = self.contained
+ 
+diff --git a/stix2/utils.py b/stix2/utils.py
+index 9febd78..4ef3d23 100644
+--- a/stix2/utils.py
++++ b/stix2/utils.py
+@@ -166,7 +166,7 @@ def get_dict(data):
+ def find_property_index(obj, properties, tuple_to_find):
+     """Recursively find the property in the object model, return the index
+     according to the _properties OrderedDict. If it's a list look for
+-    individual objects.
++    individual objects. Returns and integer indicating its location
+     """
+     from .base import _STIXBase
+     try:
+@@ -183,6 +183,11 @@ def find_property_index(obj, properties, tuple_to_find):
+                                                   tuple_to_find)
+                         if val is not None:
+                             return val
++                    elif isinstance(item, dict):
++                        for idx, val in enumerate(sorted(item)):
++                            if (tuple_to_find[0] == val and
++                                    item.get(val) == tuple_to_find[1]):
++                                return idx
+             elif isinstance(pv, dict):
+                 if pv.get(tuple_to_find[0]) is not None:
+                     try:
+diff --git a/stix2/v20/observables.py b/stix2/v20/observables.py
+index 39a8f19..f6bac2b 100644
+--- a/stix2/v20/observables.py
++++ b/stix2/v20/observables.py
+@@ -8,8 +8,8 @@ Observable and do not have a ``_type`` attribute.
+ from collections import OrderedDict
+ 
+ from ..base import _Extension, _Observable, _STIXBase
+-from ..exceptions import (AtLeastOnePropertyError, DependentPropertiesError,
+-                          ParseError)
++from ..exceptions import (AtLeastOnePropertyError, CustomContentError,
++                          DependentPropertiesError, ParseError)
+ from ..properties import (BinaryProperty, BooleanProperty, DictionaryProperty,
+                           EmbeddedObjectProperty, EnumProperty, FloatProperty,
+                           HashesProperty, HexProperty, IntegerProperty,
+@@ -67,7 +67,7 @@ class ExtensionsProperty(DictionaryProperty):
+                     else:
+                         raise ValueError("Cannot determine extension type.")
+                 else:
+-                    raise ValueError("The key used in the extensions dictionary is not an extension type name")
++                    raise CustomContentError("Can't parse unknown extension type: {}".format(key))
+         else:
+             raise ValueError("The enclosing type '%s' has no extensions defined" % self.enclosing_type)
+         return dictified
+@@ -923,15 +923,23 @@ def parse_observable(data, _valid_refs=None, allow_custom=False):
+     try:
+         obj_class = OBJ_MAP_OBSERVABLE[obj['type']]
+     except KeyError:
+-        raise ParseError("Can't parse unknown observable type '%s'! For custom observables, "
+-                         "use the CustomObservable decorator." % obj['type'])
++        if allow_custom:
++            # flag allows for unknown custom objects too, but will not
++            # be parsed into STIX observable object, just returned as is
++            return obj
++        raise CustomContentError("Can't parse unknown observable type '%s'! For custom observables, "
++                                 "use the CustomObservable decorator." % obj['type'])
+ 
+     if 'extensions' in obj and obj['type'] in EXT_MAP:
+         for name, ext in obj['extensions'].items():
+-            if name not in EXT_MAP[obj['type']]:
+-                raise ParseError("Can't parse Unknown extension type '%s' for observable type '%s'!" % (name, obj['type']))
+-            ext_class = EXT_MAP[obj['type']][name]
+-            obj['extensions'][name] = ext_class(allow_custom=allow_custom, **obj['extensions'][name])
++            try:
++                ext_class = EXT_MAP[obj['type']][name]
++            except KeyError:
++                if not allow_custom:
++                    raise CustomContentError("Can't parse unknown extension type '%s'"
++                                             "for observable type '%s'!" % (name, obj['type']))
++            else:  # extension was found
++                obj['extensions'][name] = ext_class(allow_custom=allow_custom, **obj['extensions'][name])
+ 
+     return obj_class(allow_custom=allow_custom, **obj)
+ 
+

@@ -1,0 +1,145 @@
+diff --git a/eliot/tests/corotests.py b/eliot/tests/corotests.py
+index de844c8..78e3501 100644
+--- a/eliot/tests/corotests.py
++++ b/eliot/tests/corotests.py
+@@ -10,7 +10,7 @@ from threading import Thread
+ from unittest import TestCase
+ 
+ from ..testing import capture_logging
+-from .._parse import Parser
++from ..parse import Parser
+ from .. import start_action
+ from .._action import _ExecutionContext, _context, use_asyncio_context
+ from .._asyncio import AsyncioContext
+diff --git a/eliot/tests/test_action.py b/eliot/tests/test_action.py
+index 86eb5e1..dc1113b 100644
+--- a/eliot/tests/test_action.py
++++ b/eliot/tests/test_action.py
+@@ -5,7 +5,7 @@ Tests for L{eliot._action}.
+ from __future__ import unicode_literals
+ 
+ import pickle
+-from unittest import TestCase
++from unittest import TestCase, skipIf
+ from threading import Thread
+ from warnings import catch_warnings, simplefilter
+ 
+@@ -44,7 +44,7 @@ from .._message import (
+ from .._output import MemoryLogger
+ from .._validation import ActionType, Field, _ActionSerializers
+ from ..testing import assertContainsFields, capture_logging
+-from .._parse import Parser
++from ..parse import Parser
+ from .. import (
+     _action,
+     add_destination,
+@@ -1655,6 +1655,9 @@ class LogCallTests(TestCase):
+ 
+     def assert_logged(self, logger, action_type, expected_params, expected_result):
+         """Assert that an action of given structure was logged."""
++        if six.PY2:
++            # On Python 2 we don't include the module or class:
++            action_type = action_type.split(".")[-1]
+         [tree] = Parser.parse_stream(logger.messages)
+         root = tree.root()
+         self.assertEqual(root.action_type, action_type)
+@@ -1676,7 +1679,7 @@ class LogCallTests(TestCase):
+             return 4
+ 
+         myfunc(2, 3)
+-        self.assert_logged(logger, u"myfunc",
++        self.assert_logged(logger, self.id() + ".<locals>.myfunc",
+                            {u"x": 2, u"y": 3}, 4)
+ 
+     @capture_logging(None)
+@@ -1712,7 +1715,7 @@ class LogCallTests(TestCase):
+             return 4
+ 
+         myfunc(2, y=5)
+-        self.assert_logged(logger, u"myfunc",
++        self.assert_logged(logger, self.id() + ".<locals>.myfunc",
+                            {u"x": 2, u"y": 5}, 4)
+ 
+     @capture_logging(None)
+@@ -1723,7 +1726,7 @@ class LogCallTests(TestCase):
+             return 6
+ 
+         myfunc(2)
+-        self.assert_logged(logger, u"myfunc",
++        self.assert_logged(logger, self.id() + ".<locals>.myfunc",
+                            {u"x": 2, u"y": 1}, 6)
+ 
+     @capture_logging(None)
+@@ -1734,7 +1737,7 @@ class LogCallTests(TestCase):
+             return 6
+ 
+         myfunc(2, 3, 4, a=1, b=2)
+-        self.assert_logged(logger, u"myfunc",
++        self.assert_logged(logger, self.id() + ".<locals>.myfunc",
+                            {u"x": 2, u"y": (3, 4), u"z": {u"a": 1, u"b": 2}},
+                            6)
+ 
+@@ -1746,7 +1749,16 @@ class LogCallTests(TestCase):
+             return 6
+ 
+         myfunc(2, 3, 4)
+-        self.assert_logged(logger, u"myfunc", {u"x": 2, u"z": 4}, 6)
++        self.assert_logged(logger, self.id() + ".<locals>.myfunc",
++                           {u"x": 2, u"z": 4}, 6)
++
++    @skipIf(six.PY2, "Didn't bother implementing safety check on Python 2")
++    def test_wrong_whitelist_args(self):
++        """If C{include_args} doesn't match function, raise an exception."""
++        with self.assertRaises(ValueError):
++            @log_call(include_args=["a", "x", "y"])
++            def f(x, y):
++                pass
+ 
+     @capture_logging(None)
+     def test_no_result(self, logger):
+@@ -1771,3 +1783,16 @@ class LogCallTests(TestCase):
+             for_pickling,
+             pickle.loads(pickle.dumps(for_pickling))
+         )
++
++    @capture_logging(None)
++    def test_methods(self, logger):
++        """self is not logged."""
++        class C(object):
++            @log_call
++            def f(self, x):
++                pass
++
++        C().f(2)
++        self.assert_logged(logger, self.id() + u".<locals>.C.f", {u"x": 2}, None)
++
++
+diff --git a/eliot/tests/test_parse.py b/eliot/tests/test_parse.py
+index a24ad00..77410ee 100644
+--- a/eliot/tests/test_parse.py
++++ b/eliot/tests/test_parse.py
+@@ -16,7 +16,7 @@ from pyrsistent import PClass, field, pvector_field
+ 
+ from .. import start_action, Message
+ from ..testing import MemoryLogger
+-from .._parse import Task, Parser
++from ..parse import Task, Parser
+ from .._message import (
+     WrittenMessage,
+     MESSAGE_TYPE_FIELD,
+@@ -295,3 +295,15 @@ class ParserTests(TestCase):
+                 if m is not None]))
+         assertCountEqual(
+             self, all_tasks, [parse_to_task(msgs) for msgs in all_messages])
++
++
++class BackwardsCompatibility(TestCase):
++    """Tests for backwards compatibility."""
++
++    def test_imports(self):
++        """Old ways of importing still work."""
++        import eliot._parse
++        from eliot import _parse
++        import eliot.parse
++        self.assertIs(eliot.parse, eliot._parse)
++        self.assertIs(_parse, eliot.parse)

@@ -1,0 +1,171 @@
+diff --git a/privacypanda/anonymize.py b/privacypanda/anonymize.py
+index bbaa617..1fb62ec 100644
+--- a/privacypanda/anonymize.py
++++ b/privacypanda/anonymize.py
+@@ -1,15 +1,19 @@
+ """
+ Code for cleaning a dataframe of private data
+ """
+-import pandas as pd
++from typing import TYPE_CHECKING, Dict, Tuple
++
+ from numpy import unique as np_unique
+ 
+ from .addresses import check_addresses
+ from .email import check_emails
+ from .phonenumbers import check_phonenumbers
+ 
++if TYPE_CHECKING:
++    import pandas
++
+ 
+-def anonymize(df: pd.DataFrame) -> pd.DataFrame:
++def anonymize(df: "pandas.DataFrame") -> "pandas.DataFrame":
+     """
+     Remove private data from a dataframe
+ 
+@@ -39,3 +43,49 @@ def anonymize(df: pd.DataFrame) -> pd.DataFrame:
+ 
+     # Drop columns
+     return df.drop(private_cols, axis=1)
++
++
++def unique_id(
++    data: "pandas.DataFrame", column: str, id_mapping=None
++) -> Tuple["pandas.DataFrame", Dict[str, int]]:
++    """
++    Replace data in a given column of a dataframe with a unique id.
++
++    Parameters
++    ----------
++    data : pandas.DataFrame
++        The data to anonymise
++    column : str
++        The name of the column in data to be anonymised
++    id_mapping : dict, optional
++        Existing unique ID mappings to use. If not provided, start mapping from scratch
++
++    Returns
++    -------
++    pandas.DataFrame
++        The given data, but with the data in the given column mapped to a unique id
++    dict
++        The mapping of non-private data to unique IDs
++    """
++    if id_mapping is None:
++        id_mapping = {}
++
++    current_max_id = max(id_mapping.values())
++
++    for idx in data.shape[0]:
++        datum = data[idx, column]
++
++        if isinstance(datum, str):
++            # Assume it's an ID already
++            continue
++
++        try:
++            id = id_mapping[datum]
++        except KeyError:
++            current_max_id += 1
++            id_mapping[datum] = current_max_id
++            data[idx, column] = current_max_id
++        else:
++            data[idx, column] = id
++
++    return data, id_mapping
+diff --git a/privacypanda/report.py b/privacypanda/report.py
+index 7cff4f0..a844c35 100644
+--- a/privacypanda/report.py
++++ b/privacypanda/report.py
+@@ -2,17 +2,16 @@
+ Code for reporting the privacy of a dataframe
+ """
+ from collections import defaultdict
+-from typing import TYPE_CHECKING, List, Union
++from typing import TYPE_CHECKING, Callable, List, Union
++
++import pandas as pd
+ 
+ from .addresses import check_addresses
+ from .email import check_emails
++from .errors import PrivacyError
+ from .phonenumbers import check_phonenumbers
+ 
+-if TYPE_CHECKING:
+-    import pandas
+-
+-
+-__all__ = ["report_privacy"]
++__all__ = ["report_privacy", "check_privacy"]
+ 
+ 
+ class Report:
+@@ -56,7 +55,20 @@ class Report:
+         return report
+ 
+ 
+-def report_privacy(df: "pandas.DataFrame") -> Report:
++def report_privacy(df: pd.DataFrame) -> Report:
++    """
++    Create a Report on the privacy of a dataframe
++
++    Parameters
++    ----------
++    df : pandas.DataFrame
++        The data on which to create a report
++
++    Returns
++    -------
++    privacypanda.report.Report
++        The report object on the provided dataframe
++    """
+     report = Report()
+ 
+     checks = {
+@@ -70,3 +82,44 @@ def report_privacy(df: "pandas.DataFrame") -> Report:
+         report.add_breach(columns, breach)
+ 
+     return report
++
++
++# Privacy decorator
++def check_privacy(func: Callable) -> Callable:
++    """
++    A decorator which checks if the output of a function
++    breaches privacy
++
++    Parameters
++    ----------
++    func : function
++        The function to wrap
++
++    Returns
++    -------
++    The function, wrapped so function output
++    is checked for privacy breaches
++
++    Raises
++    ------
++    PrivacyError
++        If the output of the wrapped function breaches privacy
++    """
++
++    def inner_func(*args, **kwargs):
++        data = func(*args, **kwargs)
++
++        if isinstance(data, pd.DataFrame):
++            privacy_report = report_privacy(data)
++
++            if privacy_report._breaches.keys():
++                # Output list of breaches
++                breaches = f""
++                for breach_col, breach_type in privacy_report._breaches.items():
++                    breaches += f"\t{breach_col}: {breach_type}\n"
++
++                raise PrivacyError("Privacy breach in data:\n" + breaches)
++
++        return data
++
++    return inner_func
+

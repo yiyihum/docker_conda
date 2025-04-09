@@ -1,0 +1,1172 @@
+diff --git a/tests/basic_env.py b/tests/basic_env.py
+--- a/tests/basic_env.py
++++ b/tests/basic_env.py
+@@ -192,10 +192,12 @@ def __init__(self, methodName):
+         TestDvcFixture.__init__(self)
+         TestCase.__init__(self, methodName)
+         self._caplog = None
++        self._capsys = None
+ 
+     @pytest.fixture(autouse=True)
+-    def inject_fixtures(self, caplog):
++    def inject_fixtures(self, caplog, capsys):
+         self._caplog = caplog
++        self._capsys = capsys
+ 
+ 
+ class TestDvcGit(TestDvcGitFixture, TestCase):
+diff --git a/tests/func/metrics/test_diff.py b/tests/func/metrics/test_diff.py
+--- a/tests/func/metrics/test_diff.py
++++ b/tests/func/metrics/test_diff.py
+@@ -1,5 +1,4 @@
+ import json
+-import logging
+ 
+ from dvc.main import main
+ from dvc.utils.serialize import dump_yaml
+@@ -185,15 +184,13 @@ def _gen(val):
+     _gen(3.45678910111213)
+ 
+     caplog.clear()
++    capsys.readouterr()  # clearing the buffer
+     assert main(["metrics", "diff", "HEAD~2"]) == 0
+-    (info,) = [
+-        msg
+-        for name, level, msg in caplog.record_tuples
+-        if name.startswith("dvc") and level == logging.INFO
+-    ]
+-    assert info == (
+-        "Path    Metric    Old      New      Change\n"
+-        "m.yaml  foo       1.23457  3.45679  2.22222"
++
++    captured = capsys.readouterr()
++    assert captured.out == (
++        "Path    Metric    Old     New     Change\n"
++        "m.yaml  foo       1.2346  3.4568  2.2222\n"
+     )
+ 
+ 
+diff --git a/tests/func/test_repro.py b/tests/func/test_repro.py
+--- a/tests/func/test_repro.py
++++ b/tests/func/test_repro.py
+@@ -914,6 +914,7 @@ def test(self):
+         self.assertEqual(0, ret)
+ 
+         self._caplog.clear()
++        self._capsys.readouterr()  # clearing the buffer
+ 
+         from dvc.dvcfile import DVC_FILE_SUFFIX
+ 
+@@ -923,7 +924,8 @@ def test(self):
+         self.assertEqual(0, ret)
+ 
+         expected_metrics_display = f"Path\n{metrics_file}  {metrics_value}\n"
+-        self.assertIn(expected_metrics_display, self._caplog.text)
++        actual, _ = self._capsys.readouterr()
++        self.assertIn(expected_metrics_display, actual)
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/unit/command/test_metrics.py b/tests/unit/command/test_metrics.py
+--- a/tests/unit/command/test_metrics.py
++++ b/tests/unit/command/test_metrics.py
+@@ -1,15 +1,10 @@
+-import textwrap
++import json
+ 
+ from dvc.cli import parse_args
+-from dvc.command.metrics import (
+-    CmdMetricsDiff,
+-    CmdMetricsShow,
+-    _show_diff,
+-    _show_metrics,
+-)
++from dvc.command.metrics import CmdMetricsDiff, CmdMetricsShow
+ 
+ 
+-def test_metrics_diff(dvc, mocker):
++def test_metrics_diff(dvc, mocker, capsys):
+     cli_args = parse_args(
+         [
+             "metrics",
+@@ -18,25 +13,26 @@ def test_metrics_diff(dvc, mocker):
+             "HEAD~1",
+             "-R",
+             "--all",
+-            "--show-json",
+             "--show-md",
+             "--targets",
+             "target1",
+             "target2",
+-            "--show-md",
+             "--no-path",
+-            "--precision",
+-            "10",
+         ]
+     )
++
+     assert cli_args.func == CmdMetricsDiff
+ 
+     cmd = cli_args.func(cli_args)
+-    m = mocker.patch("dvc.repo.metrics.diff.diff", return_value={})
++    diff = {"metrics.yaml": {"": {"old": 1, "new": 3}}}
++    metrics_diff = mocker.patch(
++        "dvc.repo.metrics.diff.diff", return_value=diff
++    )
++    show_diff_mock = mocker.patch("dvc.compare.show_diff")
+ 
+     assert cmd.run() == 0
+ 
+-    m.assert_called_once_with(
++    metrics_diff.assert_called_once_with(
+         cmd.repo,
+         targets=["target1", "target2"],
+         a_rev="HEAD~10",
+@@ -44,60 +40,51 @@ def test_metrics_diff(dvc, mocker):
+         recursive=True,
+         all=True,
+     )
+-
+-
+-def test_metrics_show_json_diff():
+-    assert _show_diff(
+-        {"metrics.json": {"a.b.c": {"old": 1, "new": 2, "diff": 3}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path          Metric    Old    New    Change
+-        metrics.json  a.b.c     1      2      3"""
+-    )
+-
+-
+-def test_metrics_show_raw_diff():
+-    assert _show_diff(
+-        {"metrics": {"": {"old": "1", "new": "2"}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path     Metric    Old    New    Change
+-        metrics            1      2      —"""
++    show_diff_mock.assert_called_once_with(
++        diff, title="Metric", no_path=True, precision=5, markdown=True,
+     )
+ 
+ 
+-def test_metrics_diff_no_diff():
+-    assert _show_diff(
+-        {"other.json": {"a.b.d": {"old": "old", "new": "new"}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path        Metric    Old    New    Change
+-        other.json  a.b.d     old    new    —"""
++def test_metrics_diff_json(dvc, mocker, caplog, capsys):
++    cli_args = parse_args(
++        [
++            "metrics",
++            "diff",
++            "HEAD~10",
++            "HEAD~1",
++            "-R",
++            "--all",
++            "--show-json",
++            "--targets",
++            "target1",
++            "target2",
++            "--no-path",
++            "--precision",
++            "10",
++        ]
+     )
+ 
++    assert cli_args.func == CmdMetricsDiff
++    cmd = cli_args.func(cli_args)
+ 
+-def test_metrics_diff_no_changes():
+-    assert _show_diff({}) == ""
+-
+-
+-def test_metrics_diff_new_metric():
+-    assert _show_diff(
+-        {"other.json": {"a.b.d": {"old": None, "new": "new"}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path        Metric    Old    New    Change
+-        other.json  a.b.d     —      new    —"""
++    diff = {"metrics.yaml": {"": {"old": 1, "new": 3}}}
++    metrics_diff = mocker.patch(
++        "dvc.repo.metrics.diff.diff", return_value=diff
+     )
++    show_diff_mock = mocker.patch("dvc.compare.show_diff")
+ 
+-
+-def test_metrics_diff_deleted_metric():
+-    assert _show_diff(
+-        {"other.json": {"a.b.d": {"old": "old", "new": None}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path        Metric    Old    New    Change
+-        other.json  a.b.d     old    —      —"""
++    assert cmd.run() == 0
++    metrics_diff.assert_called_once_with(
++        cmd.repo,
++        targets=["target1", "target2"],
++        a_rev="HEAD~10",
++        b_rev="HEAD~1",
++        recursive=True,
++        all=True,
+     )
++    show_diff_mock.assert_not_called()
++    assert json.dumps(diff) in caplog.text
++    assert capsys.readouterr() == ("", "")
+ 
+ 
+ def test_metrics_show(dvc, mocker):
+@@ -119,11 +106,7 @@ def test_metrics_show(dvc, mocker):
+ 
+     cmd = cli_args.func(cli_args)
+     m1 = mocker.patch("dvc.repo.metrics.show.show", return_value={})
+-    m2 = mocker.patch(
+-        "dvc.command.metrics._show_metrics",
+-        spec=_show_metrics,
+-        return_value="",
+-    )
++    m2 = mocker.patch("dvc.compare.show_metrics", return_value="")
+ 
+     assert cmd.run() == 0
+ 
+@@ -145,243 +128,42 @@ def test_metrics_show(dvc, mocker):
+     )
+ 
+ 
+-def test_metrics_diff_precision():
+-    diff = {
+-        "other.json": {
+-            "a.b": {
+-                "old": 0.1234567,
+-                "new": 0.765432101234567,
+-                "diff": 0.641975401234567,
+-            }
+-        }
+-    }
+-
+-    assert _show_diff(diff) == textwrap.dedent(
+-        """\
+-        Path        Metric    Old      New      Change
+-        other.json  a.b       0.12346  0.76543  0.64198"""
+-    )
+-
+-    assert _show_diff(diff, precision=10) == textwrap.dedent(
+-        """\
+-        Path        Metric    Old        New           Change
+-        other.json  a.b       0.1234567  0.7654321012  0.6419754012"""
+-    )
+-
+-
+-def test_metrics_diff_sorted():
+-    assert _show_diff(
+-        {
+-            "metrics.yaml": {
+-                "x.b": {"old": 5, "new": 6, "diff": 1},
+-                "a.d.e": {"old": 3, "new": 4, "diff": 1},
+-                "a.b.c": {"old": 1, "new": 2, "diff": 1},
+-            }
+-        }
+-    ) == textwrap.dedent(
+-        """\
+-        Path          Metric    Old    New    Change
+-        metrics.yaml  a.b.c     1      2      1
+-        metrics.yaml  a.d.e     3      4      1
+-        metrics.yaml  x.b       5      6      1"""
+-    )
+-
+-
+-def test_metrics_diff_markdown_empty():
+-    assert _show_diff({}, markdown=True) == textwrap.dedent(
+-        """\
+-        | Path   | Metric   | Old   | New   | Change   |
+-        |--------|----------|-------|-------|----------|
+-        """
+-    )
+-
+-
+-def test_metrics_diff_markdown():
+-    assert _show_diff(
+-        {
+-            "metrics.yaml": {
+-                "x.b": {"old": 5, "new": 6},
+-                "a.d.e": {"old": 3, "new": 4, "diff": 1},
+-                "a.b.c": {"old": 1, "new": 2, "diff": 1},
+-            }
+-        },
+-        markdown=True,
+-    ) == textwrap.dedent(
+-        """\
+-        | Path         | Metric   | Old   | New   | Change   |
+-        |--------------|----------|-------|-------|----------|
+-        | metrics.yaml | a.b.c    | 1     | 2     | 1        |
+-        | metrics.yaml | a.d.e    | 3     | 4     | 1        |
+-        | metrics.yaml | x.b      | 5     | 6     | —        |
+-        """
+-    )
+-
+-
+-def test_metrics_diff_no_path():
+-    assert _show_diff(
+-        {
+-            "metrics.yaml": {
+-                "x.b": {"old": 5, "new": 6, "diff": 1},
+-                "a.d.e": {"old": 3, "new": 4, "diff": 1},
+-                "a.b.c": {"old": 1, "new": 2, "diff": 1},
+-            }
+-        },
+-        no_path=True,
+-    ) == textwrap.dedent(
+-        """\
+-        Metric    Old    New    Change
+-        a.b.c     1      2      1
+-        a.d.e     3      4      1
+-        x.b       5      6      1"""
+-    )
+-
+-
+-def test_metrics_show_with_valid_falsey_values():
+-    assert _show_metrics(
+-        {"branch_1": {"metrics.json": {"a": 0, "b": {"ad": 0.0, "bc": 0.0}}}},
+-        all_branches=True,
+-    ) == textwrap.dedent(
+-        """\
+-        Revision    Path          a    b.ad    b.bc
+-        branch_1    metrics.json  0    0.0     0.0"""
+-    )
+-
+-
+-def test_metrics_show_with_no_revision():
+-    assert _show_metrics(
+-        {"branch_1": {"metrics.json": {"a": 0, "b": {"ad": 0.0, "bc": 0.0}}}},
+-        all_branches=False,
+-    ) == textwrap.dedent(
+-        """\
+-        Path          a    b.ad    b.bc
+-        metrics.json  0    0.0     0.0"""
+-    )
+-
+-
+-def test_metrics_show_with_non_dict_values():
+-    assert _show_metrics(
+-        {"branch_1": {"metrics.json": 1}}, all_branches=True,
+-    ) == textwrap.dedent(
+-        """\
+-        Revision    Path
+-        branch_1    metrics.json  1"""
+-    )
+-
+-
+-def test_metrics_show_with_multiple_revision():
+-    assert _show_metrics(
+-        {
+-            "branch_1": {"metrics.json": {"a": 1, "b": {"ad": 1, "bc": 2}}},
+-            "branch_2": {"metrics.json": {"a": 1, "b": {"ad": 3, "bc": 4}}},
+-        },
+-        all_branches=True,
+-    ) == textwrap.dedent(
+-        """\
+-        Revision    Path          a    b.ad    b.bc
+-        branch_1    metrics.json  1    1       2
+-        branch_2    metrics.json  1    3       4"""
+-    )
+-
+-
+-def test_metrics_show_with_one_revision_multiple_paths():
+-    assert _show_metrics(
+-        {
+-            "branch_1": {
+-                "metrics.json": {"a": 1, "b": {"ad": 0.1, "bc": 1.03}},
+-                "metrics_1.json": {"a": 2.3, "b": {"ad": 6.5, "bc": 7.9}},
+-            }
+-        },
+-        all_branches=True,
+-    ) == textwrap.dedent(
+-        """\
+-        Revision    Path            a    b.ad    b.bc
+-        branch_1    metrics.json    1    0.1     1.03
+-        branch_1    metrics_1.json  2.3  6.5     7.9"""
+-    )
+-
+-
+-def test_metrics_show_with_different_metrics_header():
+-    assert _show_metrics(
+-        {
+-            "branch_1": {"metrics.json": {"b": {"ad": 1, "bc": 2}, "c": 4}},
+-            "branch_2": {"metrics.json": {"a": 1, "b": {"ad": 3, "bc": 4}}},
+-        },
+-        all_branches=True,
+-    ) == textwrap.dedent(
+-        """\
+-        Revision    Path          a    b.ad    b.bc    c
+-        branch_1    metrics.json  —    1       2       4
+-        branch_2    metrics.json  1    3       4       —"""
++def test_metrics_show_json(dvc, mocker, caplog, capsys):
++    cli_args = parse_args(
++        [
++            "metrics",
++            "show",
++            "--show-json",
++            "-R",
++            "--all-tags",
++            "--all-branches",
++            "--all-commits",
++            "target1",
++            "target2",
++            "--precision",
++            "8",
++        ]
+     )
+ 
+-
+-def test_metrics_show_precision():
+-    metrics = {
+-        "branch_1": {
+-            "metrics.json": {
+-                "a": 1.098765366365355,
+-                "b": {"ad": 1.5342673, "bc": 2.987725527},
+-            }
+-        }
++    assert cli_args.func == CmdMetricsShow
++    cmd = cli_args.func(cli_args)
++    d = {
++        "branch_1": {"metrics.json": {"b": {"ad": 1, "bc": 2}, "c": 4}},
++        "branch_2": {"metrics.json": {"a": 1, "b": {"ad": 3, "bc": 4}}},
+     }
++    metrics_show = mocker.patch("dvc.repo.metrics.show.show", return_value=d)
++    show_metrics_mock = mocker.patch("dvc.compare.show_metrics")
+ 
+-    assert _show_metrics(metrics, all_branches=True,) == textwrap.dedent(
+-        """\
+-        Revision    Path          a        b.ad     b.bc
+-        branch_1    metrics.json  1.09877  1.53427  2.98773"""
+-    )
+-
+-    assert _show_metrics(
+-        metrics, all_branches=True, precision=4
+-    ) == textwrap.dedent(
+-        """\
+-        Revision    Path          a       b.ad    b.bc
+-        branch_1    metrics.json  1.0988  1.5343  2.9877"""
+-    )
+-
+-    assert _show_metrics(
+-        metrics, all_branches=True, precision=7
+-    ) == textwrap.dedent(
+-        """\
+-        Revision    Path          a          b.ad       b.bc
+-        branch_1    metrics.json  1.0987654  1.5342673  2.9877255"""
+-    )
+-
+-
+-def test_metrics_show_default():
+-    assert _show_metrics(
+-        {
+-            "metrics.yaml": {
+-                "x.b": {"old": 5, "new": 6},
+-                "a.d.e": {"old": 3, "new": 4, "diff": 1},
+-                "a.b.c": {"old": 1, "new": 2, "diff": 1},
+-            }
+-        },
+-    ) == textwrap.dedent(
+-        """\
+-        Path    diff    new    old
+-        x.b     —       6      5
+-        a.d.e   1       4      3
+-        a.b.c   1       2      1"""
+-    )
+-
++    assert cmd.run() == 0
+ 
+-def test_metrics_show_md():
+-    assert _show_metrics(
+-        {
+-            "metrics.yaml": {
+-                "x.b": {"old": 5, "new": 6},
+-                "a.d.e": {"old": 3, "new": 4, "diff": 1},
+-                "a.b.c": {"old": 1, "new": 2, "diff": 1},
+-            }
+-        },
+-        markdown=True,
+-    ) == textwrap.dedent(
+-        """\
+-        | Path   | diff   | new   | old   |
+-        |--------|--------|-------|-------|
+-        | x.b    | —      | 6     | 5     |
+-        | a.d.e  | 1      | 4     | 3     |
+-        | a.b.c  | 1      | 2     | 1     |
+-        """
++    metrics_show.assert_called_once_with(
++        cmd.repo,
++        ["target1", "target2"],
++        recursive=True,
++        all_tags=True,
++        all_branches=True,
++        all_commits=True,
+     )
++    show_metrics_mock.assert_not_called()
++    assert json.dumps(d) in caplog.text
++    assert capsys.readouterr() == ("", "")
+diff --git a/tests/unit/command/test_params.py b/tests/unit/command/test_params.py
+--- a/tests/unit/command/test_params.py
++++ b/tests/unit/command/test_params.py
+@@ -1,8 +1,7 @@
+ import logging
+-import textwrap
+ 
+ from dvc.cli import parse_args
+-from dvc.command.params import CmdParamsDiff, _show_diff
++from dvc.command.params import CmdParamsDiff
+ 
+ 
+ def test_params_diff(dvc, mocker):
+@@ -24,11 +23,12 @@ def test_params_diff(dvc, mocker):
+     assert cli_args.func == CmdParamsDiff
+ 
+     cmd = cli_args.func(cli_args)
+-    m = mocker.patch("dvc.repo.params.diff.diff", return_value={})
++    params_diff = mocker.patch("dvc.repo.params.diff.diff", return_value={})
++    show_diff_mock = mocker.patch("dvc.compare.show_diff")
+ 
+     assert cmd.run() == 0
+ 
+-    m.assert_called_once_with(
++    params_diff.assert_called_once_with(
+         cmd.repo,
+         a_rev="HEAD~10",
+         b_rev="HEAD~1",
+@@ -36,6 +36,7 @@ def test_params_diff(dvc, mocker):
+         all=True,
+         deps=True,
+     )
++    show_diff_mock.assert_not_called()
+ 
+ 
+ def test_params_diff_from_cli(dvc, mocker):
+@@ -43,80 +44,20 @@ def test_params_diff_from_cli(dvc, mocker):
+     assert cli_args.func == CmdParamsDiff
+ 
+     cmd = cli_args.func(cli_args)
+-    m = mocker.patch("dvc.repo.params.diff.diff", return_value={})
++    params_diff = mocker.patch("dvc.repo.params.diff.diff", return_value={})
++    show_diff_mock = mocker.patch("dvc.compare.show_diff")
+ 
+     assert cmd.run() == 0
+ 
+-    m.assert_called_once_with(
++    params_diff.assert_called_once_with(
+         cmd.repo, a_rev=None, b_rev=None, all=False, targets=None, deps=False,
+     )
+-
+-
+-def test_params_diff_changed():
+-    assert _show_diff(
+-        {"params.yaml": {"a.b.c": {"old": 1, "new": 2}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path         Param    Old    New
+-        params.yaml  a.b.c    1      2"""
+-    )
+-
+-
+-def test_params_diff_list():
+-    assert _show_diff(
+-        {"params.yaml": {"a.b.c": {"old": 1, "new": [2, 3]}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path         Param    Old    New
+-        params.yaml  a.b.c    1      [2, 3]"""
+-    )
+-
+-
+-def test_params_diff_unchanged():
+-    assert _show_diff(
+-        {"params.yaml": {"a.b.d": {"old": "old", "new": "new"}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path         Param    Old    New
+-        params.yaml  a.b.d    old    new"""
+-    )
+-
+-
+-def test_params_diff_no_changes():
+-    assert _show_diff({}) == ""
+-
+-
+-def test_params_diff_new():
+-    assert _show_diff(
+-        {"params.yaml": {"a.b.d": {"old": None, "new": "new"}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path         Param    Old    New
+-        params.yaml  a.b.d    —      new"""
+-    )
+-
+-
+-def test_params_diff_deleted():
+-    assert _show_diff(
+-        {"params.yaml": {"a.b.d": {"old": "old", "new": None}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path         Param    Old    New
+-        params.yaml  a.b.d    old    —"""
++    show_diff_mock.assert_called_once_with(
++        {}, title="Param", markdown=False, no_path=False, show_changes=False
+     )
+ 
+ 
+-def test_params_diff_prec():
+-    assert _show_diff(
+-        {"params.yaml": {"train.lr": {"old": 0.0042, "new": 0.0043}}}
+-    ) == textwrap.dedent(
+-        """\
+-        Path         Param     Old     New
+-        params.yaml  train.lr  0.0042  0.0043"""
+-    )
+-
+-
+-def test_params_diff_show_json(dvc, mocker, caplog):
++def test_params_diff_show_json(dvc, mocker, caplog, capsys):
+     cli_args = parse_args(
+         ["params", "diff", "HEAD~10", "HEAD~1", "--show-json"]
+     )
+@@ -124,73 +65,11 @@ def test_params_diff_show_json(dvc, mocker, caplog):
+     mocker.patch(
+         "dvc.repo.params.diff.diff", return_value={"params.yaml": {"a": "b"}}
+     )
++    show_diff_mock = mocker.patch("dvc.compare.show_diff")
++
+     with caplog.at_level(logging.INFO, logger="dvc"):
+         assert cmd.run() == 0
+         assert '{"params.yaml": {"a": "b"}}\n' in caplog.text
+ 
+-
+-def test_params_diff_sorted():
+-    assert _show_diff(
+-        {
+-            "params.yaml": {
+-                "x.b": {"old": 5, "new": 6},
+-                "a.d.e": {"old": 3, "new": 4},
+-                "a.b.c": {"old": 1, "new": 2},
+-            }
+-        }
+-    ) == textwrap.dedent(
+-        """\
+-        Path         Param    Old    New
+-        params.yaml  a.b.c    1      2
+-        params.yaml  a.d.e    3      4
+-        params.yaml  x.b      5      6"""
+-    )
+-
+-
+-def test_params_diff_markdown_empty():
+-    assert _show_diff({}, markdown=True) == textwrap.dedent(
+-        """\
+-        | Path   | Param   | Old   | New   |
+-        |--------|---------|-------|-------|
+-        """
+-    )
+-
+-
+-def test_params_diff_markdown():
+-    assert _show_diff(
+-        {
+-            "params.yaml": {
+-                "x.b": {"old": 5, "new": 6},
+-                "a.d.e": {"old": None, "new": 4},
+-                "a.b.c": {"old": 1, "new": None},
+-            }
+-        },
+-        markdown=True,
+-    ) == textwrap.dedent(
+-        """\
+-        | Path        | Param   | Old   | New   |
+-        |-------------|---------|-------|-------|
+-        | params.yaml | a.b.c   | 1     | —     |
+-        | params.yaml | a.d.e   | —     | 4     |
+-        | params.yaml | x.b     | 5     | 6     |
+-        """
+-    )
+-
+-
+-def test_params_diff_no_path():
+-    assert _show_diff(
+-        {
+-            "params.yaml": {
+-                "x.b": {"old": 5, "new": 6},
+-                "a.d.e": {"old": 3, "new": 4},
+-                "a.b.c": {"old": 1, "new": 2},
+-            }
+-        },
+-        no_path=True,
+-    ) == textwrap.dedent(
+-        """\
+-        Param    Old    New
+-        a.b.c    1      2
+-        a.d.e    3      4
+-        x.b      5      6"""
+-    )
++    show_diff_mock.assert_not_called()
++    assert capsys.readouterr() == ("", "")
+diff --git a/tests/unit/test_compare.py b/tests/unit/test_compare.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/test_compare.py
+@@ -0,0 +1,455 @@
++import textwrap
++
++import pytest
++
++from dvc.compare import diff_table, metrics_table, show_diff, show_metrics
++
++
++@pytest.mark.parametrize("title", ["Metric", "Param"])
++def test_diff_table(title):
++    td = diff_table(
++        {"metrics.json": {"a.b.c": {"old": 1, "new": 2, "diff": 3}}},
++        title=title,
++    )
++    assert td.as_dict() == [
++        {
++            "Path": "metrics.json",
++            title: "a.b.c",
++            "Old": "1",
++            "New": "2",
++            "Change": "3",
++        }
++    ]
++
++
++def test_diff_table_with_value_column():
++    td = diff_table(
++        {"metrics.json": {"a.b.c": {"old": 1, "new": 2, "diff": 3}}},
++        title="Metric",
++        old=False,
++    )
++    assert td.as_dict() == [
++        {
++            "Path": "metrics.json",
++            "Metric": "a.b.c",
++            "Value": "2",
++            "Change": "3",
++        }
++    ]
++
++
++def test_no_path():
++    td = diff_table(
++        {"metrics.json": {"a.b.c": {"old": 1, "new": 2, "diff": 3}}},
++        title="Metric",
++        no_path=True,
++    )
++    assert td.as_dict() == [
++        {"Metric": "a.b.c", "Old": "1", "New": "2", "Change": "3"}
++    ]
++
++
++def test_do_not_show_changes():
++    td = diff_table(
++        {"metrics.json": {"a.b.c": {"old": 1, "new": 2, "diff": 3}}},
++        title="Metric",
++        show_changes=False,
++    )
++    assert td.as_dict() == [
++        {"Path": "metrics.json", "Metric": "a.b.c", "Old": "1", "New": "2"}
++    ]
++
++
++def test_diff_table_precision():
++    diff = {
++        "metrics.json": {
++            "a.b.c": {"old": 1.1234, "new": 2.2345, "diff": 3.3456}
++        }
++    }
++    td = diff_table(diff, title="Metric", precision=3,)
++    assert td.as_dict() == [
++        {
++            "Path": "metrics.json",
++            "Metric": "a.b.c",
++            "Old": "1.12",
++            "New": "2.23",
++            "Change": "3.35",
++        }
++    ]
++
++
++@pytest.mark.parametrize(
++    "extra, expected", [({"on_empty_diff": "no diff"}, "no diff"), ({}, "-")]
++)
++def test_diff_unsupported_diff_message(extra, expected):
++    td = diff_table(
++        {"metrics.json": {"": {"old": "1", "new": "2"}}},
++        title="Metric",
++        **extra
++    )
++    assert td.as_dict() == [
++        {
++            "Path": "metrics.json",
++            "Metric": "",
++            "Old": "1",
++            "New": "2",
++            "Change": expected,
++        }
++    ]
++
++
++def test_diff_new():
++    td = diff_table(
++        {"param.json": {"a.b.d": {"old": None, "new": "new"}}}, title="Param"
++    )
++    assert td.as_dict() == [
++        {
++            "Path": "param.json",
++            "Param": "a.b.d",
++            "Old": "-",
++            "New": "new",
++            "Change": "-",
++        }
++    ]
++
++
++def test_diff_old_deleted():
++    td = diff_table(
++        {"metric.json": {"a.b.d": {"old": "old", "new": None}}}, title="Metric"
++    )
++    assert td.as_dict() == [
++        {
++            "Path": "metric.json",
++            "Metric": "a.b.d",
++            "Old": "old",
++            "New": "-",
++            "Change": "-",
++        }
++    ]
++
++
++def test_diff_sorted():
++    td = diff_table(
++        {
++            "metrics.yaml": {
++                "x.b": {"old": 5, "new": 6, "diff": 1},
++                "a.d.e": {"old": 3, "new": 4, "diff": 1},
++                "a.b.c": {"old": 1, "new": 2, "diff": 1},
++            }
++        },
++        "Metric",
++    )
++    assert list(td) == [
++        ["metrics.yaml", "a.b.c", "1", "2", "1"],
++        ["metrics.yaml", "a.d.e", "3", "4", "1"],
++        ["metrics.yaml", "x.b", "5", "6", "1"],
++    ]
++
++
++def test_diff_falsey_values():
++    diff = {"metrics.yaml": {"x.b": {"old": 0, "new": 0.0, "diff": 0.0}}}
++    td = diff_table(diff, "Metric")
++    assert td.as_dict() == [
++        {
++            "Path": "metrics.yaml",
++            "Metric": "x.b",
++            "Old": "0",
++            "New": "0.0",
++            "Change": "0.0",
++        }
++    ]
++
++
++@pytest.mark.parametrize(
++    "composite, expected",
++    [([2, 3], "[2, 3]"), ({"foo": 3, "bar": 3}, "{'foo': 3, 'bar': 3}")],
++)
++def test_diff_list(composite, expected):
++    td = diff_table(
++        {"params.yaml": {"a.b.c": {"old": 1, "new": composite}}}, "Param"
++    )
++    assert td.as_dict() == [
++        {
++            "Path": "params.yaml",
++            "Param": "a.b.c",
++            "Old": "1",
++            "New": expected,
++            "Change": "-",
++        }
++    ]
++
++
++@pytest.mark.parametrize("markdown", [True, False])
++def test_diff_mocked(mocker, markdown):
++    ret = mocker.MagicMock()
++    m = mocker.patch("dvc.compare.diff_table", return_value=ret)
++
++    show_diff({}, "metrics", markdown=markdown)
++
++    m.assert_called_once_with(
++        {},
++        title="metrics",
++        old=True,
++        no_path=False,
++        precision=None,
++        on_empty_diff=None,
++        show_changes=True,
++    )
++    ret.render.assert_called_once_with(markdown=markdown)
++
++
++def test_diff_default(capsys):
++    show_diff(
++        {
++            "metrics.yaml": {
++                "x.b": {"old": 5, "new": 6},
++                "a.d.e": {"old": 3, "new": 4, "diff": 1},
++                "a.b.c": {"old": 1, "new": 2, "diff": 1},
++            }
++        },
++        "Metric",
++    )
++    out, _ = capsys.readouterr()
++    assert out == textwrap.dedent(
++        """\
++        Path          Metric    Old    New    Change
++        metrics.yaml  a.b.c     1      2      1
++        metrics.yaml  a.d.e     3      4      1
++        metrics.yaml  x.b       5      6      -
++        """
++    )
++
++
++def test_metrics_diff_md(capsys):
++    show_diff(
++        {
++            "metrics.yaml": {
++                "x.b": {"old": 5, "new": 6},
++                "a.d.e": {"old": 3, "new": 4, "diff": 1},
++                "a.b.c": {"old": 1, "new": 2, "diff": 1},
++            }
++        },
++        "Metric",
++        markdown=True,
++    )
++    out, _ = capsys.readouterr()
++    assert out == textwrap.dedent(
++        """\
++        | Path         | Metric   | Old   | New   | Change   |
++        |--------------|----------|-------|-------|----------|
++        | metrics.yaml | a.b.c    | 1     | 2     | 1        |
++        | metrics.yaml | a.d.e    | 3     | 4     | 1        |
++        | metrics.yaml | x.b      | 5     | 6     | -        |
++
++        """
++    )
++
++
++def test_metrics_show_with_valid_falsey_values():
++    td = metrics_table(
++        {"branch_1": {"metrics.json": {"a": 0, "b": {"ad": 0.0, "bc": 0.0}}}},
++        all_branches=True,
++    )
++    assert td.as_dict() == [
++        {
++            "Revision": "branch_1",
++            "Path": "metrics.json",
++            "a": "0",
++            "b.ad": "0.0",
++            "b.bc": "0.0",
++        }
++    ]
++
++
++def test_metrics_show_with_no_revision():
++    td = metrics_table(
++        {"branch_1": {"metrics.json": {"a": 0, "b": {"ad": 0.0, "bc": 0.0}}}},
++        all_branches=False,
++    )
++    assert td.as_dict() == [
++        {"Path": "metrics.json", "a": "0", "b.ad": "0.0", "b.bc": "0.0"}
++    ]
++
++
++def test_metrics_show_with_non_dict_values():
++    td = metrics_table({"branch_1": {"metrics.json": 1}}, all_branches=True,)
++    assert td.as_dict() == [
++        {"Revision": "branch_1", "Path": "metrics.json", "": "1"}
++    ]
++
++
++def test_metrics_show_with_multiple_revision():
++    td = metrics_table(
++        {
++            "branch_1": {"metrics.json": {"a": 1, "b": {"ad": 1, "bc": 2}}},
++            "branch_2": {"metrics.json": {"a": 1, "b": {"ad": 3, "bc": 4}}},
++        },
++        all_branches=True,
++    )
++    assert td.as_dict() == [
++        {
++            "Revision": "branch_1",
++            "Path": "metrics.json",
++            "a": "1",
++            "b.ad": "1",
++            "b.bc": "2",
++        },
++        {
++            "Revision": "branch_2",
++            "Path": "metrics.json",
++            "a": "1",
++            "b.ad": "3",
++            "b.bc": "4",
++        },
++    ]
++
++
++def test_metrics_show_with_one_revision_multiple_paths():
++    td = metrics_table(
++        {
++            "branch_1": {
++                "metrics.json": {"a": 1, "b": {"ad": 0.1, "bc": 1.03}},
++                "metrics_1.json": {"a": 2.3, "b": {"ad": 6.5, "bc": 7.9}},
++            }
++        },
++        all_branches=True,
++    )
++    assert td.as_dict() == [
++        {
++            "Revision": "branch_1",
++            "Path": "metrics.json",
++            "a": "1",
++            "b.ad": "0.1",
++            "b.bc": "1.03",
++        },
++        {
++            "Revision": "branch_1",
++            "Path": "metrics_1.json",
++            "a": "2.3",
++            "b.ad": "6.5",
++            "b.bc": "7.9",
++        },
++    ]
++
++
++def test_metrics_show_with_different_metrics_header():
++    td = metrics_table(
++        {
++            "branch_1": {"metrics.json": {"b": {"ad": 1, "bc": 2}, "c": 4}},
++            "branch_2": {"metrics.json": {"a": 1, "b": {"ad": 3, "bc": 4}}},
++        },
++        all_branches=True,
++    )
++    assert td.as_dict() == [
++        {
++            "Revision": "branch_1",
++            "Path": "metrics.json",
++            "a": "-",
++            "b.ad": "1",
++            "b.bc": "2",
++            "c": "4",
++        },
++        {
++            "Revision": "branch_2",
++            "Path": "metrics.json",
++            "a": "1",
++            "b.ad": "3",
++            "b.bc": "4",
++            "c": "-",
++        },
++    ]
++
++
++def test_metrics_show_precision():
++    metrics = {
++        "branch_1": {
++            "metrics.json": {
++                "a": 1.098765366365355,
++                "b": {"ad": 1.5342673, "bc": 2.987725527},
++            }
++        }
++    }
++
++    td = metrics_table(metrics, all_branches=True, precision=4)
++    assert td.as_dict() == [
++        {
++            "Revision": "branch_1",
++            "Path": "metrics.json",
++            "a": "1.099",
++            "b.ad": "1.534",
++            "b.bc": "2.988",
++        }
++    ]
++
++    td = metrics_table(metrics, all_branches=True, precision=7)
++    assert td.as_dict() == [
++        {
++            "Revision": "branch_1",
++            "Path": "metrics.json",
++            "a": "1.098765",
++            "b.ad": "1.534267",
++            "b.bc": "2.987726",
++        }
++    ]
++
++
++@pytest.mark.parametrize("markdown", [True, False])
++def test_metrics_show_mocked(mocker, markdown):
++    ret = mocker.MagicMock()
++    m = mocker.patch("dvc.compare.metrics_table", return_value=ret)
++
++    show_metrics({}, markdown=markdown)
++
++    m.assert_called_once_with(
++        {},
++        all_branches=False,
++        all_tags=False,
++        all_commits=False,
++        precision=None,
++    )
++    ret.render.assert_called_once_with(markdown=markdown)
++
++
++def test_metrics_show_default(capsys):
++    show_metrics(
++        {
++            "metrics.yaml": {
++                "x.b": {"old": 5, "new": 6},
++                "a.d.e": {"old": 3, "new": 4, "diff": 1},
++                "a.b.c": {"old": 1, "new": 2, "diff": 1},
++            }
++        },
++    )
++    out, _ = capsys.readouterr()
++    assert out == textwrap.dedent(
++        """\
++        Path    diff    new    old
++        x.b     -       6      5
++        a.d.e   1       4      3
++        a.b.c   1       2      1
++        """
++    )
++
++
++def test_metrics_show_md(capsys):
++    show_metrics(
++        {
++            "metrics.yaml": {
++                "x.b": {"old": 5, "new": 6},
++                "a.d.e": {"old": 3, "new": 4, "diff": 1},
++                "a.b.c": {"old": 1, "new": 2, "diff": 1},
++            }
++        },
++        markdown=True,
++    )
++    out, _ = capsys.readouterr()
++    assert out == textwrap.dedent(
++        """\
++        | Path   | diff   | new   | old   |
++        |--------|--------|-------|-------|
++        | x.b    | -      | 6     | 5     |
++        | a.d.e  | 1      | 4     | 3     |
++        | a.b.c  | 1      | 2     | 1     |
++
++        """
++    )

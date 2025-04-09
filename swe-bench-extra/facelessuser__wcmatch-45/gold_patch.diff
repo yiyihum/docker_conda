@@ -1,0 +1,135 @@
+diff --git a/docs/src/markdown/changelog.md b/docs/src/markdown/changelog.md
+index 5e0bb17..92de27d 100644
+--- a/docs/src/markdown/changelog.md
++++ b/docs/src/markdown/changelog.md
+@@ -1,5 +1,9 @@
+ # Changelog
+ 
++## 3.1.0
++
++- **NEW**: Deprecated `WcMatch` class methods `kill` and `reset`. `WcMatch` should be broken with a simple `break` statement instead.
++
+ ## 3.0.2
+ 
+ - **FIX**: Fix an offset issue when processing an absolute path pattern in `glob` on Linux or macOS.
+diff --git a/docs/src/markdown/wcmatch.md b/docs/src/markdown/wcmatch.md
+index f2d53f3..a81efa2 100644
+--- a/docs/src/markdown/wcmatch.md
++++ b/docs/src/markdown/wcmatch.md
+@@ -109,7 +109,7 @@ Perform match returning an iterator of files that match the patterns.
+ 
+ #### `WcMatch.kill`
+ 
+-If searching with `imatch`, this provides a way to kill the internal searching.
++If searching with `imatch`, this provides a way to gracefully kill the internal searching. Internally, you can call `is_aborted` to check if a request to abort has been made. So if work on a file is being done in an `on_match`, you can check if there has been a request to kill the process, and tie up loose ends gracefully.
+ 
+ ```pycon3
+ >>> from wcmatch import wcmatch
+@@ -121,6 +121,11 @@ If searching with `imatch`, this provides a way to kill the internal searching.
+ ./LICENSE.md
+ ```
+ 
++Once a "kill" has been issued, the class will remain in an aborted state. To clear the "kill" state, you must call [`reset`](#wcmatchreset). This allows a process to define a `Wcmatch` class and reuse it. If a process receives an early kill and sets it before the match is started, when the match is started, it will immediately abort. This helps with race conditions depending on how you are using `WcMatch`.
++
++!!! warning "Deprecated 3.1"
++    `kill` has been deprecated in 3.1. `kill` is viewed as unnecessary. Please use a simple `break` within your loop to terminate file search.
++
+ #### `WcMatch.reset`
+ 
+ Resets the abort state after running `kill`.
+@@ -138,6 +143,9 @@ Resets the abort state after running `kill`.
+ ['./LICENSE.md', './README.md']
+ ```
+ 
++!!! warning "Deprecated 3.1"
++    `kill` has been deprecated in 3.1. `kill` is viewed as unnecessary. Please use a simple `break` within your loop to terminate file search.
++
+ #### `WcMatch.get_skipped`
+ 
+ Returns the number of skipped files. Files in skipped folders are not included in the count.
+@@ -217,6 +225,20 @@ When accessing or processing a file throws an error, it is sent to `on_error`. H
+ 
+ On match returns the path of the matched file.  You can override `on_match` and change what is returned.  You could return just the base, you could parse the file and return the content, or return a special match record with additional file meta data. `on_match` must return something, and all results will be returned via `match` or `imatch`.
+ 
++#### `WcMatch.on_reset`
++
++```py3
++    def on_reset(self):
++        """On reset."""
++        pass
++```
++
++`on_reset` is a hook to provide a way to reset any custom logic in classes that have derived from `WcMatch`. `on_reset`
++is called on every new `match` call.
++
++!!! new "New 3.1"
++    `on_reset` was added in 3.1.
++
+ ## Flags
+ 
+ #### `wcmatch.RECURSIVE, wcmatch.RV` {: #wcmatchrecursive}
+diff --git a/wcmatch/wcmatch.py b/wcmatch/wcmatch.py
+index e3957cb..b76f559 100644
+--- a/wcmatch/wcmatch.py
++++ b/wcmatch/wcmatch.py
+@@ -72,9 +72,9 @@ class WcMatch(object):
+     def __init__(self, *args, **kwargs):
+         """Initialize the directory walker object."""
+ 
++        self._abort = False
+         args = list(args)
+         self._skipped = 0
+-        self._abort = False
+         self._directory = util.norm_slash(args.pop(0))
+         self.is_bytes = isinstance(self._directory, bytes)
+         if not self._directory:
+@@ -196,16 +196,21 @@ class WcMatch(object):
+ 
+         return os.path.join(base, name)
+ 
++    def on_reset(self):
++        """On reset."""
++
+     def get_skipped(self):
+         """Get number of skipped files."""
+ 
+         return self._skipped
+ 
++    @util.deprecated("Please use builtin 'break' keyword to exit the loop instead.")
+     def kill(self):
+         """Abort process."""
+ 
+         self._abort = True
+ 
++    @util.deprecated("Please use builtin 'break' keyword to exit the loop instead.")
+     def reset(self):
+         """Revive class from a killed state."""
+ 
+@@ -217,6 +222,9 @@ class WcMatch(object):
+         self._base_len = len(self.base)
+ 
+         for base, dirs, files in os.walk(self.base, followlinks=self.follow_links):
++            if self._abort:
++                break
++
+             # Remove child folders based on exclude rules
+             for name in dirs[:]:
+                 try:
+@@ -254,9 +262,6 @@ class WcMatch(object):
+                     if self._abort:
+                         break
+ 
+-            if self._abort:
+-                break
+-
+     def match(self):
+         """Run the directory walker."""
+ 
+@@ -265,6 +270,7 @@ class WcMatch(object):
+     def imatch(self):
+         """Run the directory walker as iterator."""
+ 
++        self.on_reset()
+         self._skipped = 0
+         for f in self._walk():
+             yield f

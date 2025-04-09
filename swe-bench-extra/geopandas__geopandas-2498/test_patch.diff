@@ -1,0 +1,185 @@
+diff --git a/geopandas/testing.py b/geopandas/testing.py
+index ae89cd0..54b6868 100644
+--- a/geopandas/testing.py
++++ b/geopandas/testing.py
+@@ -288,8 +288,19 @@ def assert_geodataframe_equal(
+         assert isinstance(left, type(right))
+ 
+         if check_crs:
++            # allow if neither left and right has an active geometry column
++            if (
++                left._geometry_column_name is None
++                and right._geometry_column_name is None
++            ):
++                pass
++            elif (
++                left._geometry_column_name not in left.columns
++                and right._geometry_column_name not in right.columns
++            ):
++                pass
+             # no crs can be either None or {}
+-            if not left.crs and not right.crs:
++            elif not left.crs and not right.crs:
+                 pass
+             else:
+                 assert left.crs == right.crs
+@@ -328,9 +339,12 @@ def assert_geodataframe_equal(
+                 check_crs=check_crs,
+             )
+ 
++    # ensure the active geometry column is the same
++    assert left._geometry_column_name == right._geometry_column_name
++
+     # drop geometries and check remaining columns
+-    left2 = left.drop([left._geometry_column_name], axis=1)
+-    right2 = right.drop([right._geometry_column_name], axis=1)
++    left2 = left.select_dtypes(exclude="geometry")
++    right2 = right.select_dtypes(exclude="geometry")
+     assert_frame_equal(
+         left2,
+         right2,
+diff --git a/geopandas/tests/test_geom_methods.py b/geopandas/tests/test_geom_methods.py
+index 6d24a4f..7e1cad2 100644
+--- a/geopandas/tests/test_geom_methods.py
++++ b/geopandas/tests/test_geom_methods.py
+@@ -11,6 +11,7 @@ import shapely
+ from shapely.geometry import (
+     LinearRing,
+     LineString,
++    MultiLineString,
+     MultiPoint,
+     Point,
+     Polygon,
+@@ -26,7 +27,7 @@ from geopandas.base import GeoPandasBase
+ from geopandas.testing import assert_geodataframe_equal
+ from geopandas.tests.util import assert_geoseries_equal, geom_almost_equals, geom_equals
+ from geopandas import _compat as compat
+-from pandas.testing import assert_frame_equal, assert_series_equal, assert_index_equal
++from pandas.testing import assert_frame_equal, assert_index_equal, assert_series_equal
+ import pytest
+ 
+ 
+@@ -834,6 +835,49 @@ class TestGeomMethods:
+         # the convex hull of a square should be the same as the square
+         assert_geoseries_equal(self.squares, self.squares.convex_hull)
+ 
++    @pytest.mark.skipif(
++        not (compat.USE_PYGEOS or compat.USE_SHAPELY_20),
++        reason="delaunay_triangles not implemented for shapely<2",
++    )
++    def test_delaunay_triangles(self):
++        expected = GeoSeries(
++            [
++                GeometryCollection([Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])]),
++                GeometryCollection([Polygon([(0, 1), (0, 0), (1, 1), (0, 1)])]),
++            ]
++        )
++        dlt = self.g3.delaunay_triangles()
++        assert isinstance(dlt, GeoSeries)
++        assert_series_equal(expected, dlt)
++
++    @pytest.mark.skipif(
++        not (compat.USE_PYGEOS or compat.USE_SHAPELY_20),
++        reason="delaunay_triangles not implemented for shapely<2",
++    )
++    def test_delaunay_triangles_pass_kwargs(self):
++        expected = GeoSeries(
++            [
++                MultiLineString([[(0, 0), (1, 1)], [(0, 0), (1, 0)], [(1, 0), (1, 1)]]),
++                MultiLineString([[(0, 1), (1, 1)], [(0, 0), (0, 1)], [(0, 0), (1, 1)]]),
++            ]
++        )
++        dlt = self.g3.delaunay_triangles(only_edges=True)
++        assert isinstance(dlt, GeoSeries)
++        assert_series_equal(expected, dlt)
++
++    @pytest.mark.skipif(
++        compat.USE_PYGEOS or compat.USE_SHAPELY_20,
++        reason="delaunay_triangles implemented for shapely>2",
++    )
++    def test_delaunay_triangles_shapely_pre20(self):
++        s = GeoSeries([Point(1, 1)])
++        with pytest.raises(
++            NotImplementedError,
++            match=f"shapely >= 2.0 or PyGEOS is required, "
++            f"version {shapely.__version__} is installed",
++        ):
++            s.delaunay_triangles()
++
+     def test_exterior(self):
+         exp_exterior = GeoSeries([LinearRing(p.boundary) for p in self.g3])
+         for expected, computed in zip(exp_exterior, self.g3.exterior):
+diff --git a/geopandas/tests/test_pandas_methods.py b/geopandas/tests/test_pandas_methods.py
+index 99da218..c10a418 100644
+--- a/geopandas/tests/test_pandas_methods.py
++++ b/geopandas/tests/test_pandas_methods.py
+@@ -776,9 +776,7 @@ def test_pivot(df):
+     # pivot failing due to creating a MultiIndex
+     result = df.pivot(columns="value1")
+     expected = GeoDataFrame(pd.DataFrame(df).pivot(columns="value1"))
+-    # TODO assert_geodataframe_equal crashes
+-    assert isinstance(result, GeoDataFrame)
+-    assert_frame_equal(result, expected)
++    assert_geodataframe_equal(result, expected)
+ 
+ 
+ def test_preserve_attrs(df):
+diff --git a/geopandas/tests/test_testing.py b/geopandas/tests/test_testing.py
+index 1783dd2..b119f72 100644
+--- a/geopandas/tests/test_testing.py
++++ b/geopandas/tests/test_testing.py
+@@ -3,7 +3,8 @@ import warnings
+ import numpy as np
+ 
+ from shapely.geometry import Point, Polygon
+-from pandas import Series
++import pandas as pd
++from pandas import DataFrame, Series
+ 
+ from geopandas import GeoDataFrame, GeoSeries
+ from geopandas.array import from_shapely
+@@ -139,3 +140,44 @@ def test_almost_equal_but_not_equal():
+     assert_geoseries_equal(s_origin, s_almost_origin, check_less_precise=True)
+     with pytest.raises(AssertionError):
+         assert_geoseries_equal(s_origin, s_almost_origin)
++
++
++def test_geodataframe_no_active_geometry_column():
++    def create_dataframe():
++        gdf = GeoDataFrame({"value": [1, 2], "geometry": [Point(1, 1), Point(2, 2)]})
++        gdf["geom2"] = GeoSeries([Point(3, 3), Point(4, 4)])
++        return gdf
++
++    # no active geometry column (None)
++    df1 = create_dataframe()
++    df1._geometry_column_name = None
++    df2 = create_dataframe()
++    df2._geometry_column_name = None
++    assert_geodataframe_equal(df1, df2)
++
++    # active geometry column ("geometry") not present
++    df1 = create_dataframe()[["value", "geom2"]]
++    df2 = create_dataframe()[["value", "geom2"]]
++    assert_geodataframe_equal(df1, df2)
++
++    df1 = GeoDataFrame(create_dataframe()[["value"]])
++    df2 = GeoDataFrame(create_dataframe()[["value"]])
++    assert_geodataframe_equal(df1, df2)
++
++
++def test_geodataframe_multiindex():
++    def create_dataframe():
++        gdf = DataFrame([[Point(0, 0), Point(1, 1)], [Point(2, 2), Point(3, 3)]])
++        gdf = GeoDataFrame(gdf.astype("geometry"))
++        gdf.columns = pd.MultiIndex.from_product([["geometry"], [0, 1]])
++        return gdf
++
++    df1 = create_dataframe()
++    df2 = create_dataframe()
++    assert_geodataframe_equal(df1, df2)
++
++    df1 = create_dataframe()
++    df1._geometry_column_name = None
++    df2 = create_dataframe()
++    df2._geometry_column_name = None
++    assert_geodataframe_equal(df1, df2)

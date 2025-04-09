@@ -1,0 +1,165 @@
+diff --git a/jenkinsapi_tests/systests/conftest.py b/jenkinsapi_tests/systests/conftest.py
+index 89fefe6..3f3c461 100644
+--- a/jenkinsapi_tests/systests/conftest.py
++++ b/jenkinsapi_tests/systests/conftest.py
+@@ -25,7 +25,8 @@ PLUGIN_DEPENDENCIES = [
+     "https://updates.jenkins-ci.org/latest/nested-view.hpi",
+     "https://updates.jenkins-ci.org/latest/ssh-slaves.hpi",
+     "https://updates.jenkins-ci.org/latest/structs.hpi",
+-    "http://updates.jenkins-ci.org/latest/plain-credentials.hpi"
++    "http://updates.jenkins-ci.org/latest/plain-credentials.hpi",
++    "http://updates.jenkins-ci.org/latest/envinject.hpi"
+ ]
+ 
+ 
+diff --git a/jenkinsapi_tests/systests/job_configs.py b/jenkinsapi_tests/systests/job_configs.py
+index ce6341e..c5c3387 100644
+--- a/jenkinsapi_tests/systests/job_configs.py
++++ b/jenkinsapi_tests/systests/job_configs.py
+@@ -311,3 +311,31 @@ JOB_WITH_FILE_AND_PARAMS = """
+   </publishers>
+   <buildWrappers/>
+ </project>""".strip()
++
++JOB_WITH_ENV_VARS = '''\
++<?xml version="1.0" encoding="UTF-8"?><project>
++  <actions/>
++  <description/>
++  <keepDependencies>false</keepDependencies>
++  <properties/>
++  <scm class="hudson.scm.NullSCM"/>
++  <canRoam>true</canRoam>
++  <disabled>false</disabled>
++  <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
++  <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
++  <triggers class="vector"/>
++  <concurrentBuild>false</concurrentBuild>
++  <builders/>
++  <publishers/>
++  <buildWrappers>
++    <EnvInjectBuildWrapper plugin="envinject@1.93.1">
++      <info>
++        <groovyScriptContent>
++          return [\'key1\': \'value1\', \'key2\': \'value2\']
++        </groovyScriptContent>
++        <loadFilesFromMaster>false</loadFilesFromMaster>
++      </info>
++    </EnvInjectBuildWrapper>
++  </buildWrappers>
++</project>
++'''.strip()
+diff --git a/jenkinsapi_tests/systests/test_env_vars.py b/jenkinsapi_tests/systests/test_env_vars.py
+new file mode 100644
+index 0000000..05dd831
+--- /dev/null
++++ b/jenkinsapi_tests/systests/test_env_vars.py
+@@ -0,0 +1,17 @@
++"""
++System tests for `jenkinsapi.jenkins` module.
++"""
++from jenkinsapi_tests.systests.job_configs import JOB_WITH_ENV_VARS
++from jenkinsapi_tests.test_utils.random_strings import random_string
++
++
++def test_get_env_vars(jenkins):
++    job_name = 'get_env_vars_create1_%s' % random_string()
++    job = jenkins.create_job(job_name, JOB_WITH_ENV_VARS)
++    job.invoke(block=True)
++    build = job.get_last_build()
++    while build.is_running():
++        time.sleep(0.25)
++    data = build.get_env_vars()
++    assert data['key1'] == 'value1'
++    assert data['key2'] == 'value2'
+diff --git a/jenkinsapi_tests/systests/test_nodes.py b/jenkinsapi_tests/systests/test_nodes.py
+index 46fb86f..c9ba26b 100644
+--- a/jenkinsapi_tests/systests/test_nodes.py
++++ b/jenkinsapi_tests/systests/test_nodes.py
+@@ -37,7 +37,13 @@ def test_create_jnlp_node(jenkins):
+         'node_description': 'Test JNLP Node',
+         'remote_fs': '/tmp',
+         'labels': 'systest_jnlp',
+-        'exclusive': True
++        'exclusive': True,
++        'tool_location': [
++            {
++                "key": "hudson.tasks.Maven$MavenInstallation$DescriptorImpl@Maven 3.0.5",
++                "home": "/home/apache-maven-3.0.5/"
++            },
++        ]
+     }
+     node = jenkins.nodes.create_node(node_name, node_dict)
+     assert isinstance(node, Node) is True
+@@ -72,7 +78,13 @@ def test_create_ssh_node(jenkins):
+         'suffix_start_slave_cmd': '',
+         'retention': 'ondemand',
+         'ondemand_delay': 0,
+-        'ondemand_idle_delay': 5
++        'ondemand_idle_delay': 5,
++        'tool_location': [
++            {
++                "key": "hudson.tasks.Maven$MavenInstallation$DescriptorImpl@Maven 3.0.5",
++                "home": "/home/apache-maven-3.0.5/"
++            },
++        ]
+     }
+     node = jenkins.nodes.create_node(node_name, node_dict)
+     assert isinstance(node, Node) is True
+diff --git a/jenkinsapi_tests/unittests/configs.py b/jenkinsapi_tests/unittests/configs.py
+index cdcfd14..981a858 100644
+--- a/jenkinsapi_tests/unittests/configs.py
++++ b/jenkinsapi_tests/unittests/configs.py
+@@ -205,3 +205,8 @@ BUILD_SCM_DATA = {
+     'timestamp': 1372553675652,
+     'url': 'http://localhost:8080/job/git_yssrtigfds/3/'
+ }
++
++BUILD_ENV_VARS = {
++    '_class': 'org.jenkinsci.plugins.envinject.EnvInjectVarList',
++    'envMap': {'KEY': 'VALUE'}
++}
+diff --git a/jenkinsapi_tests/unittests/test_build.py b/jenkinsapi_tests/unittests/test_build.py
+index 1af1bd9..a72fc91 100644
+--- a/jenkinsapi_tests/unittests/test_build.py
++++ b/jenkinsapi_tests/unittests/test_build.py
+@@ -1,3 +1,5 @@
++import requests
++import warnings
+ import pytest
+ import pytz
+ from . import configs
+@@ -154,3 +156,34 @@ def test_only_ParametersAction_parameters_considered(build):
+     params = build.get_params()
+     assert params == expected
+ 
++def test_build_env_vars(monkeypatch, build):
++    def fake_get_data(cls, tree=None, params=None):
++        return configs.BUILD_ENV_VARS
++    monkeypatch.setattr(Build, 'get_data', fake_get_data)
++    assert build.get_env_vars() == configs.BUILD_ENV_VARS['envMap']
++
++def test_build_env_vars_wo_injected_env_vars_plugin(monkeypatch, build):
++    def fake_get_data(cls, tree=None, params=None):
++        raise requests.HTTPError('404')
++    monkeypatch.setattr(Build, 'get_data', fake_get_data)
++
++    with pytest.raises(requests.HTTPError) as excinfo:
++        with pytest.warns(None) as record:
++            build.get_env_vars()
++    assert '404' == str(excinfo.value)
++    assert len(record) == 1
++    expected = UserWarning('Make sure the Environment Injector '
++                           'plugin is installed.')
++    assert str(record[0].message) == str(expected)
++
++def test_build_env_vars_other_exception(monkeypatch, build):
++    def fake_get_data(cls, tree=None, params=None):
++        raise ValueError()
++    monkeypatch.setattr(Build, 'get_data', fake_get_data)
++
++    with pytest.raises(Exception) as excinfo:
++        with pytest.warns(None) as record:
++            build.get_env_vars()
++    assert '' == str(excinfo.value)
++    assert len(record) == 0
++

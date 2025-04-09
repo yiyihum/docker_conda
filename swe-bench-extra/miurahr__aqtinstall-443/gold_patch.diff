@@ -1,0 +1,239 @@
+diff --git a/aqt/archives.py b/aqt/archives.py
+index 0792044..bfc7bfb 100644
+--- a/aqt/archives.py
++++ b/aqt/archives.py
+@@ -373,11 +373,11 @@ class ToolArchives(QtArchives):
+         self.tool_name = tool_name
+         self.os_name = os_name
+         self.logger = getLogger("aqt.archives")
+-        self.is_require_version_match = version_str is not None
++        self.tool_version_str: Optional[str] = version_str
+         super(ToolArchives, self).__init__(
+             os_name=os_name,
+             target=target,
+-            version_str=version_str or "0.0.1",  # dummy value
++            version_str="0.0.1",  # dummy value
+             arch=arch,
+             base=base,
+             timeout=timeout,
+@@ -424,7 +424,7 @@ class ToolArchives(QtArchives):
+ 
+         name = packageupdate.find("Name").text
+         named_version = packageupdate.find("Version").text
+-        if self.is_require_version_match and named_version != self.version:
++        if self.tool_version_str and named_version != self.tool_version_str:
+             message = f"The package '{self.arch}' has the version '{named_version}', not the requested '{self.version}'."
+             raise NoPackageFound(message, suggested_action=self.help_msg())
+         package_desc = packageupdate.find("Description").text
+diff --git a/aqt/installer.py b/aqt/installer.py
+index 9beddca..cc42402 100644
+--- a/aqt/installer.py
++++ b/aqt/installer.py
+@@ -402,8 +402,9 @@ class Cli:
+         if EXT7Z and sevenzip is None:
+             # override when py7zr is not exist
+             sevenzip = self._set_sevenzip(Settings.zipcmd)
+-        version = getattr(args, "version", "0.0.1")  # for legacy aqt tool
+-        Cli._validate_version_str(version)
++        version = getattr(args, "version", None)
++        if version is not None:
++            Cli._validate_version_str(version, allow_minus=True)
+         keep = args.keep
+         if args.base is not None:
+             base = args.base
+@@ -807,10 +808,23 @@ class Cli:
+                 Settings.load_settings()
+ 
+     @staticmethod
+-    def _validate_version_str(version_str: str, *, allow_latest: bool = False, allow_empty: bool = False):
++    def _validate_version_str(
++        version_str: str, *, allow_latest: bool = False, allow_empty: bool = False, allow_minus: bool = False
++    ) -> None:
++        """
++        Raise CliInputError if the version is not an acceptable Version.
++
++        :param version_str: The version string to check.
++        :param allow_latest: If true, the string "latest" is acceptable.
++        :param allow_empty: If true, the empty string is acceptable.
++        :param allow_minus: If true, everything after the first '-' in the version will be ignored.
++                            This allows acceptance of versions like "1.2.3-0-202101020304"
++        """
+         if (allow_latest and version_str == "latest") or (allow_empty and not version_str):
+             return
+         try:
++            if "-" in version_str and allow_minus:
++                version_str = version_str[: version_str.find("-")]
+             Version(version_str)
+         except ValueError as e:
+             raise CliInputError(f"Invalid version: '{version_str}'! Please use the form '5.X.Y'.") from e
+diff --git a/ci/generate_azure_pipelines_matrices.py b/ci/generate_azure_pipelines_matrices.py
+index 8000029..79778a5 100644
+--- a/ci/generate_azure_pipelines_matrices.py
++++ b/ci/generate_azure_pipelines_matrices.py
+@@ -5,6 +5,7 @@ import collections
+ import json
+ import random
+ from itertools import product
++from typing import Dict, Optional
+ 
+ MIRRORS = [
+     "https://ftp.jaist.ac.jp/pub/qtproject",
+@@ -29,6 +30,7 @@ class BuildJob:
+         output_dir=None,
+         list_options=None,
+         spec=None,
++        tool_options: Optional[Dict[str, str]] = None,
+     ):
+         self.command = command
+         self.qt_version = qt_version
+@@ -40,6 +42,7 @@ class BuildJob:
+         self.mirror = mirror
+         self.subarchives = subarchives
+         self.list_options = list_options if list_options else {}
++        self.tool_options: Dict[str, str] = tool_options if tool_options else {}
+         # `steps.yml` assumes that qt_version is the highest version that satisfies spec
+         self.spec = spec
+         self.output_dir = output_dir
+@@ -276,6 +279,33 @@ linux_build_jobs.extend(
+     ]
+ )
+ 
++qt_creator_bin_path = "./Tools/QtCreator/bin/"
++qt_creator_mac_bin_path = "./Qt Creator.app/Contents/MacOS/"
++qt_ifw_bin_path = "./Tools/QtInstallerFramework/4.1/bin/"
++tool_options = {
++    "TOOL1_ARGS": "tools_qtcreator qt.tools.qtcreator",
++    "LIST_TOOL1_CMD": f"ls {qt_creator_bin_path}",
++    "TEST_TOOL1_CMD": f"{qt_creator_bin_path}qbs --version",
++    "TOOL2_ARGS": "tools_ifw",
++    "TEST_TOOL2_CMD": f"{qt_ifw_bin_path}archivegen --version",
++    "LIST_TOOL2_CMD": f"ls {qt_ifw_bin_path}",
++}
++# Mac Qt Creator is a .app, or "Package Bundle", so the path is changed:
++tool_options_mac = {
++    **tool_options,
++    "TEST_TOOL1_CMD": f'"{qt_creator_mac_bin_path}qbs" --version',
++    "LIST_TOOL1_CMD": f'ls "{qt_creator_mac_bin_path}"',
++}
++windows_build_jobs.append(
++    BuildJob("install-tool", "", "windows", "desktop", "", "", tool_options=tool_options)
++)
++linux_build_jobs.append(
++    BuildJob("install-tool", "", "linux", "desktop", "", "", tool_options=tool_options)
++)
++mac_build_jobs.append(
++    BuildJob("install-tool", "", "mac", "desktop", "", "", tool_options=tool_options_mac)
++)
++
+ matrices = {}
+ 
+ for platform_build_job in all_platform_build_jobs:
+@@ -313,6 +343,12 @@ for platform_build_job in all_platform_build_jobs:
+                 ("OUTPUT_DIR", build_job.output_dir if build_job.output_dir else ""),
+                 ("QT_BINDIR", build_job.qt_bindir()),
+                 ("WIN_QT_BINDIR", build_job.win_qt_bindir()),
++                ("TOOL1_ARGS", build_job.tool_options.get("TOOL1_ARGS", "")),
++                ("LIST_TOOL1_CMD", build_job.tool_options.get("LIST_TOOL1_CMD", "")),
++                ("TEST_TOOL1_CMD", build_job.tool_options.get("TEST_TOOL1_CMD", "")),
++                ("TOOL2_ARGS", build_job.tool_options.get("TOOL2_ARGS", "")),
++                ("LIST_TOOL2_CMD", build_job.tool_options.get("LIST_TOOL2_CMD", "")),
++                ("TEST_TOOL2_CMD", build_job.tool_options.get("TEST_TOOL2_CMD", "")),
+             ]
+         )
+ 
+diff --git a/ci/steps.yml b/ci/steps.yml
+index ba6fcdb..0550716 100644
+--- a/ci/steps.yml
++++ b/ci/steps.yml
+@@ -7,6 +7,13 @@ steps:
+       pip install -e .
+     displayName: install package
+ 
++  # Install linux dependencies
++  - bash: |
++      sudo apt-get update
++      sudo apt-get install -y libgl1-mesa-dev libxkbcommon-x11-0
++    condition: and(eq(variables['TARGET'], 'desktop'), eq(variables['Agent.OS'], 'Linux'))
++    displayName: install test dependency for Linux
++
+   # Run Aqt
+   ##----------------------------------------------------
+   ## we insert sleep in random 1sec < duration < 60sec to reduce
+@@ -108,6 +115,22 @@ steps:
+       if [[ "$(SUBCOMMAND)" == "install-doc" ]]; then
+         python -m aqt $(SUBCOMMAND) $(HOST) $(TARGET) $(QT_VERSION) --archives $(SUBARCHIVES)
+       fi
++      if [[ "$(SUBCOMMAND)" == "install-tool" ]]; then
++        opt=""
++        if [[ "$(OUTPUT_DIR)" != "" ]]; then
++          opt+=" --outputdir $(OUTPUT_DIR)"
++          sudo mkdir -p "$(OUTPUT_DIR)"
++          sudo chown $(whoami) "$(OUTPUT_DIR)"
++        fi
++        python -m aqt $(SUBCOMMAND) $(HOST) $(TARGET) $(TOOL1_ARGS) $opt
++        $(LIST_TOOL1_CMD)
++        echo "Testing $(TOOL1_ARGS) with '$(TEST_TOOL1_CMD)'"
++        $(TEST_TOOL1_CMD)
++        python -m aqt $(SUBCOMMAND) $(HOST) $(TARGET) $(TOOL2_ARGS) $opt
++        $(LIST_TOOL2_CMD)
++        echo "Testing $(TOOL2_ARGS) with '$(TEST_TOOL2_CMD)'"
++        $(TEST_TOOL2_CMD)
++      fi
+     workingDirectory: $(Build.BinariesDirectory)
+     env:
+       AQT_CONFIG: $(Build.SourcesDirectory)/ci/settings.ini
+@@ -132,15 +155,9 @@ steps:
+       export PATH=$(QT_BINDIR):$PATH
+       qmake $(Build.BinariesDirectory)/tests/accelbubble
+       make
+-    condition: and(eq(variables['TARGET'], 'android'), or(eq(variables['Agent.OS'], 'Linux'), eq(variables['Agent.OS'], 'Darwin')), ne(variables['SUBCOMMAND'], 'list'))
++    condition: and(eq(variables['TARGET'], 'android'), or(eq(variables['Agent.OS'], 'Linux'), eq(variables['Agent.OS'], 'Darwin')), ne(variables['SUBCOMMAND'], 'list'), ne(variables['SUBCOMMAND'], 'install-tool'))
+     displayName: Build accelbubble example application to test for android
+ 
+-  - script: |
+-      sudo apt-get update
+-      sudo apt-get install -y libgl1-mesa-dev
+-    condition: and(eq(variables['TARGET'], 'desktop'), eq(variables['Agent.OS'], 'Linux'), eq(variables['SUBCOMMAND'], 'install-qt'))
+-    displayName: install test dependency for Linux
+-
+   ##----------------------------------------------------
+   # determine Windows build system
+   - powershell: |
+@@ -169,7 +186,7 @@ steps:
+       }
+       cd $(WIN_QT_BINDIR)
+       unzip $(Build.SourcesDirectory)\ci\jom_1_1_3.zip
+-    condition: eq( variables['Agent.OS'], 'Windows_NT')
++    condition: and(eq( variables['Agent.OS'], 'Windows_NT'), eq(variables['SUBCOMMAND'], 'install-qt'))
+     displayName: Detect toolchain for Windows and update PATH
+ 
+   # When no modules
+@@ -195,9 +212,19 @@ steps:
+       } elseif ( $env:TOOLCHAIN -eq 'MINGW' ) {
+         if ( $env:ARCH -eq 'win64_mingw81' ) {
+           python -m aqt install-tool --outputdir $(Build.BinariesDirectory)/Qt $(HOST) desktop tools_mingw qt.tools.win64_mingw810
++          if ($?) {
++            Write-Host 'Successfully installed tools_mingw'
++          } else {
++            throw 'Failed to install tools_mingw'
++          }
+           [Environment]::SetEnvironmentVariable("Path", ";$(Build.BinariesDirectory)\Qt\Tools\mingw810_64\bin" + $env:Path, "Machine")
+         } else {
+           python -m aqt install-tool --outputdir $(Build.BinariesDirectory)/Qt $(HOST) desktop tools_mingw qt.tools.win32_mingw810
++          if ($?) {
++            Write-Host 'Successfully installed tools_mingw'
++          } else {
++            throw 'Failed to install tools_mingw'
++          }
+           [Environment]::SetEnvironmentVariable("Path", ";$(Build.BinariesDirectory)\Qt\Tools\mingw810_32\bin" + $env:Path, "Machine")
+         }
+         $env:Path = "$(Build.BinariesDirectory)\Qt\Tools\$(ARCHDIR)\bin;$(WIN_QT_BINDIR);" + $env:Path
+@@ -208,7 +235,7 @@ steps:
+         qmake $(Build.BinariesDirectory)\tests\helloworld
+         mingw32-make
+       }
+-    condition: and(eq( variables['Agent.OS'], 'Windows_NT'), eq(variables['MODULE'], ''))
++    condition: and(eq( variables['Agent.OS'], 'Windows_NT'), eq(variables['MODULE'], ''), eq(variables['SUBCOMMAND'], 'install-qt'))
+     displayName: build test with qmake w/o extra module
+   - powershell: |
+       Import-VisualStudioVars -VisualStudioVersion $(VSVER) -Architecture $(ARCHITECTURE)

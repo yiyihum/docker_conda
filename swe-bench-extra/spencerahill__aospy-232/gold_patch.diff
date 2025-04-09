@@ -1,0 +1,169 @@
+diff --git a/aospy/calc.py b/aospy/calc.py
+index aaabe53..1591ba2 100644
+--- a/aospy/calc.py
++++ b/aospy/calc.py
+@@ -524,7 +524,7 @@ class Calc(object):
+                         **{reg.name + '_pressure': coord}
+                     )
+             reg_dat.update(**{reg.name: data_out})
+-        return OrderedDict(sorted(reg_dat.items(), key=lambda t: t[0]))
++        return xr.Dataset(reg_dat)
+ 
+     def _apply_all_time_reductions(self, full_ts, monthly_ts, eddy_ts):
+         """Apply all requested time reductions to the data."""
+@@ -587,6 +587,9 @@ class Calc(object):
+         reduced = self._apply_all_time_reductions(full, monthly, eddy)
+         logging.info("Writing desired gridded outputs to disk.")
+         for dtype_time, data in reduced.items():
++            data = _add_metadata_as_attrs(data, self.var.units,
++                                          self.var.description,
++                                          self.dtype_out_vert)
+             self.save(data, dtype_time, dtype_out_vert=self.dtype_out_vert,
+                       save_files=True, write_to_tar=write_to_tar)
+         return self
+@@ -601,15 +604,13 @@ class Calc(object):
+                 reg_data = xr.open_dataset(path)
+             except (EOFError, RuntimeError, IOError):
+                 reg_data = xr.Dataset()
+-            # Add the new data to the dictionary or Dataset.
+-            # Same method works for both.
+             reg_data.update(data)
+             data_out = reg_data
+         else:
+             data_out = data
+         if isinstance(data_out, xr.DataArray):
+             data_out = xr.Dataset({self.name: data_out})
+-        data_out.to_netcdf(path, engine='scipy')
++        data_out.to_netcdf(path, engine='netcdf4', format='NETCDF3_64BIT')
+ 
+     def _write_to_tar(self, dtype_out_time):
+         """Add the data to the tar file in tar_out_direc."""
+@@ -767,3 +768,25 @@ class Calc(object):
+         if plot_units:
+             data = self.var.to_plot_units(data, dtype_vert=dtype_out_vert)
+         return data
++
++def _add_metadata_as_attrs(data, units, description, dtype_out_vert):
++    """Add metadata attributes to Dataset or DataArray"""
++    if isinstance(data, xr.DataArray):
++        return _add_metadata_as_attrs_da(data, units, description,
++                                         dtype_out_vert)
++    else:
++        for name, arr in data.data_vars.items():
++            _add_metadata_as_attrs_da(arr, units, description,
++                                      dtype_out_vert)
++        return data
++
++def _add_metadata_as_attrs_da(data, units, description, dtype_out_vert):
++    """Add metadata attributes to DataArray"""
++    if dtype_out_vert == 'vert_int':
++        if units != '':
++            units = '(vertical integral of {0}): {0} kg m^-2)'.format(units)
++        else:
++            units = '(vertical integral of quantity with unspecified units)'
++    data.attrs['units'] = units
++    data.attrs['description'] = description
++    return data
+diff --git a/docs/examples.rst b/docs/examples.rst
+index 8045770..a1759a0 100644
+--- a/docs/examples.rst
++++ b/docs/examples.rst
+@@ -395,10 +395,18 @@ Each :py:class:`aospy.Calc` object includes the paths to the output
+ 
+ and the results of each output type
+ 
+-.. ipython:: pythoon
++.. ipython:: python
+ 
+     calcs[0].data_out
+ 
++.. note::
++
++    Notice that the variable's name and description have been copied
++    to the resulting Dataset (and hence also to the netCDF file saved
++    to disk). This enables you to better understand what the physical
++    quantity is, even if you don't have the original ``Var`` definition
++    on hand.
++
+ .. note::
+ 
+    You may have noticed that ``subset_...`` and ``raw_...``
+diff --git a/docs/whats-new.rst b/docs/whats-new.rst
+index b93abb0..b4eb019 100644
+--- a/docs/whats-new.rst
++++ b/docs/whats-new.rst
+@@ -22,12 +22,15 @@ Breaking Changes
+ Documentation
+ ~~~~~~~~~~~~~
+ 
+-Corrected link to documentation badge on repository main page (:pull:213). By DaCoEx <https://github.com/dacoex>_.
++Corrected link to documentation badge on repository main page
++(:pull:213). By DaCoEx <https://github.com/dacoex>_.
+ 
+-=======
+ Enhancements
+ ~~~~~~~~~~~~
+ 
++- Add units and description from ``Var`` objects to output netcdf
++  files (closes :issue:`201` via :pull:`232`). By `Micah Kim
++  <https://github.com/micahkim23>`_.
+ - Remove potentially confusing attributes from example netcdf files.
+   (closes :issue:`214` via :pull:`216`). By `Micah Kim
+   <https://github.com/micahkim23>`_.
+@@ -37,13 +40,18 @@ Bug Fixes
+ 
+ - Cast input DataArrays with datatype ``np.float32`` to ``np.float64``
+   as a workaround for incorrectly computed means on float32 arrays in
+-  bottleneck (see 
+-  `pydata/xarray#1346 <https://github.com/pydata/xarray/issues/1346>`_).
+-  If one would like to disable this behavior (i.e. restore the original
+-  behavior before this fix), one can set the ``upcast_float32`` keyword
+-  argument in their DataLoaders to ``False``.
+-  Fixes :issue:`217` via :pull:`218`.  By `Spencer Clark
++  bottleneck (see `pydata/xarray#1346
++  <https://github.com/pydata/xarray/issues/1346>`_).  If one would
++  like to disable this behavior (i.e. restore the original behavior
++  before this fix), one can set the ``upcast_float32`` keyword
++  argument in their DataLoaders to ``False``.  Fixes :issue:`217` via
++  :pull:`218`.  By `Spencer Clark
+   <https://github.com/spencerkclark>`_.
++- Switch from using ``scipy`` to ``netcdf4`` as the engine when
++  writing to netCDF files to avoid bugs when using ``libnetcdf``
++  version 4.5.0 (:pull:`235`).  By `Spencer Hill
++  <https://github.com/spencerahill>`_.
++
+ 
+ Testing
+ ~~~~~~~
+@@ -101,8 +109,9 @@ Enhancements
+ Dependencies
+ ~~~~~~~~~~~~
+ 
+-- ``multiprocess`` is no longer required for submitting ``aospy`` calculations
+-  in parallel (see discussion in :issue:`169` and pull request :pull:`172`).
++- ``multiprocess`` is no longer required for submitting ``aospy``
++  calculations in parallel (see discussion in :issue:`169` and pull
++  request :pull:`172`).
+ - ``aospy`` now requires an installation of ``dask`` with version
+   greater than or equal to 0.14 (see discussion in pull request
+   :pull:`172`).
+@@ -129,13 +138,13 @@ Bug Fixes
+   included data from outside the Timestamp-valid range (fixed in
+   :pull:`189`). By
+   `Spencer Clark <https://github.com/spencerkclark>`_.
+-- Toggle the ``mask_and_scale`` option to ``True`` when reading in netCDF files
+-  to enable missing values encoded as floats to be converted to NaN's
+-  (fixes :issue:`190` via :pull:`192`).  By
++- Toggle the ``mask_and_scale`` option to ``True`` when reading in
++  netCDF files to enable missing values encoded as floats to be
++  converted to NaN's (fixes :issue:`190` via :pull:`192`).  By
+   `Spencer Clark <https://github.com/spencerkclark>`_.
+-- Force regional calculations to mask gridcell weights where the loaded
+-  datapoints were invalid instead of just masking points outside the desired
+-  region (fixes :issue:`190` via :pull:`192`).  By
++- Force regional calculations to mask gridcell weights where the
++  loaded datapoints were invalid instead of just masking points
++  outside the desired region (fixes :issue:`190` via :pull:`192`).  By
+   `Spencer Clark <https://github.com/spencerkclark>`_.
+ - Retain original input data's mask during gridpoint-by-gridpoint
+   temporal averages (fixes :issue:`193` via :pull:`196`).  By `Spencer

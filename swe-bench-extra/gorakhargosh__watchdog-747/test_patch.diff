@@ -1,0 +1,130 @@
+diff --git a/tests/test_emitter.py b/tests/test_emitter.py
+index 6df98ae..4fd0506 100644
+--- a/tests/test_emitter.py
++++ b/tests/test_emitter.py
+@@ -31,7 +31,8 @@ from watchdog.events import (
+     DirDeletedEvent,
+     DirModifiedEvent,
+     DirCreatedEvent,
+-    DirMovedEvent
++    DirMovedEvent,
++    FileClosedEvent,
+ )
+ from watchdog.observers.api import ObservedWatch
+ 
+@@ -107,6 +108,33 @@ def test_create():
+         assert os.path.normpath(event.src_path) == os.path.normpath(p(''))
+         assert isinstance(event, DirModifiedEvent)
+ 
++    if platform.is_linux():
++        event = event_queue.get(timeout=5)[0]
++        assert event.src_path == p('a')
++        assert isinstance(event, FileClosedEvent)
++
++
++@pytest.mark.skipif(not platform.is_linux(), reason="FileCloseEvent only supported in GNU/Linux")
++@pytest.mark.flaky(max_runs=5, min_passes=1, rerun_filter=rerun_filter)
++def test_close():
++    f_d = open(p('a'), 'a')
++    start_watching()
++    f_d.close()
++
++    # After file creation/open in append mode
++    event = event_queue.get(timeout=5)[0]
++    assert event.src_path == p('a')
++    assert isinstance(event, FileClosedEvent)
++
++    event = event_queue.get(timeout=5)[0]
++    assert os.path.normpath(event.src_path) == os.path.normpath(p(''))
++    assert isinstance(event, DirModifiedEvent)
++
++    # After read-only, only IN_CLOSE_NOWRITE is emitted but not catched for now #747
++    open(p('a'), 'r').close()
++
++    assert event_queue.empty()
++
+ 
+ @pytest.mark.flaky(max_runs=5, min_passes=1, rerun_filter=rerun_filter)
+ @pytest.mark.skipif(
+@@ -153,6 +181,11 @@ def test_modify():
+     assert event.src_path == p('a')
+     assert isinstance(event, FileModifiedEvent)
+ 
++    if platform.is_linux():
++        event = event_queue.get(timeout=5)[0]
++        assert event.src_path == p('a')
++        assert isinstance(event, FileClosedEvent)
++
+ 
+ @pytest.mark.flaky(max_runs=5, min_passes=1, rerun_filter=rerun_filter)
+ def test_move():
+@@ -423,7 +456,7 @@ def test_renaming_top_level_directory():
+         if event_queue.empty():
+             break
+ 
+-    assert all([isinstance(e, (FileCreatedEvent, FileMovedEvent, DirModifiedEvent)) for e in events])
++    assert all([isinstance(e, (FileCreatedEvent, FileMovedEvent, DirModifiedEvent, FileClosedEvent)) for e in events])
+ 
+     for event in events:
+         if isinstance(event, FileCreatedEvent):
+diff --git a/tests/test_events.py b/tests/test_events.py
+index f41a3f8..476f6ef 100644
+--- a/tests/test_events.py
++++ b/tests/test_events.py
+@@ -19,6 +19,7 @@ from watchdog.events import (
+     FileDeletedEvent,
+     FileModifiedEvent,
+     FileCreatedEvent,
++    FileClosedEvent,
+     DirDeletedEvent,
+     DirModifiedEvent,
+     DirCreatedEvent,
+@@ -29,6 +30,7 @@ from watchdog.events import (
+     EVENT_TYPE_CREATED,
+     EVENT_TYPE_DELETED,
+     EVENT_TYPE_MOVED,
++    EVENT_TYPE_CLOSED,
+ )
+ 
+ path_1 = '/path/xyz'
+@@ -82,6 +84,14 @@ def test_file_moved_event():
+     assert not event.is_synthetic
+ 
+ 
++def test_file_closed_event():
++    event = FileClosedEvent(path_1)
++    assert path_1 == event.src_path
++    assert EVENT_TYPE_CLOSED == event.event_type
++    assert not event.is_directory
++    assert not event.is_synthetic
++
++
+ def test_dir_deleted_event():
+     event = DirDeletedEvent(path_1)
+     assert path_1 == event.src_path
+@@ -111,6 +121,7 @@ def test_file_system_event_handler_dispatch():
+     file_del_event = FileDeletedEvent('/path/blah.txt')
+     dir_cre_event = DirCreatedEvent('/path/blah.py')
+     file_cre_event = FileCreatedEvent('/path/blah.txt')
++    file_cls_event = FileClosedEvent('/path/blah.txt')
+     dir_mod_event = DirModifiedEvent('/path/blah.py')
+     file_mod_event = FileModifiedEvent('/path/blah.txt')
+     dir_mov_event = DirMovedEvent('/path/blah.py', '/path/blah')
+@@ -125,6 +136,7 @@ def test_file_system_event_handler_dispatch():
+         file_del_event,
+         file_cre_event,
+         file_mov_event,
++        file_cls_event,
+     ]
+ 
+     class TestableEventHandler(FileSystemEventHandler):
+@@ -144,6 +156,9 @@ def test_file_system_event_handler_dispatch():
+         def on_created(self, event):
+             assert event.event_type == EVENT_TYPE_CREATED
+ 
++        def on_closed(self, event):
++            assert event.event_type == EVENT_TYPE_CLOSED
++
+     handler = TestableEventHandler()
+ 
+     for event in all_events:

@@ -1,0 +1,189 @@
+diff --git a/tests/css/test_help_text.py b/tests/css/test_help_text.py
+index 5c34c3974..f5818a11d 100644
+--- a/tests/css/test_help_text.py
++++ b/tests/css/test_help_text.py
+@@ -1,10 +1,22 @@
+ import pytest
+ 
+ from tests.utilities.render import render
+-from textual.css._help_text import spacing_wrong_number_of_values, spacing_invalid_value, scalar_help_text, \
+-    string_enum_help_text, color_property_help_text, border_property_help_text, layout_property_help_text, \
+-    docks_property_help_text, dock_property_help_text, fractional_property_help_text, offset_property_help_text, \
+-    align_help_text, offset_single_axis_help_text, style_flags_property_help_text
++from textual.css._help_text import (
++    spacing_wrong_number_of_values_help_text,
++    spacing_invalid_value_help_text,
++    scalar_help_text,
++    string_enum_help_text,
++    color_property_help_text,
++    border_property_help_text,
++    layout_property_help_text,
++    docks_property_help_text,
++    dock_property_help_text,
++    fractional_property_help_text,
++    offset_property_help_text,
++    align_help_text,
++    offset_single_axis_help_text,
++    style_flags_property_help_text,
++)
+ 
+ 
+ @pytest.fixture(params=["css", "inline"])
+@@ -15,22 +27,24 @@ def styling_context(request):
+ def test_help_text_examples_are_contextualized():
+     """Ensure that if the user is using CSS, they see CSS-specific examples
+     and if they're using inline styles they see inline-specific examples."""
+-    rendered_inline = render(spacing_invalid_value("padding", "inline"))
++    rendered_inline = render(spacing_invalid_value_help_text("padding", "inline"))
+     assert "widget.styles.padding" in rendered_inline
+ 
+-    rendered_css = render(spacing_invalid_value("padding", "css"))
++    rendered_css = render(spacing_invalid_value_help_text("padding", "css"))
+     assert "padding:" in rendered_css
+ 
+ 
+ def test_spacing_wrong_number_of_values(styling_context):
+-    rendered = render(spacing_wrong_number_of_values("margin", 3, styling_context))
++    rendered = render(
++        spacing_wrong_number_of_values_help_text("margin", 3, styling_context)
++    )
+     assert "Invalid number of values" in rendered
+     assert "margin" in rendered
+     assert "3" in rendered
+ 
+ 
+ def test_spacing_invalid_value(styling_context):
+-    rendered = render(spacing_invalid_value("padding", styling_context))
++    rendered = render(spacing_invalid_value_help_text("padding", styling_context))
+     assert "Invalid value for" in rendered
+     assert "padding" in rendered
+ 
+@@ -47,7 +61,9 @@ def test_scalar_help_text(styling_context):
+ 
+ 
+ def test_string_enum_help_text(styling_context):
+-    rendered = render(string_enum_help_text("display", ["none", "hidden"], styling_context))
++    rendered = render(
++        string_enum_help_text("display", ["none", "hidden"], styling_context)
++    )
+     assert "Invalid value for" in rendered
+ 
+     # Ensure property name is mentioned
+@@ -113,7 +129,9 @@ def test_offset_single_axis_help_text():
+ 
+ 
+ def test_style_flags_property_help_text(styling_context):
+-    rendered = render(style_flags_property_help_text("text-style", "notavalue b", styling_context))
++    rendered = render(
++        style_flags_property_help_text("text-style", "notavalue b", styling_context)
++    )
+     assert "Invalid value" in rendered
+     assert "notavalue" in rendered
+ 
+diff --git a/tests/css/test_stylesheet.py b/tests/css/test_stylesheet.py
+index 4544d1e1d..202935a3d 100644
+--- a/tests/css/test_stylesheet.py
++++ b/tests/css/test_stylesheet.py
+@@ -1,7 +1,10 @@
+ from contextlib import nullcontext as does_not_raise
++from typing import Any
++
+ import pytest
+ 
+ from textual.color import Color
++from textual.css._help_renderables import HelpText
+ from textual.css.stylesheet import Stylesheet, StylesheetParseError
+ from textual.css.tokenizer import TokenizeError
+ 
+@@ -53,3 +56,50 @@ def test_color_property_parsing(css_value, expectation, expected_color):
+     if expected_color:
+         css_rule = stylesheet.rules[0]
+         assert css_rule.styles.background == expected_color
++
++
++@pytest.mark.parametrize(
++    "css_property_name,expected_property_name_suggestion",
++    [
++        ["backgroundu", "background"],
++        ["bckgroundu", "background"],
++        ["ofset-x", "offset-x"],
++        ["ofst_y", "offset-y"],
++        ["colr", "color"],
++        ["colour", "color"],
++        ["wdth", "width"],
++        ["wth", "width"],
++        ["wh", None],
++        ["xkcd", None],
++    ],
++)
++def test_did_you_mean_for_css_property_names(
++    css_property_name: str, expected_property_name_suggestion
++):
++    stylesheet = Stylesheet()
++    css = """
++    * {
++      border: blue;
++      ${PROPERTY}: red;
++    }
++    """.replace(
++        "${PROPERTY}", css_property_name
++    )
++
++    stylesheet.add_source(css)
++    with pytest.raises(StylesheetParseError) as err:
++        stylesheet.parse()
++
++    _, help_text = err.value.errors.rules[0].errors[0]  # type: Any, HelpText
++    displayed_css_property_name = css_property_name.replace("_", "-")
++    assert (
++        help_text.summary == f"Invalid CSS property [i]{displayed_css_property_name}[/]"
++    )
++
++    expected_bullets_length = 1 if expected_property_name_suggestion else 0
++    assert len(help_text.bullets) == expected_bullets_length
++    if expected_property_name_suggestion is not None:
++        expected_suggestion_message = (
++            f'Did you mean "{expected_property_name_suggestion}"?'
++        )
++        assert help_text.bullets[0].markup == expected_suggestion_message
+diff --git a/tests/test_suggestions.py b/tests/test_suggestions.py
+new file mode 100644
+index 000000000..8faedcbaf
+--- /dev/null
++++ b/tests/test_suggestions.py
+@@ -0,0 +1,35 @@
++import pytest
++
++from textual.suggestions import get_suggestion, get_suggestions
++
++
++@pytest.mark.parametrize(
++    "word, possible_words, expected_result",
++    (
++        ["background", ("background",), "background"],
++        ["backgroundu", ("background",), "background"],
++        ["bkgrund", ("background",), "background"],
++        ["llow", ("background",), None],
++        ["llow", ("background", "yellow"), "yellow"],
++        ["yllow", ("background", "yellow", "ellow"), "yellow"],
++    ),
++)
++def test_get_suggestion(word, possible_words, expected_result):
++    assert get_suggestion(word, possible_words) == expected_result
++
++
++@pytest.mark.parametrize(
++    "word, possible_words, count, expected_result",
++    (
++        ["background", ("background",), 1, ["background"]],
++        ["backgroundu", ("background",), 1, ["background"]],
++        ["bkgrund", ("background",), 1, ["background"]],
++        ["llow", ("background",), 1, []],
++        ["llow", ("background", "yellow"), 1, ["yellow"]],
++        ["yllow", ("background", "yellow", "ellow"), 1, ["yellow"]],
++        ["yllow", ("background", "yellow", "ellow"), 2, ["yellow", "ellow"]],
++        ["yllow", ("background", "yellow", "red"), 2, ["yellow"]],
++    ),
++)
++def test_get_suggestions(word, possible_words, count, expected_result):
++    assert get_suggestions(word, possible_words, count) == expected_result

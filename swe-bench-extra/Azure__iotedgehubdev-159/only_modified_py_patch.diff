@@ -1,0 +1,376 @@
+diff --git a/iotedgehubdev/cli.py b/iotedgehubdev/cli.py
+index e6a4b7c..843cf8a 100644
+--- a/iotedgehubdev/cli.py
++++ b/iotedgehubdev/cli.py
+@@ -49,7 +49,7 @@ def _with_telemetry(func):
+             telemetry.flush()
+             return value
+         except Exception as e:
+-            output.error('Error: {0}'.format(str(e)))
++            output.error(str(e))
+             telemetry.fail(str(e), 'Command failed')
+             telemetry.flush()
+             sys.exit(1)
+@@ -57,6 +57,29 @@ def _with_telemetry(func):
+     return _wrapper
+ 
+ 
++def _parse_config_json():
++    config_file = HostPlatform.get_config_file_path()
++
++    if not Utils.check_if_file_exists(config_file):
++        raise ValueError('Cannot find config file. Please run `{0}` first.'.format(_get_setup_command()))
++
++    with open(config_file) as f:
++        try:
++            config_json = json.load(f)
++
++            connection_str = config_json[CONN_STR]
++            cert_path = config_json[CERT_PATH]
++            gatewayhost = config_json[GATEWAY_HOST]
++
++            return EdgeManager(connection_str, gatewayhost, cert_path)
++        except (ValueError, KeyError):
++            raise ValueError('Invalid config file. Please run `{0}` again.'.format(_get_setup_command()))
++
++
++def _get_setup_command():
++    return '{0}iotedgehubdev setup -c "<edge-device-connection-string>"'.format('' if os.name == 'nt' else 'sudo ')
++
++
+ @click.group(context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
+ @click.version_option()
+ def main():
+@@ -136,27 +159,13 @@ def setup(connection_string, gateway_host):
+               help='Specify the output file to save the connection string. If the file exists, the content will be overwritten.')
+ @_with_telemetry
+ def modulecred(modules, local, output_file):
+-    configFile = HostPlatform.get_config_file_path()
+-    if Utils.check_if_file_exists(configFile) is not True:
+-        output.error('Cannot find config file. Please run `iotedgehubdev setup` first.')
+-        sys.exit(1)
+-    try:
+-        with open(configFile) as f:
+-            jsonObj = json.load(f)
+-        if CONN_STR in jsonObj and CERT_PATH in jsonObj and GATEWAY_HOST in jsonObj:
+-            connection_str = jsonObj[CONN_STR]
+-            cert_path = jsonObj[CERT_PATH]
+-            gatewayhost = jsonObj[GATEWAY_HOST]
+-            edgeManager = EdgeManager(connection_str, gatewayhost, cert_path)
+-            modules = [module.strip() for module in modules.strip().split('|')]
+-            credential = edgeManager.outputModuleCred(modules, local, output_file)
+-            output.info(credential[0])
+-            output.info(credential[1])
+-        else:
+-            output.error('Missing keys in config file. Please run `iotedgehubdev setup` again.')
+-            sys.exit(1)
+-    except Exception as e:
+-        raise e
++    edge_manager = _parse_config_json()
++
++    if edge_manager:
++        modules = [module.strip() for module in modules.strip().split('|')]
++        credential = edge_manager.outputModuleCred(modules, local, output_file)
++        output.info(credential[0])
++        output.info(credential[1])
+ 
+ 
+ @click.command(context_settings=CONTEXT_SETTINGS,
+@@ -189,28 +198,16 @@ def modulecred(modules, local, output_file):
+               help='Docker daemon socket to connect to')
+ @_with_telemetry
+ def start(inputs, port, deployment, verbose, host):
+-    configFile = HostPlatform.get_config_file_path()
+-    try:
+-        with open(configFile) as f:
+-            jsonObj = json.load(f)
+-            if CONN_STR in jsonObj and CERT_PATH in jsonObj and GATEWAY_HOST in jsonObj:
+-                connection_str = jsonObj[CONN_STR]
+-                cert_path = jsonObj[CERT_PATH]
+-                gatewayhost = jsonObj[GATEWAY_HOST]
+-                edgeManager = EdgeManager(connection_str, gatewayhost, cert_path)
+-                if host is not None:
+-                    os.environ[DOCKER_HOST] = host
+-            else:
+-                output.error('Missing keys in config file. Please run `iotedgehubdev setup` again.')
+-                sys.exit(1)
+-    except Exception as e:
+-        raise e
++    edge_manager = _parse_config_json()
+ 
+-    hostname_hash, suffix = Utils.hash_connection_str_hostname(connection_str)
+-    telemetry.add_extra_props({'iothubhostname': hostname_hash, 'iothubhostnamesuffix': suffix})
++    if edge_manager:
++        if host is not None:
++            os.environ[DOCKER_HOST] = host
+ 
+-    if inputs is None and deployment is not None:
+-        try:
++        hostname_hash, suffix = Utils.hash_connection_str_hostname(edge_manager.hostname)
++        telemetry.add_extra_props({'iothubhostname': hostname_hash, 'iothubhostnamesuffix': suffix})
++
++        if inputs is None and deployment is not None:
+             with open(deployment) as json_file:
+                 json_data = json.load(json_file)
+                 if 'modulesContent' in json_data:
+@@ -222,33 +219,31 @@ def start(inputs, port, deployment, verbose, host):
+             except RegistriesLoginError as e:
+                 output.warning(e.message())
+                 telemetry.add_extra_props({'failloginregistries': len(e.registries())})
+-            edgeManager.start_solution(module_content, verbose)
++            edge_manager.start_solution(module_content, verbose)
+             if not verbose:
+                 output.info('IoT Edge Simulator has been started in solution mode.')
+-        except Exception as e:
+-            raise e
+-    else:
+-        if deployment is not None:
+-            output.info('Deployment manifest is ignored when inputs are present.')
+-        if inputs is None:
+-            input_list = ['input1']
+         else:
+-            input_list = [input_.strip() for input_ in inputs.strip().split(',')]
++            if deployment is not None:
++                output.info('Deployment manifest is ignored when inputs are present.')
++            if inputs is None:
++                input_list = ['input1']
++            else:
++                input_list = [input_.strip() for input_ in inputs.strip().split(',')]
+ 
+-        edgeManager.start_singlemodule(input_list, port)
++            edge_manager.start_singlemodule(input_list, port)
+ 
+-        data = '--data \'{{"inputName": "{0}","data":"hello world"}}\''.format(input_list[0])
+-        url = 'http://localhost:{0}/api/v1/messages'.format(port)
+-        curl_msg = '        curl --header "Content-Type: application/json" --request POST {0} {1}'.format(data, url)
+-        output.info('IoT Edge Simulator has been started in single module mode.')
+-        output.info('Please run `iotedgehubdev modulecred` to get credential to connect your module.')
+-        output.info('And send message through:')
+-        output.line()
+-        output.echo(curl_msg, 'green')
+-        output.line()
+-        output.info(
+-            'Please refer to https://github.com/Azure/iot-edge-testing-utility/blob/master/swagger.json'
+-            ' for detail schema')
++            data = '--data \'{{"inputName": "{0}","data":"hello world"}}\''.format(input_list[0])
++            url = 'http://localhost:{0}/api/v1/messages'.format(port)
++            curl_msg = '        curl --header "Content-Type: application/json" --request POST {0} {1}'.format(data, url)
++            output.info('IoT Edge Simulator has been started in single module mode.')
++            output.info('Please run `iotedgehubdev modulecred` to get credential to connect your module.')
++            output.info('And send message through:')
++            output.line()
++            output.echo(curl_msg, 'green')
++            output.line()
++            output.info(
++                'Please refer to https://github.com/Azure/iot-edge-testing-utility/blob/master/swagger.json'
++                ' for detail schema')
+ 
+ 
+ @click.command(context_settings=CONTEXT_SETTINGS,
+@@ -259,13 +254,10 @@ def start(inputs, port, deployment, verbose, host):
+               help='Docker daemon socket to connect to')
+ @_with_telemetry
+ def stop(host):
+-    try:
+-        if host is not None:
+-            os.environ[DOCKER_HOST] = host
+-        EdgeManager.stop()
+-        output.info('IoT Edge Simulator has been stopped successfully.')
+-    except Exception as e:
+-        raise e
++    if host is not None:
++        os.environ[DOCKER_HOST] = host
++    EdgeManager.stop()
++    output.info('IoT Edge Simulator has been stopped successfully.')
+ 
+ 
+ main.add_command(setup)
+diff --git a/iotedgehubdev/edgemanager.py b/iotedgehubdev/edgemanager.py
+index cf0183f..921b52f 100644
+--- a/iotedgehubdev/edgemanager.py
++++ b/iotedgehubdev/edgemanager.py
+@@ -42,14 +42,18 @@ class EdgeManager(object):
+ 
+     def __init__(self, connection_str, gatewayhost, cert_path):
+         connection_str_dict = Utils.parse_device_connection_str(connection_str)
+-        self.hostname = connection_str_dict[EC.HOSTNAME_KEY]
+-        self.device_id = connection_str_dict[EC.DEVICE_ID_KEY]
+-        self.access_key = connection_str_dict[EC.ACCESS_KEY_KEY]
+-        self.compose_file = None
+-        self.gatewayhost = gatewayhost
+-        self.device_uri = '{0}/devices/{1}'.format(self.hostname, self.device_id)
+-        self.cert_path = cert_path
+-        self.edge_cert = EdgeCert(self.cert_path, self.gatewayhost)
++        self._hostname = connection_str_dict[EC.HOSTNAME_KEY]
++        self._device_id = connection_str_dict[EC.DEVICE_ID_KEY]
++        self._access_key = connection_str_dict[EC.ACCESS_KEY_KEY]
++        self._compose_file = None
++        self._gatewayhost = gatewayhost
++        self._device_uri = '{0}/devices/{1}'.format(self._hostname, self._device_id)
++        self._cert_path = cert_path
++        self._edge_cert = EdgeCert(self._cert_path, self._gatewayhost)
++
++    @property
++    def hostname(self):
++        return self._hostname
+ 
+     @staticmethod
+     def stop(edgedockerclient=None):
+@@ -117,7 +121,7 @@ class EdgeManager(object):
+         edgedockerclient.copy_file_to_volume(
+             EdgeManager.INPUT, EdgeManager.MODULE_VOLUME, self._device_cert(),
+             module_mount,
+-            self.edge_cert.get_cert_file_path(EC.EDGE_DEVICE_CA))
++            self._edge_cert.get_cert_file_path(EC.EDGE_DEVICE_CA))
+         edgedockerclient.start(inputContainer.get('Id'))
+ 
+     def config_solution(self, module_content, target, mount_base):
+@@ -152,7 +156,7 @@ class EdgeManager(object):
+ 
+         network_info = {
+             'NW_NAME': EdgeManager.NW_NAME,
+-            'ALIASES': self.gatewayhost
++            'ALIASES': self._gatewayhost
+         }
+ 
+         compose_project = ComposeProject(module_content)
+@@ -233,13 +237,13 @@ class EdgeManager(object):
+ 
+         edgedockerclient.copy_file_to_volume(
+             EdgeManager.CERT_HELPER, EdgeManager.HUB_VOLUME, EdgeManager._chain_cert(),
+-            hub_mount, self.edge_cert.get_cert_file_path(EC.EDGE_CHAIN_CA))
++            hub_mount, self._edge_cert.get_cert_file_path(EC.EDGE_CHAIN_CA))
+         edgedockerclient.copy_file_to_volume(
+             EdgeManager.CERT_HELPER, EdgeManager.HUB_VOLUME, EdgeManager._hubserver_pfx(),
+-            hub_mount, self.edge_cert.get_pfx_file_path(EC.EDGE_HUB_SERVER))
++            hub_mount, self._edge_cert.get_pfx_file_path(EC.EDGE_HUB_SERVER))
+         edgedockerclient.copy_file_to_volume(
+             EdgeManager.CERT_HELPER, EdgeManager.MODULE_VOLUME, self._device_cert(),
+-            module_mount, self.edge_cert.get_cert_file_path(EC.EDGE_DEVICE_CA))
++            module_mount, self._edge_cert.get_cert_file_path(EC.EDGE_DEVICE_CA))
+ 
+     def start(self, modulesDict, routes):
+         return
+@@ -258,7 +262,7 @@ class EdgeManager(object):
+ 
+     def outputModuleCred(self, names, islocal, output_file):
+         connstrENV = 'EdgeHubConnectionString={0}'.format('|'.join([self.getOrAddModule(name, islocal) for name in names]))
+-        deviceCAEnv = 'EdgeModuleCACertificateFile={0}'.format(self.edge_cert.get_cert_file_path(EC.EDGE_DEVICE_CA))
++        deviceCAEnv = 'EdgeModuleCACertificateFile={0}'.format(self._edge_cert.get_cert_file_path(EC.EDGE_DEVICE_CA))
+         cred = [connstrENV, deviceCAEnv]
+ 
+         if output_file is not None:
+@@ -272,7 +276,7 @@ class EdgeManager(object):
+ 
+     def getModule(self, name, islocal):
+         moduleUri = self._getModuleReqUri(name)
+-        sas = Utils.get_iot_hub_sas_token(self.device_uri, self.access_key, None)
++        sas = Utils.get_iot_hub_sas_token(self._device_uri, self._access_key, None)
+         res = requests.get(
+             moduleUri,
+             headers={
+@@ -294,7 +298,7 @@ class EdgeManager(object):
+ 
+     def updateModule(self, name, etag, islocal):
+         moduleUri = self._getModuleReqUri(name)
+-        sas = Utils.get_iot_hub_sas_token(self.device_uri, self.access_key, None)
++        sas = Utils.get_iot_hub_sas_token(self._device_uri, self._access_key, None)
+         res = requests.put(
+             moduleUri,
+             headers={
+@@ -304,7 +308,7 @@ class EdgeManager(object):
+             },
+             data=json.dumps({
+                 'moduleId': name,
+-                'deviceId': self.device_id,
++                'deviceId': self._device_id,
+                 'authentication': {
+                     'type': 'sas'
+                 }
+@@ -316,7 +320,7 @@ class EdgeManager(object):
+ 
+     def addModule(self, name, islocal):
+         moduleUri = self._getModuleReqUri(name)
+-        sas = Utils.get_iot_hub_sas_token(self.device_uri, self.access_key, None)
++        sas = Utils.get_iot_hub_sas_token(self._device_uri, self._access_key, None)
+         res = requests.put(
+             moduleUri,
+             headers={
+@@ -325,7 +329,7 @@ class EdgeManager(object):
+             },
+             data=json.dumps({
+                 'moduleId': name,
+-                'deviceId': self.device_id
++                'deviceId': self._device_id
+             })
+         )
+         if res.ok is not True:
+@@ -334,7 +338,7 @@ class EdgeManager(object):
+ 
+     def _getModuleReqUri(self, name):
+         return "https://{0}/devices/{1}/modules/{2}?api-version=2018-06-30".format(
+-            self.hostname, self.device_id, name)
++            self._hostname, self._device_id, name)
+ 
+     def _generateModuleConnectionStr(self, response, islocal):
+         jsonObj = response.json()
+@@ -343,13 +347,13 @@ class EdgeManager(object):
+         sasKey = jsonObj['authentication']['symmetricKey']['primaryKey']
+         hubTemplate = 'HostName={0};DeviceId={1};ModuleId={2};SharedAccessKey={3}'
+         moduleTemplate = 'HostName={0};GatewayHostName={1};DeviceId={2};ModuleId={3};SharedAccessKey={4}'
+-        gatewayhost = self.gatewayhost
++        gatewayhost = self._gatewayhost
+         if (islocal):
+             gatewayhost = 'localhost'
+         if (moduleId == '$edgeHub'):
+-            return hubTemplate.format(self.hostname, deviceId, moduleId, sasKey)
++            return hubTemplate.format(self._hostname, deviceId, moduleId, sasKey)
+         else:
+-            return moduleTemplate.format(self.hostname, gatewayhost, deviceId, moduleId, sasKey)
++            return moduleTemplate.format(self._hostname, gatewayhost, deviceId, moduleId, sasKey)
+ 
+     def _generateRoutesEnvFromInputs(self, inputs):
+         routes = [
+@@ -368,7 +372,7 @@ class EdgeManager(object):
+ 
+     def _start_edge_hub(self, edgedockerclient, edgeHubConnStr, routes, mount_base):
+         edgedockerclient.pull(EdgeManager.EDGEHUB_IMG, None, None)
+-        network_config = edgedockerclient.create_config_for_network(EdgeManager.NW_NAME, aliases=[self.gatewayhost])
++        network_config = edgedockerclient.create_config_for_network(EdgeManager.NW_NAME, aliases=[self._gatewayhost])
+         hub_mount = EdgeManager.HUB_MOUNT.format(mount_base)
+         hub_host_config = edgedockerclient.create_host_config(
+             mounts=[docker.types.Mount(hub_mount, EdgeManager.HUB_VOLUME)],
+@@ -399,10 +403,10 @@ class EdgeManager(object):
+ 
+         edgedockerclient.copy_file_to_volume(
+             EdgeManager.EDGEHUB, EdgeManager.HUB_VOLUME, EdgeManager._chain_cert(),
+-            hub_mount, self.edge_cert.get_cert_file_path(EC.EDGE_CHAIN_CA))
++            hub_mount, self._edge_cert.get_cert_file_path(EC.EDGE_CHAIN_CA))
+         edgedockerclient.copy_file_to_volume(
+             EdgeManager.EDGEHUB, EdgeManager.HUB_VOLUME, EdgeManager._hubserver_pfx(),
+-            hub_mount, self.edge_cert.get_pfx_file_path(EC.EDGE_HUB_SERVER))
++            hub_mount, self._edge_cert.get_pfx_file_path(EC.EDGE_HUB_SERVER))
+         edgedockerclient.start(hubContainer.get('Id'))
+ 
+     def _obtain_mount_path(self, edgedockerclient):
+diff --git a/iotedgehubdev/utils.py b/iotedgehubdev/utils.py
+index 08a04ad..937b24e 100644
+--- a/iotedgehubdev/utils.py
++++ b/iotedgehubdev/utils.py
+@@ -147,14 +147,8 @@ class Utils(object):
+ 
+     @staticmethod
+     @suppress_all_exceptions()
+-    def hash_connection_str_hostname(connection_str):
++    def hash_connection_str_hostname(hostname):
+         """Hash connection string hostname to count distint IoT Hub number"""
+-        try:
+-            connection_str_dict = Utils.parse_device_connection_str(connection_str)
+-            hostname = connection_str_dict[EC.HOSTNAME_KEY]
+-        except Exception:
+-            hostname = None
+-
+         if not hostname:
+             return ("", "")
+ 
+

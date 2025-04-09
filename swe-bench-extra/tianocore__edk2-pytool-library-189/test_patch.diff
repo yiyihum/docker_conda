@@ -1,0 +1,192 @@
+diff --git a/edk2toollib/uefi/edk2/test_path_utilities.py b/edk2toollib/uefi/edk2/test_path_utilities.py
+index 8526760..e46d6e1 100644
+--- a/edk2toollib/uefi/edk2/test_path_utilities.py
++++ b/edk2toollib/uefi/edk2/test_path_utilities.py
+@@ -13,6 +13,7 @@
+ import tempfile
+ import shutil
+ from edk2toollib.uefi.edk2.path_utilities import Edk2Path
++from pathlib import Path
+ 
+ 
+ class PathUtilitiesTest(unittest.TestCase):
+@@ -385,6 +386,117 @@ def test_get_containing_package_ws_abs_different_case(self):
+         p = os.path.join(folder_pp1_abs, "testfile.c")
+         self.assertIsNone(pathobj.GetContainingPackage(p), folder_pp_rel)
+ 
++    def test_get_containing_modules_with_relative_path(self):
++        """Test that a relative path raises an exception.
++
++        Note: GetContainingModules() only accepts absolute paths.
++
++        File layout:
++            root/                   <-- Current working directory (self.tmp)
++                folder_ws           <-- Workspace directory
++                    pp1             <-- Package Path 1
++                        PPTestPkg   <-- An edk2 package
++                            PPTestPkg.DEC
++                            module1
++                                module1.INF
++                            module2
++                                module2.INF
++                                X64
++                                    TestFile.c
++                    WSTestPkg       <-- An edk2 package
++                        WSTestPkg.dec
++                        module1
++                            module1.inf
++                        module2
++                            module2.inf
++                            X64
++                                TestFile.c
++       """
++        # Make the workspace directory: folder_ws/
++        ws_rel = "folder_ws"
++        ws_abs = os.path.join(self.tmp, ws_rel)
++        os.mkdir(ws_abs)
++
++        # Make Package Path 1 directory: folder_ws/pp1
++        folder_pp_rel = "pp1"
++        folder_pp1_abs = os.path.join(ws_abs, folder_pp_rel)
++        os.mkdir(folder_pp1_abs)
++
++        # Make WSTestPkg: folder_ws/WSTestPkg
++        ws_p_name = "WSTestPkg"
++        self._make_edk2_package_helper(ws_abs, ws_p_name)
++
++        # Make PPTestPkg in Package Path 1: folder_ws/pp1/PPTestPkg
++        pp_p_name = "PPTestPkg"
++        self._make_edk2_package_helper(folder_pp1_abs, pp_p_name, extension_case_lower=False)
++
++        pathobj = Edk2Path(ws_abs, [folder_pp1_abs])
++
++        # Change the current working directory to the workspace
++        os.chdir(ws_abs)
++
++        # Pass a valid relative path to GetContainingModules()
++        #   folder_ws/WSTestPkg/module2/module2.inf
++        p = os.path.join("WSTestPkg", "module2", "module2.inf")
++        self.assertRaises(Exception, pathobj.GetContainingModules, p)
++
++        # Pass an invalid relative path to GetContainingModules()
++        #   folder_ws/WSTestPkg/module2/module3.inf
++        p = os.path.join("WSTestPkg", "module2", "module3.inf")
++        self.assertRaises(Exception, pathobj.GetContainingModules, p)
++
++        # Pass a valid non .inf relative path to GetContainingModules()
++        #   folder_ws/WSTestPkg/module2/X64/TestFile.c
++        p = os.path.join("WSTestPkg", "module2", "X64", "TestFile.c")
++        self.assertRaises(Exception, pathobj.GetContainingModules, p)
++
++    def test_get_containing_module_with_infs_in_other_temp_dirs(self):
++        ''' test that GetContainingModule does not look outside the workspace
++        root for modules. To do so, a temporary .inf file is placed in the
++        user's temporary directory. Such a file could already exist and
++        similarly impact test results. To ensure consistent test results, this
++        test explicitly creates such a file.
++
++        File layout:
++
++        root/                         <-- User temporary directory
++           SomeModule.inf             <-- .inf file in user temporary directory
++           <temp_working_dir>/        <-- Current working directory (self.tmp)
++               folder_ws              <-- Workspace root
++                   WSTestPkg          <-- An edk2 package
++                       WSTestPkg.dec
++                       module1
++                           module1.inf
++                       module2
++                           module2.inf
++                           X64
++                               TestFile.c
++        '''
++        # Make the workspace directory: <self.tmp>/folder_ws/
++        ws_rel = "folder_ws"
++        ws_abs = os.path.join(self.tmp, ws_rel)
++
++        # Make WSTestPkg: <self.tmp>/folder_ws/WSTestPkg/
++        ws_p_name = "WSTestPkg"
++        self._make_edk2_package_helper(ws_abs, ws_p_name)
++
++        # Place a .inf file in the temporary directory
++        # <Temporary Directory>/SomeModule.inf
++        other_inf = os.path.join(os.path.dirname(self.tmp), "SomeModule.inf")
++        with open(other_inf, 'w'):
++            pass
++
++        try:
++            pathobj = Edk2Path(ws_abs, [])
++
++            # File outside of the workspace - invalid and should return None
++            p = os.path.join(os.path.dirname(ws_abs), "testfile.c")
++            relist = pathobj.GetContainingModules(p)
++            self.assertEqual(len(relist), 0)
++        finally:
++            if os.path.isfile(other_inf):
++                os.remove(other_inf)
++
+     def test_get_containing_module(self):
+         ''' test basic usage of GetContainingModule with packages path nested
+         inside the workspace
+@@ -432,7 +544,9 @@ def test_get_containing_module(self):
+         p = os.path.join(ws_pkg_abs, "module1", "testfile.c")
+         relist = pathobj.GetContainingModules(p)
+         self.assertEqual(len(relist), 1)
+-        self.assertIn(os.path.join(ws_pkg_abs, "module1", "module1.inf"), relist)
++        self.assertEqual(
++            Path(os.path.join(ws_pkg_abs, "module1", "module1.inf")),
++            Path(relist[0]))
+ 
+         # file in workspace root - no package- should return ws root
+         p = os.path.join(ws_abs, "testfile.c")
+@@ -448,13 +562,17 @@ def test_get_containing_module(self):
+         p = os.path.join(ws_pkg_abs, "module2", "X64", "testfile.c")
+         relist = pathobj.GetContainingModules(p)
+         self.assertEqual(len(relist), 1)
+-        self.assertIn(os.path.join(ws_pkg_abs, "module2", "module2.inf"), relist)
++        self.assertEqual(
++            Path(os.path.join(ws_pkg_abs, "module2", "module2.inf")),
++            Path(relist[0]))
+ 
+         # inf file in module2 x64
+         p = os.path.join(ws_pkg_abs, "module2", "module2.inf")
+         relist = pathobj.GetContainingModules(p)
+         self.assertEqual(len(relist), 1)
+-        self.assertIn(os.path.join(ws_pkg_abs, "module2", "module2.inf"), relist)
++        self.assertEqual(
++            Path(os.path.join(ws_pkg_abs, "module2", "module2.inf")),
++            Path(relist[0]))
+ 
+         # file in PPTestPkg root
+         p = os.path.join(pp_pkg_abs, "testfile.c")
+@@ -465,13 +583,17 @@ def test_get_containing_module(self):
+         p = os.path.join(pp_pkg_abs, "module1", "testfile.c")
+         relist = pathobj.GetContainingModules(p)
+         self.assertEqual(len(relist), 1)
+-        self.assertIn(os.path.join(pp_pkg_abs, "module1", "module1.INF"), relist)
++        self.assertEqual(
++            Path(os.path.join(pp_pkg_abs, "module1", "module1.INF")),
++            Path(relist[0]))
+ 
+         # inf file in module in PPTestPkg
+         p = os.path.join(pp_pkg_abs, "module1", "module1.INF")
+         relist = pathobj.GetContainingModules(p)
+         self.assertEqual(len(relist), 1)
+-        self.assertIn(os.path.join(pp_pkg_abs, "module1", "module1.INF"), relist)
++        self.assertEqual(
++            Path(os.path.join(pp_pkg_abs, "module1", "module1.INF")),
++            Path(relist[0]))
+ 
+         # file in packages path root - no module
+         p = os.path.join(folder_pp1_abs, "testfile.c")
+@@ -493,7 +615,9 @@ def test_get_containing_module(self):
+         p = os.path.join(ws_pkg_abs, "module1", "ThisParentDirDoesNotExist", "testfile.c")
+         relist = pathobj.GetContainingModules(p)
+         self.assertEqual(len(relist), 1)
+-        self.assertIn(os.path.join(ws_pkg_abs, "module1", "module1.inf"), relist)
++        self.assertEqual(
++            Path(os.path.join(ws_pkg_abs, "module1", "module1.inf")),
++            Path(relist[0]))
+ 
+     def test_get_edk2_relative_path_from_absolute_path(self):
+         ''' test basic usage of GetEdk2RelativePathFromAbsolutePath with packages path nested

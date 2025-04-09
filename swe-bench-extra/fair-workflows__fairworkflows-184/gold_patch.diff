@@ -1,0 +1,215 @@
+diff --git a/fairworkflows/fairstep.py b/fairworkflows/fairstep.py
+index e369441..b409a74 100644
+--- a/fairworkflows/fairstep.py
++++ b/fairworkflows/fairstep.py
+@@ -13,6 +13,7 @@ from rdflib import RDF, RDFS, DCTERMS
+ from fairworkflows import namespaces, LinguisticSystem, LINGSYS_ENGLISH, LINGSYS_PYTHON
+ from fairworkflows.config import DUMMY_FAIRWORKFLOWS_URI, IS_FAIRSTEP_RETURN_VALUE_PARAMETER_NAME, \
+     LOGGER
++from fairworkflows.prov import prov_logger, StepRetroProv
+ from fairworkflows.rdf_wrapper import RdfWrapper, replace_in_rdf
+ 
+ 
+@@ -441,7 +442,7 @@ def is_fairstep(label: str = None, is_pplan_step: bool = True, is_manual_task: b
+         def _add_logging(func):
+             @functools.wraps(func)
+             def _wrapper(*func_args, **func_kwargs):
+-                LOGGER.info(f'Running step: {func.__name__}')
++                prov_logger.add(StepRetroProv(step=fairstep))
+                 return func(*func_args, **func_kwargs)
+             return _wrapper
+         func._fairstep = fairstep
+diff --git a/fairworkflows/fairworkflow.py b/fairworkflows/fairworkflow.py
+index 587563c..11a01a9 100644
+--- a/fairworkflows/fairworkflow.py
++++ b/fairworkflows/fairworkflow.py
+@@ -7,18 +7,18 @@ from pathlib import Path
+ from tempfile import TemporaryDirectory
+ from typing import Iterator, Optional, Callable
+ 
+-import nanopub
+ import networkx as nx
+ import noodles
+ import rdflib
+ from noodles.interface import PromisedObject
+-from rdflib import RDF, RDFS, DCTERMS
++from rdflib import RDF
+ from rdflib.tools.rdf2dot import rdf2dot
+ from requests import HTTPError
+ 
++from fairworkflows import namespaces, LinguisticSystem, LINGSYS_PYTHON
+ from fairworkflows.config import LOGGER
+-from fairworkflows import namespaces, LinguisticSystem, LINGSYS_ENGLISH, LINGSYS_PYTHON
+ from fairworkflows.fairstep import FairStep
++from fairworkflows.prov import WorkflowRetroProv, prov_logger
+ from fairworkflows.rdf_wrapper import RdfWrapper
+ 
+ 
+@@ -363,47 +363,31 @@ class FairWorkflow(RdfWrapper):
+         Returns a tuple (result, retroprov), where result is the final output of the executed
+         workflow and retroprov is the retrospective provenance logged during execution.
+         """
+-
+         if not hasattr(self, 'workflow_level_promise'):
+             raise ValueError('Cannot execute workflow as no noodles step_level_promise has been constructed.')
+-
+-        log = io.StringIO()
+-        log_handler = logging.StreamHandler(log)
+-        formatter = logging.Formatter('%(asctime)s - %(message)s')
+-        log_handler.setFormatter(formatter)
+-
+-        LOGGER.setLevel(logging.INFO)
+-        LOGGER.handlers = [log_handler]
++        prov_logger.empty()
+         self.workflow_level_promise = noodles.workflow.from_call(
+             noodles.get_workflow(self.workflow_level_promise).root_node.foo, args, kwargs, {})
+         result = noodles.run_single(self.workflow_level_promise)
+ 
+         # Generate the retrospective provenance as a (nano-) Publication object
+-        retroprov = self._generate_retrospective_prov_publication(log.getvalue())
++        retroprov = self._generate_retrospective_prov_publication()
+ 
+         return result, retroprov
+ 
+-    def _generate_retrospective_prov_publication(self, log:str) -> nanopub.Publication:
++    def _generate_retrospective_prov_publication(self) -> WorkflowRetroProv:
+         """
+         Utility method for generating a Publication object for the retrospective
+         provenance of this workflow. Uses the given 'log' string as the actual
+         provenance for now.
+         """
+-        log_message = rdflib.Literal(log)
+-        this_retroprov = rdflib.BNode('retroprov')
+-        if self.uri is None or self.uri == 'None': # TODO: This is horrific
+-            this_workflow = rdflib.URIRef('http://www.example.org/unpublishedworkflow')
++        if self._is_published:
++            workflow_uri = rdflib.URIRef(self.uri)
+         else:
+-            this_workflow = rdflib.URIRef(self.uri)
+-
+-        retroprov_assertion = rdflib.Graph()
+-        retroprov_assertion.add((this_retroprov, rdflib.RDF.type, namespaces.PROV.Activity))
+-        retroprov_assertion.add((this_retroprov, namespaces.PROV.wasDerivedFrom, this_workflow))
+-        retroprov_assertion.add((this_retroprov, RDFS.label, log_message))
+-        retroprov = nanopub.Publication.from_assertion(assertion_rdf=retroprov_assertion)
+-
+-        return retroprov
++            workflow_uri = rdflib.URIRef('http://www.example.org/unpublishedworkflow')
+ 
++        step_provs = prov_logger.get_all()
++        return WorkflowRetroProv(self, workflow_uri, step_provs)
+ 
+     def draw(self, filepath):
+         """Visualize workflow.
+diff --git a/fairworkflows/linguistic_system.py b/fairworkflows/linguistic_system.py
+index 3dfa785..4a4adcc 100644
+--- a/fairworkflows/linguistic_system.py
++++ b/fairworkflows/linguistic_system.py
+@@ -56,5 +56,5 @@ LINGSYS_ENGLISH = LinguisticSystem(lstype=DC.LinguisticSystem,
+ LINGSYS_PYTHON = LinguisticSystem(lstype=SCHEMAORG.ComputerLanguage,
+                                   label='python',
+                                   version_info='.'.join([str(v) for v in sys.version_info]),
+-                                  see_also="https://en.wikipedia.org/wiki/Python_(programming_language)")
++                                  see_also="https://www.wikidata.org/wiki/Q28865")
+ 
+diff --git a/fairworkflows/prov.py b/fairworkflows/prov.py
+new file mode 100644
+index 0000000..d138b62
+--- /dev/null
++++ b/fairworkflows/prov.py
+@@ -0,0 +1,95 @@
++import threading
++from datetime import datetime
++from typing import List, Iterator
++
++import rdflib
++
++from fairworkflows import namespaces
++from fairworkflows.rdf_wrapper import RdfWrapper
++
++
++class ProvLogger:
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.items = []
++
++    def add(self, item):
++        with self.lock:
++            self.items.append(item)
++
++    def get_all(self):
++        with self.lock:
++            items, self.items = self.items, []
++        return items
++
++    def empty(self):
++        self.items = []
++
++
++prov_logger = ProvLogger()
++
++
++class RetroProv(RdfWrapper):
++    def __init__(self):
++        super().__init__(uri=None, ref_name='retroprov')
++        self.timestamp = datetime.now()
++
++
++class StepRetroProv(RetroProv):
++    def __init__(self, step):
++        super().__init__()
++        self.set_attribute(rdflib.RDF.type, namespaces.PPLAN.Activity)
++        self.step = step
++        self.step_uri = step.uri
++
++    @property
++    def step_uri(self):
++        """Refers to URI of step associated to this provenance.
++
++        Matches the predicate prov:wasDerivedFrom associated to this retrospective provenance
++        """
++        return self.get_attribute(namespaces.PROV.wasDerivedFrom)
++
++    @step_uri.setter
++    def step_uri(self, value):
++        self.set_attribute(namespaces.PPLAN.correspondsToStep, rdflib.URIRef(value), overwrite=True)
++
++    def __str__(self):
++        """String representation."""
++        s = f'Step retrospective provenance.\n'
++        s += self._rdf.serialize(format='trig').decode('utf-8')
++        return s
++
++
++class WorkflowRetroProv(RetroProv):
++    def __init__(self, workflow, workflow_uri, step_provs: List[StepRetroProv]):
++        super().__init__()
++        self.set_attribute(rdflib.RDF.type, namespaces.PPLAN.Bundle)
++        self.workflow = workflow
++        self.workflow_uri = workflow_uri
++        self._step_provs = step_provs
++
++    @property
++    def workflow_uri(self):
++        """Refers to URI of step associated to this provenance.
++
++        Matches the predicate prov:wasDerivedFrom associated to this retrospective provenance
++        """
++        return self.get_attribute(namespaces.PROV.wasDerivedFrom)
++
++    @workflow_uri.setter
++    def workflow_uri(self, value):
++        self.set_attribute(namespaces.PROV.wasDerivedFrom, rdflib.URIRef(value), overwrite=True)
++
++    def __iter__(self) -> Iterator[StepRetroProv]:
++        """Iterate over StepRetroProv that were part of the execution of the workflow."""
++        yield from self._step_provs
++
++    def __len__(self) -> int:
++        return len(self._step_provs)
++
++    def __str__(self):
++        """String representation."""
++        s = f'Workflow retrospective provenance.\n'
++        s += self._rdf.serialize(format='trig').decode('utf-8')
++        return s

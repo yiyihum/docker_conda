@@ -1,0 +1,93 @@
+diff --git a/synapse/http/server.py b/synapse/http/server.py
+index f067c163c..d993161a3 100644
+--- a/synapse/http/server.py
++++ b/synapse/http/server.py
+@@ -65,8 +65,8 @@ def wrap_json_request_handler(h):
+     The handler method must have a signature of "handle_foo(self, request)",
+     where "request" must be a SynapseRequest.
+ 
+-    The handler must return a deferred. If the deferred succeeds we assume that
+-    a response has been sent. If the deferred fails with a SynapseError we use
++    The handler must return a deferred or a coroutine. If the deferred succeeds
++    we assume that a response has been sent. If the deferred fails with a SynapseError we use
+     it to send a JSON response with the appropriate HTTP reponse code. If the
+     deferred fails with any other type of error we send a 500 reponse.
+     """
+@@ -353,16 +353,22 @@ class DirectServeResource(resource.Resource):
+         """
+         Render the request, using an asynchronous render handler if it exists.
+         """
+-        render_callback_name = "_async_render_" + request.method.decode("ascii")
++        async_render_callback_name = "_async_render_" + request.method.decode("ascii")
+ 
+-        if hasattr(self, render_callback_name):
+-            # Call the handler
+-            callback = getattr(self, render_callback_name)
+-            defer.ensureDeferred(callback(request))
++        # Try and get the async renderer
++        callback = getattr(self, async_render_callback_name, None)
+ 
+-            return NOT_DONE_YET
+-        else:
+-            super().render(request)
++        # No async renderer for this request method.
++        if not callback:
++            return super().render(request)
++
++        resp = callback(request)
++
++        # If it's a coroutine, turn it into a Deferred
++        if isinstance(resp, types.CoroutineType):
++            defer.ensureDeferred(resp)
++
++        return NOT_DONE_YET
+ 
+ 
+ def _options_handler(request):
+diff --git a/synapse/rest/media/v1/preview_url_resource.py b/synapse/rest/media/v1/preview_url_resource.py
+index 0337b64dc..053346fb8 100644
+--- a/synapse/rest/media/v1/preview_url_resource.py
++++ b/synapse/rest/media/v1/preview_url_resource.py
+@@ -95,6 +95,7 @@ class PreviewUrlResource(DirectServeResource):
+         )
+ 
+     def render_OPTIONS(self, request):
++        request.setHeader(b"Allow", b"OPTIONS, GET")
+         return respond_with_json(request, 200, {}, send_cors=True)
+ 
+     @wrap_json_request_handler
+diff --git a/synapse/util/logcontext.py b/synapse/util/logcontext.py
+index 6b0d2deea..9e1b53780 100644
+--- a/synapse/util/logcontext.py
++++ b/synapse/util/logcontext.py
+@@ -24,6 +24,7 @@ See doc/log_contexts.rst for details on how this works.
+ 
+ import logging
+ import threading
++import types
+ 
+ from twisted.internet import defer, threads
+ 
+@@ -528,8 +529,9 @@ def run_in_background(f, *args, **kwargs):
+     return from the function, and that the sentinel context is set once the
+     deferred returned by the function completes.
+ 
+-    Useful for wrapping functions that return a deferred which you don't yield
+-    on (for instance because you want to pass it to deferred.gatherResults()).
++    Useful for wrapping functions that return a deferred or coroutine, which you don't
++    yield or await on (for instance because you want to pass it to
++    deferred.gatherResults()).
+ 
+     Note that if you completely discard the result, you should make sure that
+     `f` doesn't raise any deferred exceptions, otherwise a scary-looking
+@@ -544,6 +546,9 @@ def run_in_background(f, *args, **kwargs):
+         # by synchronous exceptions, so let's turn them into Failures.
+         return defer.fail()
+ 
++    if isinstance(res, types.CoroutineType):
++        res = defer.ensureDeferred(res)
++
+     if not isinstance(res, defer.Deferred):
+         return res
+ 
+

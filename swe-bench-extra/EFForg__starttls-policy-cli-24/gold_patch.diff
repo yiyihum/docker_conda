@@ -1,0 +1,187 @@
+diff --git a/starttls_policy_cli/configure.py b/starttls_policy_cli/configure.py
+index 8ec010d..bb13dec 100644
+--- a/starttls_policy_cli/configure.py
++++ b/starttls_policy_cli/configure.py
+@@ -20,8 +20,9 @@ class ConfigGenerator(object):
+     """
+     __metaclass__ = abc.ABCMeta
+ 
+-    def __init__(self, policy_dir):
++    def __init__(self, policy_dir, enforce_testing=False):
+         self._policy_dir = policy_dir
++        self._enforce_testing = enforce_testing
+         self._policy_filename = os.path.join(self._policy_dir, constants.POLICY_FILENAME)
+         self._config_filename = os.path.join(self._policy_dir, self.default_filename)
+         self._policy_config = None
+@@ -86,15 +87,6 @@ class ConfigGenerator(object):
+     def default_filename(self):
+         """The expected default filename of the generated configuration file."""
+ 
+-def _policy_for_domain(domain, tls_policy, max_domain_len):
+-    line = ("{0:%d} " % max_domain_len).format(domain)
+-    if tls_policy.mode == "enforce":
+-        line += " secure match="
+-        line += ":".join(tls_policy.mxs)
+-    elif tls_policy.mode == "testing":
+-        line = "# " + line + "undefined due to testing policy"
+-    return line
+-
+ class PostfixGenerator(ConfigGenerator):
+     """Configuration generator for postfix.
+     """
+@@ -103,7 +95,7 @@ class PostfixGenerator(ConfigGenerator):
+         policies = []
+         max_domain_len = len(max(policy_list, key=len))
+         for domain, tls_policy in sorted(six.iteritems(policy_list)):
+-            policies.append(_policy_for_domain(domain, tls_policy, max_domain_len))
++            policies.append(self._policy_for_domain(domain, tls_policy, max_domain_len))
+         return "\n".join(policies)
+ 
+     def _generate_expired_fallback(self, policy_list):
+@@ -122,6 +114,16 @@ class PostfixGenerator(ConfigGenerator):
+             "And finally:\n\n"
+             "postfix reload\n").format(abs_path=abs_path, filename=filename)
+ 
++    def _policy_for_domain(self, domain, tls_policy, max_domain_len):
++        line = ("{0:%d} " % max_domain_len).format(domain)
++        mode = tls_policy.mode
++        if mode == "enforce" or self._enforce_testing and mode == "testing":
++            line += " secure match="
++            line += ":".join(tls_policy.mxs)
++        elif mode == "testing":
++            line = "# " + line + "undefined due to testing policy"
++        return line
++
+     @property
+     def mta_name(self):
+         return "Postfix"
+diff --git a/starttls_policy_cli/main.py b/starttls_policy_cli/main.py
+index 2963964..fe553e6 100644
+--- a/starttls_policy_cli/main.py
++++ b/starttls_policy_cli/main.py
+@@ -9,12 +9,26 @@ GENERATORS = {
+ }
+ 
+ def _argument_parser():
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--generate", help="The MTA you want to generate a configuration file for.",
++    parser = argparse.ArgumentParser(
++        description="Generates MTA configuration file according to STARTTLS-Everywhere policy",
++        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
++    parser.add_argument("-g", "--generate",
++                        choices=GENERATORS,
++                        help="The MTA you want to generate a configuration file for.",
+                         dest="generate", required=True)
+     # TODO: decide whether to use /etc/ for policy list home
+-    parser.add_argument("--policy-dir", help="Policy file directory on this computer.",
++    parser.add_argument("-d", "--policy-dir",
++                        help="Policy file directory on this computer.",
+                         default="/etc/starttls-policy/", dest="policy_dir")
++    parser.add_argument("-e", "--early-adopter",
++                        help="Early Adopter mode. Processes all \"testing\" domains in policy list "
++                        "same way as domains in \"enforce\" mode, effectively requiring strong TLS "
++                        "for domains in \"testing\" mode too. This mode is useful for participating"
++                        " in tests of recently added domains with real communications and earlier "
++                        "security hardening at the cost of increased probability of delivery "
++                        "degradation. Use this mode with awareness about all implications.",
++                        action="store_true",
++                        dest="early_adopter")
+     return parser
+ 
+ 
+@@ -24,19 +38,15 @@ def _ensure_directory(directory):
+ 
+ def _generate(arguments):
+     _ensure_directory(arguments.policy_dir)
+-    config_generator = GENERATORS[arguments.generate](arguments.policy_dir)
++    config_generator = GENERATORS[arguments.generate](arguments.policy_dir,
++                                                      arguments.early_adopter)
+     config_generator.generate()
+     config_generator.manual_instructions()
+ 
+-def _perform(arguments, parser):
+-    if arguments.generate not in GENERATORS:
+-        parser.error("no configuration generator exists for '%s'" % arguments.generate)
+-    _generate(arguments)
+-
+ def main():
+     """ Entrypoint for CLI tool. """
+     parser = _argument_parser()
+-    _perform(parser.parse_args(), parser)
++    _generate(parser.parse_args())
+ 
+ if __name__ == "__main__":
+     main()  # pragma: no cover
+diff --git a/starttls_policy_cli/policy.py b/starttls_policy_cli/policy.py
+index b4ab17a..1cb0212 100644
+--- a/starttls_policy_cli/policy.py
++++ b/starttls_policy_cli/policy.py
+@@ -1,5 +1,4 @@
+ """ Policy config wrapper """
+-import collections
+ import logging
+ import datetime
+ import io
+@@ -8,6 +7,12 @@ import six
+ from starttls_policy_cli import util
+ from starttls_policy_cli import constants
+ 
++try:
++    # Python 3.3+
++    from collections.abc import Mapping
++except ImportError:
++    from collections import Mapping
++
+ logger = logging.getLogger(__name__)
+ logger.addHandler(logging.StreamHandler())
+ 
+@@ -210,7 +215,6 @@ class PolicyNoAlias(Policy):
+     @property
+     def policy_alias(self):
+         """ This type of policy can't be aliased. Returns None."""
+-        pass
+ 
+     @policy_alias.setter
+     def policy_alias(self, value):
+@@ -218,7 +222,7 @@ class PolicyNoAlias(Policy):
+         # pylint: disable=unused-argument
+         raise util.ConfigError('PolicyNoAlias object cannot have policy-alias field!')
+ 
+-class Config(MergableConfig, collections.Mapping):
++class Config(MergableConfig, Mapping):
+     """Class for retrieving properties in TLS Policy config.
+     If `policy_aliases` is specified, they must be set before `policies`,
+     so policy format validation can work properly.
+@@ -238,6 +242,7 @@ class Config(MergableConfig, collections.Mapping):
+             yield domain
+ 
+     def keys(self):
++        """ Returns iterable over policies even if this attribute is not set """
+         if self.policies is None:
+             return set([])
+         return self.policies.keys()
+diff --git a/starttls_policy_cli/util.py b/starttls_policy_cli/util.py
+index 8f7da53..6b703a7 100644
+--- a/starttls_policy_cli/util.py
++++ b/starttls_policy_cli/util.py
+@@ -103,20 +103,14 @@ TLS_VERSIONS = ('TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3')
+ ENFORCE_MODES = ('testing', 'enforce')
+ 
+ POLICY_SCHEMA = {
+-        'min-tls-version': {
+-            'enforce': partial(enforce_in, TLS_VERSIONS),
+-            'default': 'TLSv1.2',
+-            },
+         'mode': {
+             'enforce': partial(enforce_in, ENFORCE_MODES),
+             'default': 'testing',
+             },
+-        # TODO (#50) Validate mxs as FQDNs (using public suffix list)
+         'mxs': {
+             'enforce': partial(enforce_list, partial(enforce_type, six.string_types)),
+             'default': [],
+             },
+-        # TODO (#50) Validate reporting endpoint as https: or mailto:
+         'policy-alias': partial(enforce_type, six.string_types),
+ }
+ 

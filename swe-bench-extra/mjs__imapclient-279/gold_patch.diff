@@ -1,0 +1,116 @@
+diff --git a/doc/src/advanced.rst b/doc/src/advanced.rst
+index a151e38..7356328 100644
+--- a/doc/src/advanced.rst
++++ b/doc/src/advanced.rst
+@@ -3,6 +3,33 @@ Advanced Usage
+ This document covers some more advanced features and tips for handling
+ specific usages.
+ 
++Cleaning Up Connections
++~~~~~~~~~~~~~~~~~~~~~~~
++
++To communicate with the server, IMAPClient establishes a TCP connection. It is
++important for long-lived processes to always close connections at some
++point to avoid leaking memory and file descriptors. This is usually done with
++the ``logout`` method::
++
++  import imapclient
++
++  c = imapclient.IMAPClient(host="imap.foo.org")
++  c.login("bar@foo.org", "passwd")
++  c.select_folder("INBOX")
++  c.logout()
++
++However if an error is raised when selecting the folder, the connection may be
++left open.
++
++IMAPClient may be used as a context manager that automatically closes
++connections when they are not needed anymore::
++
++  import imapclient
++
++  with imapclient.IMAPClient(host="imap.foo.org") as c:
++      c.login("bar@foo.org", "passwd")
++      c.select_folder("INBOX")
++
+ Watching a mailbox asynchronously using idle
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ TODO
+diff --git a/doc/src/index.rst b/doc/src/index.rst
+index af62a24..3f08ce7 100644
+--- a/doc/src/index.rst
++++ b/doc/src/index.rst
+@@ -66,6 +66,8 @@ messages in the INBOX folder.
+     ID #44: "See that fun article about lobsters in Pacific ocean!" received 2017-06-09 09:49:47
+     ID #46: "Planning for our next vacations" received 2017-05-12 10:29:30
+ 
++    >>> server.logout()
++    b'Logging out'
+ 
+ User Guide
+ ----------
+diff --git a/doc/src/releases.rst b/doc/src/releases.rst
+index 3e6c672..8199b24 100644
+--- a/doc/src/releases.rst
++++ b/doc/src/releases.rst
+@@ -10,6 +10,8 @@ Changed
+ - XXX Use built-in TLS when sensible.
+ - Logs are now handled by the Python logging module. `debug` and `log_file`
+   are not used anymore.
++- A context manager is introduced to automatically close connections to remote
++  servers.
+ 
+ Other
+ -----
+diff --git a/imapclient/imapclient.py b/imapclient/imapclient.py
+index 3792a1f..cff7b1b 100644
+--- a/imapclient/imapclient.py
++++ b/imapclient/imapclient.py
+@@ -117,6 +117,10 @@ class IMAPClient(object):
+     system time). This attribute can be changed between ``fetch()``
+     calls if required.
+ 
++    Can be used as a context manager to automatically close opened connections:
++    >>> with IMAPClient(host="imap.foo.org") as client:
++    ...     client.login("bar@foo.org", "passwd")
++
+     """
+ 
+     Error = imaplib.IMAP4.error
+@@ -150,8 +154,11 @@ class IMAPClient(object):
+         self._timeout = timeout
+         self._starttls_done = False
+         self._cached_capabilities = None
++        self._idle_tag = None
+ 
+         self._imap = self._create_IMAP4()
++        self._set_timeout()
++
+         logger.debug("Connected to host %s over %s", self.host,
+                      "SSL/TLS" if ssl else "plain text")
+ 
+@@ -162,9 +169,22 @@ class IMAPClient(object):
+         self._imap.debug = 5
+         self._imap._mesg = imaplib_logger.debug
+ 
+-        self._idle_tag = None
++    def __enter__(self):
++        return self
+ 
+-        self._set_timeout()
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        """Logout and closes the connection when exiting the context manager.
++
++        All exceptions during logout and connection shutdown are caught because
++        an error here usually means the connection was already closed.
++        """
++        try:
++            self.logout()
++        except Exception:
++            try:
++                self.shutdown()
++            except Exception as e:
++                logger.info("Could not close the connection cleanly: %s", e)
+ 
+     def _create_IMAP4(self):
+         if self.stream:

@@ -1,0 +1,233 @@
+diff --git a/tests/func/test_add.py b/tests/func/test_add.py
+--- a/tests/func/test_add.py
++++ b/tests/func/test_add.py
+@@ -468,6 +468,28 @@ def test_should_throw_proper_exception_on_corrupted_stage_file(caplog, tmp_dir,
+     assert expected_error in caplog.text
+ 
+ 
++def test_should_throw_proper_exception_on_existing_out(caplog, tmp_dir, dvc):
++    tmp_dir.gen({"foo": "foo"})
++    (tmp_dir / "out").write_text("old contents")
++
++    assert main(["add", "foo", "--out", "out"]) == 1
++
++    assert (tmp_dir / "out").read_text() == "old contents"
++    expected_error_lines = [
++        "Error: The file 'out' already exists locally.",
++        "To override it, re-run with '--force'.",
++    ]
++    assert all(line in caplog.text for line in expected_error_lines)
++
++
++def test_add_force_overwrite_out(caplog, tmp_dir, dvc):
++    tmp_dir.gen({"foo": "foo"})
++    (tmp_dir / "out").write_text("old contents")
++
++    assert main(["add", "foo", "--out", "out", "--force"]) == 0
++    assert (tmp_dir / "foo").read_text() == "foo"
++
++
+ def test_add_filename(tmp_dir, dvc):
+     tmp_dir.gen({"foo": "foo", "bar": "bar", "data": {"file": "file"}})
+     ret = main(["add", "foo", "bar", "--file", "error.dvc"])
+diff --git a/tests/func/test_get.py b/tests/func/test_get.py
+--- a/tests/func/test_get.py
++++ b/tests/func/test_get.py
+@@ -1,3 +1,4 @@
++import errno
+ import logging
+ import os
+ 
+@@ -5,6 +6,7 @@
+ 
+ from dvc.cachemgr import CacheManager
+ from dvc.cli import main
++from dvc.exceptions import FileExistsLocallyError
+ from dvc.fs import system
+ from dvc.repo import Repo
+ from dvc.repo.get import GetDVCFileError
+@@ -21,18 +23,36 @@ def test_get_repo_file(tmp_dir, erepo_dir):
+     assert (tmp_dir / "file_imported").read_text() == "contents"
+ 
+ 
+-def test_get_repo_file_replace_without_confirmation(tmp_dir, erepo_dir):
++def test_get_repo_file_no_override(tmp_dir, erepo_dir):
+     with erepo_dir.chdir():
+-        erepo_dir.dvc_gen("file", "contents", commit="create file")
+-        erepo_dir.dvc_gen("file2", "something different", commit="create file2")
++        erepo_dir.dvc_gen("file1", "file1 contents", commit="create file")
++        erepo_dir.dvc_gen("file2", "file2 contents", commit="create file2")
+ 
+-    Repo.get(os.fspath(erepo_dir), "file", "file_imported")
++    Repo.get(os.fspath(erepo_dir), "file1", "file_imported")
+     # getting another file with a name that already exists in Repo.
+-    with pytest.raises(FileExistsError):
++    with pytest.raises(FileExistsLocallyError) as exc_info:
+         Repo.get(os.fspath(erepo_dir), "file2", "file_imported")
+ 
++    # Make sure it's a functional FileExistsError with errno
++    assert isinstance(exc_info.value, FileExistsError)
++    assert exc_info.value.errno == errno.EEXIST
++
+     assert os.path.isfile("file_imported")
+-    assert (tmp_dir / "file_imported").read_text() == "contents"
++    assert (tmp_dir / "file_imported").read_text() == "file1 contents"
++
++
++def test_get_repo_file_with_override(tmp_dir, erepo_dir):
++    with erepo_dir.chdir():
++        erepo_dir.dvc_gen("file1", "file1 contents", commit="create file")
++        erepo_dir.dvc_gen("file2", "file2 contents", commit="create file2")
++
++    Repo.get(os.fspath(erepo_dir), "file1", "file_imported")
++
++    # override with the 2nd file
++    Repo.get(os.fspath(erepo_dir), "file2", "file_imported", force=True)
++
++    assert os.path.isfile("file_imported")
++    assert (tmp_dir / "file_imported").read_text() == "file2 contents"
+ 
+ 
+ def test_get_repo_dir(tmp_dir, erepo_dir):
+diff --git a/tests/func/test_get_url.py b/tests/func/test_get_url.py
+--- a/tests/func/test_get_url.py
++++ b/tests/func/test_get_url.py
+@@ -1,8 +1,9 @@
++import errno
+ import os
+ 
+ import pytest
+ 
+-from dvc.exceptions import URLMissingError
++from dvc.exceptions import FileExistsLocallyError, URLMissingError
+ from dvc.repo import Repo
+ from dvc.testing.workspace_tests import TestGetUrl as _TestGetUrl
+ 
+@@ -16,6 +17,28 @@ def test_get_file(tmp_dir):
+     assert (tmp_dir / "foo_imported").read_text() == "foo contents"
+ 
+ 
++def test_get_file_conflict_and_override(tmp_dir):
++    tmp_dir.gen({"foo": "foo contents"})
++    tmp_dir.gen({"bar": "bar contents"})
++
++    with pytest.raises(FileExistsLocallyError) as exc_info:
++        Repo.get_url("foo", "bar")
++
++    # verify no override
++    assert (tmp_dir / "bar").is_file()
++    assert (tmp_dir / "bar").read_text() == "bar contents"
++
++    # verify meaningful/BC exception type/errno
++    assert isinstance(exc_info.value, FileExistsError)
++    assert exc_info.value.errno == errno.EEXIST
++
++    # now, override
++    Repo.get_url("foo", "bar", force=True)
++
++    assert (tmp_dir / "bar").is_file()
++    assert (tmp_dir / "bar").read_text() == "foo contents"
++
++
+ def test_get_dir(tmp_dir):
+     tmp_dir.gen({"foo": {"foo": "foo contents"}})
+ 
+diff --git a/tests/func/test_import_url.py b/tests/func/test_import_url.py
+--- a/tests/func/test_import_url.py
++++ b/tests/func/test_import_url.py
+@@ -49,6 +49,21 @@ def test_should_remove_outs_before_import(tmp_dir, dvc, mocker, erepo_dir):
+     assert remove_outs_call_counter.mock.call_count == 1
+ 
+ 
++def test_import_conflict_and_override(tmp_dir, dvc):
++    tmp_dir.gen("foo", "foo")
++    tmp_dir.gen("bar", "bar")
++
++    # bar exists, fail
++    ret = main(["import-url", "foo", "bar"])
++    assert ret != 0
++    assert not os.path.exists("bar.dvc")
++
++    # force override
++    ret = main(["import-url", "foo", "bar", "--force"])
++    assert ret == 0
++    assert os.path.exists("bar.dvc")
++
++
+ def test_import_filename(tmp_dir, dvc, cloud):
+     external_source = cloud / "file"
+     (cloud / "file").write_text("content", encoding="utf-8")
+diff --git a/tests/unit/command/test_add.py b/tests/unit/command/test_add.py
+--- a/tests/unit/command/test_add.py
++++ b/tests/unit/command/test_add.py
+@@ -41,6 +41,7 @@ def test_add(mocker, dvc):
+         labels=None,
+         meta=None,
+         jobs=None,
++        force=False,
+     )
+ 
+ 
+@@ -78,6 +79,7 @@ def test_add_to_remote(mocker):
+         labels=None,
+         meta=None,
+         jobs=None,
++        force=False,
+     )
+ 
+ 
+diff --git a/tests/unit/command/test_get.py b/tests/unit/command/test_get.py
+--- a/tests/unit/command/test_get.py
++++ b/tests/unit/command/test_get.py
+@@ -23,7 +23,9 @@ def test_get(mocker):
+ 
+     assert cmd.run() == 0
+ 
+-    m.assert_called_once_with("repo_url", path="src", out="out", rev="version", jobs=4)
++    m.assert_called_once_with(
++        "repo_url", path="src", out="out", rev="version", jobs=4, force=False
++    )
+ 
+ 
+ def test_get_url(mocker, capsys):
+diff --git a/tests/unit/command/test_get_url.py b/tests/unit/command/test_get_url.py
+--- a/tests/unit/command/test_get_url.py
++++ b/tests/unit/command/test_get_url.py
+@@ -11,4 +11,4 @@ def test_get_url(mocker):
+ 
+     assert cmd.run() == 0
+ 
+-    m.assert_called_once_with("src", out="out", jobs=5)
++    m.assert_called_once_with("src", out="out", jobs=5, force=False)
+diff --git a/tests/unit/command/test_imp_url.py b/tests/unit/command/test_imp_url.py
+--- a/tests/unit/command/test_imp_url.py
++++ b/tests/unit/command/test_imp_url.py
+@@ -41,6 +41,7 @@ def test_import_url(mocker):
+         labels=None,
+         meta=None,
+         jobs=4,
++        force=False,
+         version_aware=False,
+     )
+ 
+@@ -94,10 +95,11 @@ def test_import_url_no_exec_download_flags(mocker, flag, expected):
+         remote=None,
+         to_remote=False,
+         desc="description",
+-        jobs=None,
+         type=None,
+         labels=None,
+         meta=None,
++        jobs=None,
++        force=False,
+         version_aware=False,
+         **expected,
+     )
+@@ -136,6 +138,7 @@ def test_import_url_to_remote(mocker):
+         labels=None,
+         meta=None,
+         jobs=None,
++        force=False,
+         version_aware=False,
+     )
+ 

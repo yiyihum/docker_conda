@@ -1,0 +1,107 @@
+diff --git a/README.md b/README.md
+index 9641b76..e365664 100644
+--- a/README.md
++++ b/README.md
+@@ -59,13 +59,22 @@ with pipes(logger, stderr=STDOUT):
+     call_some_c_function()
+ ```
+ 
++Forward C-level output to a file (avoids GIL issues with a background thread, new in 3.1):
++
++```python
++from wurlitzer import pipes, STDOUT
++
++with open("log.txt", "ab") as f, pipes(f, stderr=STDOUT):
++    blocking_gil_holding_function()
++```
++
+ Or even simpler, enable it as an IPython extension:
+ 
+ ```
+ %load_ext wurlitzer
+ ```
+ 
+-To forward all C-level output to IPython during execution.
++To forward all C-level output to IPython (e.g. Jupyter cell output) during execution.
+ 
+ ## Acknowledgments
+ 
+diff --git a/wurlitzer.py b/wurlitzer.py
+index 5626f98..67f61d4 100644
+--- a/wurlitzer.py
++++ b/wurlitzer.py
+@@ -210,6 +210,17 @@ class Wurlitzer:
+         save_fd = os.dup(real_fd)
+         self._save_fds[name] = save_fd
+ 
++        try:
++            capture_fd = getattr(self, "_" + name).fileno()
++        except Exception:
++            pass
++        else:
++            # if it has a fileno(),
++            # dup directly to capture file,
++            # no pipes needed
++            dup2(capture_fd, real_fd)
++            return None
++
+         pipe_out, pipe_in = os.pipe()
+         # set max pipe buffer size (linux only)
+         if self._bufsize:
+@@ -272,19 +283,32 @@ class Wurlitzer:
+         self._flush()
+         # setup handle
+         self._setup_handle()
+-        self._control_r, self._control_w = os.pipe()
+ 
+         # create pipe for stdout
+-        pipes = [self._control_r]
+-        names = {self._control_r: 'control'}
++        pipes = []
++        names = {}
+         if self._stdout:
+             pipe = self._setup_pipe('stdout')
+-            pipes.append(pipe)
+-            names[pipe] = 'stdout'
++            if pipe:
++                pipes.append(pipe)
++                names[pipe] = 'stdout'
+         if self._stderr:
+             pipe = self._setup_pipe('stderr')
+-            pipes.append(pipe)
+-            names[pipe] = 'stderr'
++            if pipe:
++                pipes.append(pipe)
++                names[pipe] = 'stderr'
++
++        if not pipes:
++            # no pipes to handle (e.g. direct FD capture)
++            # so no forwarder thread needed
++            self.thread = None
++            return self.handle
++
++        # setup forwarder thread
++
++        self._control_r, self._control_w = os.pipe()
++        pipes.append(self._control_r)
++        names[self._control_r] = "control"
+ 
+         # flush pipes in a background thread to avoid blocking
+         # the reader thread when the buffer is full
+@@ -366,11 +390,11 @@ class Wurlitzer:
+     def __exit__(self, exc_type, exc_value, traceback):
+         # flush before exiting
+         self._flush()
+-
+-        # signal output is complete on control pipe
+-        os.write(self._control_w, b'\1')
+-        self.thread.join()
+-        os.close(self._control_w)
++        if self.thread:
++            # signal output is complete on control pipe
++            os.write(self._control_w, b'\1')
++            self.thread.join()
++            os.close(self._control_w)
+ 
+         # restore original state
+         for name, real_fd in self._real_fds.items():

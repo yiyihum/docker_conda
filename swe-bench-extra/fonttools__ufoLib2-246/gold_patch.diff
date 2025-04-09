@@ -1,0 +1,86 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 4f90292..7142d15 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -53,11 +53,14 @@ jobs:
+       run: pip install tox coverage
+     - name: Run Tox
+       run: tox -e py-cov
+-    - name: Re-run Tox (without cattrs)
++    - name: Re-run Tox without cattrs
+       if: startsWith(matrix.platform, 'ubuntu-latest') && startsWith(matrix.python-version, '3.10')
+       run: |
+-        .tox/py-cov/bin/pip uninstall -y cattrs
+-        tox -e py-cov --skip-pkg-install
++        tox -e py-nocattrs
++    - name: Re-run Tox without msgpack
++      if: startsWith(matrix.platform, 'ubuntu-latest') && startsWith(matrix.python-version, '3.10')
++      run: |
++        tox -e py-nomsgpack
+     - name: Produce coverage files
+       run: |
+         coverage combine
+diff --git a/src/ufoLib2/errors.py b/src/ufoLib2/errors.py
+index 292b963..6ace0c5 100644
+--- a/src/ufoLib2/errors.py
++++ b/src/ufoLib2/errors.py
+@@ -1,5 +1,17 @@
+ from __future__ import annotations
+ 
++from typing import Any
++
+ 
+ class Error(Exception):
+     """The base exception for ufoLib2."""
++
++
++class ExtrasNotInstalledError(Error):
++    """The extras required for this feature are not installed."""
++
++    def __init__(self, extras: str) -> None:
++        super().__init__(f"Extras not installed: ufoLib2[{extras}]")
++
++    def __call__(self, *args: Any, **kwargs: Any) -> None:
++        raise self
+diff --git a/src/ufoLib2/serde/__init__.py b/src/ufoLib2/serde/__init__.py
+index 0573abb..2659e9b 100644
+--- a/src/ufoLib2/serde/__init__.py
++++ b/src/ufoLib2/serde/__init__.py
+@@ -4,6 +4,7 @@ from functools import partialmethod
+ from importlib import import_module
+ from typing import IO, Any, AnyStr, Callable, Type
+ 
++from ufoLib2.errors import ExtrasNotInstalledError
+ from ufoLib2.typing import PathLike, T
+ 
+ _SERDE_FORMATS_ = ("json", "msgpack")
+@@ -75,12 +76,9 @@ def serde(cls: Type[T]) -> Type[T]:
+ 
+         try:
+             serde_submodule = import_module(f"ufoLib2.serde.{fmt}")
+-        except ImportError as e:
+-            exc = e
+-
+-            def raise_error(*args: Any, **kwargs: Any) -> None:
+-                raise exc
+-
++        except ImportError as exc:
++            raise_error = ExtrasNotInstalledError(fmt)
++            raise_error.__cause__ = exc
+             for method in ("loads", "load", "dumps", "dump"):
+                 setattr(cls, f"{fmt}_{method}", raise_error)
+         else:
+diff --git a/tox.ini b/tox.ini
+index e55a83b..d34ec05 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -7,6 +7,9 @@ deps =
+     -r requirements.txt
+     -r requirements-dev.txt
+ commands =
++    nocattrs: pip uninstall -y cattrs
++    noorjson: pip uninstall -y orjson
++    nomsgpack: pip uninstall -y msgpack
+     cov: coverage run --parallel-mode -m pytest {posargs}
+     !cov: pytest {posargs}
+ 

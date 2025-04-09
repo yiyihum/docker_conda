@@ -1,0 +1,191 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0f30f39..a0a1471 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,11 +12,14 @@ New methods:
+ - Added `count_coordinates` method from shapely to GeoSeries/GeoDataframe (#3026).
+ - Added `minimum_clearance` method from shapely to GeoSeries/GeoDataframe (#2989).
+ - Added `is_ccw` method from shapely to GeoSeries/GeoDataframe (#3027).
++- Added ``transform`` method from shapely to GeoSeries/GeoDataFrame (#3075).
+ 
+ New features and improvements:
+ 
+ - GeoSeries and GeoDataFrame `__repr__` now trims trailing zeros for a more readable
+   output (#3087).
++- `make_valid` option in `overlay` now uses the `make_valid` method instead of
++  `buffer(0)` (#3113).
+ 
+ Potentially breaking changes:
+ - reading a data source that does not have a geometry field using ``read_file``
+diff --git a/doc/source/docs/reference/geoseries.rst b/doc/source/docs/reference/geoseries.rst
+index 8f843c9..07a451d 100644
+--- a/doc/source/docs/reference/geoseries.rst
++++ b/doc/source/docs/reference/geoseries.rst
+@@ -108,6 +108,7 @@ Constructive methods and attributes
+    GeoSeries.segmentize
+    GeoSeries.shortest_line
+    GeoSeries.simplify
++   GeoSeries.transform
+ 
+ Affine transformations
+ ----------------------
+diff --git a/geopandas/array.py b/geopandas/array.py
+index 5fd9746..b905251 100644
+--- a/geopandas/array.py
++++ b/geopandas/array.py
+@@ -1,26 +1,25 @@
++import inspect
+ import numbers
+ import operator
+ import warnings
+-import inspect
+ from functools import lru_cache
+ 
+ import numpy as np
+ import pandas as pd
+-from pandas.api.extensions import (
+-    ExtensionArray,
+-    ExtensionDtype,
+-    register_extension_dtype,
+-)
+-
+ import shapely
+ import shapely.affinity
+ import shapely.geometry
+-from shapely.geometry.base import BaseGeometry
+ import shapely.ops
+ import shapely.wkt
++from pandas.api.extensions import (
++    ExtensionArray,
++    ExtensionDtype,
++    register_extension_dtype,
++)
+ from pyproj import CRS, Transformer
+ from pyproj.aoi import AreaOfInterest
+ from pyproj.database import query_utm_crs_info
++from shapely.geometry.base import BaseGeometry
+ 
+ from .sindex import SpatialIndex
+ 
+@@ -638,6 +637,11 @@ class GeometryArray(ExtensionArray):
+             crs=self.crs,
+         )
+ 
++    def transform(self, transformation, include_z=False):
++        return GeometryArray(
++            shapely.transform(self._data, transformation, include_z), crs=self.crs
++        )
++
+     #
+     # Binary predicates
+     #
+diff --git a/geopandas/base.py b/geopandas/base.py
+index b80f9e6..a2de795 100644
+--- a/geopandas/base.py
++++ b/geopandas/base.py
+@@ -1,11 +1,11 @@
+-from warnings import warn
+ import warnings
++from warnings import warn
+ 
+ import numpy as np
+ import pandas as pd
+-from pandas import DataFrame, Series
+ import shapely
+-from shapely.geometry import box, MultiPoint
++from pandas import DataFrame, Series
++from shapely.geometry import MultiPoint, box
+ from shapely.geometry.base import BaseGeometry
+ 
+ from . import _compat as compat
+@@ -1298,6 +1298,46 @@ GeometryCollection
+         """
+         return _delegate_geo_method("segmentize", self, max_segment_length)
+ 
++    def transform(self, transformation, include_z=False):
++        """Returns a ``GeoSeries`` with the transformation function
++        applied to the geometry coordinates.
++
++        Parameters
++        ----------
++        transformation : Callable
++            A function that transforms a (N, 2) or (N, 3) ndarray of float64
++            to another (N,2) or (N, 3) ndarray of float64
++        include_z : bool, default False
++            If True include the third dimension in the coordinates array that
++            is passed to the ``transformation`` function. If a geometry has no third
++            dimension, the z-coordinates passed to the function will be NaN.
++
++        Returns
++        -------
++        GeoSeries
++
++        Examples
++        --------
++        >>> from shapely import Point, Polygon
++        >>> s = geopandas.GeoSeries([Point(0, 0)])
++        >>> s.transform(lambda x: x + 1)
++        0    POINT (1 1)
++        dtype: geometry
++
++        >>> s = geopandas.GeoSeries([Polygon([(0, 0), (1, 1), (0, 1)])])
++        >>> s.transform(lambda x: x * [2, 3])
++        0    POLYGON ((0 0, 2 3, 0 3, 0 0))
++        dtype: geometry
++
++        By default the third dimension is ignored and you need explicitly include it:
++
++        >>> s = geopandas.GeoSeries([Point(0, 0, 0)])
++        >>> s.transform(lambda x: x + 1, include_z=True)
++        0    POINT Z (1 1 1)
++        dtype: geometry
++        """
++        return _delegate_geo_method("transform", self, transformation, include_z)
++
+     #
+     # Reduction operations that return a Shapely geometry
+     #
+diff --git a/geopandas/geodataframe.py b/geopandas/geodataframe.py
+index ddee1f8..8f161b4 100644
+--- a/geopandas/geodataframe.py
++++ b/geopandas/geodataframe.py
+@@ -2327,7 +2327,7 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
+             geometries.
+         make_valid : bool, default True
+             If True, any invalid input geometries are corrected with a call to
+-            `buffer(0)`, if False, a `ValueError` is raised if any input geometries
++            make_valid(), if False, a `ValueError` is raised if any input geometries
+             are invalid.
+ 
+         Returns
+diff --git a/geopandas/tools/overlay.py b/geopandas/tools/overlay.py
+index bdc8e3c..6cb10b5 100644
+--- a/geopandas/tools/overlay.py
++++ b/geopandas/tools/overlay.py
+@@ -36,7 +36,7 @@ def _overlay_intersection(df1, df2):
+         right.reset_index(drop=True, inplace=True)
+         intersections = left.intersection(right)
+         poly_ix = intersections.geom_type.isin(["Polygon", "MultiPolygon"])
+-        intersections.loc[poly_ix] = intersections[poly_ix].buffer(0)
++        intersections.loc[poly_ix] = intersections[poly_ix].make_valid()
+ 
+         # only keep actual intersecting geometries
+         pairs_intersect = pd.DataFrame({"__idx1": idx1, "__idx2": idx2})
+@@ -166,7 +166,7 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
+         which will set keep_geom_type to True but warn upon dropping
+         geometries.
+     make_valid : bool, default True
+-        If True, any invalid input geometries are corrected with a call to `buffer(0)`,
++        If True, any invalid input geometries are corrected with a call to make_valid(),
+         if False, a `ValueError` is raised if any input geometries are invalid.
+ 
+     Returns
+@@ -296,7 +296,7 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
+             mask = ~df.geometry.is_valid
+             col = df._geometry_column_name
+             if make_valid:
+-                df.loc[mask, col] = df.loc[mask, col].buffer(0)
++                df.loc[mask, col] = df.loc[mask, col].make_valid()
+             elif mask.any():
+                 raise ValueError(
+                     "You have passed make_valid=False along with "

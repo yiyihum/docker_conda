@@ -1,0 +1,162 @@
+diff --git a/fs/base.py b/fs/base.py
+index 18f3ccd..fae7ce1 100644
+--- a/fs/base.py
++++ b/fs/base.py
+@@ -1633,7 +1633,7 @@ class FS(object):
+             fs.errors.UnsupportedHash: If the requested hash is not supported.
+ 
+         """
+-        _path = self.validatepath(path)
++        self.validatepath(path)
+         try:
+             hash_object = hashlib.new(name)
+         except ValueError:
+diff --git a/fs/osfs.py b/fs/osfs.py
+index 10f8713..8782551 100644
+--- a/fs/osfs.py
++++ b/fs/osfs.py
+@@ -39,7 +39,6 @@ except ImportError:
+         sendfile = None  # type: ignore  # pragma: no cover
+ 
+ from . import errors
+-from .errors import FileExists
+ from .base import FS
+ from .enums import ResourceType
+ from ._fscompat import fsencode, fsdecode, fspath
+@@ -49,6 +48,7 @@ from .permissions import Permissions
+ from .error_tools import convert_os_errors
+ from .mode import Mode, validate_open_mode
+ from .errors import FileExpected, NoURL
++from ._url_tools import url_quote
+ 
+ if False:  # typing.TYPE_CHECKING
+     from typing import (
+@@ -137,7 +137,8 @@ class OSFS(FS):
+                 )
+         else:
+             if not os.path.isdir(_root_path):
+-                raise errors.CreateFailed("root path does not exist")
++                message = "root path '{}' does not exist".format(_root_path)
++                raise errors.CreateFailed(message)
+ 
+         _meta = self._meta = {
+             "network": False,
+@@ -526,7 +527,6 @@ class OSFS(FS):
+             namespaces = namespaces or ()
+             _path = self.validatepath(path)
+             sys_path = self.getsyspath(_path)
+-            _sys_path = fsencode(sys_path)
+             with convert_os_errors("scandir", path, directory=True):
+                 for entry_name in os.listdir(sys_path):
+                     _entry_name = fsdecode(entry_name)
+@@ -584,9 +584,14 @@ class OSFS(FS):
+ 
+     def geturl(self, path, purpose="download"):
+         # type: (Text, Text) -> Text
+-        if purpose != "download":
++        sys_path = self.getsyspath(path)
++        if purpose == "download":
++            return "file://" + sys_path
++        elif purpose == "fs":
++            url_path = url_quote(sys_path)
++            return "osfs://" + url_path
++        else:
+             raise NoURL(path, purpose)
+-        return "file://" + self.getsyspath(path)
+ 
+     def gettype(self, path):
+         # type: (Text) -> ResourceType
+diff --git a/fs/tarfs.py b/fs/tarfs.py
+index ce2109c..250291a 100644
+--- a/fs/tarfs.py
++++ b/fs/tarfs.py
+@@ -4,7 +4,6 @@
+ from __future__ import print_function
+ from __future__ import unicode_literals
+ 
+-import copy
+ import os
+ import tarfile
+ import typing
+@@ -17,14 +16,14 @@ from . import errors
+ from .base import FS
+ from .compress import write_tar
+ from .enums import ResourceType
+-from .errors import IllegalBackReference
++from .errors import IllegalBackReference, NoURL
+ from .info import Info
+ from .iotools import RawWrapper
+ from .opener import open_fs
+-from .path import dirname, relpath, basename, isbase, normpath, parts, frombase
++from .path import relpath, basename, isbase, normpath, parts, frombase
+ from .wrapfs import WrapFS
+ from .permissions import Permissions
+-
++from ._url_tools import url_quote
+ 
+ if False:  # typing.TYPE_CHECKING
+     from tarfile import TarInfo
+@@ -461,16 +460,25 @@ class ReadTarFS(FS):
+     def close(self):
+         # type: () -> None
+         super(ReadTarFS, self).close()
+-        self._tar.close()
++        if hasattr(self, "_tar"):
++            self._tar.close()
+ 
+     def isclosed(self):
+         # type: () -> bool
+         return self._tar.closed  # type: ignore
+ 
++    def geturl(self, path, purpose="download"):
++        # type: (Text, Text) -> Text
++        if purpose == "fs" and isinstance(self._file, six.string_types):
++            quoted_file = url_quote(self._file)
++            quoted_path = url_quote(path)
++            return "tar://{}!/{}".format(quoted_file, quoted_path)
++        else:
++            raise NoURL(path, purpose)
++
+ 
+ if __name__ == "__main__":  # pragma: no cover
+     from fs.tree import render
+-    from fs.opener import open_fs
+ 
+     with TarFS("tests.tar") as tar_fs:
+         print(tar_fs.listdir("/"))
+diff --git a/fs/zipfs.py b/fs/zipfs.py
+index 1fdf463..c347731 100644
+--- a/fs/zipfs.py
++++ b/fs/zipfs.py
+@@ -22,6 +22,7 @@ from .opener import open_fs
+ from .path import dirname, forcedir, normpath, relpath
+ from .time import datetime_to_epoch
+ from .wrapfs import WrapFS
++from ._url_tools import url_quote
+ 
+ if False:  # typing.TYPE_CHECKING
+     from typing import (
+@@ -434,7 +435,8 @@ class ReadZipFS(FS):
+     def close(self):
+         # type: () -> None
+         super(ReadZipFS, self).close()
+-        self._zip.close()
++        if hasattr(self, "_zip"):
++            self._zip.close()
+ 
+     def readbytes(self, path):
+         # type: (Text) -> bytes
+@@ -444,3 +446,12 @@ class ReadZipFS(FS):
+         zip_name = self._path_to_zip_name(path)
+         zip_bytes = self._zip.read(zip_name)
+         return zip_bytes
++
++    def geturl(self, path, purpose="download"):
++        # type: (Text, Text) -> Text
++        if purpose == "fs" and isinstance(self._file, six.string_types):
++            quoted_file = url_quote(self._file)
++            quoted_path = url_quote(path)
++            return "zip://{}!/{}".format(quoted_file, quoted_path)
++        else:
++            raise errors.NoURL(path, purpose)
+

@@ -1,0 +1,84 @@
+diff --git a/README.md b/README.md
+index 2f30b57..6f72ed6 100644
+--- a/README.md
++++ b/README.md
+@@ -101,12 +101,12 @@ class Message:
+     foo: List[int32] = field(1, default_factory=list)
+ ```
+ 
++It's also possible to wrap a field type with [`typing.Optional`](https://docs.python.org/3/library/typing.html#typing.Optional). If `None` is assigned to an `Optional` field, then the field will be skipped during serialization.
++
+ ### Default values
+ 
+ In `pure-protobuf` it's developer's responsibility to take care of default values. If encoded message does not contain a particular element, the corresponding field stays unassigned. It means that the standard `default` and `default_factory` parameters of the `field` function work as usual.
+ 
+-It's allowed to wrap a field type with [`typing.Optional`](https://docs.python.org/3/library/typing.html#typing.Optional). It's discarded by `pure-protobuf` but allows you to hint a nullable field properly.
+-
+ ### Enumerations
+ 
+ Subclasses of the standard [`IntEnum`](https://docs.python.org/3/library/enum.html#intenum) class are supported:
+diff --git a/pure_protobuf/dataclasses_.py b/pure_protobuf/dataclasses_.py
+index b51e930..2ce4e96 100644
+--- a/pure_protobuf/dataclasses_.py
++++ b/pure_protobuf/dataclasses_.py
+@@ -124,7 +124,7 @@ def make_field(number: int, name: str, type_: Any) -> Tuple[int, Field]:
+     Figure out how to serialize and de-serialize the field.
+     Returns the field number and a corresponding ``Field`` instance.
+     """
+-    type_ = remove_optional(type_)
++    is_optional, type_ = get_optional(type_)
+     is_repeated, type_ = get_repeated(type_)
+ 
+     if isinstance(type_, type) and issubclass(type_, Message):
+@@ -144,7 +144,7 @@ def make_field(number: int, name: str, type_: Any) -> Tuple[int, Field]:
+ 
+     if not is_repeated:
+         # Non-repeated field.
+-        return number, NonRepeatedField(number, name, serializer)
++        return number, NonRepeatedField(number, name, serializer, is_optional)
+     elif serializer.wire_type != WireType.BYTES:
+         # Repeated fields of scalar numeric types are packed by default.
+         # See also: https://developers.google.com/protocol-buffers/docs/encoding#packed
+@@ -154,9 +154,9 @@ def make_field(number: int, name: str, type_: Any) -> Tuple[int, Field]:
+         return number, UnpackedRepeatedField(number, name, serializer)
+ 
+ 
+-def remove_optional(type_: Any) -> Any:
++def get_optional(type_: Any) -> Tuple[bool, Any]:
+     """
+-    Removes ``Optional`` type annotation if present.
++    Extracts ``Optional`` type annotation if present.
+     This may be useful if a user wants to annotate a field with ``Optional[...]`` and set default to ``None``.
+     """
+     if getattr(type_, '__origin__', None) is Union:
+@@ -166,9 +166,9 @@ def remove_optional(type_: Any) -> Any:
+         if len(args) == 2 and NoneType in args:
+             # Extract inner type.
+             type_, = args - {NoneType}
+-            return type_
++            return True, type_
+ 
+-    return type_
++    return False, type_
+ 
+ 
+ def get_repeated(type_: Any) -> Tuple[bool, Any]:
+diff --git a/pure_protobuf/fields.py b/pure_protobuf/fields.py
+index a4976b9..0a8b4fb 100644
+--- a/pure_protobuf/fields.py
++++ b/pure_protobuf/fields.py
+@@ -61,8 +61,13 @@ class NonRepeatedField(Field):
+     See also: https://developers.google.com/protocol-buffers/docs/encoding#optional
+     """
+ 
++    def __init__(self, number: int, name: str, serializer: Serializer, is_optional: bool):
++        super().__init__(number, name, serializer)
++        self.is_optional = is_optional
++
+     def validate(self, value: Any):
+-        self.serializer.validate(value)
++        if value is not None or not self.is_optional:
++            self.serializer.validate(value)
+ 
+     def dump(self, value: Any, io: IO):
+         if value is not None:

@@ -1,0 +1,261 @@
+diff --git a/dvc/api/__init__.py b/dvc/api/__init__.py
+--- a/dvc/api/__init__.py
++++ b/dvc/api/__init__.py
+@@ -2,11 +2,16 @@
+ 
+ from .data import open  # pylint: disable=redefined-builtin
+ from .data import get_url, read
+-from .experiments import exp_save, make_checkpoint
++from .experiments import exp_save, exp_show, make_checkpoint
++from .scm import all_branches, all_commits, all_tags
+ from .show import metrics_show, params_show
+ 
+ __all__ = [
++    "all_branches",
++    "all_commits",
++    "all_tags",
+     "exp_save",
++    "exp_show",
+     "get_url",
+     "make_checkpoint",
+     "open",
+diff --git a/dvc/api/experiments.py b/dvc/api/experiments.py
+--- a/dvc/api/experiments.py
++++ b/dvc/api/experiments.py
+@@ -1,10 +1,13 @@
+ import builtins
+ import os
+ from time import sleep
+-from typing import List, Optional
++from typing import Dict, List, Optional, Union
++
++from rich.text import Text
+ 
+ from dvc.env import DVC_CHECKPOINT, DVC_ROOT
+ from dvc.repo import Repo
++from dvc.repo.experiments.show import tabulate
+ from dvc.stage.monitor import CheckpointTask
+ 
+ 
+@@ -69,3 +72,86 @@ def exp_save(
+         return repo.experiments.save(
+             name=name, force=force, include_untracked=include_untracked
+         )
++
++
++def _postprocess(exp_rows):
++    for exp_row in exp_rows:
++        for k, v in exp_row.items():
++            if isinstance(v, Text):
++                v_str = str(v)
++                try:
++                    exp_row[k] = float(v_str)
++                except ValueError:
++                    exp_row[k] = v_str
++    return exp_rows
++
++
++def exp_show(
++    repo: Optional[str] = None,
++    revs: Optional[Union[str, List[str]]] = None,
++    num: int = 1,
++    hide_queued: bool = False,
++    hide_failed: bool = False,
++    sha: bool = False,
++    param_deps: bool = False,
++    force: bool = False,
++) -> List[Dict]:
++    """Get DVC experiments tracked in `repo`.
++
++    Without arguments, this function will retrieve all experiments derived from
++    the Git `HEAD`.
++
++    See the options below to customize the experiments retrieved.
++
++    Args:
++        repo (str, optional): location of the DVC repository.
++            Defaults to the current project (found by walking up from the
++            current working directory tree).
++            It can be a URL or a file system path.
++            Both HTTP and SSH protocols are supported for online Git repos
++            (e.g. [user@]server:project.git).
++        revs (Union[str, List[str]], optional): Git revision(s) (e.g. branch,
++            tag, SHA commit) to use as a reference point to start listing
++            experiments.
++            Defaults to `None`, which will use `HEAD` as starting point.
++        num (int, optional): show experiments from the last `num` commits
++            (first parents) starting from the `revs` baseline.
++            Give a negative value to include all first-parent commits (similar
++            to `git log -n`).
++            Defaults to 1.
++        hide_queued (bool, optional): hide experiments that are queued for
++            execution.
++            Defaults to `False`.
++        hide_failed (bool, optional): hide experiments that have failed.
++        sha (bool, optional): show the Git commit SHAs of the experiments
++            instead of branch, tag, or experiment names.
++            Defaults to `False`.
++        param_deps (bool, optional): include only parameters that are stage
++            dependencies.
++            Defaults to `False`.
++        force (bool, optional): force re-collection of experiments instead of
++            loading from internal experiments cache.
++            DVC caches `exp_show` data for completed experiments to improve
++            performance of subsequent calls.
++            When `force` is specified, DVC will reload all experiment data and
++            ignore any previously cached results.
++            Defaults to `False`.
++
++    Returns:
++        List[Dict]: Each item in the list will contain a dictionary with
++            the info for an individual experiment.
++            See Examples below.
++    """
++    with Repo.open(repo) as _repo:
++        experiments = _repo.experiments.show(
++            hide_queued=hide_queued,
++            hide_failed=hide_failed,
++            revs=revs,
++            num=num,
++            sha_only=sha,
++            param_deps=param_deps,
++            force=force,
++        )
++        td, _ = tabulate(experiments, fill_value=None)
++
++        return _postprocess(td.as_dict())
+diff --git a/dvc/api/scm.py b/dvc/api/scm.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/api/scm.py
+@@ -0,0 +1,54 @@
++from typing import List, Optional
++
++from dvc.repo import Repo
++
++
++def all_branches(repo: Optional[str] = None) -> List[str]:
++    """Get all Git branches in a DVC repository.
++
++    Args:
++        repo (str, optional): location of the DVC repository.
++            Defaults to the current project (found by walking up from the
++            current working directory tree).
++            It can be a URL or a file system path.
++            Both HTTP and SSH protocols are supported for online Git repos
++            (e.g. [user@]server:project.git).
++    Returns:
++        List[str]: Names of the Git branches.
++    """
++    with Repo.open(repo) as _repo:
++        return _repo.scm.list_branches()
++
++
++def all_commits(repo: Optional[str] = None) -> List[str]:
++    """Get all Git commits in a DVC repository.
++
++    Args:
++        repo (str, optional): location of the DVC repository.
++            Defaults to the current project (found by walking up from the
++            current working directory tree).
++            It can be a URL or a file system path.
++            Both HTTP and SSH protocols are supported for online Git repos
++            (e.g. [user@]server:project.git).
++    Returns:
++        List[str]: SHAs of the Git commits.
++    """
++    with Repo.open(repo) as _repo:
++        return _repo.scm.list_all_commits()
++
++
++def all_tags(repo: Optional[str] = None) -> List[str]:
++    """Get all Git tags in a DVC repository.
++
++    Args:
++        repo (str, optional): location of the DVC repository.
++            Defaults to the current project (found by walking up from the
++            current working directory tree).
++            It can be a URL or a file system path.
++            Both HTTP and SSH protocols are supported for online Git repos
++            (e.g. [user@]server:project.git).
++    Returns:
++        List[str]: Names of the Git tags.
++    """
++    with Repo.open(repo) as _repo:
++        return _repo.scm.list_tags()
+diff --git a/dvc/compare.py b/dvc/compare.py
+--- a/dvc/compare.py
++++ b/dvc/compare.py
+@@ -35,7 +35,7 @@ def with_value(value, default):
+ 
+ 
+ class TabularData(MutableSequence[Sequence["CellT"]]):
+-    def __init__(self, columns: Sequence[str], fill_value: str = ""):
++    def __init__(self, columns: Sequence[str], fill_value: Optional[str] = ""):
+         self._columns: Dict[str, Column] = {name: Column() for name in columns}
+         self._keys: List[str] = list(columns)
+         self._fill_value = fill_value
+diff --git a/dvc/repo/experiments/show.py b/dvc/repo/experiments/show.py
+--- a/dvc/repo/experiments/show.py
++++ b/dvc/repo/experiments/show.py
+@@ -62,7 +62,7 @@ def show(
+ 
+ def tabulate(
+     baseline_states: Iterable["ExpState"],
+-    fill_value: str = "-",
++    fill_value: Optional[str] = "-",
+     error_value: str = "!",
+     **kwargs,
+ ) -> Tuple["TabularData", Dict[str, Iterable[str]]]:
+@@ -124,7 +124,7 @@ def _build_rows(
+     baseline_states: Iterable["ExpState"],
+     *,
+     all_headers: Iterable[str],
+-    fill_value: str,
++    fill_value: Optional[str],
+     sort_by: Optional[str] = None,
+     sort_order: Optional[Literal["asc", "desc"]] = None,
+     **kwargs,
+@@ -234,7 +234,7 @@ def _exp_range_rows(
+     exp_range: "ExpRange",
+     *,
+     all_headers: Iterable[str],
+-    fill_value: str,
++    fill_value: Optional[str],
+     is_base: bool = False,
+     **kwargs,
+ ) -> Iterator[Tuple["CellT", ...]]:
+@@ -276,7 +276,7 @@ def _data_cells(
+     metrics_names: Mapping[str, Iterable[str]],
+     params_names: Mapping[str, Iterable[str]],
+     deps_names: Iterable[str],
+-    fill_value: str = "-",
++    fill_value: Optional[str] = "-",
+     error_value: str = "!",
+     precision: Optional[int] = None,
+     **kwargs,
+@@ -317,10 +317,10 @@ def _d_cells(
+ 
+ def format_time(
+     timestamp: Optional[datetime],
+-    fill_value: str = "-",
++    fill_value: Optional[str] = "-",
+     iso: bool = False,
+     **kwargs,
+-) -> str:
++) -> Optional[str]:
+     if not timestamp:
+         return fill_value
+     if iso:
+diff --git a/dvc/ui/table.py b/dvc/ui/table.py
+--- a/dvc/ui/table.py
++++ b/dvc/ui/table.py
+@@ -14,7 +14,7 @@
+ SHOW_MAX_WIDTH = 1024
+ 
+ 
+-CellT = Union[str, "RichText"]  # RichText is mostly compatible with str
++CellT = Union[str, "RichText", None]  # RichText is mostly compatible with str
+ Row = Sequence[CellT]
+ TableData = Sequence[Row]
+ Headers = Sequence[str]

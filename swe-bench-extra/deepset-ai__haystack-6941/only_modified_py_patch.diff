@@ -1,0 +1,123 @@
+diff --git a/haystack/components/extractors/named_entity_extractor.py b/haystack/components/extractors/named_entity_extractor.py
+index 6ca988fa..f8d8d717 100644
+--- a/haystack/components/extractors/named_entity_extractor.py
++++ b/haystack/components/extractors/named_entity_extractor.py
+@@ -126,6 +126,9 @@ class NamedEntityExtractor:
+             raise ComponentError(f"Unknown NER backend '{type(backend).__name__}' for extractor")
+ 
+     def warm_up(self):
++        """
++        Initialize the named entity extractor backend.
++        """
+         try:
+             self._backend.initialize()
+         except Exception as e:
+@@ -135,6 +138,16 @@ class NamedEntityExtractor:
+ 
+     @component.output_types(documents=List[Document])
+     def run(self, documents: List[Document], batch_size: int = 1) -> Dict[str, Any]:
++        """
++         Run the named-entity extractor.
++
++        :param documents:
++             Documents to process.
++        :param batch_size:
++             Batch size used for processing the documents.
++        :returns:
++             The processed documents.
++        """
+         texts = [doc.content if doc.content is not None else "" for doc in documents]
+         annotations = self._backend.annotate(texts, batch_size=batch_size)
+ 
+@@ -150,6 +163,9 @@ class NamedEntityExtractor:
+         return {"documents": documents}
+ 
+     def to_dict(self) -> Dict[str, Any]:
++        """
++        Serialize this component to a dictionary.
++        """
+         return default_to_dict(
+             self,
+             backend=self._backend.type,
+@@ -160,6 +176,12 @@ class NamedEntityExtractor:
+ 
+     @classmethod
+     def from_dict(cls, data: Dict[str, Any]) -> "NamedEntityExtractor":
++        """
++        Deserialize the component from a dictionary.
++
++        :param data:
++            The dictionary to deserialize from.
++        """
+         try:
+             init_params = data["init_parameters"]
+             init_params["device"] = ComponentDevice.from_dict(init_params["device"])
+diff --git a/haystack/core/component/component.py b/haystack/core/component/component.py
+index 95ae87d7..c231e41d 100644
+--- a/haystack/core/component/component.py
++++ b/haystack/core/component/component.py
+@@ -160,6 +160,21 @@ class ComponentMeta(type):
+         return instance
+ 
+ 
++def _component_repr(component: Component) -> str:
++    """
++    All Components override their __repr__ method with this one.
++    It prints the component name and the input/output sockets.
++    """
++    result = object.__repr__(component)
++    if pipeline := getattr(component, "__haystack_added_to_pipeline__"):
++        # This Component has been added in a Pipeline, let's get the name from there.
++        result += f"\n{pipeline.get_component_name(component)}"
++
++    # We're explicitly ignoring the type here because we're sure that the component
++    # has the __haystack_input__ and __haystack_output__ attributes at this point
++    return f"{result}\n{component.__haystack_input__}\n{component.__haystack_output__}"  # type: ignore[attr-defined]
++
++
+ class _Component:
+     """
+     See module's docstring.
+@@ -332,6 +347,9 @@ class _Component:
+         self.registry[class_path] = class_
+         logger.debug("Registered Component %s", class_)
+ 
++        # Override the __repr__ method with a default one
++        class_.__repr__ = _component_repr
++
+         return class_
+ 
+     def __call__(self, class_):
+diff --git a/haystack/core/component/sockets.py b/haystack/core/component/sockets.py
+index 25bf4fdc..374ae630 100644
+--- a/haystack/core/component/sockets.py
++++ b/haystack/core/component/sockets.py
+@@ -82,8 +82,9 @@ class Sockets:
+             return pipeline.get_component_name(self._component)
+ 
+         # This Component has not been added to a Pipeline yet, so we can't know its name.
+-        # Let's use the class name instead.
+-        return str(self._component)
++        # Let's use default __repr__. We don't call repr() directly as Components have a custom
++        # __repr__ method and that would lead to infinite recursion since we call Sockets.__repr__ in it.
++        return object.__repr__(self._component)
+ 
+     def __getattribute__(self, name):
+         try:
+@@ -96,12 +97,10 @@ class Sockets:
+         return object.__getattribute__(self, name)
+ 
+     def __repr__(self) -> str:
+-        result = self._component_name()
++        result = ""
+         if self._sockets_io_type == InputSocket:
+-            result += " inputs:\n"
++            result = "Inputs:\n"
+         elif self._sockets_io_type == OutputSocket:
+-            result += " outputs:\n"
++            result = "Outputs:\n"
+ 
+-        result += "\n".join([f"  - {n}: {_type_name(s.type)}" for n, s in self._sockets_dict.items()])
+-
+-        return result
++        return result + "\n".join([f"  - {n}: {_type_name(s.type)}" for n, s in self._sockets_dict.items()])

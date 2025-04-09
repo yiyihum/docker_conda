@@ -1,0 +1,123 @@
+diff --git a/src/fountain/_ast/visitor.py b/src/fountain/_ast/visitor.py
+index 12308b0..7859e02 100644
+--- a/src/fountain/_ast/visitor.py
++++ b/src/fountain/_ast/visitor.py
+@@ -1,4 +1,4 @@
+-from typing import Generic, TypeVar
++from typing import Any, Generic, TypeVar
+ 
+ from .nodes import Expr, Stmt
+ 
+@@ -12,11 +12,11 @@ class NodeVisitor(Generic[R]):
+         )
+         return method(node)
+ 
+-    def execute(self, node: Stmt) -> None:
++    def execute(self, node: Stmt) -> Any:
+         method = getattr(
+             self, f"execute_{node.__class__.__name__}", self.execute_default
+         )
+-        method(node)
++        return method(node)
+ 
+     def evaluate_default(self, expr: Expr) -> R:
+         raise NotImplementedError(f"Unexpected node: {expr}")  # pragma: no cover
+diff --git a/src/fountain/_cli.py b/src/fountain/_cli.py
+index 2f258fc..45778de 100644
+--- a/src/fountain/_cli.py
++++ b/src/fountain/_cli.py
+@@ -1,10 +1,11 @@
+ import argparse
+ import pathlib
+ import sys
++from typing import Any
+ 
+ from ._ast import parse, tokenize
+ from ._exceptions import EvalError, ParseError, TokenizeError
+-from ._interpreter import Interpreter
++from ._interpreter import Interpreter, stringify
+ 
+ 
+ def main() -> None:
+@@ -32,28 +33,27 @@ class CLI:
+         else:
+             return self._run_prompt()
+ 
++    def evaluate(self, source: str) -> Any:
++        tokens = tokenize(source)
++        statements = parse(tokens)
++        return self._interpreter.interpret(statements)
++
+     def run(self, source: str) -> int:
+         try:
+-            tokens = tokenize(source)
++            self.evaluate(source)
+         except TokenizeError as exc:
+             self._report(exc.message, lineno=exc.lineno)
+             return 65
+-
+-        try:
+-            statements = parse(tokens)
+         except ParseError as exc:
+             where = "at end" if exc.at_eof else f"at {exc.token.lexeme!r}"
+             self._report(exc.message, lineno=exc.token.lineno, where=where)
+             return 65
+-
+-        try:
+-            self._interpreter.interpret(statements)
+         except EvalError as exc:
+             where = f"at {exc.token.lexeme!r}"
+             self._report(exc.message, lineno=exc.token.lineno, where=where)
+             return 70
+-
+-        return 0
++        else:
++            return 0
+ 
+     def _run_file(self, path: str) -> int:
+         try:
+@@ -78,7 +78,9 @@ class CLI:
+             if not line:
+                 break
+ 
+-            _ = self.run(line)
++            value = self.evaluate(line)
++            if value is not None:
++                print(stringify(value))
+ 
+         return 0
+ 
+diff --git a/src/fountain/_interpreter.py b/src/fountain/_interpreter.py
+index 566e332..112f810 100644
+--- a/src/fountain/_interpreter.py
++++ b/src/fountain/_interpreter.py
+@@ -40,21 +40,23 @@ class Interpreter(NodeVisitor[Any]):
+             scope.assign(name, value)
+         self._scope = scope
+ 
+-    def interpret(self, statements: list[Stmt]) -> None:
++    def interpret(self, statements: list[Stmt]) -> Any:
++        value: Any = None
+         try:
+             for stmt in statements:
+-                self.execute(stmt)
++                value = self.execute(stmt)
+         except EvalError:
+             raise
++        else:
++            return value
+ 
+     def execute_Assign(self, stmt: Assign) -> None:
+         name = stmt.target.lexeme
+         value = self.evaluate(stmt.value)
+         self._scope.assign(name, value)
+ 
+-    def execute_Expression(self, stmt: Expression) -> None:
+-        value = self.evaluate(stmt.expression)
+-        print(stringify(value))
++    def execute_Expression(self, stmt: Expression) -> Any:
++        return self.evaluate(stmt.expression)
+ 
+     def execute_Print(self, stmt: Print) -> None:
+         value = self.evaluate(stmt.expression)
+

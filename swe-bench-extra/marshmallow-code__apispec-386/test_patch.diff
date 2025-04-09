@@ -1,0 +1,147 @@
+diff --git a/tests/test_ext_marshmallow.py b/tests/test_ext_marshmallow.py
+index f474b5f..ce1083d 100644
+--- a/tests/test_ext_marshmallow.py
++++ b/tests/test_ext_marshmallow.py
+@@ -102,7 +102,6 @@ class TestDefinitionHelper:
+ 
+     @pytest.mark.parametrize("schema", [AnalysisSchema, AnalysisSchema()])
+     def test_resolve_schema_dict_auto_reference_return_none(self, schema):
+-        # this resolver return None
+         def resolver(schema):
+             return None
+ 
+@@ -162,6 +161,27 @@ class TestDefinitionHelper:
+         assert "Pet" in definitions
+         assert "Pet1" in definitions
+ 
++    def test_resolve_nested_schema_many_true_resolver_return_none(self):
++        def resolver(schema):
++            return None
++
++        class PetFamilySchema(Schema):
++            pets_1 = Nested(PetSchema, many=True)
++            pets_2 = List(Nested(PetSchema))
++
++        spec = APISpec(
++            title="Test auto-reference",
++            version="0.1",
++            openapi_version="2.0",
++            plugins=(MarshmallowPlugin(schema_name_resolver=resolver),),
++        )
++
++        spec.components.schema("PetFamily", schema=PetFamilySchema)
++        props = get_schemas(spec)["PetFamily"]["properties"]
++        pets_1 = props["pets_1"]
++        pets_2 = props["pets_2"]
++        assert pets_1["type"] == pets_2["type"] == "array"
++
+ 
+ class TestComponentParameterHelper:
+     @pytest.mark.parametrize("schema", [PetSchema, PetSchema()])
+@@ -250,7 +270,8 @@ class TestCustomField:
+ 
+ class TestOperationHelper:
+     @pytest.mark.parametrize(
+-        "pet_schema", (PetSchema, PetSchema(), "tests.schemas.PetSchema")
++        "pet_schema",
++        (PetSchema, PetSchema(), PetSchema(many=True), "tests.schemas.PetSchema"),
+     )
+     @pytest.mark.parametrize("spec_fixture", ("2.0",), indirect=True)
+     def test_schema_v2(self, spec_fixture, pet_schema):
+@@ -268,7 +289,11 @@ class TestOperationHelper:
+             },
+         )
+         get = get_paths(spec_fixture.spec)["/pet"]["get"]
+-        reference = get["responses"][200]["schema"]
++        if isinstance(pet_schema, Schema) and pet_schema.many is True:
++            assert get["responses"][200]["schema"]["type"] == "array"
++            reference = get["responses"][200]["schema"]["items"]
++        else:
++            reference = get["responses"][200]["schema"]
+         assert reference == {"$ref": ref_path(spec_fixture.spec) + "Pet"}
+         assert len(spec_fixture.spec.components._schemas) == 1
+         resolved_schema = spec_fixture.spec.components._schemas["Pet"]
+@@ -276,7 +301,8 @@ class TestOperationHelper:
+         assert get["responses"][200]["description"] == "successful operation"
+ 
+     @pytest.mark.parametrize(
+-        "pet_schema", (PetSchema, PetSchema(), "tests.schemas.PetSchema")
++        "pet_schema",
++        (PetSchema, PetSchema(), PetSchema(many=True), "tests.schemas.PetSchema"),
+     )
+     @pytest.mark.parametrize("spec_fixture", ("3.0.0",), indirect=True)
+     def test_schema_v3(self, spec_fixture, pet_schema):
+@@ -294,7 +320,16 @@ class TestOperationHelper:
+             },
+         )
+         get = get_paths(spec_fixture.spec)["/pet"]["get"]
+-        reference = get["responses"][200]["content"]["application/json"]["schema"]
++        if isinstance(pet_schema, Schema) and pet_schema.many is True:
++            assert (
++                get["responses"][200]["content"]["application/json"]["schema"]["type"]
++                == "array"
++            )
++            reference = get["responses"][200]["content"]["application/json"]["schema"][
++                "items"
++            ]
++        else:
++            reference = get["responses"][200]["content"]["application/json"]["schema"]
+ 
+         assert reference == {"$ref": ref_path(spec_fixture.spec) + "Pet"}
+         assert len(spec_fixture.spec.components._schemas) == 1
+diff --git a/tests/test_openapi.py b/tests/test_openapi.py
+index 41b2298..3a64ef3 100644
+--- a/tests/test_openapi.py
++++ b/tests/test_openapi.py
+@@ -413,25 +413,16 @@ class TestMarshmallowSchemaToModelDefinition:
+         res = openapi.fields2jsonschema(fields_dict)
+         assert res["required"] == ["id"]
+ 
+-    def test_schema_instance_inspection(self, openapi):
++    @pytest.mark.parametrize("many", (True, False))
++    def test_schema_instance_inspection(self, openapi, many):
+         class UserSchema(Schema):
+             _id = fields.Int()
+ 
+-        res = openapi.schema2jsonschema(UserSchema())
++        res = openapi.schema2jsonschema(UserSchema(many=many))
+         assert res["type"] == "object"
+         props = res["properties"]
+         assert "_id" in props
+ 
+-    def test_schema_instance_inspection_with_many(self, openapi):
+-        class UserSchema(Schema):
+-            _id = fields.Int()
+-
+-        res = openapi.schema2jsonschema(UserSchema(many=True))
+-        assert res["type"] == "array"
+-        assert "items" in res
+-        props = res["items"]["properties"]
+-        assert "_id" in props
+-
+     def test_raises_error_if_no_declared_fields(self, openapi):
+         class NotASchema(object):
+             pass
+@@ -654,7 +645,7 @@ class TestNesting:
+     def test_schema2jsonschema_with_nested_fields_with_adhoc_changes(
+         self, spec_fixture
+     ):
+-        category_schema = CategorySchema(many=True)
++        category_schema = CategorySchema()
+         category_schema.fields["id"].required = True
+ 
+         class PetSchema(Schema):
+@@ -667,10 +658,10 @@ class TestNesting:
+         assert props["Category"] == spec_fixture.openapi.schema2jsonschema(
+             category_schema
+         )
+-        assert set(props["Category"]["items"]["required"]) == {"id", "name"}
++        assert set(props["Category"]["required"]) == {"id", "name"}
+ 
+-        props["Category"]["items"]["required"] = ["name"]
+-        assert props["Category"]["items"] == spec_fixture.openapi.schema2jsonschema(
++        props["Category"]["required"] = ["name"]
++        assert props["Category"] == spec_fixture.openapi.schema2jsonschema(
+             CategorySchema
+         )
+ 

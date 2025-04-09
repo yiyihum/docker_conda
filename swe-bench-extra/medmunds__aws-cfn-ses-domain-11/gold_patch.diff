@@ -1,0 +1,95 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f6726bc..dda2185 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -21,6 +21,11 @@
+ * Support using the [`Region`](README.md#region) property to provision an Amazon SES 
+   domain in a different region from where you're running your CloudFormation stack.
+   (Thanks to @gfodor.)
++  
++* Fix incorrect handling of `EnableSend: false` and other potential problems with
++  Boolean properties, by working around CloudFormation's non-standard YAML parsing. 
++  (Thanks to @aajtodd.)
++
+ 
+ ### Features
+ 
+diff --git a/aws_cfn_ses_domain/ses_domain_identity.py b/aws_cfn_ses_domain/ses_domain_identity.py
+index d57d77f..623558e 100644
+--- a/aws_cfn_ses_domain/ses_domain_identity.py
++++ b/aws_cfn_ses_domain/ses_domain_identity.py
+@@ -8,8 +8,7 @@ import boto3
+ from botocore.exceptions import BotoCoreError, ClientError
+ 
+ from .cfnresponse import FAILED, SUCCESS, send
+-from .utils import format_arn
+-
++from .utils import format_arn, to_bool
+ 
+ logger = logging.getLogger()
+ logger.setLevel(os.getenv("LOG_LEVEL", "WARNING"))
+@@ -24,6 +23,7 @@ DEFAULT_PROPERTIES = {
+     "TTL": "1800",
+     "Region": os.getenv("AWS_REGION"),  # where the stack (lambda fn) is running
+ }
++BOOLEAN_PROPERTIES = ("EnableSend", "EnableReceive")
+ 
+ 
+ def handle_domain_identity_request(event, context):
+@@ -52,6 +52,17 @@ def handle_domain_identity_request(event, context):
+         resource_type="identity", resource_name=domain,
+         defaults_from=event["StackId"])  # current stack's ARN has account and partition
+ 
++    for prop in BOOLEAN_PROPERTIES:
++        # CloudFormation may convert YAML/JSON bools to strings, so reverse that
++        # https://github.com/medmunds/aws-cfn-ses-domain/issues/10
++        try:
++            properties[prop] = to_bool(properties[prop])
++        except ValueError:
++            return send(event, context, FAILED,
++                        reason=f"The '{prop}' property must be 'true' or 'false',"
++                               f" not '{properties[prop]}'.",
++                        physical_resource_id=domain_arn)
++
+     if event["RequestType"] == "Delete" and event["PhysicalResourceId"] == domain:
+         # v0.3 backwards compatibility:
+         # Earlier versions used just the domain as the PhysicalResourceId.
+diff --git a/aws_cfn_ses_domain/utils.py b/aws_cfn_ses_domain/utils.py
+index a4787eb..a4937ee 100644
+--- a/aws_cfn_ses_domain/utils.py
++++ b/aws_cfn_ses_domain/utils.py
+@@ -25,3 +25,34 @@ def format_arn(partition=None, service=None, region=None, account=None,
+         resource = resource if resource is not None else _resource
+ 
+     return f"arn:{partition}:{service}:{region}:{account}:{resource}"
++
++
++def to_bool(val):
++    """Convert val to True or False.
++
++    Converts 'true' (case-insensitive) and 1, '1', or True to True.
++    Converts 'false', 'null' or 'none' (case-insensitive), the empty string '',
++    and 0, '0', or False to False.
++    Raises a ValueError for any other input.
++
++    >>> to_bool('true')
++    True
++    >>> to_bool('False')
++    False
++    >>> to_bool(0)
++    False
++    >>> to_bool('0')
++    False
++    >>> to_bool(None)
++    False
++    >>> to_bool('yes')
++    ValueError("Invalid boolean value 'yes'")
++    """
++    # (Loosely adapted from distutils.util.strtobool)
++    strval = str(val).lower()
++    if strval in ('true', '1'):
++        return True
++    elif strval in ('false', '0', 'null', 'none', ''):
++        return False
++    else:
++        raise ValueError(f"Invalid boolean value {val!r}")

@@ -1,0 +1,315 @@
+diff --git a/linkml/generators/jsonschemagen.py b/linkml/generators/jsonschemagen.py
+index 3d21a670..4d6158f3 100644
+--- a/linkml/generators/jsonschemagen.py
++++ b/linkml/generators/jsonschemagen.py
+@@ -371,11 +371,34 @@ class JsonSchemaGenerator(Generator):
+                 if slot_is_inlined:
+                     # If inline we have to include redefined slots
+                     if slot.multivalued:
+-                        range_id_slot = self.schemaview.get_identifier_slot(slot.range, use_key=True)
++                        range_id_slot, range_simple_dict_value_slot, range_required_slots = self._get_range_associated_slots(slot)
++                        # if the range class has an ID and the slot is not inlined as a list, then we need to consider
++                        # various inlined as dict formats
+                         if range_id_slot is not None and not slot.inlined_as_list:
++                            # At a minimum, the inlined dict can have keys (additionalProps) that are IDs
++                            # and the values are the range class but possibly omitting the ID.
++                            additionalProps = [JsonSchema.ref_for(reference, identifier_optional=True)]
++
++                            # If the range can be collected as a simple dict, then we can also accept the value
++                            # of that simple dict directly.
++                            if range_simple_dict_value_slot is not None:
++                                additionalProps.append(self.get_subschema_for_slot(range_simple_dict_value_slot))
++
++                            # If the range has no required slots, then null is acceptable
++                            if len(range_required_slots) == 0:
++                                additionalProps.append(JsonSchema({"type": "null"}))
++
++                            # If through the above logic we identified multiple acceptable forms, then wrap them
++                            # in an "anyOf", otherwise just take the only acceptable form
++                            if len(additionalProps) == 1:
++                                additionalProps = additionalProps[0]
++                            else:
++                                additionalProps = JsonSchema({
++                                    "anyOf": additionalProps
++                                })
+                             prop = JsonSchema({
+                                 "type": "object",
+-                                "additionalProperties": JsonSchema.ref_for(reference, identifier_optional=True)
++                                "additionalProperties": additionalProps
+                             })
+                             self.top_level_schema.add_lax_def(reference, self.aliased_slot_name(range_id_slot))
+                         else:
+@@ -453,6 +476,26 @@ class JsonSchemaGenerator(Generator):
+             self.handle_class(class_definition)
+ 
+         return self.top_level_schema.to_json(sort_keys=True, indent=self.indent if self.indent > 0 else None)
++    
++    def _get_range_associated_slots(self, slot: SlotDefinition) -> Tuple[Union[SlotDefinition, None], Union[SlotDefinition, None], Union[List[SlotDefinition], None]]:
++        range_class = self.schemaview.get_class(slot.range)
++        if range_class is None:
++            return None, None, None
++        
++        range_class_id_slot = self.schemaview.get_identifier_slot(range_class.name, use_key=True)
++        if range_class_id_slot is None:
++            return None, None, None
++        
++        non_id_slots = [
++            s for s in self.schemaview.class_induced_slots(range_class.name) if s.name != range_class_id_slot.name
++        ]
++        non_id_required_slots = [s for s in non_id_slots if s.required]
++
++        range_simple_dict_value_slot = None
++        if len(non_id_slots) == 1:
++            range_simple_dict_value_slot = non_id_slots[0]
++        
++        return range_class_id_slot, range_simple_dict_value_slot, non_id_required_slots
+ 
+ 
+ @shared_arguments(JsonSchemaGenerator)
+diff --git a/linkml/linter/cli.py b/linkml/linter/cli.py
+index 7f5b9fbd..6bdaf3f3 100644
+--- a/linkml/linter/cli.py
++++ b/linkml/linter/cli.py
+@@ -53,6 +53,18 @@ def get_yaml_files(root: Path) -> Iterable[str]:
+     help="Report format.",
+     show_default=True,
+ )
++@click.option(
++    "--validate",
++    is_flag=True,
++    default=False,
++    help="Validate the schema against the LinkML Metamodel before linting.",
++)
++@click.option(
++    "--validate-only",
++    is_flag=True,
++    default=False,
++    help="Validate the schema against the LinkML Metamodel and then exit without checking linter rules.",
++)
+ @click.option("-v", "--verbose", is_flag=True)
+ @click.option(
+     "-o", "--output", type=click.File("w"), default="-", help="Report file name."
+@@ -77,10 +89,12 @@ def main(
+     fix: bool,
+     config: str,
+     format: str,
++    validate: bool,
++    validate_only: bool,
+     output,
+     ignore_warnings: bool,
+     max_warnings: int,
+-    verbose: bool
++    verbose: bool,
+ ):
+     """Run linter on SCHEMA.
+ 
+@@ -117,7 +131,9 @@ def main(
+     formatter.start_report()
+     for path in get_yaml_files(schema):
+         formatter.start_schema(path)
+-        report = linter.lint(path, fix=fix)
++        report = linter.lint(
++            path, fix=fix, validate_schema=validate, validate_only=validate_only
++        )
+         for problem in report:
+             if str(problem.level) is RuleLevel.error.text:
+                 error_count += 1
+diff --git a/linkml/linter/formatters/terminal_formatter.py b/linkml/linter/formatters/terminal_formatter.py
+index 1c284c9f..a4833209 100644
+--- a/linkml/linter/formatters/terminal_formatter.py
++++ b/linkml/linter/formatters/terminal_formatter.py
+@@ -60,3 +60,5 @@ class TerminalFormatter(Formatter):
+                 + " "
+                 + plural("schema", problem_schemas)
+             )
++        else:
++            self.write(click.style("\u2713", fg="green") + " No problems found")
+diff --git a/linkml/linter/linter.py b/linkml/linter/linter.py
+index c4eb92e5..f4d3c8b5 100644
+--- a/linkml/linter/linter.py
++++ b/linkml/linter/linter.py
+@@ -1,15 +1,21 @@
+ import inspect
++import json
+ from copy import deepcopy
+ from dataclasses import dataclass
+ from functools import lru_cache
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, Union
+ 
++import jsonschema
+ import yaml
++from jsonschema.exceptions import best_match
+ from linkml_runtime import SchemaView
+ from linkml_runtime.dumpers import yaml_dumper
+ from linkml_runtime.linkml_model import SchemaDefinition
+ 
++from linkml.generators.jsonschemagen import JsonSchemaGenerator
++
++from .. import LOCAL_METAMODEL_YAML_FILE
+ from .config.datamodel.config import Config, ExtendableConfigs, RuleLevel
+ 
+ 
+@@ -29,6 +35,14 @@ def get_named_config(name: str) -> Dict[str, Any]:
+         return yaml.safe_load(config_file)
+ 
+ 
++@lru_cache
++def get_metamodel_validator() -> jsonschema.Validator:
++    meta_json_gen = JsonSchemaGenerator(LOCAL_METAMODEL_YAML_FILE, not_closed=False)
++    meta_json_schema = json.loads(meta_json_gen.serialize())
++    validator = jsonschema.Draft7Validator(meta_json_schema)
++    return validator
++
++
+ def merge_configs(original: dict, other: dict):
+     result = deepcopy(original)
+     for key, value in other.items():
+@@ -39,6 +53,18 @@ def merge_configs(original: dict, other: dict):
+     return result
+ 
+ 
++def _format_path_component(value):
++    if isinstance(value, int):
++        return f"[{value}]"
++    return value
++
++
++def _format_path(path):
++    if not path:
++        return "<root>"
++    return " > ".join(_format_path_component(p) for p in path)
++
++
+ class Linter:
+     def __init__(self, config: Dict[str, Any] = {}) -> None:
+         default_config = deepcopy(get_named_config("default"))
+@@ -61,17 +87,45 @@ class Linter:
+             ]
+         )
+ 
++    def validate_schema(self, schema_path: str):
++        with open(schema_path) as schema_file:
++            schema = yaml.safe_load(schema_file)
++
++        validator = get_metamodel_validator()
++        for err in validator.iter_errors(schema):
++            best_err = best_match([err])
++            message = f"In {_format_path(best_err.absolute_path)}: {best_err.message}"
++            if best_err.context:
++                message += f" ({', '.join(e.message for e in best_err.context)})"
++            yield LinterProblem(
++                rule_name="valid-schema",
++                message=message,
++                level=RuleLevel(RuleLevel.error),
++                schema_source=schema,
++            )
++
+     def lint(
+-        self, schema=Union[str, SchemaDefinition], fix: bool = False
++        self,
++        schema: Union[str, SchemaDefinition],
++        fix: bool = False,
++        validate_schema: bool = False,
++        validate_only: bool = False,
+     ) -> Iterable[LinterProblem]:
++        if (validate_schema or validate_only) and isinstance(schema, str):
++            yield from self.validate_schema(schema)
++
++        if validate_only:
++            return
++
+         try:
+             schema_view = SchemaView(schema)
+         except:
+-            yield LinterProblem(
+-                message="File is not a valid LinkML schema",
+-                level=RuleLevel(RuleLevel.error),
+-                schema_source=(schema if isinstance(schema, str) else None),
+-            )
++            if not validate_schema:
++                yield LinterProblem(
++                    message="File is not a valid LinkML schema. Use --validate for more details.",
++                    level=RuleLevel(RuleLevel.error),
++                    schema_source=(schema if isinstance(schema, str) else None),
++                )
+             return
+ 
+         for rule_id, rule_config in self.config.rules.__dict__.items():
+diff --git a/linkml/linter/rules.py b/linkml/linter/rules.py
+index 9deef5d4..89f17b80 100644
+--- a/linkml/linter/rules.py
++++ b/linkml/linter/rules.py
+@@ -18,7 +18,6 @@ from .linter import LinterProblem
+ 
+ 
+ class LinterRule(ABC):
+-
+     PATTERNS = {
+         "snake": re.compile(r"[a-z][_a-z0-9]+"),
+         "uppersnake": re.compile(r"[A-Z][_A-Z0-9]+"),
+@@ -52,7 +51,6 @@ class LinterRule(ABC):
+ 
+ 
+ class NoEmptyTitleRule(LinterRule):
+-
+     id = "no_empty_title"
+ 
+     def check(
+@@ -71,7 +69,6 @@ class NoEmptyTitleRule(LinterRule):
+ 
+ 
+ class NoXsdIntTypeRule(LinterRule):
+-
+     id = "no_xsd_int_type"
+ 
+     def check(self, schema_view: SchemaView, fix: bool = False):
+@@ -86,7 +83,6 @@ class NoXsdIntTypeRule(LinterRule):
+ 
+ 
+ class PermissibleValuesFormatRule(LinterRule):
+-
+     id = "permissible_values_format"
+ 
+     def check(
+@@ -114,7 +110,6 @@ def _get_recommended_metamodel_slots() -> List[str]:
+ 
+ 
+ class RecommendedRule(LinterRule):
+-
+     id = "recommended"
+ 
+     def __init__(self, config: RecommendedRuleConfig) -> None:
+@@ -138,7 +133,6 @@ class RecommendedRule(LinterRule):
+ 
+ 
+ class TreeRootClassRule(LinterRule):
+-
+     id = "tree_root_class"
+ 
+     def __init__(self, config: TreeRootClassRuleConfig) -> None:
+@@ -224,7 +218,6 @@ class TreeRootClassRule(LinterRule):
+ 
+ 
+ class NoInvalidSlotUsageRule(LinterRule):
+-
+     id = "no_invalid_slot_usage"
+ 
+     def check(
+@@ -245,7 +238,6 @@ class NoInvalidSlotUsageRule(LinterRule):
+ 
+ 
+ class StandardNamingRule(LinterRule):
+-
+     id = "standard_naming"
+ 
+     def __init__(self, config: StandardNamingConfig) -> None:
+@@ -283,7 +275,6 @@ class StandardNamingRule(LinterRule):
+ 
+ 
+ class CanonicalPrefixesRule(LinterRule):
+-
+     id = "canonical_prefixes"
+ 
+     def __init__(self, config: CanonicalPrefixesConfig) -> None:
+

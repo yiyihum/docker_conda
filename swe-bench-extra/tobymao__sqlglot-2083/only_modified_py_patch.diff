@@ -1,0 +1,123 @@
+diff --git a/sqlglot/dialects/clickhouse.py b/sqlglot/dialects/clickhouse.py
+index efe3c6e8..23b63fe4 100644
+--- a/sqlglot/dialects/clickhouse.py
++++ b/sqlglot/dialects/clickhouse.py
+@@ -294,8 +294,20 @@ class ClickHouse(Dialect):
+         STRUCT_DELIMITER = ("(", ")")
+         NVL2_SUPPORTED = False
+ 
++        STRING_TYPE_MAPPING = {
++            exp.DataType.Type.CHAR: "String",
++            exp.DataType.Type.LONGBLOB: "String",
++            exp.DataType.Type.LONGTEXT: "String",
++            exp.DataType.Type.MEDIUMBLOB: "String",
++            exp.DataType.Type.MEDIUMTEXT: "String",
++            exp.DataType.Type.TEXT: "String",
++            exp.DataType.Type.VARBINARY: "String",
++            exp.DataType.Type.VARCHAR: "String",
++        }
++
+         TYPE_MAPPING = {
+             **generator.Generator.TYPE_MAPPING,
++            **STRING_TYPE_MAPPING,
+             exp.DataType.Type.ARRAY: "Array",
+             exp.DataType.Type.BIGINT: "Int64",
+             exp.DataType.Type.DATETIME64: "DateTime64",
+@@ -365,6 +377,16 @@ class ClickHouse(Dialect):
+             "NAMED COLLECTION",
+         }
+ 
++        def datatype_sql(self, expression: exp.DataType) -> str:
++            # String is the standard ClickHouse type, every other variant is just an alias.
++            # Additionally, any supplied length parameter will be ignored.
++            #
++            # https://clickhouse.com/docs/en/sql-reference/data-types/string
++            if expression.this in self.STRING_TYPE_MAPPING:
++                return "String"
++
++            return super().datatype_sql(expression)
++
+         def safeconcat_sql(self, expression: exp.SafeConcat) -> str:
+             # Clickhouse errors out if we try to cast a NULL value to TEXT
+             expression = expression.copy()
+diff --git a/sqlglot/dialects/duckdb.py b/sqlglot/dialects/duckdb.py
+index dea7f26a..eb891a16 100644
+--- a/sqlglot/dialects/duckdb.py
++++ b/sqlglot/dialects/duckdb.py
+@@ -207,6 +207,9 @@ class DuckDB(Dialect):
+ 
+             return this
+ 
++        def _parse_struct_types(self) -> t.Optional[exp.Expression]:
++            return self._parse_field_def()
++
+         def _pivot_column_names(self, aggregations: t.List[exp.Expression]) -> t.List[str]:
+             if len(aggregations) == 1:
+                 return super()._pivot_column_names(aggregations)
+diff --git a/sqlglot/dialects/oracle.py b/sqlglot/dialects/oracle.py
+index eb3a1580..c43c020d 100644
+--- a/sqlglot/dialects/oracle.py
++++ b/sqlglot/dialects/oracle.py
+@@ -22,7 +22,7 @@ def _parse_xml_table(self: parser.Parser) -> exp.XMLTable:
+     by_ref = self._match_text_seq("RETURNING", "SEQUENCE", "BY", "REF")
+ 
+     if self._match_text_seq("COLUMNS"):
+-        columns = self._parse_csv(lambda: self._parse_column_def(self._parse_field(any_token=True)))
++        columns = self._parse_csv(self._parse_field_def)
+ 
+     return self.expression(exp.XMLTable, this=this, passing=passing, columns=columns, by_ref=by_ref)
+ 
+diff --git a/sqlglot/dialects/tsql.py b/sqlglot/dialects/tsql.py
+index 1f5c351b..1470455c 100644
+--- a/sqlglot/dialects/tsql.py
++++ b/sqlglot/dialects/tsql.py
+@@ -666,6 +666,16 @@ class TSQL(Dialect):
+ 
+             return sql
+ 
++        def create_sql(self, expression: exp.Create) -> str:
++            kind = self.sql(expression, "kind").upper()
++            exists = expression.args.get("exists")
++
++            if exists and kind == "SCHEMA":
++                schema_name = self.sql(expression, "this")
++                return f"IF NOT EXISTS (SELECT * FROM information_schema.schemata WHERE SCHEMA_NAME = {schema_name}) EXEC('CREATE SCHEMA {schema_name}')"
++
++            return super().create_sql(expression)
++
+         def offset_sql(self, expression: exp.Offset) -> str:
+             return f"{super().offset_sql(expression)} ROWS"
+ 
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 24f12cba..c1d86954 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -3489,14 +3489,14 @@ class Parser(metaclass=_Parser):
+         if not self._match(TokenType.L_PAREN):
+             return this
+ 
+-        args = self._parse_csv(
+-            lambda: self._parse_constraint()
+-            or self._parse_column_def(self._parse_field(any_token=True))
+-        )
++        args = self._parse_csv(lambda: self._parse_constraint() or self._parse_field_def())
+ 
+         self._match_r_paren()
+         return self.expression(exp.Schema, this=this, expressions=args)
+ 
++    def _parse_field_def(self) -> t.Optional[exp.Expression]:
++        return self._parse_column_def(self._parse_field(any_token=True))
++
+     def _parse_column_def(self, this: t.Optional[exp.Expression]) -> t.Optional[exp.Expression]:
+         # column defs are not really columns, they're identifiers
+         if isinstance(this, exp.Column):
+@@ -4506,7 +4506,7 @@ class Parser(metaclass=_Parser):
+ 
+         self._match(TokenType.COLUMN)
+         exists_column = self._parse_exists(not_=True)
+-        expression = self._parse_column_def(self._parse_field(any_token=True))
++        expression = self._parse_field_def()
+ 
+         if expression:
+             expression.set("exists", exists_column)
+

@@ -1,0 +1,134 @@
+diff --git a/reframe/core/builtins.py b/reframe/core/builtins.py
+index 8d4eb599..6f32c3a7 100644
+--- a/reframe/core/builtins.py
++++ b/reframe/core/builtins.py
+@@ -37,7 +37,7 @@ def final(fn):
+ 
+ # Hook-related builtins
+ 
+-def run_before(stage):
++def run_before(stage, *, always_last=False):
+     '''Attach the decorated function before a certain pipeline stage.
+ 
+     The function will run just before the specified pipeline stage and it
+@@ -47,14 +47,25 @@ def run_before(stage):
+ 
+     :param stage: The pipeline stage where this function will be attached to.
+         See :ref:`pipeline-hooks` for the list of valid stage values.
++
++    :param always_last: Run this hook always as the last one of the stage. In
++        a whole test hierarchy, only a single hook can be explicitly pinned at
++        the end of the same-stage sequence of hooks. If another hook is
++        declared as ``always_last`` in the same stage, an error will be
++        issued.
++
++    .. versionchanged:: 4.4
++       The ``always_last`` argument was added.
++
+     '''
+-    return hooks.attach_to('pre_' + stage)
++
++    return hooks.attach_to('pre_' + stage, always_last)
+ 
+ 
+-def run_after(stage):
++def run_after(stage, *, always_last=False):
+     '''Attach the decorated function after a certain pipeline stage.
+ 
+-    This is analogous to :func:`~RegressionMixin.run_before`, except that the
++    This is analogous to :func:`run_before`, except that the
+     hook will execute right after the stage it was attached to. This decorator
+     also supports ``'init'`` as a valid ``stage`` argument, where in this
+     case, the hook will execute right after the test is initialized (i.e.
+@@ -81,7 +92,7 @@ def run_after(stage):
+        Add support for post-init hooks.
+ 
+     '''
+-    return hooks.attach_to('post_' + stage)
++    return hooks.attach_to('post_' + stage, always_last)
+ 
+ 
+ require_deps = hooks.require_deps
+diff --git a/reframe/core/hooks.py b/reframe/core/hooks.py
+index 4fde8932..74fab55a 100644
+--- a/reframe/core/hooks.py
++++ b/reframe/core/hooks.py
+@@ -9,16 +9,16 @@ import inspect
+ import reframe.utility as util
+ 
+ 
+-def attach_to(phase):
++def attach_to(phase, always_last):
+     '''Backend function to attach a hook to a given phase.
+ 
+     :meta private:
+     '''
+     def deco(func):
+         if hasattr(func, '_rfm_attach'):
+-            func._rfm_attach.append(phase)
++            func._rfm_attach.append((phase, always_last))
+         else:
+-            func._rfm_attach = [phase]
++            func._rfm_attach = [(phase, always_last)]
+ 
+         try:
+             # no need to resolve dependencies independently; this function is
+@@ -124,6 +124,7 @@ class Hook:
+     @property
+     def stages(self):
+         return self._rfm_attach
++        # return [stage for stage, _ in self._rfm_attach]
+ 
+     def __getattr__(self, attr):
+         return getattr(self.__fn, attr)
+@@ -179,7 +180,7 @@ class HookRegistry:
+             self.__hooks.discard(h)
+             self.__hooks.add(h)
+         elif hasattr(v, '_rfm_resolve_deps'):
+-            v._rfm_attach = ['post_setup']
++            v._rfm_attach = [('post_setup', None)]
+             self.__hooks.add(Hook(v))
+ 
+     def update(self, other, *, denied_hooks=None):
+diff --git a/reframe/core/pipeline.py b/reframe/core/pipeline.py
+index ee72e4a0..ac08e2fc 100644
+--- a/reframe/core/pipeline.py
++++ b/reframe/core/pipeline.py
+@@ -179,12 +179,32 @@ class RegressionTest(RegressionMixin, jsonext.JSONSerializable):
+     @classmethod
+     def pipeline_hooks(cls):
+         ret = {}
++        last = {}
+         for hook in cls._rfm_hook_registry:
+-            for stage in hook.stages:
+-                try:
+-                    ret[stage].append(hook.fn)
+-                except KeyError:
+-                    ret[stage] = [hook.fn]
++            for stage, always_last in hook.stages:
++                if always_last:
++                    if stage in last:
++                        hook_name = hook.__qualname__
++                        pinned_name = last[stage].__qualname__
++                        raise ReframeSyntaxError(
++                            f'cannot pin hook {hook_name!r} as last '
++                            f'of stage {stage!r} as {pinned_name!r} '
++                            f'is already pinned last'
++                        )
++
++                    last[stage] = hook
++                else:
++                    try:
++                        ret[stage].append(hook.fn)
++                    except KeyError:
++                        ret[stage] = [hook.fn]
++
++        # Append the last hooks
++        for stage, hook in last.items():
++            try:
++                ret[stage].append(hook.fn)
++            except KeyError:
++                ret[stage] = [hook.fn]
+ 
+         return ret
+ 

@@ -1,0 +1,892 @@
+diff --git a/dvc/repo/experiments/__init__.py b/dvc/repo/experiments/__init__.py
+--- a/dvc/repo/experiments/__init__.py
++++ b/dvc/repo/experiments/__init__.py
+@@ -32,7 +32,7 @@
+     ExpRefInfo,
+ )
+ from .stash import ExpStashEntry
+-from .utils import exp_refs_by_rev, scm_locked, unlocked_repo
++from .utils import exp_refs_by_rev, unlocked_repo
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -50,18 +50,12 @@ class Experiments:
+     )
+ 
+     def __init__(self, repo):
+-        from dvc.lock import make_lock
+         from dvc.scm import NoSCMError
+ 
+         if repo.config["core"].get("no_scm", False):
+             raise NoSCMError
+ 
+         self.repo = repo
+-        self.scm_lock = make_lock(
+-            os.path.join(self.repo.tmp_dir, "exp_scm_lock"),
+-            tmp_dir=self.repo.tmp_dir,
+-            hardlink_lock=repo.config["core"].get("hardlink_lock", False),
+-        )
+ 
+     @property
+     def scm(self):
+@@ -253,7 +247,6 @@ def _validate_new_ref(self, exp_ref: ExpRefInfo):
+         if self.scm.get_ref(str(exp_ref)):
+             raise ExperimentExistsError(exp_ref.name)
+ 
+-    @scm_locked
+     def new(
+         self,
+         queue: BaseStashQueue,
+@@ -279,7 +272,6 @@ def new(
+         except ExperimentExistsError as err:
+             if not (kwargs.get("force", False) or kwargs.get("reset", False)):
+                 raise err
+-
+         return queue.put(*args, **kwargs)
+ 
+     def _resume_checkpoint(
+diff --git a/dvc/repo/experiments/executor/base.py b/dvc/repo/experiments/executor/base.py
+--- a/dvc/repo/experiments/executor/base.py
++++ b/dvc/repo/experiments/executor/base.py
+@@ -12,6 +12,7 @@
+     Callable,
+     Dict,
+     Iterable,
++    List,
+     NamedTuple,
+     Optional,
+     Tuple,
+@@ -34,17 +35,7 @@
+     ExperimentExistsError,
+     UnchangedExperimentError,
+ )
+-from ..refs import (
+-    EXEC_BASELINE,
+-    EXEC_BRANCH,
+-    EXEC_CHECKPOINT,
+-    EXEC_HEAD,
+-    EXEC_MERGE,
+-    EXEC_NAMESPACE,
+-    EXPS_NAMESPACE,
+-    EXPS_STASH,
+-    ExpRefInfo,
+-)
++from ..refs import EXEC_BASELINE, EXEC_BRANCH, EXEC_CHECKPOINT, ExpRefInfo
+ 
+ if TYPE_CHECKING:
+     from queue import Queue
+@@ -58,10 +49,6 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-EXEC_TMP_DIR = "exps"
+-EXEC_PID_DIR = "run"
+-
+-
+ class ExecutorResult(NamedTuple):
+     exp_hash: Optional[str]
+     ref_info: Optional["ExpRefInfo"]
+@@ -172,6 +159,7 @@ def __init__(
+     @abstractmethod
+     def init_git(
+         self,
++        repo: "Repo",
+         scm: "Git",
+         stash_rev: str,
+         entry: "ExpStashEntry",
+@@ -319,6 +307,7 @@ def unpack_repro_args(path):
+     def fetch_exps(
+         self,
+         dest_scm: "Git",
++        refs: List[str],
+         force: bool = False,
+         on_diverged: Callable[[str, bool], None] = None,
+         **kwargs,
+@@ -327,26 +316,19 @@ def fetch_exps(
+ 
+         Args:
+             dest_scm: Destination Git instance.
++            refs: reference names to be fetched from the remotes.
+             force: If True, diverged refs will be overwritten
+             on_diverged: Callback in the form on_diverged(ref, is_checkpoint)
+                 to be called when an experiment ref has diverged.
+ 
+         Extra kwargs will be passed into the remote git client.
+         """
+-        from ..utils import iter_remote_refs
+-
+-        refs = []
+-        has_checkpoint = False
+-        for ref in iter_remote_refs(
+-            dest_scm,
+-            self.git_url,
+-            base=EXPS_NAMESPACE,
+-            **kwargs,
+-        ):
+-            if ref == EXEC_CHECKPOINT:
+-                has_checkpoint = True
+-            elif not ref.startswith(EXEC_NAMESPACE) and ref != EXPS_STASH:
+-                refs.append(ref)
++
++        if EXEC_CHECKPOINT in refs:
++            refs.remove(EXEC_CHECKPOINT)
++            has_checkpoint = True
++        else:
++            has_checkpoint = False
+ 
+         def on_diverged_ref(orig_ref: str, new_rev: str):
+             if force:
+@@ -755,21 +737,12 @@ def _set_log_level(level):
+             dvc_logger.setLevel(level)
+ 
+     @contextmanager
+-    def set_exec_refs(
+-        self, scm: "Git", stash_rev: str, entry: "ExpStashEntry"
+-    ):
++    def set_temp_refs(self, scm: "Git", temp_dict: Dict[str, str]):
+         try:
+-            # Executor will be initialized with an empty git repo that
+-            # we populate by pushing:
+-            #   EXEC_HEAD - the base commit for this experiment
+-            #   EXEC_MERGE - the unmerged changes (from our stash)
+-            #       to be reproduced
+-            #   EXEC_BASELINE - the baseline commit for this experiment
+-            scm.set_ref(EXEC_HEAD, entry.head_rev)
+-            scm.set_ref(EXEC_MERGE, stash_rev)
+-            scm.set_ref(EXEC_BASELINE, entry.baseline_rev)
++            for ref, rev in temp_dict.items():
++                scm.set_ref(ref, rev)
+             yield
+         finally:
+-            for ref in (EXEC_HEAD, EXEC_MERGE, EXEC_BASELINE):
++            for ref in temp_dict:
+                 if scm.get_ref(ref):
+                     scm.remove_ref(ref)
+diff --git a/dvc/repo/experiments/executor/local.py b/dvc/repo/experiments/executor/local.py
+--- a/dvc/repo/experiments/executor/local.py
++++ b/dvc/repo/experiments/executor/local.py
+@@ -4,9 +4,11 @@
+ from tempfile import mkdtemp
+ from typing import TYPE_CHECKING, Optional
+ 
+-from funcy import cached_property
++from funcy import cached_property, retry
+ from scmrepo.exceptions import SCMError as _SCMError
++from shortuuid import uuid
+ 
++from dvc.lock import LockError
+ from dvc.scm import SCM, GitMergeError
+ from dvc.utils.fs import makedirs, remove
+ 
+@@ -18,8 +20,10 @@
+     EXEC_HEAD,
+     EXEC_MERGE,
+     EXEC_NAMESPACE,
++    EXPS_TEMP,
+ )
+-from .base import EXEC_TMP_DIR, BaseExecutor, TaskStatus
++from ..utils import EXEC_TMP_DIR, get_exp_rwlock
++from .base import BaseExecutor, TaskStatus
+ 
+ if TYPE_CHECKING:
+     from scmrepo.git import Git
+@@ -67,8 +71,10 @@ class TempDirExecutor(BaseLocalExecutor):
+     QUIET = True
+     DEFAULT_LOCATION = "tempdir"
+ 
++    @retry(180, errors=LockError, timeout=1)
+     def init_git(
+         self,
++        repo: "Repo",
+         scm: "Git",
+         stash_rev: str,
+         entry: "ExpStashEntry",
+@@ -85,18 +91,43 @@ def init_git(
+         if infofile:
+             self.info.dump_json(infofile)
+ 
+-        with self.set_exec_refs(scm, stash_rev, entry):
+-            refspec = f"{EXEC_NAMESPACE}/"
+-            push_refspec(scm, self.git_url, refspec, refspec)
+-
+-        if branch:
+-            push_refspec(scm, self.git_url, branch, branch)
+-            self.scm.set_ref(EXEC_BRANCH, branch, symbolic=True)
+-        elif self.scm.get_ref(EXEC_BRANCH):
+-            self.scm.remove_ref(EXEC_BRANCH)
++        temp_head = f"{EXPS_TEMP}/head-{uuid()}"
++        temp_merge = f"{EXPS_TEMP}/merge-{uuid()}"
++        temp_baseline = f"{EXPS_TEMP}/baseline-{uuid()}"
++
++        temp_ref_dict = {
++            temp_head: entry.head_rev,
++            temp_merge: stash_rev,
++            temp_baseline: entry.baseline_rev,
++        }
++        with get_exp_rwlock(
++            repo, writes=[temp_head, temp_merge, temp_baseline]
++        ), self.set_temp_refs(scm, temp_ref_dict):
++            # Executor will be initialized with an empty git repo that
++            # we populate by pushing:
++            #   EXEC_HEAD - the base commit for this experiment
++            #   EXEC_MERGE - the unmerged changes (from our stash)
++            #       to be reproduced
++            #   EXEC_BASELINE - the baseline commit for this experiment
++            refspec = [
++                (temp_head, EXEC_HEAD),
++                (temp_merge, EXEC_MERGE),
++                (temp_baseline, EXEC_BASELINE),
++            ]
++
++            if branch:
++                refspec.append((branch, branch))
++                with get_exp_rwlock(repo, reads=[branch]):
++                    push_refspec(scm, self.git_url, refspec)
++                self.scm.set_ref(EXEC_BRANCH, branch, symbolic=True)
++            else:
++                push_refspec(scm, self.git_url, refspec)
++                if self.scm.get_ref(EXEC_BRANCH):
++                    self.scm.remove_ref(EXEC_BRANCH)
++
++            if self.scm.get_ref(EXEC_CHECKPOINT):
++                self.scm.remove_ref(EXEC_CHECKPOINT)
+ 
+-        if self.scm.get_ref(EXEC_CHECKPOINT):
+-            self.scm.remove_ref(EXEC_CHECKPOINT)
+         # checkout EXEC_HEAD and apply EXEC_MERGE on top of it without
+         # committing
+         head = EXEC_BRANCH if branch else EXEC_HEAD
+@@ -167,8 +198,10 @@ def from_stash_entry(
+         logger.debug("Init workspace executor in '%s'", root_dir)
+         return executor
+ 
++    @retry(180, errors=LockError, timeout=1)
+     def init_git(
+         self,
++        repo: "Repo",
+         scm: "Git",
+         stash_rev: str,
+         entry: "ExpStashEntry",
+@@ -179,25 +212,26 @@ def init_git(
+         if infofile:
+             self.info.dump_json(infofile)
+ 
+-        scm.set_ref(EXEC_HEAD, entry.head_rev)
+-        scm.set_ref(EXEC_MERGE, stash_rev)
+-        scm.set_ref(EXEC_BASELINE, entry.baseline_rev)
+-        self._detach_stack.enter_context(
+-            self.scm.detach_head(
+-                self.scm.get_ref(EXEC_HEAD),
+-                force=True,
+-                client="dvc",
++        with get_exp_rwlock(repo, writes=[EXEC_NAMESPACE]):
++            scm.set_ref(EXEC_HEAD, entry.head_rev)
++            scm.set_ref(EXEC_MERGE, stash_rev)
++            scm.set_ref(EXEC_BASELINE, entry.baseline_rev)
++            self._detach_stack.enter_context(
++                self.scm.detach_head(
++                    self.scm.get_ref(EXEC_HEAD),
++                    force=True,
++                    client="dvc",
++                )
+             )
+-        )
+-        merge_rev = self.scm.get_ref(EXEC_MERGE)
+-        try:
+-            self.scm.merge(merge_rev, squash=True, commit=False)
+-        except _SCMError as exc:
+-            raise GitMergeError(str(exc), scm=self.scm)
+-        if branch:
+-            self.scm.set_ref(EXEC_BRANCH, branch, symbolic=True)
+-        elif scm.get_ref(EXEC_BRANCH):
+-            self.scm.remove_ref(EXEC_BRANCH)
++            merge_rev = self.scm.get_ref(EXEC_MERGE)
++            try:
++                self.scm.merge(merge_rev, squash=True, commit=False)
++            except _SCMError as exc:
++                raise GitMergeError(str(exc), scm=self.scm)
++            if branch:
++                self.scm.set_ref(EXEC_BRANCH, branch, symbolic=True)
++            elif scm.get_ref(EXEC_BRANCH):
++                self.scm.remove_ref(EXEC_BRANCH)
+ 
+     def init_cache(self, repo: "Repo", rev: str, run_cache: bool = True):
+         pass
+diff --git a/dvc/repo/experiments/executor/ssh.py b/dvc/repo/experiments/executor/ssh.py
+--- a/dvc/repo/experiments/executor/ssh.py
++++ b/dvc/repo/experiments/executor/ssh.py
+@@ -9,6 +9,7 @@
+ from funcy import first
+ 
+ from ..refs import (
++    EXEC_BASELINE,
+     EXEC_BRANCH,
+     EXEC_CHECKPOINT,
+     EXEC_HEAD,
+@@ -119,6 +120,7 @@ def _git_client_args(fs):
+ 
+     def init_git(
+         self,
++        repo: "Repo",
+         scm: "Git",
+         stash_rev: str,
+         entry: "ExpStashEntry",
+@@ -147,12 +149,18 @@ def init_git(
+             # (see https://github.com/iterative/dvc/issues/6508)
+             kwargs = self._git_client_args(fs)
+ 
+-            with self.set_exec_refs(scm, stash_rev, entry):
+-                refspec = f"{EXEC_NAMESPACE}/"
+-                push_refspec(scm, self.git_url, refspec, refspec, **kwargs)
++            ref_dict = {
++                EXEC_HEAD: entry.head_rev,
++                EXEC_MERGE: stash_rev,
++                EXEC_BASELINE: entry.baseline_rev,
++            }
++            with self.set_temp_refs(scm, ref_dict):
++                exec_namespace = f"{EXEC_NAMESPACE}/"
++                refspec = [(exec_namespace, exec_namespace)]
++                push_refspec(scm, self.git_url, refspec, **kwargs)
+ 
+             if branch:
+-                push_refspec(scm, self.git_url, branch, branch, **kwargs)
++                push_refspec(scm, self.git_url, [(branch, branch)], **kwargs)
+                 self._ssh_cmd(fs, f"git symbolic-ref {EXEC_BRANCH} {branch}")
+             else:
+                 self._ssh_cmd(
+diff --git a/dvc/repo/experiments/queue/base.py b/dvc/repo/experiments/queue/base.py
+--- a/dvc/repo/experiments/queue/base.py
++++ b/dvc/repo/experiments/queue/base.py
+@@ -26,16 +26,12 @@
+ from dvc.ui import ui
+ 
+ from ..exceptions import CheckpointExistsError, ExperimentExistsError
+-from ..executor.base import (
+-    EXEC_PID_DIR,
+-    EXEC_TMP_DIR,
+-    BaseExecutor,
+-    ExecutorResult,
+-)
++from ..executor.base import BaseExecutor, ExecutorResult
+ from ..executor.local import WorkspaceExecutor
+ from ..refs import ExpRefInfo
+ from ..stash import ExpStash, ExpStashEntry
+-from ..utils import exp_refs_by_rev, scm_locked
++from ..utils import EXEC_PID_DIR, EXEC_TMP_DIR, exp_refs_by_rev, get_exp_rwlock
++from .utils import get_remote_executor_refs
+ 
+ if TYPE_CHECKING:
+     from scmrepo.git import Git
+@@ -555,28 +551,39 @@ def _update_params(self, params: Dict[str, List[str]]):
+ 
+     @staticmethod
+     @retry(180, errors=LockError, timeout=1)
+-    @scm_locked
++    def get_stash_entry(
++        exp: "Experiments",
++        queue_entry: QueueEntry,
++    ) -> "ExpStashEntry":
++        stash = ExpStash(exp.scm, queue_entry.stash_ref)
++        stash_rev = queue_entry.stash_rev
++        with get_exp_rwlock(exp.repo, writes=[queue_entry.stash_ref]):
++            stash_entry = stash.stash_revs.get(
++                stash_rev,
++                ExpStashEntry(None, stash_rev, stash_rev, None, None),
++            )
++            if stash_entry.stash_index is not None:
++                stash.drop(stash_entry.stash_index)
++        return stash_entry
++
++    @classmethod
+     def init_executor(
++        cls,
+         exp: "Experiments",
+         queue_entry: QueueEntry,
+         executor_cls: Type[BaseExecutor] = WorkspaceExecutor,
+         **kwargs,
+     ) -> BaseExecutor:
+-        scm = exp.scm
+-        stash = ExpStash(scm, queue_entry.stash_ref)
+-        stash_rev = queue_entry.stash_rev
+-        stash_entry = stash.stash_revs.get(
+-            stash_rev,
+-            ExpStashEntry(None, stash_rev, stash_rev, None, None),
+-        )
+-        if stash_entry.stash_index is not None:
+-            stash.drop(stash_entry.stash_index)
++        stash_entry = cls.get_stash_entry(exp, queue_entry)
++
+         executor = executor_cls.from_stash_entry(
+             exp.repo, stash_entry, **kwargs
+         )
+ 
++        stash_rev = queue_entry.stash_rev
+         infofile = exp.celery_queue.get_infofile_path(stash_rev)
+         executor.init_git(
++            exp.repo,
+             exp.repo.scm,
+             stash_rev,
+             stash_entry,
+@@ -597,7 +604,6 @@ def get_infofile_path(self, name: str) -> str:
+ 
+     @staticmethod
+     @retry(180, errors=LockError, timeout=1)
+-    @scm_locked
+     def collect_git(
+         exp: "Experiments",
+         executor: BaseExecutor,
+@@ -611,16 +617,20 @@ def on_diverged(ref: str, checkpoint: bool):
+                 raise CheckpointExistsError(ref_info.name)
+             raise ExperimentExistsError(ref_info.name)
+ 
+-        for ref in executor.fetch_exps(
+-            exp.scm,
+-            force=exec_result.force,
+-            on_diverged=on_diverged,
+-        ):
+-            exp_rev = exp.scm.get_ref(ref)
+-            if exp_rev:
+-                assert exec_result.exp_hash
+-                logger.debug("Collected experiment '%s'.", exp_rev[:7])
+-                results[exp_rev] = exec_result.exp_hash
++        refs = get_remote_executor_refs(exp.scm, executor.git_url)
++
++        with get_exp_rwlock(exp.repo, writes=refs):
++            for ref in executor.fetch_exps(
++                exp.scm,
++                refs,
++                force=exec_result.force,
++                on_diverged=on_diverged,
++            ):
++                exp_rev = exp.scm.get_ref(ref)
++                if exp_rev:
++                    assert exec_result.exp_hash
++                    logger.debug("Collected experiment '%s'.", exp_rev[:7])
++                    results[exp_rev] = exec_result.exp_hash
+ 
+         return results
+ 
+diff --git a/dvc/repo/experiments/queue/celery.py b/dvc/repo/experiments/queue/celery.py
+--- a/dvc/repo/experiments/queue/celery.py
++++ b/dvc/repo/experiments/queue/celery.py
+@@ -23,7 +23,9 @@
+ from dvc.ui import ui
+ 
+ from ..exceptions import UnresolvedQueueExpNamesError
+-from ..executor.base import EXEC_TMP_DIR, ExecutorInfo, ExecutorResult
++from ..executor.base import ExecutorInfo, ExecutorResult
++from ..refs import CELERY_STASH
++from ..utils import EXEC_TMP_DIR, get_exp_rwlock
+ from .base import BaseStashQueue, QueueDoneResult, QueueEntry, QueueGetResult
+ from .exceptions import CannotKillTasksError
+ from .tasks import run_exp
+@@ -164,7 +166,8 @@ def start_workers(self, count: int) -> int:
+ 
+     def put(self, *args, **kwargs) -> QueueEntry:
+         """Stash an experiment and add it to the queue."""
+-        entry = self._stash_exp(*args, **kwargs)
++        with get_exp_rwlock(self.repo, writes=["workspace", CELERY_STASH]):
++            entry = self._stash_exp(*args, **kwargs)
+         self.celery.signature(run_exp.s(entry.asdict())).delay()
+         return entry
+ 
+diff --git a/dvc/repo/experiments/queue/tasks.py b/dvc/repo/experiments/queue/tasks.py
+--- a/dvc/repo/experiments/queue/tasks.py
++++ b/dvc/repo/experiments/queue/tasks.py
+@@ -1,4 +1,4 @@
+-from typing import Any, Dict
++from typing import TYPE_CHECKING, Any, Dict
+ 
+ from celery import shared_task
+ from celery.utils.log import get_task_logger
+@@ -7,11 +7,15 @@
+ from ..executor.local import TempDirExecutor
+ from .base import BaseStashQueue, QueueEntry
+ 
++if TYPE_CHECKING:
++    from ..executor.base import BaseExecutor
++
++
+ logger = get_task_logger(__name__)
+ 
+ 
+ @shared_task
+-def setup_exp(entry_dict: Dict[str, Any]) -> TempDirExecutor:
++def setup_exp(entry_dict: Dict[str, Any]) -> "BaseExecutor":
+     """Setup an experiment.
+ 
+     Arguments:
+diff --git a/dvc/repo/experiments/queue/tempdir.py b/dvc/repo/experiments/queue/tempdir.py
+--- a/dvc/repo/experiments/queue/tempdir.py
++++ b/dvc/repo/experiments/queue/tempdir.py
+@@ -6,14 +6,13 @@
+ 
+ from ..exceptions import ExpQueueEmptyError
+ from ..executor.base import (
+-    EXEC_PID_DIR,
+-    EXEC_TMP_DIR,
+     BaseExecutor,
+     ExecutorInfo,
+     ExecutorResult,
+     TaskStatus,
+ )
+ from ..executor.local import TempDirExecutor
++from ..utils import EXEC_PID_DIR, EXEC_TMP_DIR
+ from .base import BaseStashQueue, QueueEntry, QueueGetResult
+ from .utils import fetch_running_exp_from_temp_dir
+ from .workspace import WorkspaceQueue
+diff --git a/dvc/repo/experiments/queue/utils.py b/dvc/repo/experiments/queue/utils.py
+--- a/dvc/repo/experiments/queue/utils.py
++++ b/dvc/repo/experiments/queue/utils.py
+@@ -1,17 +1,40 @@
+ import logging
+-from typing import TYPE_CHECKING, Dict
++from typing import TYPE_CHECKING, Dict, List
+ 
+ from scmrepo.exceptions import SCMError
+ 
+ from ..executor.base import ExecutorInfo, TaskStatus
++from ..refs import EXEC_CHECKPOINT, EXEC_NAMESPACE, EXPS_NAMESPACE, EXPS_STASH
++from ..utils import get_exp_rwlock, iter_remote_refs
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ if TYPE_CHECKING:
++    from scmrepo.git import Git
++
+     from .base import BaseStashQueue
+ 
+ 
++def get_remote_executor_refs(scm: "Git", remote_url: str) -> List[str]:
++    """Get result list refs from a remote repository
++
++    Args:
++        remote_url : remote executor's url
++    """
++    refs = []
++    for ref in iter_remote_refs(
++        scm,
++        remote_url,
++        base=EXPS_NAMESPACE,
++    ):
++        if ref == EXEC_CHECKPOINT or (
++            not ref.startswith(EXEC_NAMESPACE) and ref != EXPS_STASH
++        ):
++            refs.append(ref)
++    return refs
++
++
+ def fetch_running_exp_from_temp_dir(
+     queue: "BaseStashQueue", rev: str, fetch_refs: bool
+ ) -> Dict[str, Dict]:
+@@ -45,15 +68,18 @@ def on_diverged(_ref: str, _checkpoint: bool):
+ 
+             executor = TempDirExecutor.from_info(info)
+             try:
+-                for ref in executor.fetch_exps(
+-                    queue.scm,
+-                    on_diverged=on_diverged,
+-                ):
+-                    logger.debug("Updated running experiment '%s'.", ref)
+-                    last_rev = queue.scm.get_ref(ref)
+-                    result[rev]["last"] = last_rev
+-                    if last_rev:
+-                        result[last_rev] = info.asdict()
++                refs = get_remote_executor_refs(queue.scm, executor.git_url)
++                with get_exp_rwlock(queue.repo, writes=refs):
++                    for ref in executor.fetch_exps(
++                        queue.scm,
++                        refs,
++                        on_diverged=on_diverged,
++                    ):
++                        logger.debug("Updated running experiment '%s'.", ref)
++                        last_rev = queue.scm.get_ref(ref)
++                        result[rev]["last"] = last_rev
++                        if last_rev:
++                            result[last_rev] = info.asdict()
+             except (InvalidRemoteSCMRepo, SCMError):
+                 # ignore stale info files
+                 del result[rev]
+diff --git a/dvc/repo/experiments/queue/workspace.py b/dvc/repo/experiments/queue/workspace.py
+--- a/dvc/repo/experiments/queue/workspace.py
++++ b/dvc/repo/experiments/queue/workspace.py
+@@ -21,7 +21,8 @@
+     TaskStatus,
+ )
+ from ..executor.local import WorkspaceExecutor
+-from ..refs import EXEC_BRANCH
++from ..refs import EXEC_BRANCH, WORKSPACE_STASH
++from ..utils import get_exp_rwlock
+ from .base import BaseStashQueue, QueueDoneResult, QueueEntry, QueueGetResult
+ 
+ if TYPE_CHECKING:
+@@ -34,7 +35,8 @@ class WorkspaceQueue(BaseStashQueue):
+     _EXEC_NAME: Optional[str] = "workspace"
+ 
+     def put(self, *args, **kwargs) -> QueueEntry:
+-        return self._stash_exp(*args, **kwargs)
++        with get_exp_rwlock(self.repo, writes=["workspace", WORKSPACE_STASH]):
++            return self._stash_exp(*args, **kwargs)
+ 
+     def get(self) -> QueueGetResult:
+         revs = self.stash.stash_revs
+diff --git a/dvc/repo/experiments/refs.py b/dvc/repo/experiments/refs.py
+--- a/dvc/repo/experiments/refs.py
++++ b/dvc/repo/experiments/refs.py
+@@ -16,6 +16,7 @@
+ EXEC_BASELINE = f"{EXEC_NAMESPACE}/EXEC_BASELINE"
+ EXEC_HEAD = f"{EXEC_NAMESPACE}/EXEC_HEAD"
+ EXEC_MERGE = f"{EXEC_NAMESPACE}/EXEC_MERGE"
++EXPS_TEMP = f"{EXPS_NAMESPACE}/temp"
+ STASHES = {WORKSPACE_STASH, CELERY_STASH}
+ 
+ 
+diff --git a/dvc/repo/experiments/remove.py b/dvc/repo/experiments/remove.py
+--- a/dvc/repo/experiments/remove.py
++++ b/dvc/repo/experiments/remove.py
+@@ -152,8 +152,7 @@ def _remove_commited_exps(
+                 push_refspec(
+                     scm,
+                     remote,
+-                    None,
+-                    str(ref_info),
++                    [(None, str(ref_info))],
+                     progress=pbar.update_git,
+                 )
+     else:
+diff --git a/dvc/repo/experiments/utils.py b/dvc/repo/experiments/utils.py
+--- a/dvc/repo/experiments/utils.py
++++ b/dvc/repo/experiments/utils.py
+@@ -1,6 +1,9 @@
++import os
++import sys
+ from collections import defaultdict
+ from functools import wraps
+ from typing import (
++    TYPE_CHECKING,
+     Callable,
+     Dict,
+     Generator,
+@@ -9,6 +12,7 @@
+     Mapping,
+     Optional,
+     Set,
++    Tuple,
+     Union,
+ )
+ 
+@@ -16,6 +20,7 @@
+ 
+ from dvc.exceptions import InvalidArgumentError
+ from dvc.repo.experiments.exceptions import AmbiguousExpRefInfo
++from dvc.rwlock import rwlock
+ 
+ from .refs import (
+     EXEC_APPLY,
+@@ -28,18 +33,34 @@
+     ExpRefInfo,
+ )
+ 
++if TYPE_CHECKING:
++    from dvc.repo import Repo
+ 
+-def scm_locked(f):
+-    # Lock the experiments workspace so that we don't try to perform two
+-    # different sequences of git operations at once
+-    @wraps(f)
+-    def wrapper(exp, *args, **kwargs):
+-        from dvc.scm import map_scm_exception
+ 
+-        with map_scm_exception(), exp.scm_lock:
+-            return f(exp, *args, **kwargs)
++EXEC_TMP_DIR = "exps"
++EXEC_PID_DIR = "run"
+ 
+-    return wrapper
++
++def get_exp_rwlock(
++    repo: "Repo",
++    reads: Optional[List[str]] = None,
++    writes: Optional[List[str]] = None,
++):
++    reads = reads or []
++    writes = writes or []
++
++    cmd = " ".join(sys.argv)
++    path = os.path.join(repo.tmp_dir, EXEC_TMP_DIR)
++    repo.fs.makedirs(path, exist_ok=True)
++
++    return rwlock(
++        path,
++        repo.fs,
++        cmd,
++        reads,
++        writes,
++        repo.config["core"].get("hardlink_lock", False),
++    )
+ 
+ 
+ def unlocked_repo(f):
+@@ -108,8 +129,7 @@ def iter_remote_refs(
+ def push_refspec(
+     scm: "Git",
+     url: str,
+-    src: Optional[str],
+-    dest: str,
++    push_list=List[Tuple[Optional[str], str]],
+     force: bool = False,
+     on_diverged: Optional[Callable[[str, str], bool]] = None,
+     **kwargs,
+@@ -119,20 +139,21 @@ def push_refspec(
+ 
+     from ...scm import GitAuthError, SCMError
+ 
+-    if not src:
+-        refspecs = [f":{dest}"]
+-    elif src.endswith("/"):
+-        refspecs = []
+-        dest = dest.rstrip("/") + "/"
+-        for ref in scm.iter_refs(base=src):
+-            refname = ref.split("/")[-1]
+-            refspecs.append(f"{ref}:{dest}{refname}")
+-    else:
+-        if dest.endswith("/"):
+-            refname = src.split("/")[-1]
+-            refspecs = [f"{src}:{dest}/{refname}"]
++    refspecs = []
++    for src, dest in push_list:
++        if not src:
++            refspecs.append(f":{dest}")
++        elif src.endswith("/"):
++            dest = dest.rstrip("/") + "/"
++            for ref in scm.iter_refs(base=src):
++                refname = ref.split("/")[-1]
++                refspecs.append(f"{ref}:{dest}{refname}")
+         else:
+-            refspecs = [f"{src}:{dest}"]
++            if dest.endswith("/"):
++                refname = src.split("/")[-1]
++                refspecs.append(f"{src}:{dest}/{refname}")
++            else:
++                refspecs.append(f"{src}:{dest}")
+ 
+     try:
+         results = scm.push_refspecs(
+diff --git a/dvc/rwlock.py b/dvc/rwlock.py
+--- a/dvc/rwlock.py
++++ b/dvc/rwlock.py
+@@ -4,6 +4,7 @@
+ from collections import defaultdict
+ from contextlib import contextmanager
+ 
++import psutil
+ from voluptuous import Invalid, Optional, Required, Schema
+ 
+ from .exceptions import DvcException
+@@ -72,35 +73,67 @@ def _infos_to_str(infos):
+     )
+ 
+ 
+-def _check_blockers(lock, info, *, mode, waiters):
++def _check_blockers(tmp_dir, lock, info, *, mode, waiters):
+     from .lock import LockError
+ 
+-    for waiter_path in waiters:
+-        blockers = [
+-            blocker
+-            for path, infos in lock[mode].items()
+-            if localfs.path.overlaps(waiter_path, path)
+-            for blocker in (infos if isinstance(infos, list) else [infos])
+-            if blocker != info
+-        ]
++    non_existing_pid = set()
+ 
+-        if not blockers:
++    blockers = []
++    to_release = defaultdict(list)
++    for path, infos in lock[mode].items():
++        for waiter_path in waiters:
++            if localfs.path.overlaps(waiter_path, path):
++                break
++        else:
+             continue
+ 
++        infos = infos if isinstance(infos, list) else [infos]
++        for blocker in infos:
++            if blocker == info:
++                continue
++
++            pid = int(blocker["pid"])
++
++            if pid in non_existing_pid:
++                pass
++            elif psutil.pid_exists(pid):
++                blockers.append(blocker)
++                continue
++            else:
++                non_existing_pid.add(pid)
++                cmd = blocker["cmd"]
++                logger.warning(
++                    "Process '%s' with (Pid %s), in RWLock-file '%s'"
++                    " had been killed. Auto remove it from the lock file.",
++                    cmd,
++                    pid,
++                    relpath(path),
++                )
++            to_release[json.dumps(blocker, sort_keys=True)].append(path)
++
++    if to_release:
++        for info_json, path_list in to_release.items():
++            info = json.loads(info_json)
++            if mode == "read":
++                _release_read(lock, info, path_list)
++            elif mode == "write":
++                _release_write(lock, info, path_list)
++
++    if blockers:
+         raise LockError(
+-            "'{path}' is busy, it is being blocked by:\n"
+-            "{blockers}\n"
++            f"'{waiter_path}' is busy, it is being blocked by:\n"
++            f"{_infos_to_str(blockers)}\n"
+             "\n"
+             "If there are no processes with such PIDs, you can manually "
+-            "remove '.dvc/tmp/rwlock' and try again.".format(
+-                path=waiter_path, blockers=_infos_to_str(blockers)
+-            )
++            f"remove '{tmp_dir}/rwlock' and try again."
+         )
+ 
+ 
+ def _acquire_read(lock, info, paths):
+     changes = []
+ 
++    lock["read"] = lock.get("read", defaultdict(list))
++
+     for path in paths:
+         readers = lock["read"][path]
+         if info in readers:
+@@ -115,6 +148,8 @@ def _acquire_read(lock, info, paths):
+ def _acquire_write(lock, info, paths):
+     changes = []
+ 
++    lock["write"] = lock.get("write", defaultdict(dict))
++
+     for path in paths:
+         if lock["write"][path] == info:
+             continue
+@@ -171,8 +206,10 @@ def rwlock(tmp_dir, fs, cmd, read, write, hardlink):
+ 
+     with _edit_rwlock(tmp_dir, fs, hardlink) as lock:
+ 
+-        _check_blockers(lock, info, mode="write", waiters=read + write)
+-        _check_blockers(lock, info, mode="read", waiters=write)
++        _check_blockers(
++            tmp_dir, lock, info, mode="write", waiters=read + write
++        )
++        _check_blockers(tmp_dir, lock, info, mode="read", waiters=write)
+ 
+         rchanges = _acquire_read(lock, info, read)
+         wchanges = _acquire_write(lock, info, write)
+

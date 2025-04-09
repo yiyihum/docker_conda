@@ -1,0 +1,201 @@
+diff --git a/removestar/__main__.py b/removestar/__main__.py
+index c5ae9dc..a724953 100755
+--- a/removestar/__main__.py
++++ b/removestar/__main__.py
+@@ -21,6 +21,7 @@ import sys
+ 
+ from . import __version__
+ from .helper import get_diff_text
++from .output import get_colored_diff, red
+ from .removestar import fix_code
+ 
+ 
+@@ -30,7 +31,7 @@ class RawDescriptionHelpArgumentDefaultsHelpFormatter(
+     pass
+ 
+ 
+-def main():
++def main():  # noqa: PLR0912
+     parser = argparse.ArgumentParser(
+         description=__doc__,
+         prog="removestar",
+@@ -97,7 +98,7 @@ def main():
+             continue
+ 
+         if not os.path.isfile(file):
+-            print(f"Error: {file}: no such file or directory", file=sys.stderr)
++            print(red(f"Error: {file}: no such file or directory"), file=sys.stderr)
+             continue
+ 
+         with open(file, encoding="utf-8") as f:
+@@ -114,7 +115,7 @@ def main():
+             )
+         except (RuntimeError, NotImplementedError) as e:
+             if not args.quiet:
+-                print(f"Error with {file}: {e}", file=sys.stderr)
++                print(red(f"Error with {file}: {e}"), file=sys.stderr)
+             continue
+ 
+         if new_code != code:
+@@ -122,12 +123,24 @@ def main():
+             if args.in_place:
+                 with open(file, "w", encoding="utf-8") as f:
+                     f.write(new_code)
++                if not args.quiet:
++                    print(
++                        get_colored_diff(
++                            get_diff_text(
++                                io.StringIO(code).readlines(),
++                                io.StringIO(new_code).readlines(),
++                                file,
++                            )
++                        )
++                    )
+             else:
+                 print(
+-                    get_diff_text(
+-                        io.StringIO(code).readlines(),
+-                        io.StringIO(new_code).readlines(),
+-                        file,
++                    get_colored_diff(
++                        get_diff_text(
++                            io.StringIO(code).readlines(),
++                            io.StringIO(new_code).readlines(),
++                            file,
++                        )
+                     )
+                 )
+ 
+diff --git a/removestar/output.py b/removestar/output.py
+new file mode 100644
+index 0000000..973fade
+--- /dev/null
++++ b/removestar/output.py
+@@ -0,0 +1,54 @@
++def bold(line):
++    return "\033[1m" + line + "\033[0m"  # bold, reset
++
++
++def red(line):
++    return "\033[31m" + line + "\033[0m"  # red, reset
++
++
++def yellow(line):
++    return "\033[33m" + line + "\033[0m"  # yellow, reset
++
++
++def cyan(line):
++    return "\033[36m" + line + "\033[0m"  # cyan, reset
++
++
++def green(line):
++    return "\033[32m" + line + "\033[0m"  # green, reset
++
++
++def get_colored_diff(contents):
++    """Inject the ANSI color codes to the diff."""
++    # taken from https://github.com/psf/black/blob/main/src/black/output.py
++    # Copyright (c) 2018 Łukasz Langa
++
++    # Permission is hereby granted, free of charge, to any person obtaining a copy
++    # of this software and associated documentation files (the "Software"), to deal
++    # in the Software without restriction, including without limitation the rights
++    # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++    # copies of the Software, and to permit persons to whom the Software is
++    # furnished to do so, subject to the following conditions:
++
++    # The above copyright notice and this permission notice shall be included in all
++    # copies or substantial portions of the Software.
++
++    # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++    # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++    # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++    # SOFTWARE.
++    lines = contents.split("\n")
++    for i, line in enumerate(lines):
++        if line.startswith(("+++", "---")):
++            line = bold(line)  # bold, reset  # noqa: PLW2901
++        elif line.startswith("@@"):
++            line = cyan(line)  # cyan, reset  # noqa: PLW2901
++        elif line.startswith("+"):
++            line = green(line)  # green, reset  # noqa: PLW2901
++        elif line.startswith("-"):
++            line = red(line)  # red, reset  # noqa: PLW2901
++        lines[i] = line
++    return "\n".join(lines)
+diff --git a/removestar/removestar.py b/removestar/removestar.py
+index 9180be7..3c6742e 100644
+--- a/removestar/removestar.py
++++ b/removestar/removestar.py
+@@ -9,6 +9,8 @@ from pathlib import Path
+ from pyflakes.checker import _MAGIC_GLOBALS, Checker, ModuleScope
+ from pyflakes.messages import ImportStarUsage, ImportStarUsed
+ 
++from .output import green, yellow
++
+ # quit and exit are not included in old versions of pyflakes
+ MAGIC_GLOBALS = set(_MAGIC_GLOBALS).union({"quit", "exit"})
+ 
+@@ -65,13 +67,15 @@ def fix_code(
+         if not mods:
+             if not quiet:
+                 print(
+-                    f"Warning: {file}: could not find import for '{name}'",
++                    yellow(f"Warning: {file}: could not find import for '{name}'"),
+                     file=sys.stderr,
+                 )
+             continue
+         if len(mods) > 1 and not quiet:
+             print(
+-                f"Warning: {file}: '{name}' comes from multiple modules: {', '.join(map(repr, mods))}. Using '{mods[-1]}'.",
++                yellow(
++                    f"Warning: {file}: '{name}' comes from multiple modules: {', '.join(map(repr, mods))}. Using '{mods[-1]}'."
++                ),
+                 file=sys.stderr,
+             )
+ 
+@@ -157,22 +161,28 @@ def replace_imports(
+             if comment and is_noqa_comment_allowing_star_import(comment):
+                 if verbose:
+                     print(
+-                        f"{verbose_prefix}Retaining 'from {mod} import *' due to noqa comment",
++                        green(
++                            f"{verbose_prefix}Retaining 'from {mod} import *' due to noqa comment"
++                        ),
+                         file=sys.stderr,
+                     )
+                 return original_import
+ 
+             if verbose:
+                 print(
+-                    f"{verbose_prefix}Replacing 'from {mod} import *' with '{new_import.strip()}'",
++                    green(
++                        f"{verbose_prefix}Replacing 'from {mod} import *' with '{new_import.strip()}'"
++                    ),
+                     file=sys.stderr,
+                 )
+ 
+             if not new_import and comment:
+                 if not quiet:
+                     print(
+-                        f"{warning_prefix}The removed star import statement for '{mod}' "
+-                        f"had an inline comment which may not make sense without the import",
++                        yellow(
++                            f"{warning_prefix}The removed star import statement for '{mod}' "
++                            f"had an inline comment which may not make sense without the import"
++                        ),
+                         file=sys.stderr,
+                     )
+                 return f"{comment}\n"
+@@ -184,7 +194,7 @@ def replace_imports(
+         new_code, subs_made = star_import.subn(star_import_replacement, code)
+         if subs_made == 0 and not quiet:
+             print(
+-                f"{warning_prefix}Could not find the star imports for '{mod}'",
++                yellow(f"{warning_prefix}Could not find the star imports for '{mod}'"),
+                 file=sys.stderr,
+             )
+         code = new_code

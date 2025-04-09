@@ -1,0 +1,125 @@
+diff --git a/tests/test_include.py b/tests/test_include.py
+index f3eb7fc..308206d 100644
+--- a/tests/test_include.py
++++ b/tests/test_include.py
+@@ -7,7 +7,7 @@ from conda_devenv.devenv import handle_includes, render_jinja
+ 
+ def obtain_yaml_dicts(root_yaml_filename):
+     contents = open(root_yaml_filename, "r").read()
+-    contents = render_jinja(contents, filename=root_yaml_filename)
++    contents = render_jinja(contents, filename=root_yaml_filename, is_included=False)
+     root_yaml = yaml.load(contents)
+     dicts = handle_includes(root_yaml_filename, root_yaml).values()
+     dicts = list(dicts)
+diff --git a/tests/test_jinja.py b/tests/test_jinja.py
+index 551305e..b3ff3d8 100644
+--- a/tests/test_jinja.py
++++ b/tests/test_jinja.py
+@@ -10,7 +10,11 @@ from conda_devenv.devenv import render_jinja
+ 
+ 
+ def test_jinja_root():
+-    assert render_jinja("{{root}}", filename="path/to/file") == os.path.abspath("path/to")
++    assert render_jinja(
++        "{{root}}",
++        filename="path/to/file",
++        is_included=False,
++    ) == os.path.abspath("path/to")
+ 
+ 
+ def test_jinja_os(monkeypatch):
+@@ -22,13 +26,13 @@ def test_jinja_os(monkeypatch):
+         {%- endif %}
+     """).strip()
+ 
+-    assert render_jinja(template, filename="") == "variable is not set"
++    assert render_jinja(template, filename="", is_included=False) == "variable is not set"
+ 
+     monkeypatch.setenv('ENV_VARIABLE', '1')
+-    assert render_jinja(template, filename="") == "variable is set"
++    assert render_jinja(template, filename="", is_included=False) == "variable is set"
+ 
+     monkeypatch.setenv('ENV_VARIABLE', '2')
+-    assert render_jinja(template, filename="") == "variable is not set"
++    assert render_jinja(template, filename="", is_included=False) == "variable is not set"
+ 
+ 
+ def test_jinja_sys(monkeypatch):
+@@ -43,27 +47,27 @@ def test_jinja_sys(monkeypatch):
+     """).strip()
+ 
+     monkeypatch.setattr(sys, 'platform', 'linux')
+-    assert render_jinja(template, filename="") == "linux!"
++    assert render_jinja(template, filename="", is_included=False) == "linux!"
+ 
+     monkeypatch.setattr(sys, 'platform', 'windows')
+-    assert render_jinja(template, filename="") == "windows!"
++    assert render_jinja(template, filename="", is_included=False) == "windows!"
+ 
+     monkeypatch.setattr(sys, 'platform', 'darwin')
+-    assert render_jinja(template, filename="") == "others!"
++    assert render_jinja(template, filename="", is_included=False) == "others!"
+ 
+ 
+ def test_jinja_platform(monkeypatch):
+     template = "{{ platform.python_revision() }}"
+-    assert render_jinja(template, filename="") == platform.python_revision()
++    assert render_jinja(template, filename="", is_included=False) == platform.python_revision()
+ 
+ 
+ def test_jinja_invalid_template():
+-    # TODO: change this to pytest's nicer syntax: with pytest.raises()
+-    try:
+-        render_jinja(textwrap.dedent("""\
++    with pytest.raises(jinja2.exceptions.TemplateSyntaxError):
++        render_jinja(
++            textwrap.dedent("""\
+                 {%- if os.environ['ENV_VARIABLE'] == '1' %}
+                 {% %}
+-            """), filename="")
+-        pytest.fail("Should raise an exception")
+-    except jinja2.exceptions.TemplateSyntaxError as e:
+-        pass
++            """),
++            filename="",
++            is_included=False,
++        )
+diff --git a/tests/test_load_yaml_dict.py b/tests/test_load_yaml_dict.py
+index 43ed3d5..3c9d6eb 100644
+--- a/tests/test_load_yaml_dict.py
++++ b/tests/test_load_yaml_dict.py
+@@ -63,3 +63,34 @@ def test_get_env_name(mocker, tmpdir, cmd_line_name):
+         assert name == 'foo'
+     else:
+         assert name == 'bar'
++
++
++def test_is_included_var(datadir):
++    import six
++    import textwrap
++    a_env_file = datadir / 'a.devenv.yml'
++    a_env_file.write_text(six.text_type(textwrap.dedent('''\
++        name: a
++        includes:
++          - {{root}}/b.devenv.yml
++        environment:
++          VARIABLE: value_a
++          IS_A_INCLUDED: {{is_included}}
++    ''')))
++    b_env_file = datadir / 'b.devenv.yml'
++    b_env_file.write_text(six.text_type(textwrap.dedent('''\
++        name: b
++        environment:
++          {% if not is_included %}
++          VARIABLE: value_b
++          {% endif %}
++          IS_B_INCLUDED: {{is_included}}
++    ''')))
++
++    conda_env, os_env = load_yaml_dict(str(a_env_file))
++    assert conda_env == {'name': 'a'}
++    assert os_env == {
++        'IS_A_INCLUDED': False,
++        'IS_B_INCLUDED': True,
++        'VARIABLE': 'value_a',
++    }

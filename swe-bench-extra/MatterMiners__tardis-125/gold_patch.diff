@@ -1,0 +1,187 @@
+diff --git a/docs/source/changelog.rst b/docs/source/changelog.rst
+index 43ee6bb..66bed9d 100644
+--- a/docs/source/changelog.rst
++++ b/docs/source/changelog.rst
+@@ -1,4 +1,4 @@
+-.. Created by changelog.py at 2020-01-16, command
++.. Created by changelog.py at 2020-01-17, command
+    '/Users/giffler/.cache/pre-commit/repont7o94ca/py_env-default/bin/changelog docs/source/changes compile --output=docs/source/changelog.rst'
+    based on the format of 'https://keepachangelog.com/'
+ 
+@@ -6,7 +6,7 @@
+ CHANGELOG
+ #########
+ 
+-[Unreleased] - 2020-01-16
++[Unreleased] - 2020-01-17
+ =========================
+ 
+ Added
+@@ -17,6 +17,7 @@ Added
+ * Add support for COBalD legacy object initialisation
+ * The machine name has been added as a default tag in the telegraf monitoring plugin, can be overwritten.
+ * An optional and per site configurable drone minimum lifetime has been added
++* Add the possibility to use an unified `COBalD` and `TARDIS` configuration
+ 
+ Fixed
+ -----
+diff --git a/docs/source/changes/125.add_unified_configuration.yaml b/docs/source/changes/125.add_unified_configuration.yaml
+new file mode 100644
+index 0000000..74847ac
+--- /dev/null
++++ b/docs/source/changes/125.add_unified_configuration.yaml
+@@ -0,0 +1,6 @@
++category: added
++summary: Add the possibility to use an unified `COBalD` and `TARDIS` configuration
++pull requests:
++  - 125
++description: |
++  The possibility to combine the `COBalD` and the `TARDIS` configuration in one single `yaml` has been added.
+diff --git a/docs/source/index.rst b/docs/source/index.rst
+index dd507f0..ba69e33 100644
+--- a/docs/source/index.rst
++++ b/docs/source/index.rst
+@@ -141,6 +141,75 @@ Configuration of TARDIS
+               Memory: 16
+               Disk: 160
+ 
++Unified Configuration
++=====================
++
++.. content-tabs:: left-col
++
++    Alternatively a unified ``COBalD`` and ``TARDIS`` configuration can be used. In this case, the ``TARDIS``
++    part of the configuration is represented by a ``tardis`` MappingNode.
++
++    .. warning::
++        In case of the unified configuration you can currently not use the yaml tag ``!TardisPoolFactory`` to initialize
++        the pool factory, please use the `COBalD` legacy object initialisation
++        ``__type__: tardis.resources.poolfactory.create_composite_pool`` instead!
++
++.. content-tabs:: right-col
++
++    .. rubric:: Example configuration
++    .. code-block:: yaml
++
++        pipeline:
++          # Makes decision to add remove resources based utilisation and allocation
++          - !LinearController
++            low_utilisation: 0.90
++            high_allocation: 0.90
++            rate: 1
++          # Limits the demand for a resource
++          - !Limiter
++            minimum: 1
++          # Log changes
++          - !Logger
++            name: 'changes'
++          # Factory function to create composite resource pool
++          - __type__: tardis.resources.poolfactory.create_composite_pool
++        tardis:
++            Plugins:
++              SqliteRegistry:
++                db_file: drone_registry.db
++
++            BatchSystem:
++              adapter: FakeBatchSystem
++              allocation: 1.0
++              utilization: !PeriodicValue
++                           period: 3600
++                           amplitude: 0.5
++                           offset: 0.5
++                           phase: 0.
++              machine_status: Available
++
++            Sites:
++              - name: Fake
++                adapter: FakeSite
++                quota: 8000 # CPU core quota
++
++            Fake:
++              api_response_delay: !RandomGauss
++                                  mu: 0.1
++                                  sigma: 0.01
++              resource_boot_time: !RandomGauss
++                                  mu: 60
++                                  sigma: 10
++              MachineTypes:
++                - m1.infinity
++              MachineTypeConfiguration:
++                m1.infinity:
++              MachineMetaData:
++                m1.infinity:
++                  Cores: 8
++                  Memory: 16
++                  Disk: 160
++
+ Start-up your instance
+ ======================
+ 
+diff --git a/setup.py b/setup.py
+index c96442b..b4005f5 100644
+--- a/setup.py
++++ b/setup.py
+@@ -41,7 +41,10 @@ setup(
+     entry_points={
+         "cobald.config.yaml_constructors": [
+             "TardisPoolFactory = tardis.resources.poolfactory:create_composite_pool"
+-        ]
++        ],
++        "cobald.config.sections": [
++            "tardis = tardis.configuration.configuration:Configuration"
++        ],
+     },
+     keywords=package_about["__keywords__"],
+     packages=find_packages(exclude=["tests"]),
+diff --git a/tardis/configuration/configuration.py b/tardis/configuration/configuration.py
+index f5ea52d..24abfd6 100644
+--- a/tardis/configuration/configuration.py
++++ b/tardis/configuration/configuration.py
+@@ -33,10 +33,13 @@ def translate_config(obj):
+ class Configuration(Borg):
+     _shared_state = AttributeDict()
+ 
+-    def __init__(self, config_file: str = None):
++    def __init__(self, configuration: [str, dict] = None):
+         super(Configuration, self).__init__()
+-        if config_file:
+-            self.load_config(config_file)
++        if configuration:
++            if isinstance(configuration, str):  # interpret string as file name
++                self.load_config(configuration)
++            else:
++                self.update_config(configuration)
+ 
+     def load_config(self, config_file: str) -> None:
+         """
+@@ -45,6 +48,14 @@ class Configuration(Borg):
+         :type config_file: str
+         """
+         with open(config_file, "r") as config_file:
+-            self._shared_state.update(
+-                translate_config(convert_to_attribute_dict(yaml.safe_load(config_file)))
+-            )
++            self.update_config(yaml.safe_load(config_file))
++
++    def update_config(self, configuration: dict):
++        """
++        Updates the shared state of the configuration borg
++        :param configuration: Dictionary containing the configuration
++        :type configuration: dict
++        """
++        self._shared_state.update(
++            translate_config(convert_to_attribute_dict(configuration))
++        )
+diff --git a/tardis/resources/poolfactory.py b/tardis/resources/poolfactory.py
+index a80a379..6b2aa2a 100644
+--- a/tardis/resources/poolfactory.py
++++ b/tardis/resources/poolfactory.py
+@@ -27,7 +27,7 @@ def str_to_state(resources):
+     return resources
+ 
+ 
+-def create_composite_pool(configuration: str = "tardis.yml") -> WeightedComposite:
++def create_composite_pool(configuration: str = None) -> WeightedComposite:
+     configuration = Configuration(configuration)
+ 
+     composites = []

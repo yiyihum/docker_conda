@@ -1,0 +1,153 @@
+diff --git a/fsspec/generic.py b/fsspec/generic.py
+index 360f59a..2796048 100644
+--- a/fsspec/generic.py
++++ b/fsspec/generic.py
+@@ -170,7 +170,7 @@ class GenericFileSystem(AsyncFileSystem):
+                 if hasattr(fs, "open_async")
+                 else fs.open(url, "rb", **kw)
+             )
+-            callback.set_size(maybe_await(f1.size))
++            callback.set_size(await maybe_await(f1.size))
+             f2 = (
+                 await fs2.open_async(url2, "wb")
+                 if hasattr(fs2, "open_async")
+diff --git a/fsspec/implementations/arrow.py b/fsspec/implementations/arrow.py
+index 0edf8c5..803d44b 100644
+--- a/fsspec/implementations/arrow.py
++++ b/fsspec/implementations/arrow.py
+@@ -59,6 +59,7 @@ class ArrowFSWrapper(AbstractFileSystem):
+         return path
+ 
+     def ls(self, path, detail=False, **kwargs):
++        path = self._strip_protocol(path)
+         from pyarrow.fs import FileSelector
+ 
+         entries = [
+@@ -184,6 +185,11 @@ class ArrowFSWrapper(AbstractFileSystem):
+         path = self._strip_protocol(path)
+         self.fs.delete_dir(path)
+ 
++    @wrap_exceptions
++    def modified(self, path):
++        path = self._strip_protocol(path)
++        return self.fs.get_file_info(path).mtime
++
+ 
+ @mirror_from(
+     "stream", ["read", "seek", "tell", "write", "readable", "writable", "close", "size"]
+diff --git a/fsspec/implementations/cached.py b/fsspec/implementations/cached.py
+index a0799a0..0619d1a 100644
+--- a/fsspec/implementations/cached.py
++++ b/fsspec/implementations/cached.py
+@@ -232,6 +232,44 @@ class CachingFileSystem(AbstractFileSystem):
+         rmtree(self.storage[-1])
+         self.load_cache()
+ 
++    def clear_expired_cache(self, expiry_time=None):
++        """Remove all expired files and metadata from the cache
++
++        In the case of multiple cache locations, this clears only the last one,
++        which is assumed to be the read/write one.
++
++        Parameters
++        ----------
++        expiry_time: int
++            The time in seconds after which a local copy is considered useless.
++            If not defined the default is equivalent to the attribute from the
++            file caching instantiation.
++        """
++
++        if not expiry_time:
++            expiry_time = self.expiry
++
++        self._check_cache()
++
++        for path, detail in self.cached_files[-1].copy().items():
++            if time.time() - detail["time"] > expiry_time:
++                if self.same_names:
++                    basename = os.path.basename(detail["original"])
++                    fn = os.path.join(self.storage[-1], basename)
++                else:
++                    fn = os.path.join(self.storage[-1], detail["fn"])
++                if os.path.exists(fn):
++                    os.remove(fn)
++                    self.cached_files[-1].pop(path)
++
++        if self.cached_files[-1]:
++            cache_path = os.path.join(self.storage[-1], "cache")
++            with open(cache_path, "wb") as fc:
++                pickle.dump(self.cached_files[-1], fc)
++        else:
++            rmtree(self.storage[-1])
++            self.load_cache()
++
+     def pop_from_cache(self, path):
+         """Remove cached version of given file
+ 
+@@ -389,6 +427,7 @@ class CachingFileSystem(AbstractFileSystem):
+             "_check_cache",
+             "_mkcache",
+             "clear_cache",
++            "clear_expired_cache",
+             "pop_from_cache",
+             "_mkcache",
+             "local_file",
+diff --git a/fsspec/implementations/memory.py b/fsspec/implementations/memory.py
+index 09df148..cf0b2c5 100644
+--- a/fsspec/implementations/memory.py
++++ b/fsspec/implementations/memory.py
+@@ -40,7 +40,7 @@ class MemoryFileSystem(AbstractFileSystem):
+                     "name": path,
+                     "size": self.store[path].size,
+                     "type": "file",
+-                    "created": self.store[path].created,
++                    "created": self.store[path].created.timestamp(),
+                 }
+             ]
+         paths = set()
+@@ -55,7 +55,7 @@ class MemoryFileSystem(AbstractFileSystem):
+                             "name": p2,
+                             "size": self.store[p2].size,
+                             "type": "file",
+-                            "created": self.store[p2].created,
++                            "created": self.store[p2].created.timestamp(),
+                         }
+                     )
+                 elif len(p2) > len(starter):
+@@ -221,6 +221,20 @@ class MemoryFileSystem(AbstractFileSystem):
+         except KeyError as e:
+             raise FileNotFoundError(path) from e
+ 
++    def modified(self, path):
++        path = self._strip_protocol(path)
++        try:
++            return self.store[path].modified
++        except KeyError:
++            raise FileNotFoundError(path)
++
++    def created(self, path):
++        path = self._strip_protocol(path)
++        try:
++            return self.store[path].created
++        except KeyError:
++            raise FileNotFoundError(path)
++
+     def rm(self, path, recursive=False, maxdepth=None):
+         if isinstance(path, str):
+             path = self._strip_protocol(path)
+@@ -252,7 +266,8 @@ class MemoryFile(BytesIO):
+         logger.debug("open file %s", path)
+         self.fs = fs
+         self.path = path
+-        self.created = datetime.utcnow().timestamp()
++        self.created = datetime.utcnow()
++        self.modified = datetime.utcnow()
+         if data:
+             super().__init__(data)
+             self.seek(0)
+@@ -272,3 +287,4 @@ class MemoryFile(BytesIO):
+ 
+     def commit(self):
+         self.fs.store[self.path] = self
++        self.modified = datetime.utcnow()
+

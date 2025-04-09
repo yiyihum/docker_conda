@@ -1,0 +1,178 @@
+diff --git a/conftest.py b/conftest.py
+index 5a7919f..53413de 100644
+--- a/conftest.py
++++ b/conftest.py
+@@ -1,9 +1,11 @@
+ import os
+ 
++import logging
++import faulthandler
++
+ import pytest
+ from _pytest.doctest import DoctestItem
+ 
+-import logging
+ from joblib.parallel import mp
+ from joblib.backports import LooseVersion
+ try:
+@@ -53,6 +55,11 @@ def pytest_configure(config):
+         log.handlers[0].setFormatter(logging.Formatter(
+             '[%(levelname)s:%(processName)s:%(threadName)s] %(message)s'))
+ 
++    # Some CI runs failed with hanging processes that were not terminated
++    # with the timeout. To make sure we always get a proper trace, set a large
++    # enough dump_traceback_later to kill the process with a report.
++    faulthandler.dump_traceback_later(30 * 60, exit=True)
++
+     DEFAULT_BACKEND = os.environ.get(
+         "JOBLIB_TESTS_DEFAULT_PARALLEL_BACKEND", None
+     )
+@@ -66,12 +73,14 @@ def pytest_configure(config):
+ 
+ 
+ def pytest_unconfigure(config):
++
+     # Setup a global traceback printer callback to debug deadlocks that
+     # would happen once pytest has completed: for instance in atexit
+     # finalizers. At this point the stdout/stderr capture of pytest
+-    # should be disabled.
++    # should be disabled. Note that we cancel the global dump_traceback_later
++    # to waiting for too long.
++    faulthandler.cancel_dump_traceback_later()
+ 
+     # Note that we also use a shorter timeout for the per-test callback
+     # configured via the pytest-timeout extension.
+-    import faulthandler
+     faulthandler.dump_traceback_later(60, exit=True)
+diff --git a/joblib/test/test_func_inspect.py b/joblib/test/test_func_inspect.py
+index b3b7b7b..a2a010e 100644
+--- a/joblib/test/test_func_inspect.py
++++ b/joblib/test/test_func_inspect.py
+@@ -146,6 +146,26 @@ def test_func_name_on_inner_func(cached_func):
+     assert get_func_name(cached_func)[1] == 'cached_func_inner'
+ 
+ 
++def test_func_name_collision_on_inner_func():
++    # Check that two functions defining and caching an inner function
++    # with the same do not cause (module, name) collision
++    def f():
++        def inner_func():
++            return  # pragma: no cover
++        return get_func_name(inner_func)
++
++    def g():
++        def inner_func():
++            return  # pragma: no cover
++        return get_func_name(inner_func)
++
++    module, name = f()
++    other_module, other_name = g()
++
++    assert name == other_name
++    assert module != other_module
++
++
+ def test_func_inspect_errors():
+     # Check that func_inspect is robust and will work on weird objects
+     assert get_func_name('a'.lower)[-1] == 'lower'
+diff --git a/joblib/test/test_memmapping.py b/joblib/test/test_memmapping.py
+index 4d298d0..af90a96 100644
+--- a/joblib/test/test_memmapping.py
++++ b/joblib/test/test_memmapping.py
+@@ -798,9 +798,9 @@ def test_child_raises_parent_exits_cleanly(backend):
+ 
+         def get_temp_folder(parallel_obj, backend):
+             if "{b}" == "loky":
+-                return Path(p._backend._workers._temp_folder)
++                return Path(parallel_obj._backend._workers._temp_folder)
+             else:
+-                return Path(p._backend._pool._temp_folder)
++                return Path(parallel_obj._backend._pool._temp_folder)
+ 
+ 
+         if __name__ == "__main__":
+diff --git a/joblib/test/test_numpy_pickle.py b/joblib/test/test_numpy_pickle.py
+index 5c4bb09..9fee585 100644
+--- a/joblib/test/test_numpy_pickle.py
++++ b/joblib/test/test_numpy_pickle.py
+@@ -280,8 +280,9 @@ def test_compress_mmap_mode_warning(tmpdir):
+     numpy_pickle.dump(a, this_filename, compress=1)
+     with warns(UserWarning) as warninfo:
+         numpy_pickle.load(this_filename, mmap_mode='r+')
++    debug_msg = "\n".join([str(w) for w in warninfo])
+     warninfo = [w.message for w in warninfo]
+-    assert len(warninfo) == 1
++    assert len(warninfo) == 1, debug_msg
+     assert (
+         str(warninfo[0]) ==
+         'mmap_mode "r+" is not compatible with compressed '
+diff --git a/joblib/test/test_testing.py b/joblib/test/test_testing.py
+index 39ac880..cc94463 100644
+--- a/joblib/test/test_testing.py
++++ b/joblib/test/test_testing.py
+@@ -58,7 +58,9 @@ def test_check_subprocess_call_timeout():
+         'sys.stdout.flush()',
+         'sys.stderr.write("before sleep on stderr")',
+         'sys.stderr.flush()',
+-        'time.sleep(1.1)',
++        # We need to sleep for at least 2 * timeout seconds in case the SIGKILL
++        # is triggered.
++        'time.sleep(2.1)',
+         'print("process should have be killed before")',
+         'sys.stdout.flush()'])
+ 
+diff --git a/joblib/testing.py b/joblib/testing.py
+index f8939f0..caab7d2 100644
+--- a/joblib/testing.py
++++ b/joblib/testing.py
+@@ -40,20 +40,39 @@ def check_subprocess_call(cmd, timeout=5, stdout_regex=None,
+                           stderr_regex=None):
+     """Runs a command in a subprocess with timeout in seconds.
+ 
++    A SIGTERM is sent after `timeout` and if it does not terminate, a
++    SIGKILL is sent after `2 * timeout`.
++
+     Also checks returncode is zero, stdout if stdout_regex is set, and
+     stderr if stderr_regex is set.
+     """
+     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+ 
+-    def kill_process():
+-        warnings.warn("Timeout running {}".format(cmd))
++    def terminate_process():  # pragma: no cover
++        """
++        Attempt to terminate a leftover process spawned during test execution:
++        ideally this should not be needed but can help avoid clogging the CI
++        workers in case of deadlocks.
++        """
++        warnings.warn(f"Timeout running {cmd}")
++        proc.terminate()
++
++    def kill_process():  # pragma: no cover
++        """
++        Kill a leftover process spawned during test execution: ideally this
++        should not be needed but can help avoid clogging the CI workers in
++        case of deadlocks.
++        """
++        warnings.warn(f"Timeout running {cmd}")
+         proc.kill()
+ 
+     try:
+         if timeout is not None:
+-            timer = threading.Timer(timeout, kill_process)
+-            timer.start()
++            terminate_timer = threading.Timer(timeout, terminate_process)
++            terminate_timer.start()
++            kill_timer = threading.Timer(2 * timeout, kill_process)
++            kill_timer.start()
+         stdout, stderr = proc.communicate()
+         stdout, stderr = stdout.decode(), stderr.decode()
+         if proc.returncode != 0:
+@@ -76,4 +95,5 @@ def check_subprocess_call(cmd, timeout=5, stdout_regex=None,
+ 
+     finally:
+         if timeout is not None:
+-            timer.cancel()
++            terminate_timer.cancel()
++            kill_timer.cancel()

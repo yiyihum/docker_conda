@@ -1,0 +1,547 @@
+diff --git a/pydantic/__init__.py b/pydantic/__init__.py
+--- a/pydantic/__init__.py
++++ b/pydantic/__init__.py
+@@ -66,6 +66,8 @@
+     'parse_file_as',
+     'parse_obj_as',
+     'parse_raw_as',
++    'schema',
++    'schema_json',
+     # types
+     'NoneStr',
+     'NoneBytes',
+diff --git a/pydantic/errors.py b/pydantic/errors.py
+--- a/pydantic/errors.py
++++ b/pydantic/errors.py
+@@ -1,6 +1,6 @@
+ from decimal import Decimal
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Any, Callable, Set, Tuple, Type, Union
++from typing import TYPE_CHECKING, Any, Callable, Sequence, Set, Tuple, Type, Union
+ 
+ from .typing import display_as_type
+ 
+@@ -99,6 +99,8 @@
+     'InvalidLengthForBrand',
+     'InvalidByteSize',
+     'InvalidByteSizeUnit',
++    'MissingDiscriminator',
++    'InvalidDiscriminator',
+ )
+ 
+ 
+@@ -611,3 +613,23 @@ class InvalidByteSize(PydanticValueError):
+ 
+ class InvalidByteSizeUnit(PydanticValueError):
+     msg_template = 'could not interpret byte unit: {unit}'
++
++
++class MissingDiscriminator(PydanticValueError):
++    code = 'discriminated_union.missing_discriminator'
++    msg_template = 'Discriminator {discriminator_key!r} is missing in value'
++
++
++class InvalidDiscriminator(PydanticValueError):
++    code = 'discriminated_union.invalid_discriminator'
++    msg_template = (
++        'No match for discriminator {discriminator_key!r} and value {discriminator_value!r} '
++        '(allowed values: {allowed_values})'
++    )
++
++    def __init__(self, *, discriminator_key: str, discriminator_value: Any, allowed_values: Sequence[Any]) -> None:
++        super().__init__(
++            discriminator_key=discriminator_key,
++            discriminator_value=discriminator_value,
++            allowed_values=', '.join(map(repr, allowed_values)),
++        )
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -28,7 +28,7 @@
+ from . import errors as errors_
+ from .class_validators import Validator, make_generic_validator, prep_validators
+ from .error_wrappers import ErrorWrapper
+-from .errors import ConfigError, NoneIsNotAllowedError
++from .errors import ConfigError, InvalidDiscriminator, MissingDiscriminator, NoneIsNotAllowedError
+ from .types import Json, JsonWrapper
+ from .typing import (
+     Callable,
+@@ -45,7 +45,16 @@
+     is_union,
+     new_type_supertype,
+ )
+-from .utils import PyObjectStr, Representation, ValueItems, lenient_issubclass, sequence_like, smart_deepcopy
++from .utils import (
++    PyObjectStr,
++    Representation,
++    ValueItems,
++    get_discriminator_alias_and_values,
++    get_unique_discriminator_alias,
++    lenient_issubclass,
++    sequence_like,
++    smart_deepcopy,
++)
+ from .validators import constant_validator, dict_validator, find_validators, validate_json
+ 
+ Required: Any = Ellipsis
+@@ -108,6 +117,7 @@ class FieldInfo(Representation):
+         'allow_mutation',
+         'repr',
+         'regex',
++        'discriminator',
+         'extra',
+     )
+ 
+@@ -147,6 +157,7 @@ def __init__(self, default: Any = Undefined, **kwargs: Any) -> None:
+         self.max_length = kwargs.pop('max_length', None)
+         self.allow_mutation = kwargs.pop('allow_mutation', True)
+         self.regex = kwargs.pop('regex', None)
++        self.discriminator = kwargs.pop('discriminator', None)
+         self.repr = kwargs.pop('repr', True)
+         self.extra = kwargs
+ 
+@@ -212,6 +223,7 @@ def Field(
+     max_length: int = None,
+     allow_mutation: bool = True,
+     regex: str = None,
++    discriminator: str = None,
+     repr: bool = True,
+     **extra: Any,
+ ) -> Any:
+@@ -249,6 +261,8 @@ def Field(
+       assigned on an instance.  The BaseModel Config must set validate_assignment to True
+     :param regex: only applies to strings, requires the field match against a regular expression
+       pattern string. The schema will have a ``pattern`` validation keyword
++    :param discriminator: only useful with a (discriminated a.k.a. tagged) `Union` of sub models with a common field.
++      The `discriminator` is the name of this common field to shorten validation and improve generated schema
+     :param repr: show this field in the representation
+     :param **extra: any additional keyword arguments will be added as is to the schema
+     """
+@@ -272,6 +286,7 @@ def Field(
+         max_length=max_length,
+         allow_mutation=allow_mutation,
+         regex=regex,
++        discriminator=discriminator,
+         repr=repr,
+         **extra,
+     )
+@@ -315,6 +330,7 @@ class ModelField(Representation):
+         'type_',
+         'outer_type_',
+         'sub_fields',
++        'sub_fields_mapping',
+         'key_field',
+         'validators',
+         'pre_validators',
+@@ -327,6 +343,8 @@ class ModelField(Representation):
+         'alias',
+         'has_alias',
+         'field_info',
++        'discriminator_key',
++        'discriminator_alias',
+         'validate_always',
+         'allow_none',
+         'shape',
+@@ -359,10 +377,13 @@ def __init__(
+         self.required: 'BoolUndefined' = required
+         self.model_config = model_config
+         self.field_info: FieldInfo = field_info or FieldInfo(default)
++        self.discriminator_key: Optional[str] = self.field_info.discriminator
++        self.discriminator_alias: Optional[str] = self.discriminator_key
+ 
+         self.allow_none: bool = False
+         self.validate_always: bool = False
+         self.sub_fields: Optional[List[ModelField]] = None
++        self.sub_fields_mapping: Optional[Dict[str, 'ModelField']] = None  # used for discriminated union
+         self.key_field: Optional[ModelField] = None
+         self.validators: 'ValidatorsList' = []
+         self.pre_validators: Optional['ValidatorsList'] = None
+@@ -547,6 +568,15 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+             return
+ 
+         origin = get_origin(self.type_)
++
++        if origin is Annotated:
++            self.type_ = get_args(self.type_)[0]
++            self._type_analysis()
++            return
++
++        if self.discriminator_key is not None and not is_union(origin):
++            raise TypeError('`discriminator` can only be used with `Union` type')
++
+         # add extra check for `collections.abc.Hashable` for python 3.10+ where origin is not `None`
+         if origin is None or origin is CollectionsHashable:
+             # field is not "typing" object eg. Union, Dict, List etc.
+@@ -554,10 +584,6 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+             if isinstance(self.type_, type) and isinstance(None, self.type_):
+                 self.allow_none = True
+             return
+-        elif origin is Annotated:
+-            self.type_ = get_args(self.type_)[0]
+-            self._type_analysis()
+-            return
+         elif origin is Callable:
+             return
+         elif is_union(origin):
+@@ -579,6 +605,9 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+                 self._type_analysis()
+             else:
+                 self.sub_fields = [self._create_sub_type(t, f'{self.name}_{display_as_type(t)}') for t in types_]
++
++                if self.discriminator_key is not None:
++                    self.prepare_discriminated_union_sub_fields()
+             return
+         elif issubclass(origin, Tuple):  # type: ignore
+             # origin == Tuple without item type
+@@ -672,6 +701,30 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+         # type_ has been refined eg. as the type of a List and sub_fields needs to be populated
+         self.sub_fields = [self._create_sub_type(self.type_, '_' + self.name)]
+ 
++    def prepare_discriminated_union_sub_fields(self) -> None:
++        """
++        Prepare the mapping <discriminator key> -> <ModelField> and update `sub_fields`
++        Note that this process can be aborted if a `ForwardRef` is encountered
++        """
++        assert self.discriminator_key is not None
++        assert self.sub_fields is not None
++        sub_fields_mapping: Dict[str, 'ModelField'] = {}
++        all_aliases: Set[str] = set()
++
++        for sub_field in self.sub_fields:
++            t = sub_field.type_
++            if t.__class__ is ForwardRef:
++                # Stopping everything...will need to call `update_forward_refs`
++                return
++
++            alias, discriminator_values = get_discriminator_alias_and_values(t, self.discriminator_key)
++            all_aliases.add(alias)
++            for discriminator_value in discriminator_values:
++                sub_fields_mapping[discriminator_value] = sub_field
++
++        self.sub_fields_mapping = sub_fields_mapping
++        self.discriminator_alias = get_unique_discriminator_alias(all_aliases, self.discriminator_key)
++
+     def _create_sub_type(self, type_: Type[Any], name: str, *, for_keys: bool = False) -> 'ModelField':
+         if for_keys:
+             class_validators = None
+@@ -689,11 +742,15 @@ def _create_sub_type(self, type_: Type[Any], name: str, *, for_keys: bool = Fals
+                 for k, v in self.class_validators.items()
+                 if v.each_item
+             }
++
++        field_info, _ = self._get_field_info(name, type_, None, self.model_config)
++
+         return self.__class__(
+             type_=type_,
+             name=name,
+             class_validators=class_validators,
+             model_config=self.model_config,
++            field_info=field_info,
+         )
+ 
+     def populate_validators(self) -> None:
+@@ -940,6 +997,9 @@ def _validate_singleton(
+         self, v: Any, values: Dict[str, Any], loc: 'LocStr', cls: Optional['ModelOrDc']
+     ) -> 'ValidateReturn':
+         if self.sub_fields:
++            if self.discriminator_key is not None:
++                return self._validate_discriminated_union(v, values, loc, cls)
++
+             errors = []
+ 
+             if self.model_config.smart_union and is_union(get_origin(self.type_)):
+@@ -980,6 +1040,46 @@ def _validate_singleton(
+         else:
+             return self._apply_validators(v, values, loc, cls, self.validators)
+ 
++    def _validate_discriminated_union(
++        self, v: Any, values: Dict[str, Any], loc: 'LocStr', cls: Optional['ModelOrDc']
++    ) -> 'ValidateReturn':
++        assert self.discriminator_key is not None
++        assert self.discriminator_alias is not None
++
++        try:
++            discriminator_value = v[self.discriminator_alias]
++        except KeyError:
++            return v, ErrorWrapper(MissingDiscriminator(discriminator_key=self.discriminator_key), loc)
++        except TypeError:
++            try:
++                # BaseModel or dataclass
++                discriminator_value = getattr(v, self.discriminator_alias)
++            except (AttributeError, TypeError):
++                return v, ErrorWrapper(MissingDiscriminator(discriminator_key=self.discriminator_key), loc)
++
++        try:
++            sub_field = self.sub_fields_mapping[discriminator_value]  # type: ignore[index]
++        except TypeError:
++            assert cls is not None
++            raise ConfigError(
++                f'field "{self.name}" not yet prepared so type is still a ForwardRef, '
++                f'you might need to call {cls.__name__}.update_forward_refs().'
++            )
++        except KeyError:
++            assert self.sub_fields_mapping is not None
++            return v, ErrorWrapper(
++                InvalidDiscriminator(
++                    discriminator_key=self.discriminator_key,
++                    discriminator_value=discriminator_value,
++                    allowed_values=list(self.sub_fields_mapping),
++                ),
++                loc,
++            )
++        else:
++            if not isinstance(loc, tuple):
++                loc = (loc,)
++            return sub_field.validate(v, values, loc=(*loc, display_as_type(sub_field.type_)), cls=cls)
++
+     def _apply_validators(
+         self, v: Any, values: Dict[str, Any], loc: 'LocStr', cls: Optional['ModelOrDc'], validators: 'ValidatorsList'
+     ) -> 'ValidateReturn':
+diff --git a/pydantic/schema.py b/pydantic/schema.py
+--- a/pydantic/schema.py
++++ b/pydantic/schema.py
+@@ -70,6 +70,7 @@
+     all_literal_values,
+     get_args,
+     get_origin,
++    get_sub_types,
+     is_callable_type,
+     is_literal_type,
+     is_namedtuple,
+@@ -250,6 +251,37 @@ def field_schema(
+         ref_template=ref_template,
+         known_models=known_models or set(),
+     )
++
++    # https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.2.md#discriminator-object
++    if field.discriminator_key is not None:
++        assert field.sub_fields_mapping is not None
++
++        discriminator_models_refs: Dict[str, Union[str, Dict[str, Any]]] = {}
++
++        for discriminator_value, sub_field in field.sub_fields_mapping.items():
++            # sub_field is either a `BaseModel` or directly an `Annotated` `Union` of many
++            if is_union(get_origin(sub_field.type_)):
++                sub_models = get_sub_types(sub_field.type_)
++                discriminator_models_refs[discriminator_value] = {
++                    model_name_map[sub_model]: get_schema_ref(
++                        model_name_map[sub_model], ref_prefix, ref_template, False
++                    )
++                    for sub_model in sub_models
++                }
++            else:
++                sub_field_type = sub_field.type_
++                if hasattr(sub_field_type, '__pydantic_model__'):
++                    sub_field_type = sub_field_type.__pydantic_model__
++
++                discriminator_model_name = model_name_map[sub_field_type]
++                discriminator_model_ref = get_schema_ref(discriminator_model_name, ref_prefix, ref_template, False)
++                discriminator_models_refs[discriminator_value] = discriminator_model_ref['$ref']
++
++        s['discriminator'] = {
++            'propertyName': field.discriminator_alias,
++            'mapping': discriminator_models_refs,
++        }
++
+     # $ref will only be returned when there are no schema_overrides
+     if '$ref' in f_schema:
+         return f_schema, f_definitions, f_nested_models
+diff --git a/pydantic/tools.py b/pydantic/tools.py
+--- a/pydantic/tools.py
++++ b/pydantic/tools.py
+@@ -1,16 +1,19 @@
+ import json
+ from functools import lru_cache
+ from pathlib import Path
+-from typing import Any, Callable, Optional, Type, TypeVar, Union
++from typing import TYPE_CHECKING, Any, Callable, Optional, Type, TypeVar, Union
+ 
+ from .parse import Protocol, load_file, load_str_bytes
+ from .types import StrBytes
+ from .typing import display_as_type
+ 
+-__all__ = ('parse_file_as', 'parse_obj_as', 'parse_raw_as')
++__all__ = ('parse_file_as', 'parse_obj_as', 'parse_raw_as', 'schema', 'schema_json')
+ 
+ NameFactory = Union[str, Callable[[Type[Any]], str]]
+ 
++if TYPE_CHECKING:
++    from .typing import DictStrAny
++
+ 
+ def _generate_parsing_type_name(type_: Any) -> str:
+     return f'ParsingModel[{display_as_type(type_)}]'
+@@ -77,3 +80,13 @@ def parse_raw_as(
+         json_loads=json_loads,
+     )
+     return parse_obj_as(type_, obj, type_name=type_name)
++
++
++def schema(type_: Any, *, title: Optional[NameFactory] = None, **schema_kwargs: Any) -> 'DictStrAny':
++    """Generate a JSON schema (as dict) for the passed model or dynamically generated one"""
++    return _get_parsing_type(type_, type_name=title).schema(**schema_kwargs)
++
++
++def schema_json(type_: Any, *, title: Optional[NameFactory] = None, **schema_json_kwargs: Any) -> str:
++    """Generate a JSON schema (as JSON) for the passed model or dynamically generated one"""
++    return _get_parsing_type(type_, type_name=title).schema_json(**schema_json_kwargs)
+diff --git a/pydantic/typing.py b/pydantic/typing.py
+--- a/pydantic/typing.py
++++ b/pydantic/typing.py
+@@ -262,6 +262,7 @@ def is_union(tp: Type[Any]) -> bool:
+     'WithArgsTypes',
+     'get_args',
+     'get_origin',
++    'get_sub_types',
+     'typing_base',
+     'get_all_type_hints',
+     'is_union',
+@@ -310,6 +311,9 @@ def display_as_type(v: Type[Any]) -> str:
+     if not isinstance(v, typing_base) and not isinstance(v, WithArgsTypes) and not isinstance(v, type):
+         v = v.__class__
+ 
++    if is_union(get_origin(v)):
++        return f'Union[{", ".join(map(display_as_type, get_args(v)))}]'
++
+     if isinstance(v, WithArgsTypes):
+         # Generic alias are constructs like `list[int]`
+         return str(v).replace('typing.', '')
+@@ -443,10 +447,14 @@ def update_field_forward_refs(field: 'ModelField', globalns: Any, localns: Any)
+     if field.type_.__class__ == ForwardRef:
+         field.type_ = evaluate_forwardref(field.type_, globalns, localns or None)
+         field.prepare()
++
+     if field.sub_fields:
+         for sub_f in field.sub_fields:
+             update_field_forward_refs(sub_f, globalns=globalns, localns=localns)
+ 
++    if field.discriminator_key is not None:
++        field.prepare_discriminated_union_sub_fields()
++
+ 
+ def update_model_forward_refs(
+     model: Type[Any],
+@@ -487,3 +495,17 @@ def get_class(type_: Type[Any]) -> Union[None, bool, Type[Any]]:
+     except (AttributeError, TypeError):
+         pass
+     return None
++
++
++def get_sub_types(tp: Any) -> List[Any]:
++    """
++    Return all the types that are allowed by type `tp`
++    `tp` can be a `Union` of allowed types or an `Annotated` type
++    """
++    origin = get_origin(tp)
++    if origin is Annotated:
++        return get_sub_types(get_args(tp)[0])
++    elif is_union(origin):
++        return [x for t in get_args(tp) for x in get_sub_types(t)]
++    else:
++        return [tp]
+diff --git a/pydantic/utils.py b/pydantic/utils.py
+--- a/pydantic/utils.py
++++ b/pydantic/utils.py
+@@ -9,6 +9,7 @@
+     AbstractSet,
+     Any,
+     Callable,
++    Collection,
+     Dict,
+     Generator,
+     Iterable,
+@@ -23,7 +24,19 @@
+     Union,
+ )
+ 
+-from .typing import NoneType, WithArgsTypes, display_as_type
++from typing_extensions import Annotated
++
++from .errors import ConfigError
++from .typing import (
++    NoneType,
++    WithArgsTypes,
++    all_literal_values,
++    display_as_type,
++    get_args,
++    get_origin,
++    is_literal_type,
++    is_union,
++)
+ from .version import version_info
+ 
+ if TYPE_CHECKING:
+@@ -57,6 +70,8 @@
+     'ClassAttribute',
+     'path_type',
+     'ROOT_KEY',
++    'get_unique_discriminator_alias',
++    'get_discriminator_alias_and_values',
+ )
+ 
+ ROOT_KEY = '__root__'
+@@ -665,3 +680,63 @@ def all_identical(left: Iterable[Any], right: Iterable[Any]) -> bool:
+         if left_item is not right_item:
+             return False
+     return True
++
++
++def get_unique_discriminator_alias(all_aliases: Collection[str], discriminator_key: str) -> str:
++    """Validate that all aliases are the same and if that's the case return the alias"""
++    unique_aliases = set(all_aliases)
++    if len(unique_aliases) > 1:
++        raise ConfigError(
++            f'Aliases for discriminator {discriminator_key!r} must be the same (got {", ".join(sorted(all_aliases))})'
++        )
++    return unique_aliases.pop()
++
++
++def get_discriminator_alias_and_values(tp: Any, discriminator_key: str) -> Tuple[str, Tuple[str, ...]]:
++    """
++    Get alias and all valid values in the `Literal` type of the discriminator field
++    `tp` can be a `BaseModel` class or directly an `Annotated` `Union` of many.
++    """
++    is_root_model = getattr(tp, '__custom_root_type__', False)
++
++    if get_origin(tp) is Annotated:
++        tp = get_args(tp)[0]
++
++    if hasattr(tp, '__pydantic_model__'):
++        tp = tp.__pydantic_model__
++
++    if is_union(get_origin(tp)):
++        alias, all_values = _get_union_alias_and_all_values(tp, discriminator_key)
++        return alias, tuple(v for values in all_values for v in values)
++    elif is_root_model:
++        union_type = tp.__fields__[ROOT_KEY].type_
++        alias, all_values = _get_union_alias_and_all_values(union_type, discriminator_key)
++
++        if len(set(all_values)) > 1:
++            raise ConfigError(
++                f'Field {discriminator_key!r} is not the same for all submodels of {display_as_type(tp)!r}'
++            )
++
++        return alias, all_values[0]
++
++    else:
++        try:
++            t_discriminator_type = tp.__fields__[discriminator_key].type_
++        except AttributeError as e:
++            raise TypeError(f'Type {tp.__name__!r} is not a valid `BaseModel` or `dataclass`') from e
++        except KeyError as e:
++            raise ConfigError(f'Model {tp.__name__!r} needs a discriminator field for key {discriminator_key!r}') from e
++
++        if not is_literal_type(t_discriminator_type):
++            raise ConfigError(f'Field {discriminator_key!r} of model {tp.__name__!r} needs to be a `Literal`')
++
++        return tp.__fields__[discriminator_key].alias, all_literal_values(t_discriminator_type)
++
++
++def _get_union_alias_and_all_values(
++    union_type: Type[Any], discriminator_key: str
++) -> Tuple[str, Tuple[Tuple[str, ...], ...]]:
++    zipped_aliases_values = [get_discriminator_alias_and_values(t, discriminator_key) for t in get_args(union_type)]
++    # unzip: [('alias_a',('v1', 'v2)), ('alias_b', ('v3',))] => [('alias_a', 'alias_b'), (('v1', 'v2'), ('v3',))]
++    all_aliases, all_values = zip(*zipped_aliases_values)
++    return get_unique_discriminator_alias(all_aliases, discriminator_key), all_values
+

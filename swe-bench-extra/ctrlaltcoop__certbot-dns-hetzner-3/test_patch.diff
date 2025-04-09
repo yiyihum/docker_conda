@@ -1,0 +1,122 @@
+diff --git a/certbot_dns_hetzner/dns_hetzner_test.py b/certbot_dns_hetzner/dns_hetzner_test.py
+index 7456102..c754d2c 100644
+--- a/certbot_dns_hetzner/dns_hetzner_test.py
++++ b/certbot_dns_hetzner/dns_hetzner_test.py
+@@ -50,7 +50,6 @@ class AuthenticatorTest(
+         self.mock_client.add_record.assert_called_with(
+             DOMAIN, 'TXT', '_acme-challenge.' + DOMAIN + '.', mock.ANY, mock.ANY
+         )
+-        self.assertEqual(self.auth.record_id, FAKE_RECORD['record']['id'])
+ 
+     def test_perform_but_raises_zone_not_found(self):
+         self.mock_client.add_record.side_effect = mock.MagicMock(side_effect=_ZoneNotFoundException(DOMAIN))
+@@ -69,7 +68,16 @@ class AuthenticatorTest(
+         self.auth._attempt_cleanup = True
+         self.auth.cleanup([self.achall])
+ 
+-        self.mock_client.delete_record.assert_called_with(record_id=FAKE_RECORD['record']['id'])
++        self.mock_client.delete_record_by_name.assert_called_with(DOMAIN, '_acme-challenge.' + DOMAIN + '.')
++
++    def test_cleanup_but_connection_aborts(self):
++        self.mock_client.add_record.return_value = FAKE_RECORD
++        # _attempt_cleanup | pylint: disable=protected-access
++        self.auth.perform([self.achall])
++        self.auth._attempt_cleanup = True
++        self.auth.cleanup([self.achall])
++
++        self.mock_client.delete_record_by_name.assert_called_with(DOMAIN, '_acme-challenge.' + DOMAIN + '.')
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/certbot_dns_hetzner/hetzner_client_test.py b/certbot_dns_hetzner/hetzner_client_test.py
+index 4c41971..b0f55fa 100644
+--- a/certbot_dns_hetzner/hetzner_client_test.py
++++ b/certbot_dns_hetzner/hetzner_client_test.py
+@@ -1,3 +1,4 @@
++# pylint: disable=W0212
+ """
+ Test suite for _HetznerClient
+ """
+@@ -7,9 +8,10 @@ import requests
+ import requests_mock
+ 
+ from certbot_dns_hetzner.fakes import FAKE_API_TOKEN, FAKE_RECORD_RESPONSE, FAKE_DOMAIN, \
+-    FAKE_ZONES_RESPONSE_WITH_DOMAIN, FAKE_ZONES_RESPONSE_WITHOUT_DOMAIN, FAKE_RECORD_ID
++    FAKE_ZONES_RESPONSE_WITH_DOMAIN, FAKE_ZONES_RESPONSE_WITHOUT_DOMAIN, FAKE_RECORD_ID, FAKE_ZONE_ID, \
++    FAKE_RECORDS_RESPONSE_WITH_RECORD, FAKE_RECORD_NAME, FAKE_RECORDS_RESPONSE_WITHOUT_RECORD
+ from certbot_dns_hetzner.hetzner_client import HETZNER_API_ENDPOINT, _ZoneNotFoundException, \
+-    _MalformedResponseException, _NotAuthorizedException
++    _MalformedResponseException, _NotAuthorizedException, _RecordNotFoundException
+ 
+ 
+ class HetznerClientTest(unittest.TestCase):
+@@ -21,6 +23,20 @@ class HetznerClientTest(unittest.TestCase):
+         from certbot_dns_hetzner.dns_hetzner import _HetznerClient  # pylint: disable=import-outside-toplevel
+         self.client = _HetznerClient(FAKE_API_TOKEN)
+ 
++    def test_get_zone_by_name(self):
++        with requests_mock.Mocker() as mock:
++            mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=200, json=FAKE_ZONES_RESPONSE_WITH_DOMAIN)
++            zone_id = self.client._get_zone_id_by_domain(FAKE_DOMAIN)
++            self.assertEqual(zone_id, FAKE_ZONE_ID)
++
++    def test_get_zone_by_name_but_zone_response_is_garbage(self):
++        with requests_mock.Mocker() as mock:
++            mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=200, text='garbage')
++            self.assertRaises(
++                _MalformedResponseException,
++                self.client._get_zone_id_by_domain, FAKE_DOMAIN
++            )
++
+     def test_add_record(self):
+         with requests_mock.Mocker() as mock:
+             mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=200, json=FAKE_ZONES_RESPONSE_WITH_DOMAIN)
+@@ -46,6 +62,14 @@ class HetznerClientTest(unittest.TestCase):
+                 self.client.add_record, FAKE_DOMAIN, "TXT", "somename", "somevalue", 42
+             )
+ 
++    def test_add_record_but_record_but_unauthorized(self):
++        with requests_mock.Mocker() as mock:
++            mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=401)
++            self.assertRaises(
++                _NotAuthorizedException,
++                self.client.add_record, FAKE_DOMAIN, "TXT", "somename", "somevalue", 42
++            )
++
+     def test_add_record_but_zone_listing_is_401(self):
+         with requests_mock.Mocker() as mock:
+             mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=401)
+@@ -84,3 +108,33 @@ class HetznerClientTest(unittest.TestCase):
+                 _MalformedResponseException,
+                 self.client.delete_record, FAKE_RECORD_ID
+             )
++
++    def test_delete_record_by_name_and_found(self):
++        with requests_mock.Mocker() as mock:
++            mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=200, json=FAKE_ZONES_RESPONSE_WITH_DOMAIN)
++            mock.get('{0}/records?zone_id={1}'.format(
++                HETZNER_API_ENDPOINT,
++                FAKE_ZONE_ID
++            ), status_code=200, json=FAKE_RECORDS_RESPONSE_WITH_RECORD)
++            mock.delete('{0}/records/{1}'.format(HETZNER_API_ENDPOINT, FAKE_RECORD_ID), status_code=200)
++            self.client.delete_record_by_name(FAKE_DOMAIN, FAKE_RECORD_NAME)
++
++    def test_delete_record_by_name_but_its_not_found(self):
++        with requests_mock.Mocker() as mock:
++            mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=200, json=FAKE_ZONES_RESPONSE_WITH_DOMAIN)
++            mock.get('{0}/records?zone_id={1}'.format(
++                HETZNER_API_ENDPOINT,
++                FAKE_ZONE_ID
++            ), status_code=200, json=FAKE_RECORDS_RESPONSE_WITHOUT_RECORD)
++            self.assertRaises(
++                _RecordNotFoundException,
++                self.client.delete_record_by_name, FAKE_DOMAIN, FAKE_RECORD_NAME
++            )
++
++    def test_delete_record_by_name_but_zone_is_not_found(self):
++        with requests_mock.Mocker() as mock:
++            mock.get('{0}/zones'.format(HETZNER_API_ENDPOINT), status_code=200, json=FAKE_ZONES_RESPONSE_WITHOUT_DOMAIN)
++            self.assertRaises(
++                _ZoneNotFoundException,
++                self.client.delete_record_by_name, FAKE_DOMAIN, FAKE_RECORD_NAME
++            )

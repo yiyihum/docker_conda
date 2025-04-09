@@ -1,0 +1,253 @@
+diff --git a/agavepy/agave.py b/agavepy/agave.py
+index a0d4b3a..0de4ff9 100644
+--- a/agavepy/agave.py
++++ b/agavepy/agave.py
+@@ -22,7 +22,7 @@ import requests
+ from agavepy.tenants import tenant_list
+ from agavepy.clients import clients_create, clients_list
+ from agavepy.tokens import token_create
+-from agavepy.utils import save_config
++from agavepy.utils import load_config, save_config
+ 
+ import sys
+ sys.path.insert(0, os.path.dirname(__file__))
+@@ -234,34 +234,6 @@ class Agave(object):
+ 
+             setattr(self, attr, value)
+ 
+-        # The following sectionsets tenant ID (tenant_id) and tenant url 
+-        # (api_server).
+-        # Neither tenant ID nor tenant url are set.
+-        if self.tenant_id is None and self.api_server is None:
+-            tenants = self.list_tenants(tenantsurl="https://api.tacc.utexas.edu/tenants")
+-            value = input("\nPlease specify the ID for the tenant you wish to interact with: ")
+-            self.tenant_id  = tenants[value]["id"]
+-            tenant_url = tenants[value]["url"]
+-            if tenant_url[-1] == '/':
+-                tenant_url = tenant_url[:-1]
+-            self.api_server = tenant_url
+-        # Tenant ID was not set.
+-        elif self.tenant_id is None and self.api_server is not None:
+-            tenants = tenant_list(tenantsurl="https://api.tacc.utexas.edu/tenants")
+-
+-            for _, tenant in tenants.items():
+-                if self.api_server in tenant["url"]:
+-                    self.tenant_id = tenant["id"]
+-        # Tenant url was not set.
+-        elif self.api_server is None and self.tenant_id is not None:
+-            tenants = tenant_list(tenantsurl="https://api.tacc.utexas.edu/tenants")
+-
+-            tenant_url = tenants[self.tenant_id]["url"]
+-            if tenant_url[-1] == '/':
+-                tenant_url = tenant_url[:-1]
+-            self.api_server = tenant_url
+-    
+-
+         if self.resources is None:
+             self.resources = load_resource(self.api_server)
+         self.host = urllib.parse.urlsplit(self.api_server).netloc
+@@ -536,6 +508,40 @@ class Agave(object):
+         return list(set(base))
+ 
+ 
++    def init(self):
++        """ Initilize a session
++
++        Initialize a session by setting parameters refering to the tenant you
++        wish to interact with.
++        """
++        # The following sectionsets tenant ID (tenant_id) and tenant url
++        # (api_server).
++        # Neither tenant ID nor tenant url are set.
++        if self.tenant_id is None and self.api_server is None:
++            tenants = self.list_tenants(tenantsurl="https://api.tacc.utexas.edu/tenants")
++            value = input("\nPlease specify the ID for the tenant you wish to interact with: ")
++            self.tenant_id  = tenants[value]["id"]
++            tenant_url = tenants[value]["url"]
++            if tenant_url[-1] == '/':
++                tenant_url = tenant_url[:-1]
++            self.api_server = tenant_url
++        # Tenant ID was not set.
++        elif self.tenant_id is None and self.api_server is not None:
++            tenants = tenant_list(tenantsurl="https://api.tacc.utexas.edu/tenants")
++
++            for _, tenant in tenants.items():
++                if self.api_server in tenant["url"]:
++                    self.tenant_id = tenant["id"]
++        # Tenant url was not set.
++        elif self.api_server is None and self.tenant_id is not None:
++            tenants = tenant_list(tenantsurl="https://api.tacc.utexas.edu/tenants")
++
++            tenant_url = tenants[self.tenant_id]["url"]
++            if tenant_url[-1] == '/':
++                tenant_url = tenant_url[:-1]
++            self.api_server = tenant_url
++
++
+     def save_configs(self, cache_dir=None):
+         """ Save configs
+ 
+@@ -547,6 +553,12 @@ class Agave(object):
+         cache_dir: string (default: None)
+             If no cache_dir is passed it will default to ~/.agave.
+         """
++        # Check that client name is set.
++        if self.client_name is None or isinstance(self.client_name, Resource):
++            print(
++                "You must set the client_name attribute before saving configurations with this method")
++            return
++
+         current_context = {
+             "tenantid": self.tenant_id,
+             "baseurl": self.api_server,
+@@ -571,6 +583,36 @@ class Agave(object):
+         save_config(cache_dir, current_context, self.client_name)
+ 
+ 
++    def load_configs(self, cache_dir=None, tenant_id=None, username=None, client_name=None):
++        """ Load session cntext from configuration file
++
++        PARAMETERS
++        ----------
++        cache_dir: string (default: None)
++            Path to directory for storing sessions. It defaults to "~/.agave".
++        username: string (default: None)
++        client_name: string (default: None)
++            Name of oauth client.
++        """
++        # Set cache dir.
++        if cache_dir is None:
++            cache_dir = os.path.expanduser("~/.agave")
++
++        session_context = load_config(cache_dir, tenant_id, username, client_name)
++
++        self.client_name   = list(session_context)[0]
++        self.tenant_id     = session_context[self.client_name]["tenantid"]
++        self.api_server    = session_context[self.client_name]["baseurl"]
++        self.api_secret    = session_context[self.client_name]["apisecret"]
++        self.api_key       = session_context[self.client_name]["apikey"]
++        self.username      = session_context[self.client_name]["username"]
++        self.token         = session_context[self.client_name]["access_token"]
++        self.refresh_token = session_context[self.client_name]["refresh_token"]
++        self.created_at    = session_context[self.client_name]["created_at"]
++        self.expires_in    = session_context[self.client_name]["expires_in"]
++        self.expires_at    = session_context[self.client_name]["expires_at"]
++
++
+     def list_tenants(self, tenantsurl="https://api.tacc.utexas.edu/tenants"):
+         """ List Agave tenants
+ 
+diff --git a/agavepy/utils/__init__.py b/agavepy/utils/__init__.py
+index 0aff1bb..85ff707 100644
+--- a/agavepy/utils/__init__.py
++++ b/agavepy/utils/__init__.py
+@@ -1,2 +1,3 @@
+-from .cachedir_helpers import save_config
+ from .response_handlers import handle_bad_response_status_code
++from .load_configs import load_config
++from .save_configs import save_config
+diff --git a/agavepy/utils/load_configs.py b/agavepy/utils/load_configs.py
+new file mode 100644
+index 0000000..43d97a3
+--- /dev/null
++++ b/agavepy/utils/load_configs.py
+@@ -0,0 +1,45 @@
++"""
++    load_configs.py
++"""
++import errno
++import json
++import os
++
++
++
++def load_config(cache_dir, tenant_id, username, client_name):
++    """ Load configurations from file
++
++    Load configuration information from file, if it exists.
++    These function will look for the file config.json to restore a session.
++
++    PARAMETERS
++    ----------
++    cache_dir: string
++        Path to store session configuration.
++    tenant_id: string
++    username: string
++    client_name: string
++
++    RETURNS
++    -------
++    current_context: dict
++        Dictionary with client name as key and session context as value.
++    """
++    # Configuration info will be store by default in these files.
++    config_file = "{}/config.json".format(cache_dir)
++
++    # Read in configuration from cache dir if it exist, raise an exception.
++    if os.path.isfile(config_file):
++        with open(config_file, "r") as f:
++            agave_context = json.load(f)
++    else:
++        raise FileNotFoundError(
++            errno.ENOENT, os.strerror(errno.ENOENT), config_file)
++
++    # Return the current session context if no extra parameters are passed.
++    if tenant_id is None or username is None or client_name is None:
++        return agave_context["current"]
++    else:
++        print(agave_context)
++        return agave_context["sessions"][tenant_id][username]
+diff --git a/agavepy/utils/cachedir_helpers.py b/agavepy/utils/save_configs.py
+similarity index 85%
+rename from agavepy/utils/cachedir_helpers.py
+rename to agavepy/utils/save_configs.py
+index 0345f30..d94d0b8 100644
+--- a/agavepy/utils/cachedir_helpers.py
++++ b/agavepy/utils/save_configs.py
+@@ -1,5 +1,5 @@
+ """
+-    cachedir_helpers.py
++    save_configs.py
+ """
+ from __future__ import print_function
+ import json
+@@ -26,18 +26,18 @@ def make_cache_dir(cache_dir):
+ 
+ 
+ def save_config(cache_dir, current_context, client_name):
+-    """ Initiate an Agave Tenant
++    """ Save session configurations to file.
+ 
+-    Create or switch the current context to a specified Agave tenant.
+-    The current context along with all previous used are stored in a
+-    local database (arguments.agavedb).
++    Create or switch the current session context.
+ 
+     The ~/.agave/config.json file will have the following format:
+         * "current" will specify the configuration to be used for the current 
+-          session. The contents of this section should match those of 
+-          ~/.agave/current.
+-        * "tenants" will have one or more keys, and each key will have a json 
+-          object related to it. Each key will correspond to a tenant id.
++          session. The contents of this section should include a nested json 
++          object wich will hold all session configurations. It matches the 
++          information of ~/.agave/current.
++        * "sessions" will be a series of nested json objects. Each session 
++        configuration will be indexed by tenant id, user name, and client name,
++        respectively.
+ 
+     For example:
+     {
+@@ -77,6 +77,12 @@ def save_config(cache_dir, current_context, client_name):
+ 
+     PARAMETERS
+     ----------
++    cache_dir: string
++        Path to store session configuration.
++    current_context: dict
++        Session context.
++    client_name: string
++        Name of oauth client being used in the current session.
+     """
+     # Get location to store configuration.
+     make_cache_dir(cache_dir)

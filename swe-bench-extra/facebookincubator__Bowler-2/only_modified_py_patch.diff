@@ -1,0 +1,111 @@
+diff --git a/bowler/query.py b/bowler/query.py
+index e3e418b..60dcb7d 100644
+--- a/bowler/query.py
++++ b/bowler/query.py
+@@ -864,50 +864,53 @@ class Query:
+         self.processors.append(callback)
+         return self
+ 
+-    def compile(self) -> List[Type[BaseFix]]:
+-        if not self.transforms:
+-            log.debug(f"no selectors chosen, defaulting to select_root")
+-            self.select_root()
++    def create_fixer(self, transform):
++        if transform.fixer:
++            bm_compat = transform.fixer.BM_compatible
++            pattern = transform.fixer.PATTERN
++
++        else:
++            bm_compat = False
++            log.debug(f"select {transform.selector}[{transform.kwargs}]")
++            pattern = SELECTORS[transform.selector].format(**transform.kwargs)
++
++            pattern = " ".join(
++                line
++                for wholeline in pattern.splitlines()
++                for line in (wholeline.strip(),)
++                if line
++            )
+ 
+-        fixers: List[Type[BaseFix]] = []
+-        for transform in self.transforms:
+-            if transform.fixer:
+-                bm_compat = transform.fixer.BM_compatible
+-                pattern = transform.fixer.PATTERN
++            log.debug(f"generated pattern: {pattern}")
+ 
+-            else:
+-                bm_compat = False
+-                log.debug(f"select {transform.selector}[{transform.kwargs}]")
+-                pattern = SELECTORS[transform.selector].format(**transform.kwargs)
+-
+-                pattern = " ".join(
+-                    line
+-                    for wholeline in pattern.splitlines()
+-                    for line in (wholeline.strip(),)
+-                    if line
+-                )
++        filters = transform.filters
++        callbacks = transform.callbacks
+ 
+-                log.debug(f"generated pattern: {pattern}")
++        log.debug(f"registered {len(filters)} filters: {filters}")
++        log.debug(f"registered {len(callbacks)} callbacks: {callbacks}")
+ 
+-            filters = transform.filters
+-            callbacks = transform.callbacks
++        class Fixer(BaseFix):
++            PATTERN = pattern  # type: ignore
++            BM_compatible = bm_compat
+ 
+-            log.debug(f"registered {len(filters)} filters: {filters}")
+-            log.debug(f"registered {len(callbacks)} callbacks: {callbacks}")
++            def transform(self, node: Node, capture: Capture) -> None:
++                filename = cast(Filename, self.filename)
++                if not filters or all(f(node, capture, filename) for f in filters):
++                    if transform.fixer:
++                        transform.fixer().transform(node, capture)
++                    for callback in callbacks:
++                        callback(node, capture, filename)
+ 
+-            class Fixer(BaseFix):
+-                PATTERN = pattern  # type: ignore
+-                BM_compatible = bm_compat
++        return Fixer
+ 
+-                def transform(self, node: Node, capture: Capture) -> None:
+-                    filename = cast(Filename, self.filename)
+-                    if not filters or all(f(node, capture, filename) for f in filters):
+-                        if transform.fixer:
+-                            transform.fixer().transform(node, capture)
+-                        for callback in callbacks:
+-                            callback(node, capture, filename)
++    def compile(self) -> List[Type[BaseFix]]:
++        if not self.transforms:
++            log.debug(f"no selectors chosen, defaulting to select_root")
++            self.select_root()
+ 
+-            fixers.append(Fixer)
++        fixers: List[Type[BaseFix]] = []
++        for transform in self.transforms:
++            fixers.append(self.create_fixer(transform))
+ 
+         return fixers
+ 
+diff --git a/bowler/tool.py b/bowler/tool.py
+index cf9afa3..6c6c648 100644
+--- a/bowler/tool.py
++++ b/bowler/tool.py
+@@ -98,8 +98,9 @@ class BowlerTool(RefactoringTool):
+             self.hunk_processor = lambda f, h: True
+ 
+     def get_fixers(self) -> Tuple[Fixers, Fixers]:
+-        pre: Fixers = []
+-        post: Fixers = [f(self.options, self.fixer_log) for f in self.fixers]
++        fixers = [f(self.options, self.fixer_log) for f in self.fixers]
++        pre: Fixers = [f for f in fixers if f.order == "pre"]
++        post: Fixers = [f for f in fixers if f.order == "post"]
+         return pre, post
+ 
+     def processed_file(
+

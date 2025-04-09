@@ -1,0 +1,123 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 3a5d9a99..1762e314 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -128,9 +128,16 @@ jobs:
+           python-version: ${{ matrix.python }}
+       - name: Install Tox and any other packages
+         run: python -m pip install tox coveralls
+-      - name: Run Tox
+-        # Run tox using the version of Python in `PATH`
+-        run: tox -e py
++      - name: pytest
++        uses: liskin/gh-problem-matcher-wrap@v1
++        with:
++          linters: pytest
++          run: tox -e py
++        env:
++          COVERALLS_PARALLEL: true
++          COVERALLS_FLAG_NAME: run-ubuntu-${{ matrix.python }}
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          COVERALLS_SERVICE_NAME: github
+       - name: Publish coverage
+         run: coveralls --service=github
+         env:
+diff --git a/faker/documentor.py b/faker/documentor.py
+index ba72de21..5164bf7c 100644
+--- a/faker/documentor.py
++++ b/faker/documentor.py
+@@ -30,7 +30,7 @@ class Documentor:
+         formatters = []
+         providers: List[BaseProvider] = self.generator.get_providers()
+         for provider in providers[::-1]:  # reverse
+-            if locale and provider.__lang__ != locale:
++            if locale and provider.__lang__ and provider.__lang__ != locale:
+                 continue
+             formatters.append(
+                 (provider, self.get_provider_formatters(provider, **kwargs)),
+diff --git a/faker/factory.py b/faker/factory.py
+index 4d1a66dd..56f47748 100644
+--- a/faker/factory.py
++++ b/faker/factory.py
+@@ -54,7 +54,7 @@ class Factory:
+             if prov_name == "faker.providers":
+                 continue
+ 
+-            prov_cls, lang_found = cls._get_provider_class(prov_name, locale)
++            prov_cls, lang_found, _ = cls._find_provider_class(prov_name, locale)
+             provider = prov_cls(faker)
+             provider.__use_weighting__ = use_weighting
+             provider.__provider__ = prov_name
+@@ -64,31 +64,14 @@ class Factory:
+         return faker
+ 
+     @classmethod
+-    def _get_provider_class(cls, provider: str, locale: Optional[str] = "") -> Tuple[Any, Optional[str]]:
+-
+-        provider_class = cls._find_provider_class(provider, locale)
+-
+-        if provider_class:
+-            return provider_class, locale
+-
+-        if locale and locale != DEFAULT_LOCALE:
+-            # fallback to default locale
+-            provider_class = cls._find_provider_class(provider, DEFAULT_LOCALE)
+-            if provider_class:
+-                return provider_class, DEFAULT_LOCALE
+-
+-        # fallback to no locale
+-        provider_class = cls._find_provider_class(provider)
+-        if provider_class:
+-            return provider_class, None
+-
+-        msg = f"Unable to find provider `{provider}` with locale `{locale}`"
+-        raise ValueError(msg)
+-
+-    @classmethod
+-    def _find_provider_class(cls, provider_path: str, locale: Optional[str] = None) -> Any:
++    def _find_provider_class(
++        cls,
++        provider_path: str,
++        locale: Optional[str] = None,
++    ) -> Tuple[Any, Optional[str], Optional[str]]:
+ 
+         provider_module = import_module(provider_path)
++        default_locale = getattr(provider_module, "default_locale", "")
+ 
+         if getattr(provider_module, "localized", False):
+ 
+@@ -101,7 +84,7 @@ class Factory:
+             available_locales = list_module(provider_module)
+             if not locale or locale not in available_locales:
+                 unavailable_locale = locale
+-                locale = getattr(provider_module, "default_locale", DEFAULT_LOCALE)
++                locale = default_locale or DEFAULT_LOCALE
+                 logger.debug(
+                     "Specified locale `%s` is not available for "
+                     "provider `%s`. Locale reset to `%s` for this "
+@@ -122,15 +105,14 @@ class Factory:
+ 
+         else:
+ 
+-            logger.debug(
+-                "Provider `%s` does not feature localization. "
+-                "Specified locale `%s` is not utilized for this "
+-                "provider.",
+-                provider_module.__name__,
+-                locale,
+-            )
+-
+-            if locale is not None:
+-                provider_module = import_module(provider_path)
++            if locale:
++                logger.debug(
++                    "Provider `%s` does not feature localization. "
++                    "Specified locale `%s` is not utilized for this "
++                    "provider.",
++                    provider_module.__name__,
++                    locale,
++                )
++            locale = default_locale = None
+ 
+-        return provider_module.Provider  # type: ignore
++        return provider_module.Provider, locale, default_locale  # type: ignore

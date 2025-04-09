@@ -1,0 +1,188 @@
+diff --git a/docs/source/transforms.rst b/docs/source/transforms.rst
+index b02db767..1c8b8415 100644
+--- a/docs/source/transforms.rst
++++ b/docs/source/transforms.rst
+@@ -373,6 +373,12 @@ Vanilla Transforms
+     :members:
+     :special-members: __call__
+ 
++`LabelToContour`
++~~~~~~~~~~~~~~~~
++.. autoclass:: LabelToContour
++    :members:
++    :special-members: __call__
++
+ 
+ Dictionary-based Transforms
+ ---------------------------
+@@ -701,6 +707,12 @@ Dictionary-based Transforms
+     :members:
+     :special-members: __call__
+ 
++`LabelToContourd`
++~~~~~~~~~~~~~~~~~
++.. autoclass:: LabelToContourd
++    :members:
++    :special-members: __call__
++
+ `Lambdad`
+ ~~~~~~~~~
+ .. autoclass:: Lambdad
+diff --git a/monai/transforms/post/array.py b/monai/transforms/post/array.py
+index c50833e4..582fb3de 100644
+--- a/monai/transforms/post/array.py
++++ b/monai/transforms/post/array.py
+@@ -16,6 +16,7 @@ https://github.com/Project-MONAI/MONAI/wiki/MONAI_Design
+ from typing import Optional, Callable
+ 
+ import torch
++import torch.nn.functional as F
+ from monai.transforms.compose import Transform
+ from monai.networks.utils import one_hot
+ from monai.transforms.utils import get_largest_connected_component_mask
+@@ -296,56 +297,44 @@ class KeepLargestConnectedComponent(Transform):
+ 
+ class LabelToContour(Transform):
+     """
+-    Return the contour flag of objects in mask images that only compose of 0 and 1, with Laplace kernel
+-        set as default for edge detection.
++    Return the contour of binary input images that only compose of 0 and 1, with Laplace kernel
++    set as default for edge detection. Typical usage is to plot the edge of label or segmentation output.
+ 
+     Args:
+-        kernel_type: the method applied to do edge detection.
++        kernel_type: the method applied to do edge detection, default is "Laplace".
++
+     """
+ 
+-    def __init__(self, kernel_type="Laplace"):
++    def __init__(self, kernel_type: str = "Laplace"):
++        if kernel_type != "Laplace":
++            raise NotImplementedError("currently, LabelToContour only supports Laplace kernel.")
+         self.kernel_type = kernel_type
+ 
+-    def __find_img_contour(self, img):
+-        channels = img.shape[1]
+-        conv = torch.nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False, groups=channels)
+-        kernel = torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], dtype=torch.float32, device=img.device)
+-        kernel = kernel.repeat(channels, 1, 1, 1)
+-        conv.weight = torch.nn.Parameter(kernel, requires_grad=False)
+-
+-        contour_img = conv(img)
+-        torch.clamp_(contour_img, min=0.0, max=1.0)
+-        return contour_img
+-
+     def __call__(self, img):
+         """
+         Args:
+-            img: torch tensor of the img that you want to find the contour of, with shape being
+-                 (batch_size, channels, width, height[, depth])
++            img: torch tensor data to extract the contour, with shape: [batch_size, channels, height, width[, depth]]
+ 
+         Returns:
+             A torch tensor with the same shape as img, note:
+-                1. It's the binary classification result of whether a pixel is edge or not.
+-                2. In order to keep the original shape of mask image, we use padding as default.
+-                3. The edge detection is just approximate due to
+-                    a) defects inherent to Laplace kernel, ideally the edge should be thin enough, but now it has a thickness.
+-                    b) need to search the optimal/better thresold for classification
+-        """
+-        if self.kernel_type != "Laplace":
+-            raise NotImplementedError
+-        if img.ndim != 4 and img.ndim != 5:
+-            raise RuntimeError("img.ndim should be 4 or 5")
+-        if img.ndim == 4:
+-            return self.__find_img_contour(img)
++                1. it's the binary classification result of whether a pixel is edge or not.
++                2. in order to keep the original shape of mask image, we use padding as default.
++                3. the edge detection is just approximate because it defects inherent to Laplace kernel,
++                   ideally the edge should be thin enough, but now it has a thickness.
+ 
++        """
+         channels = img.shape[1]
++        if img.ndim == 4:
++            kernel = torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], dtype=torch.float32, device=img.device)
++            kernel = kernel.repeat(channels, 1, 1, 1)
++            contour_img = F.conv2d(img, kernel, bias=None, stride=1, padding=1, dilation=1, groups=channels)
++        elif img.ndim == 5:
++            kernel = -1 * torch.ones(3, 3, 3, dtype=torch.float32, device=img.device)
++            kernel[1, 1, 1] = 26
++            kernel = kernel.repeat(channels, 1, 1, 1, 1)
++            contour_img = F.conv3d(img, kernel, bias=None, stride=1, padding=1, dilation=1, groups=channels)
++        else:
++            raise RuntimeError("the dimensions of img should be 4 or 5.")
+ 
+-        conv = torch.nn.Conv3d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False, groups=channels)
+-        kernel = -1 * torch.ones(3, 3, 3, dtype=torch.float32, device=img.device)
+-        kernel[1, 1, 1] = 26
+-        kernel = kernel.repeat(channels, 1, 1, 1, 1)
+-        conv.weight = torch.nn.Parameter(kernel, requires_grad=False)
+-
+-        contour_img = conv(img)
+         torch.clamp_(contour_img, min=0.0, max=1.0)
+         return contour_img
+diff --git a/monai/transforms/post/dictionary.py b/monai/transforms/post/dictionary.py
+index dbc4a26a..53c3d3fa 100644
+--- a/monai/transforms/post/dictionary.py
++++ b/monai/transforms/post/dictionary.py
+@@ -20,7 +20,13 @@ from typing import Optional
+ from monai.config.type_definitions import KeysCollection
+ from monai.utils.misc import ensure_tuple_rep
+ from monai.transforms.compose import MapTransform
+-from monai.transforms.post.array import SplitChannel, Activations, AsDiscrete, KeepLargestConnectedComponent
++from monai.transforms.post.array import (
++    SplitChannel,
++    Activations,
++    AsDiscrete,
++    KeepLargestConnectedComponent,
++    LabelToContour,
++)
+ 
+ 
+ class SplitChanneld(MapTransform):
+@@ -145,7 +151,7 @@ class AsDiscreted(MapTransform):
+ 
+ class KeepLargestConnectedComponentd(MapTransform):
+     """
+-    dictionary-based wrapper of :py:class:monai.transforms.utility.array.KeepLargestConnectedComponent.
++    dictionary-based wrapper of :py:class:monai.transforms.KeepLargestConnectedComponent.
+     """
+ 
+     def __init__(
+@@ -176,7 +182,30 @@ class KeepLargestConnectedComponentd(MapTransform):
+ 
+     def __call__(self, data):
+         d = dict(data)
+-        for idx, key in enumerate(self.keys):
++        for key in self.keys:
++            d[key] = self.converter(d[key])
++        return d
++
++
++class LabelToContourd(MapTransform):
++    """
++    dictionary-based wrapper of :py:class:monai.transforms.LabelToContour.
++    """
++
++    def __init__(self, keys: KeysCollection, kernel_type: str = "Laplace"):
++        """
++        Args:
++            keys: keys of the corresponding items to be transformed.
++                See also: :py:class:`monai.transforms.compose.MapTransform`
++            kernel_type: the method applied to do edge detection, default is "Laplace".
++
++        """
++        super().__init__(keys)
++        self.converter = LabelToContour(kernel_type=kernel_type)
++
++    def __call__(self, data):
++        d = dict(data)
++        for key in self.keys:
+             d[key] = self.converter(d[key])
+         return d
+ 
+@@ -185,3 +214,4 @@ SplitChannelD = SplitChannelDict = SplitChanneld
+ ActivationsD = ActivationsDict = Activationsd
+ AsDiscreteD = AsDiscreteDict = AsDiscreted
+ KeepLargestConnectedComponentD = KeepLargestConnectedComponentDict = KeepLargestConnectedComponentd
++LabelToContourD = LabelToContourDict = LabelToContourd

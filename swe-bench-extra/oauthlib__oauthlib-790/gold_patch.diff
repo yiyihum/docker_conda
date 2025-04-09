@@ -1,0 +1,101 @@
+diff --git a/docs/installation.rst b/docs/installation.rst
+index 0e00e39..61428ce 100644
+--- a/docs/installation.rst
++++ b/docs/installation.rst
+@@ -118,7 +118,7 @@ Install from GitHub
+ -------------------
+ 
+ Alternatively, install it directly from the source repository on
+-GitHub.  This is the "bleading edge" version, but it may be useful for
++GitHub.  This is the "bleeding edge" version, but it may be useful for
+ accessing bug fixes and/or new features that have not been released.
+ 
+ Standard install
+diff --git a/oauthlib/oauth2/rfc6749/endpoints/metadata.py b/oauthlib/oauth2/rfc6749/endpoints/metadata.py
+index 81ee1de..d43a824 100644
+--- a/oauthlib/oauth2/rfc6749/endpoints/metadata.py
++++ b/oauthlib/oauth2/rfc6749/endpoints/metadata.py
+@@ -54,7 +54,8 @@ class MetadataEndpoint(BaseEndpoint):
+         """Create metadata response
+         """
+         headers = {
+-            'Content-Type': 'application/json'
++            'Content-Type': 'application/json',
++            'Access-Control-Allow-Origin': '*',
+         }
+         return headers, json.dumps(self.claims), 200
+ 
+diff --git a/oauthlib/oauth2/rfc6749/grant_types/authorization_code.py b/oauthlib/oauth2/rfc6749/grant_types/authorization_code.py
+index 97aeca9..b799823 100644
+--- a/oauthlib/oauth2/rfc6749/grant_types/authorization_code.py
++++ b/oauthlib/oauth2/rfc6749/grant_types/authorization_code.py
+@@ -10,6 +10,7 @@ import logging
+ from oauthlib import common
+ 
+ from .. import errors
++from ..utils import is_secure_transport
+ from .base import GrantTypeBase
+ 
+ log = logging.getLogger(__name__)
+@@ -312,6 +313,7 @@ class AuthorizationCodeGrant(GrantTypeBase):
+         self.request_validator.save_token(token, request)
+         self.request_validator.invalidate_authorization_code(
+             request.client_id, request.code, request)
++        headers.update(self._create_cors_headers(request))
+         return headers, json.dumps(token), 200
+ 
+     def validate_authorization_request(self, request):
+@@ -545,3 +547,20 @@ class AuthorizationCodeGrant(GrantTypeBase):
+         if challenge_method in self._code_challenge_methods:
+             return self._code_challenge_methods[challenge_method](verifier, challenge)
+         raise NotImplementedError('Unknown challenge_method %s' % challenge_method)
++
++    def _create_cors_headers(self, request):
++        """If CORS is allowed, create the appropriate headers."""
++        if 'origin' not in request.headers:
++            return {}
++
++        origin = request.headers['origin']
++        if not is_secure_transport(origin):
++            log.debug('Origin "%s" is not HTTPS, CORS not allowed.', origin)
++            return {}
++        elif not self.request_validator.is_origin_allowed(
++            request.client_id, origin, request):
++            log.debug('Invalid origin "%s", CORS not allowed.', origin)
++            return {}
++        else:
++            log.debug('Valid origin "%s", injecting CORS headers.', origin)
++            return {'Access-Control-Allow-Origin': origin}
+diff --git a/oauthlib/oauth2/rfc6749/request_validator.py b/oauthlib/oauth2/rfc6749/request_validator.py
+index 817d594..610a708 100644
+--- a/oauthlib/oauth2/rfc6749/request_validator.py
++++ b/oauthlib/oauth2/rfc6749/request_validator.py
+@@ -649,3 +649,28 @@ class RequestValidator:
+ 
+         """
+         raise NotImplementedError('Subclasses must implement this method.')
++
++    def is_origin_allowed(self, client_id, origin, request, *args, **kwargs):
++        """Indicate if the given origin is allowed to access the token endpoint
++        via Cross-Origin Resource Sharing (CORS).  CORS is used by browser-based
++        clients, such as Single-Page Applications, to perform the Authorization
++        Code Grant.
++
++        (Note:  If performing Authorization Code Grant via a public client such
++        as a browser, you should use PKCE as well.)
++
++        If this method returns true, the appropriate CORS headers will be added
++        to the response.  By default this method always returns False, meaning
++        CORS is disabled.
++
++        :param client_id: Unicode client identifier.
++        :param redirect_uri: Unicode origin.
++        :param request: OAuthlib request.
++        :type request: oauthlib.common.Request
++        :rtype: bool
++
++        Method is used by:
++            - Authorization Code Grant
++
++        """
++        return False

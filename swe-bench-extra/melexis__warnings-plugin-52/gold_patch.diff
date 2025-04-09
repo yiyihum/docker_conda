@@ -1,0 +1,230 @@
+diff --git a/README.rst b/README.rst
+index 139e744..e5af286 100644
+--- a/README.rst
++++ b/README.rst
+@@ -57,11 +57,16 @@ You can find more details in `Installation guide <docs/installation.rst>`_
+ Usage
+ =====
+ 
+-Since warnings plugin parses log messages (so far), you will need to redirect
+-your stderr to some text file. You can do that with shell pipes or with
++Warnings plugin parses log messages as well as direct command stream. In case you
++want to create log file, you will need to redirect your stderr to some text file.
++You can do that with shell pipes or with
+ command line arguments to command (if it supports outputting errors to file
+ instead of stderr). Be aware that some commands print warnings on stdout.
+ 
++Also warnings plugin log files need to be the last argument as otherwise the
++arguments after that are discarded, because they are considered as command
++arguments (with or without command flag).
++
+ ------------
+ Pipe example
+ ------------
+@@ -73,6 +78,16 @@ file.
+ 
+     yourcommand 2>&1 | tee doc_log.txt
+ 
++---------------
++Command example
++---------------
++
++Below is the command example for the plugin (keep in mind that parse commands are
++required).
++
++.. code-block:: bash
++
++    mlx-warnings --command <yourcommand>
+ 
+ ---------------
+ Running command
+@@ -104,20 +119,26 @@ The command returns (shell $? variable):
+ - value 0 when the number of counted warnings is within the supplied minimum and maximum limits: ok,
+ - number of counted warnings (positive) when the counter number is not within those limit.
+ 
+-----------------------------
++-------------------------
+ Parse for Sphinx warnings
+-----------------------------
++-------------------------
+ 
+ After you saved your Sphinx warnings to the file, you can parse it with
+ command:
+ 
+ .. code-block:: bash
+ 
+-    # command line
++    # command line log file
+     mlx-warnings doc_log.txt --sphinx
++    # command line command execution
++    mlx-warnings --command --sphinx <commandforsphinx>
++
++    # explicitly as python module for log file
++    python3 -m mlx.warnings --sphinx doc_log.txt
++    python -m mlx.warnings --sphinx doc_log.txt
+     # explicitly as python module
+-    python3 -m mlx.warnings doc_log.txt --sphinx
+-    python -m mlx.warnings doc_log.txt --sphinx
++    python3 -m mlx.warnings --command --sphinx <commandforsphinx>
++    python -m mlx.warnings --command --sphinx <commandforsphinx>
+ 
+ 
+ --------------------------
+@@ -129,11 +150,17 @@ command:
+ 
+ .. code-block:: bash
+ 
+-    # command line
++    # command line log file
+     mlx-warnings doc_log.txt --doxygen
++    # command line command execution
++    mlx-warnings --command --doxygen <commandfordoxygen>
++
++    # explicitly as python module for log file
++    python3 -m mlx.warnings --doxygen doc_log.txt
++    python -m mlx.warnings --doxygen doc_log.txt
+     # explicitly as python module
+-    python3 -m mlx.warnings doc_log.txt --doxygen
+-    python -m mlx.warnings doc_log.txt --doxygen
++    python3 -m mlx.warnings --command --doxygen <commandfordoxygen>
++    python -m mlx.warnings --command --doxygen <commandfordoxygen>
+ 
+ 
+ ------------------------
+@@ -145,11 +172,17 @@ command:
+ 
+ .. code-block:: bash
+ 
+-    # command line
++    # command line log file
+     mlx-warnings junit_output.xml --junit
++    # command line command execution
++    mlx-warnings --command --junit <commandforjunit>
++
++    # explicitly as python module for log file
++    python3 -m mlx.warnings --junit junit_output.xml
++    python -m mlx.warnings --junit junit_output.xml
+     # explicitly as python module
+-    python3 -m mlx.warnings junit_output.xml --junit
+-    python -m mlx.warnings junit_output.xml --junit
++    python3 -m mlx.warnings --command --junit <commandforjunit>
++    python -m mlx.warnings --command --junit <commandforjunit>
+ 
+ -------------
+ Other options
+diff --git a/src/mlx/warnings.py b/src/mlx/warnings.py
+index 240e13b..7f23c10 100644
+--- a/src/mlx/warnings.py
++++ b/src/mlx/warnings.py
+@@ -1,9 +1,13 @@
+ #!/usr/bin/env python
+ # -*- coding: utf-8 -*-
+ 
++from __future__ import print_function
++
+ import argparse
++import os
+ import pkg_resources
+ import re
++import subprocess
+ import sys
+ import abc
+ from junitparser import JUnitXml, Failure, Error
+@@ -313,33 +317,76 @@ def warnings_wrapper(args):
+     group.add_argument('-s', '--sphinx', dest='sphinx', action='store_true')
+     group.add_argument('-j', '--junit', dest='junit', action='store_true')
+     parser.add_argument('-v', '--verbose', dest='verbose', action='store_true')
++    parser.add_argument('--command', dest='command', action='store_true',
++                        help='Treat program arguments as command to execute to obtain data')
+     parser.add_argument('-m', '--maxwarnings', type=int, required=False, default=0,
+                         help='Maximum amount of warnings accepted')
+     parser.add_argument('--minwarnings', type=int, required=False, default=0,
+                         help='Minimum amount of warnings accepted')
+     parser.add_argument('--version', action='version', version='%(prog)s {version}'.format(version=pkg_resources.require('mlx.warnings')[0].version))
+ 
+-    parser.add_argument('logfile', nargs='+', help='Logfile that might contain warnings')
++    parser.add_argument('logfile', nargs='+', help='Logfile (or command) that might contain warnings')
++    parser.add_argument('flags', nargs=argparse.REMAINDER, help='Possible not-used flags from above are considered as command flags')
++
+     args = parser.parse_args(args)
+ 
+     warnings = WarningsPlugin(sphinx=args.sphinx, doxygen=args.doxygen, junit=args.junit, verbose=args.verbose)
+     warnings.set_maximum(args.maxwarnings)
+     warnings.set_minimum(args.minwarnings)
+ 
++    if args.command:
++        cmd = args.logfile
++        if args.flags:
++            cmd.extend(args.flags)
++        warnings_command(warnings, cmd)
++    else:
++        warnings_logfile(warnings, args.logfile)
++
++    warnings.return_count()
++    return warnings.return_check_limits()
++
++
++def warnings_command(warnings, cmd):
++    try:
++        print("Executing: ", end='')
++        print(cmd)
++        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                                stdin=subprocess.PIPE, bufsize=1, universal_newlines=True)
++        out, err = proc.communicate()
++        # Check stdout
++        if out:
++            try:
++                print(out.decode(encoding="utf-8"))
++                warnings.check(out.decode(encoding="utf-8"))
++            except AttributeError as e:
++                warnings.check(out)
++                print(out)
++        # Check stderr
++        if err:
++            try:
++                warnings.check(err.decode(encoding="utf-8"))
++                print(err.decode(encoding="utf-8"), file=sys.stderr)
++            except AttributeError as e:
++                warnings.check(err)
++                print(err, file=sys.stderr)
++    except OSError as e:
++        if e.errno == os.errno.ENOENT:
++            print("It seems like program " + str(cmd) + " is not installed.")
++        raise
++
++
++def warnings_logfile(warnings, log):
+     # args.logfile doesn't necessarily contain wildcards, but just to be safe, we
+     # assume it does, and try to expand them.
+     # This mechanism is put in place to allow wildcards to be passed on even when
+     # executing the script on windows (in that case there is no shell expansion of wildcards)
+     # so that the script can be used in the exact same way even when moving from one
+     # OS to another.
+-    for file_wildcard in args.logfile:
++    for file_wildcard in log:
+         for logfile in glob.glob(file_wildcard):
+             with open(logfile, 'r') as loghandle:
+                 warnings.check(loghandle.read())
+ 
+-    warnings.return_count()
+-    return warnings.return_check_limits()
+-
+ 
+ def main():
+     sys.exit(warnings_wrapper(sys.argv[1:]))
+diff --git a/tox.ini b/tox.ini
+index 33199f3..61c2795 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -35,8 +35,9 @@ commands =
+     python -c 'import mlx.warnings;print(mlx.warnings.__version__)'
+     python -m mlx.warnings -h
+     python -m mlx.warnings --version
+-    python -m mlx.warnings -j tests/junit*.xml --maxwarnings 3 --minwarnings 3
+-    python -m mlx.warnings -j "tests/junit*.xml" --maxwarnings 3 --minwarnings 3 #emulate for windows (no shell expansion)
++    python -m mlx.warnings -j --maxwarnings 3 --minwarnings 3 tests/junit*.xml
++    python -m mlx.warnings -j --maxwarnings 3 --minwarnings 3 "tests/junit*.xml"  #emulate for windows (no shell expansion)
++    python -m mlx.warnings -j --command --maxwarnings 2 --minwarnings 2 cat tests/junit_double_fail.xml
+ 
+ [testenv:bootstrap]
+ deps =

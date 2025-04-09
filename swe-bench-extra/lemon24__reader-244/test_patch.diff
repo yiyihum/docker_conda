@@ -1,0 +1,153 @@
+diff --git a/tests/test_plugins_entry_dedupe.py b/tests/test_plugins_entry_dedupe.py
+index 11cba18..b11b5b2 100644
+--- a/tests/test_plugins_entry_dedupe.py
++++ b/tests/test_plugins_entry_dedupe.py
+@@ -92,6 +92,9 @@ def test_plugin(make_reader):
+     important_one = parser.entry(
+         1, 5, datetime(2010, 1, 1), title='important', summary='also important'
+     )
++    modified_one = parser.entry(
++        1, 6, datetime(2010, 1, 1), title='title', summary='will be modified'
++    )
+ 
+     # TODO just use the feeds/entries as arguments
+ 
+@@ -110,6 +113,9 @@ def test_plugin(make_reader):
+     important_two = parser.entry(
+         1, 15, datetime(2010, 1, 2), title='important', summary='also important'
+     )
++    modified_two = parser.entry(
++        1, 6, datetime(2010, 1, 1), title='title', summary='was modified'
++    )
+ 
+     reader.update_feeds()
+ 
+@@ -128,6 +134,8 @@ def test_plugin(make_reader):
+             # the old one is marked as read in favor of the new one
+             (unread_one.id, True),
+             (unread_two.id, False),
++            # modified entry is ignored by plugin
++            (modified_one.id, False),
+         }
+     } | {
+         # the new one is important because the old one was;
+diff --git a/tests/test_plugins_mark_as_read.py b/tests/test_plugins_mark_as_read.py
+index f8f55d7..cc68e62 100644
+--- a/tests/test_plugins_mark_as_read.py
++++ b/tests/test_plugins_mark_as_read.py
+@@ -48,10 +48,14 @@ def test_regex_mark_as_read_bad_metadata(make_reader, value):
+ 
+     one = parser.feed(1, datetime(2010, 1, 1))
+     parser.entry(1, 1, datetime(2010, 1, 1), title='match')
++    parser.entry(1, 2, datetime(2010, 1, 1), title='will be modified')
+ 
+     reader.add_feed(one)
+     reader.set_feed_metadata_item(one, '.reader.mark_as_read', value)
+ 
+     reader.update_feeds()
+ 
+-    assert [e.read for e in reader.get_entries()] == [False]
++    parser.entry(1, 2, datetime(2010, 1, 1), title='modified')
++    reader.update_feeds()
++
++    assert [e.read for e in reader.get_entries()] == [False, False]
+diff --git a/tests/test_reader_hooks.py b/tests/test_reader_hooks.py
+new file mode 100644
+index 0000000..645f903
+--- /dev/null
++++ b/tests/test_reader_hooks.py
+@@ -0,0 +1,45 @@
++from datetime import datetime
++
++from fakeparser import Parser
++
++from reader.types import EntryUpdateStatus
++
++
++def test_post_entry_update_hooks(reader):
++    parser = Parser()
++    reader._parser = parser
++
++    plugin_calls = []
++
++    def first_plugin(r, e, s):
++        assert r is reader
++        plugin_calls.append((first_plugin, e, s))
++
++    def second_plugin(r, e, s):
++        assert r is reader
++        plugin_calls.append((second_plugin, e, s))
++
++    feed = parser.feed(1, datetime(2010, 1, 1))
++    one = parser.entry(1, 1, datetime(2010, 1, 1))
++    reader.add_feed(feed.url)
++    reader.after_entry_update_hooks.append(first_plugin)
++    reader.update_feeds()
++    assert plugin_calls == [(first_plugin, one, EntryUpdateStatus.NEW)]
++    assert set(e.id for e in reader.get_entries()) == {'1, 1'}
++
++    plugin_calls[:] = []
++
++    feed = parser.feed(1, datetime(2010, 1, 2))
++    one = parser.entry(1, 1, datetime(2010, 1, 2))
++    two = parser.entry(1, 2, datetime(2010, 1, 2))
++    reader.after_entry_update_hooks.append(second_plugin)
++    reader.update_feeds()
++    assert plugin_calls == [
++        (first_plugin, two, EntryUpdateStatus.NEW),
++        (second_plugin, two, EntryUpdateStatus.NEW),
++        (first_plugin, one, EntryUpdateStatus.MODIFIED),
++        (second_plugin, one, EntryUpdateStatus.MODIFIED),
++    ]
++    assert set(e.id for e in reader.get_entries()) == {'1, 1', '1, 2'}
++
++    # TODO: What is the expected behavior if a plugin raises an exception?
+diff --git a/tests/test_reader_private.py b/tests/test_reader_private.py
+index 545eb5e..fc3f6ac 100644
+--- a/tests/test_reader_private.py
++++ b/tests/test_reader_private.py
+@@ -95,44 +95,6 @@ def test_update_parse(reader, call_update_method):
+     assert parser.calls == [(feed.url, 'etag', 'last-modified')]
+ 
+ 
+-def test_post_entry_add_plugins(reader):
+-    parser = Parser()
+-    reader._parser = parser
+-
+-    plugin_calls = []
+-
+-    def first_plugin(r, e):
+-        assert r is reader
+-        plugin_calls.append((first_plugin, e))
+-
+-    def second_plugin(r, e):
+-        assert r is reader
+-        plugin_calls.append((second_plugin, e))
+-
+-    feed = parser.feed(1, datetime(2010, 1, 1))
+-    one = parser.entry(1, 1, datetime(2010, 1, 1))
+-    reader.add_feed(feed.url)
+-    reader._post_entry_add_plugins.append(first_plugin)
+-    reader.update_feeds()
+-    assert plugin_calls == [(first_plugin, one)]
+-    assert set(e.id for e in reader.get_entries()) == {'1, 1'}
+-
+-    plugin_calls[:] = []
+-
+-    feed = parser.feed(1, datetime(2010, 1, 2))
+-    one = parser.entry(1, 1, datetime(2010, 1, 2))
+-    two = parser.entry(1, 2, datetime(2010, 1, 2))
+-    reader._post_entry_add_plugins.append(second_plugin)
+-    reader.update_feeds()
+-    assert plugin_calls == [
+-        (first_plugin, two),
+-        (second_plugin, two),
+-    ]
+-    assert set(e.id for e in reader.get_entries()) == {'1, 1', '1, 2'}
+-
+-    # TODO: What is the expected behavior if a plugin raises an exception?
+-
+-
+ def test_post_feed_update_plugins(reader):
+     parser = Parser()
+     reader._parser = parser

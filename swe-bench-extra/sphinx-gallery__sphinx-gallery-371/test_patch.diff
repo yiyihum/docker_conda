@@ -1,0 +1,199 @@
+diff --git a/sphinx_gallery/tests/test_binder.py b/sphinx_gallery/tests/test_binder.py
+index da3b5ea..efca66b 100644
+--- a/sphinx_gallery/tests/test_binder.py
++++ b/sphinx_gallery/tests/test_binder.py
+@@ -12,25 +12,33 @@ from copy import deepcopy
+ 
+ import pytest
+ 
+-from sphinx_gallery.binder import (gen_binder_rst, gen_binder_url,
+-                                   check_binder_conf)
+-from sphinx_gallery.utils import _TempDir
++from sphinx_gallery.binder import gen_binder_url, check_binder_conf
+ 
+ 
+ def test_binder():
+     """Testing binder URL generation and checks."""
+-    file_path = 'myfile.py'
+-    conf1 = {'url': 'http://test1.com', 'org': 'org',
+-             'repo': 'repo', 'branch': 'branch',
+-             'dependencies': '../requirements.txt'}
+-    url = gen_binder_url(file_path, conf1)
+-    assert url == 'http://test1.com/v2/gh/org/repo/branch?filepath=_downloads/myfile.ipynb'
++    file_path = 'blahblah/mydir/myfile.py'
++    conf_base = {'url': 'http://test1.com', 'org': 'org',
++                 'repo': 'repo', 'branch': 'branch',
++                 'dependencies': '../requirements.txt'}
++    conf_base = check_binder_conf(conf_base)
++    gallery_conf_base = {'gallery_dirs': ['mydir'], 'src_dir': 'blahblah'}
++
++    url = gen_binder_url(file_path, conf_base, gallery_conf_base)
++    expected = ('http://test1.com/v2/gh/org/repo/'
++                'branch?filepath=notebooks/mydir/myfile.ipynb')
++    assert url == expected
+ 
+     # Assert filepath prefix is added
+     prefix = 'my_prefix/foo'
++    conf1 = deepcopy(conf_base)
+     conf1['filepath_prefix'] = prefix
+-    url = gen_binder_url(file_path, conf1)
+-    assert url == 'http://test1.com/v2/gh/org/repo/branch?filepath={}/_downloads/myfile.ipynb'.format(prefix)
++    url = gen_binder_url(file_path, conf1, gallery_conf_base)
++    expected = ('http://test1.com/v2/gh/org/repo/'
++                'branch?filepath={}/notebooks/'
++                'mydir/myfile.ipynb').format(prefix)
++
++    assert url == expected
+     conf1.pop('filepath_prefix')
+ 
+     # URL must have http
+@@ -43,6 +51,8 @@ def test_binder():
+ 
+     # Assert missing params
+     for key in conf1.keys():
++        if key == 'notebooks_dir':
++            continue
+         conf3 = deepcopy(conf1)
+         conf3.pop(key)
+         with pytest.raises(ValueError) as excinfo:
+@@ -56,7 +66,8 @@ def test_binder():
+             conf3 = deepcopy(conf1)
+             conf3['dependencies'] = ifile
+             url = check_binder_conf(conf3)
+-        excinfo.match(r"Did not find one of `requirements.txt` or `environment.yml`")
++        excinfo.match(r"Did not find one of `requirements.txt` "
++                      "or `environment.yml`")
+ 
+     with pytest.raises(ValueError) as excinfo:
+         conf6 = deepcopy(conf1)
+@@ -76,3 +87,20 @@ def test_binder():
+         conf7['foo'] = 'blah'
+         url = check_binder_conf(conf7)
+     excinfo.match(r"Unknown Binder config key")
++
++    # Assert using lab correctly changes URL
++    conf_lab = deepcopy(conf_base)
++    conf_lab['use_jupyter_lab'] = True
++    url = gen_binder_url(file_path, conf_lab, gallery_conf_base)
++    expected = ('http://test1.com/v2/gh/org/repo/'
++                'branch?urlpath=lab/tree/notebooks/mydir/myfile.ipynb')
++    assert url == expected
++
++    # Assert using static folder correctly changes URL
++    conf_static = deepcopy(conf_base)
++    file_path = 'blahblah/mydir/myfolder/myfile.py'
++    conf_static['notebooks_dir'] = 'ntbk_folder'
++    url = gen_binder_url(file_path, conf_static, gallery_conf_base)
++    expected = ('http://test1.com/v2/gh/org/repo/'
++                'branch?filepath=ntbk_folder/mydir/myfolder/myfile.ipynb')
++    assert url == expected
+diff --git a/sphinx_gallery/tests/test_docs_resolv.py b/sphinx_gallery/tests/test_docs_resolv.py
+index 94d4d80..6f57510 100644
+--- a/sphinx_gallery/tests/test_docs_resolv.py
++++ b/sphinx_gallery/tests/test_docs_resolv.py
+@@ -67,6 +67,27 @@ def test_parse_sphinx_docopts():
+         'SOURCELINK_SUFFIX': '.txt'
+     }
+ 
++    data_sphinx_175 = '''
++    <script type="text/javascript">
++      var DOCUMENTATION_OPTIONS = {
++        URL_ROOT: document.getElementById("documentation_options")\
++                  .getAttribute('data-url_root'),
++        VERSION:     '2.0.2',
++        COLLAPSE_INDEX: false,
++        FILE_SUFFIX: '.html',
++        HAS_SOURCE:  true,
++        SOURCELINK_SUFFIX: '.txt'
++      };
++    </script>
++    '''
++    assert sg.parse_sphinx_docopts(data_sphinx_175) == {
++        'VERSION': '2.0.2',
++        'COLLAPSE_INDEX': False,
++        'FILE_SUFFIX': '.html',
++        'HAS_SOURCE': True,
++        'SOURCELINK_SUFFIX': '.txt'
++    }
++
+     with pytest.raises(ValueError):
+         sg.parse_sphinx_docopts('empty input')
+ 
+diff --git a/sphinx_gallery/tests/test_gen_gallery.py b/sphinx_gallery/tests/test_gen_gallery.py
+index 61407fd..64276f5 100644
+--- a/sphinx_gallery/tests/test_gen_gallery.py
++++ b/sphinx_gallery/tests/test_gen_gallery.py
+@@ -102,7 +102,8 @@ def test_no_warning_simple_config(config_app):
+     cfg = config_app.config
+     assert cfg.project == "Sphinx-Gallery <Tests>"
+     build_warn = config_app._warning.getvalue()
+-    assert build_warn == ''
++    # ignore 1.8.0 dev bug
++    assert build_warn == '' or 'up extension sphinx.domains.math' in build_warn
+ 
+ 
+ @pytest.mark.conf_file(content="""
+@@ -155,7 +156,8 @@ def test_config_backreferences(config_app):
+     assert cfg.sphinx_gallery_conf['backreferences_dir'] == os.path.join(
+         'gen_modules', 'backreferences')
+     build_warn = config_app._warning.getvalue()
+-    assert build_warn == ""
++    # ignore 1.8.0 dev bug
++    assert build_warn == '' or 'up extension sphinx.domains.math' in build_warn
+ 
+ 
+ def test_duplicate_files_warn(config_app):
+@@ -167,13 +169,14 @@ def test_duplicate_files_warn(config_app):
+ 
+     # No warning because no overlapping names
+     check_duplicate_filenames(files[:-1])
+-    warnings = config_app._warning.getvalue()
+-    assert warnings == ''
++    build_warn = config_app._warning.getvalue()
++    # ignore 1.8.0 dev bug
++    assert build_warn == '' or 'up extension sphinx.domains.math' in build_warn
+ 
+     # Warning because last file is named the same
+     check_duplicate_filenames(files)
+-    warnings = config_app._warning.getvalue()
+-    assert msg.format(m) in warnings
++    build_warn = config_app._warning.getvalue()
++    assert msg.format(m) in build_warn
+ 
+ 
+ def _check_order(config_app, key):
+@@ -273,3 +276,34 @@ def test_collect_gallery_files(config_app, tmpdir):
+         [ap.strpath for ap in abs_paths if re.search(r'.*\.py$', ap.strpath)])
+ 
+     assert collected_files == expected_files
++
++
++@pytest.mark.conf_file(content="""
++import os
++import sphinx_gallery
++extensions = ['sphinx_gallery.gen_gallery']
++# General information about the project.
++project = u'Sphinx-Gallery <Tests>'
++
++sphinx_gallery_conf = {
++    'backreferences_dir' : os.path.join('modules', 'gen'),
++    'examples_dirs': 'src',
++    'gallery_dirs': ['ex'],
++    'binder': {'url': 'http://test1.com', 'org': 'org',
++               'repo': 'repo', 'branch': 'branch',
++               'notebooks_dir': 'ntbk_folder',
++               'dependencies': 'requirements.txt'}
++}""")
++def test_binder_copy_files(config_app, tmpdir):
++    """Test that notebooks are copied properly."""
++    from sphinx_gallery.binder import copy_binder_files, check_binder_conf
++    gallery_conf = config_app.config.sphinx_gallery_conf
++    # Create requirements file
++    with open(os.path.join(config_app.srcdir, 'requirements.txt'), 'w') as ff:
++        pass
++    copy_binder_files(config_app, None)
++
++    for i_file in ['plot_1', 'plot_2', 'plot_3']:
++        assert os.path.exists(os.path.join(
++            config_app.outdir, 'ntbk_folder', gallery_conf['gallery_dirs'][0],
++            i_file+'.ipynb'))

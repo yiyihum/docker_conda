@@ -1,0 +1,201 @@
+diff --git a/edk2toollib/uefi/edk2/parsers/base_parser.py b/edk2toollib/uefi/edk2/parsers/base_parser.py
+index d2179d1..2974082 100644
+--- a/edk2toollib/uefi/edk2/parsers/base_parser.py
++++ b/edk2toollib/uefi/edk2/parsers/base_parser.py
+@@ -7,6 +7,7 @@
+ ##
+ import os
+ import logging
++from edk2toollib.uefi.edk2 import path_utilities
+ 
+ 
+ class BaseParser(object):
+@@ -24,8 +25,8 @@ def __init__(self, log="BaseParser"):
+         self.ConditionalStack = []
+         self.RootPath = ""
+         self.PPs = []
+-        self.TargetFile = None
+-        self.TargetFilePath = None
++        self._Edk2PathUtil = None
++        self.TargetFilePath = None  # the abs path of the target file
+         self.CurrentLine = -1
+         self._MacroNotDefinedValue = "0"  # value to used for undefined macro
+ 
+@@ -42,19 +43,27 @@ def SetBaseAbsPath(self, path):
+         Returns:
+ 
+         """
+-        self.RootPath = path
++        self.RootPath = os.path.abspath(path)
++        self._ConfigEdk2PathUtil()
+         return self
+ 
++    def _ConfigEdk2PathUtil(self):
++        ''' creates the path utility object based on the root path and package paths '''
++        self._Edk2PathUtil = path_utilities.Edk2Path(self.RootPath, self.PPs, error_on_invalid_pp=False)
++
+     def SetPackagePaths(self, pps=[]):
+         """
+ 
+         Args:
+           pps:  (Default value = [])
+ 
++        This must be called after SetBaseAbsPath
++
+         Returns:
+ 
+         """
+         self.PPs = pps
++        self._ConfigEdk2PathUtil()
+         return self
+ 
+     def SetInputVars(self, inputdict):
+@@ -71,37 +80,43 @@ def SetInputVars(self, inputdict):
+ 
+     def FindPath(self, *p):
+         """
+-
++        Given a path, it will find it relative to the root, the current target file, or the packages path
+         Args:
+-          *p:
++          *p: any number of strings or path like objects
+ 
+-        Returns:
++        Returns: a full absolute path if the file exists, None on failure
+ 
+         """
+-        # NOTE: Some of this logic should be replaced
+-        #       with the path resolution from Edk2Module code.
++        # check if we're getting a None
++        if p is None or (len(p) == 1 and p[0] is None):
++            return None
++
++        Path = os.path.join(*p)
++        # check if it it is absolute
++        if os.path.isabs(Path) and os.path.exists(Path):
++            return Path
+ 
+         # If the absolute path exists, return it.
+         Path = os.path.join(self.RootPath, *p)
+         if os.path.exists(Path):
+-            return Path
++            return os.path.abspath(Path)
+ 
+         # If that fails, check a path relative to the target file.
+         if self.TargetFilePath is not None:
+-            Path = os.path.join(self.TargetFilePath, *p)
++            Path = os.path.abspath(os.path.join(os.path.dirname(self.TargetFilePath), *p))
+             if os.path.exists(Path):
+-                return Path
++                return os.path.abspath(Path)
+ 
+         # If that fails, check in every possible Pkg path.
+-        for Pkg in self.PPs:
+-            Path = os.path.join(self.RootPath, Pkg, *p)
+-            if os.path.exists(Path):
++        if self._Edk2PathUtil is not None:
++            target_path = os.path.join(*p)
++            Path = self._Edk2PathUtil.GetAbsolutePathOnThisSytemFromEdk2RelativePath(target_path, False)
++            if Path is not None:
+                 return Path
+ 
+         # log invalid file path
+-        Path = os.path.join(self.RootPath, *p)
+-        self.Logger.error("Invalid file path %s" % Path)
+-        return Path
++        self.Logger.error(f"Invalid file path: {p}")
++        return None
+ 
+     def WriteLinesToFile(self, filepath):
+         """
+diff --git a/edk2toollib/uefi/edk2/parsers/dsc_parser.py b/edk2toollib/uefi/edk2/parsers/dsc_parser.py
+index bc73ba4..d783100 100644
+--- a/edk2toollib/uefi/edk2/parsers/dsc_parser.py
++++ b/edk2toollib/uefi/edk2/parsers/dsc_parser.py
+@@ -47,9 +47,12 @@ def __ParseLine(self, Line, file_name=None, lineno=None):
+         if(line_resolved.strip().lower().startswith("!include")):
+             # include line.
+             tokens = line_resolved.split()
+-            self.Logger.debug("Opening Include File %s" % os.path.join(self.RootPath, tokens[1]))
+-            sp = self.FindPath(tokens[1])
+-            self._dsc_file_paths.add(sp)
++            include_file = tokens[1]
++            sp = self.FindPath(include_file)
++            if sp is None:
++                raise FileNotFoundError(include_file)
++            self.Logger.debug("Opening Include File %s" % sp)
++            self._PushTargetFile(sp)
+             lf = open(sp, "r")
+             loc = lf.readlines()
+             lf.close()
+@@ -182,8 +185,12 @@ def __ParseDefineLine(self, Line):
+         if(line_resolved.strip().lower().startswith("!include")):
+             # include line.
+             tokens = line_resolved.split()
+-            self.Logger.debug("Opening Include File %s" % os.path.join(self.RootPath, tokens[1]))
+-            sp = self.FindPath(tokens[1])
++            include_file = tokens[1]
++            self.Logger.debug("Opening Include File %s" % include_file)
++            sp = self.FindPath(include_file)
++            if sp is None:
++                raise FileNotFoundError(include_file)
++            self._PushTargetFile(sp)
+             lf = open(sp, "r")
+             loc = lf.readlines()
+             lf.close()
+@@ -297,20 +304,25 @@ def ResetParserState(self):
+ 
+     def ParseFile(self, filepath):
+         self.Logger.debug("Parsing file: %s" % filepath)
+-        self.TargetFile = os.path.abspath(filepath)
+-        self.TargetFilePath = os.path.dirname(self.TargetFile)
+-        sp = os.path.join(filepath)
+-        self._dsc_file_paths.add(sp)
++        sp = self.FindPath(filepath)
++        if sp is None:
++            raise FileNotFoundError(filepath)
++        self._PushTargetFile(sp)
+         f = open(sp, "r")
+         # expand all the lines and include other files
+         file_lines = f.readlines()
+         self.__ProcessDefines(file_lines)
+         # reset the parser state before processing more
+         self.ResetParserState()
++        self._PushTargetFile(sp)
+         self.__ProcessMore(file_lines, file_name=sp)
+         f.close()
+         self.Parsed = True
+ 
++    def _PushTargetFile(self, targetFile):
++        self.TargetFilePath = os.path.abspath(targetFile)
++        self._dsc_file_paths.add(self.TargetFilePath)
++
+     def GetMods(self):
+         return self.ThreeMods + self.SixMods
+ 
+diff --git a/edk2toollib/uefi/edk2/path_utilities.py b/edk2toollib/uefi/edk2/path_utilities.py
+index a4ebdce..ea76674 100644
+--- a/edk2toollib/uefi/edk2/path_utilities.py
++++ b/edk2toollib/uefi/edk2/path_utilities.py
+@@ -103,7 +103,7 @@ def GetEdk2RelativePathFromAbsolutePath(self, abspath):
+         self.logger.error("AbsolutePath: %s" % abspath)
+         return None
+ 
+-    def GetAbsolutePathOnThisSytemFromEdk2RelativePath(self, relpath):
++    def GetAbsolutePathOnThisSytemFromEdk2RelativePath(self, relpath, log_errors=True):
+         ''' Given a edk2 relative path return an absolute path to the file
+         in this workspace.
+ 
+@@ -124,8 +124,9 @@ def GetAbsolutePathOnThisSytemFromEdk2RelativePath(self, relpath):
+             abspath = os.path.join(a, relpath)
+             if(os.path.exists(abspath)):
+                 return abspath
+-        self.logger.error("Failed to convert Edk2Relative Path to an Absolute Path on this system.")
+-        self.logger.error("Relative Path: %s" % relpath)
++        if log_errors:
++            self.logger.error("Failed to convert Edk2Relative Path to an Absolute Path on this system.")
++            self.logger.error("Relative Path: %s" % relpath)
+ 
+         return None
+ 
+

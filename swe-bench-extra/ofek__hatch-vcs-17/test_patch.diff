@@ -1,0 +1,111 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 60ad2ba..14898cd 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -33,13 +33,17 @@ def temp_dir():
+ 
+ 
+ @contextmanager
+-def create_project(directory, metadata, setup_vcs=True):  # noqa: FBT002
+-    project_dir = os.path.join(directory, 'my-app')
+-    os.mkdir(project_dir)
++def create_project(directory, metadata, setup_vcs=True, nested=False):  # noqa: FBT002
++    root_dir = project_dir = os.path.join(directory, 'my-app')
++    os.mkdir(root_dir)
+ 
+-    gitignore_file = os.path.join(project_dir, '.gitignore')
++    gitignore_file = os.path.join(root_dir, '.gitignore')
+     write_file(gitignore_file, '/my_app/version.py')
+ 
++    if nested:
++        project_dir = os.path.join(root_dir, 'project')
++        os.mkdir(project_dir)
++
+     project_file = os.path.join(project_dir, 'pyproject.toml')
+     write_file(project_file, metadata)
+ 
+@@ -55,6 +59,9 @@ def create_project(directory, metadata, setup_vcs=True):  # noqa: FBT002
+     os.chdir(project_dir)
+     try:
+         if setup_vcs:
++            if nested:
++                os.chdir(root_dir)
++
+             git('init')
+             git('config', '--local', 'user.name', 'foo')
+             git('config', '--local', 'user.email', 'foo@bar.baz')
+@@ -62,6 +69,9 @@ def create_project(directory, metadata, setup_vcs=True):  # noqa: FBT002
+             git('commit', '-m', 'test')
+             git('tag', '1.2.3')
+ 
++            if nested:
++                os.chdir(project_dir)
++
+         yield project_dir
+     finally:
+         os.chdir(origin)
+@@ -130,3 +140,25 @@ fallback-version = "7.8.9"
+         setup_vcs=False,
+     ) as project:
+         yield project
++
++
++@pytest.fixture
++def new_project_root_elsewhere(temp_dir):
++    with create_project(
++        temp_dir,
++        """\
++[build-system]
++requires = ["hatchling", "hatch-vcs"]
++build-backend = "hatchling.build"
++
++[project]
++name = "my-app"
++dynamic = ["version"]
++
++[tool.hatch.version]
++source = "vcs"
++raw-options = { root = ".." }
++""",
++        nested=True,
++    ) as project:
++        yield project
+diff --git a/tests/test_build.py b/tests/test_build.py
+index 6b907ef..a3fdcb6 100644
+--- a/tests/test_build.py
++++ b/tests/test_build.py
+@@ -109,3 +109,34 @@ def test_fallback(new_project_fallback):
+     assert os.path.isfile(os.path.join(package_directory, 'foo.py'))
+     assert os.path.isfile(os.path.join(package_directory, 'bar.py'))
+     assert os.path.isfile(os.path.join(package_directory, 'baz.py'))
++
++
++def test_root(new_project_root_elsewhere):
++    build_project('-t', 'wheel')
++
++    build_dir = os.path.join(new_project_root_elsewhere, 'dist')
++    assert os.path.isdir(build_dir)
++
++    artifacts = os.listdir(build_dir)
++    assert len(artifacts) == 1
++    wheel_file = artifacts[0]
++
++    assert wheel_file == 'my_app-1.2.3-py2.py3-none-any.whl'
++
++    extraction_directory = os.path.join(os.path.dirname(new_project_root_elsewhere), '_archive')
++    os.mkdir(extraction_directory)
++
++    with zipfile.ZipFile(os.path.join(build_dir, wheel_file), 'r') as zip_archive:
++        zip_archive.extractall(extraction_directory)
++
++    metadata_directory = os.path.join(extraction_directory, 'my_app-1.2.3.dist-info')
++    assert os.path.isdir(metadata_directory)
++
++    package_directory = os.path.join(extraction_directory, 'my_app')
++    assert os.path.isdir(package_directory)
++    assert len(os.listdir(package_directory)) == 4
++
++    assert os.path.isfile(os.path.join(package_directory, '__init__.py'))
++    assert os.path.isfile(os.path.join(package_directory, 'foo.py'))
++    assert os.path.isfile(os.path.join(package_directory, 'bar.py'))
++    assert os.path.isfile(os.path.join(package_directory, 'baz.py'))

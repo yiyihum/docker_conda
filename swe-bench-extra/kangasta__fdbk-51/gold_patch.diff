@@ -1,0 +1,297 @@
+diff --git a/fdbk/_db_connection.py b/fdbk/_db_connection.py
+index 5a4f371..4769179 100644
+--- a/fdbk/_db_connection.py
++++ b/fdbk/_db_connection.py
+@@ -106,7 +106,14 @@ class DBConnection:
+         '''
+         return self.get_data(topic_id)[-1]
+ 
+-    def get_summary(self, topic_id, since=None, until=None, limit=None):
++    def get_summary(
++            self,
++            topic_id,
++            since=None,
++            until=None,
++            limit=None,
++            aggregate_to=None,
++            aggregate_with=None):
+         '''Get summary of the topic data
+ 
+         Args:
+@@ -114,6 +121,8 @@ class DBConnection:
+             since: Datetime of the earliest entry to include
+             until: Datetime of the most recent entry to include
+             limit: Number of entries to include from the most recent
++            aggregate_to: Aggregate data into specified number of data points
++            aggregate_with: Aggregate data with speficied function
+ 
+         Returns:
+             Dictionary with summary of the topic
+@@ -133,7 +142,8 @@ class DBConnection:
+             "warnings": []
+         }
+ 
+-        results, warnings = run_data_tools(topic_d, data_d)
++        results, warnings = run_data_tools(
++            topic_d, data_d, aggregate_to, aggregate_with)
+         summary_d["warnings"].extend(warnings)
+ 
+         results, warnings = post_process(results)
+@@ -147,7 +157,9 @@ class DBConnection:
+                                  type_=None,
+                                  since=None,
+                                  until=None,
+-                                 limit=None):
++                                 limit=None,
++                                 aggregate_to=None,
++                                 aggregate_with=None):
+         if not topic_ids:
+             # TODO: only fetch topics list once in this function
+             topic_ids = [topic["id"] for topic in self.get_topics(type_)]
+@@ -168,7 +180,8 @@ class DBConnection:
+             result_d["topic_names"].append(topic_d["name"])
+             result_d["fields"].extend(topic_d["fields"])
+ 
+-            new_results, warnings = run_data_tools(topic_d, data_d)
++            new_results, warnings = run_data_tools(
++                topic_d, data_d, aggregate_to, aggregate_with)
+             results.extend(new_results)
+             result_d["warnings"].extend(warnings)
+ 
+@@ -192,7 +205,9 @@ class DBConnection:
+             type_=None,
+             since=None,
+             until=None,
+-            limit=None):
++            limit=None,
++            aggregate_to=None,
++            aggregate_with=None):
+         '''Get overview of the data
+ 
+         Args:
+@@ -203,6 +218,8 @@ class DBConnection:
+             since: Datetime of the earliest entry to include
+             until: Datetime of the most recent entry to include
+             limit: Number of entries to include from the most recent
++            aggregate_to: Aggregate data into specified number of data points
++            aggregate_with: Aggregate data with speficied function
+ 
+         Returns:
+             Dictionary with overview of the topics data
+@@ -215,7 +232,9 @@ class DBConnection:
+             type_=type_,
+             since=since,
+             until=until,
+-            limit=limit)
++            limit=limit,
++            aggregate_to=aggregate_to,
++            aggregate_with=aggregate_with)
+ 
+ 
+ ConnectionClass = DBConnection
+diff --git a/fdbk/data_tools/__init__.py b/fdbk/data_tools/__init__.py
+index a60d0f6..0096656 100644
+--- a/fdbk/data_tools/__init__.py
++++ b/fdbk/data_tools/__init__.py
+@@ -5,4 +5,5 @@ Functions to ease the simple data analysis done by the DBConnection.
+ '''
+ 
+ from .functions import *
++from ._aggregate import *
+ from ._utils import *
+diff --git a/fdbk/data_tools/_aggregate.py b/fdbk/data_tools/_aggregate.py
+new file mode 100644
+index 0000000..007d604
+--- /dev/null
++++ b/fdbk/data_tools/_aggregate.py
+@@ -0,0 +1,66 @@
++from datetime import timezone
++from dateutil.parser import isoparse
++
++from fdbk.utils import timestamp_as_str
++from fdbk.utils.messages import (
++    method_not_supported)
++
++from .functions import functions as data_functions, VALUE_FUNCS
++
++
++def _dt_timestamp(data_point):
++    return isoparse(data_point.get('timestamp'))
++
++
++def _as_naive_utc(dt_timestamp):
++    return dt_timestamp.astimezone(timezone.utc).replace(tzinfo=None)
++
++
++def _get_keys(data_point):
++    return [key for key in data_point if key != 'timestamp']
++
++
++def aggregate(data, aggregate_to, aggregate_with=None):
++    if not aggregate_with:
++        aggregate_with = 'average'
++
++    warnings = []
++    aggregated = []
++
++    if aggregate_with not in VALUE_FUNCS:
++        warnings.append(method_not_supported(aggregate_with))
++        return ([], warnings,)
++
++    start = _dt_timestamp(data[0])
++    end = _dt_timestamp(data[-1])
++    window = (end - start) / aggregate_to
++
++    keys = _get_keys(data[0])
++    remaining = data
++    for i in range(aggregate_to):
++        try:
++            last = next(j for j, a in enumerate(remaining)
++                        if _dt_timestamp(a) > start + (i + 1) * window)
++            current = remaining[:last]
++            if not current:
++                continue
++            remaining = remaining[last:]
++        except StopIteration:
++            if i == (aggregate_to - 1):
++                current = remaining
++            else:
++                continue
++
++        aggregated_point = dict(
++            timestamp=timestamp_as_str(
++                _as_naive_utc(
++                    start + i * window)))
++        for key in keys:
++            try:
++                aggregated_point[key] = data_functions[aggregate_with](
++                    current, key, None).get('payload').get('value')
++            except BaseException:
++                aggregated_point[key] = None
++        aggregated.append(aggregated_point)
++
++    return (aggregated, warnings,)
+diff --git a/fdbk/data_tools/_utils.py b/fdbk/data_tools/_utils.py
+index 0b5dea2..1158389 100644
+--- a/fdbk/data_tools/_utils.py
++++ b/fdbk/data_tools/_utils.py
+@@ -1,8 +1,9 @@
+ from fdbk.utils.messages import (
+     method_not_supported, field_is_undefined, collection_name_is_undefined)
+ 
+-from .functions import functions as data_functions
++from .functions import functions as data_functions, CHART_FUNCS
+ from .functions.utils import chart_dict, statistics_dict
++from ._aggregate import aggregate
+ 
+ 
+ def _create_chart(type_, field):
+@@ -180,10 +181,17 @@ def post_process(statistics):
+     return _process(funcs, statistics)
+ 
+ 
+-def run_data_tools(topic_d, data):
++def run_data_tools(topic_d, data, aggregate_to=None, aggregate_with=None):
+     results = []
+     warnings = []
+ 
++    if aggregate_to:
++        chart_data, aggregate_warnings = aggregate(
++            data, aggregate_to, aggregate_with)
++        warnings.extend(aggregate_warnings)
++    else:
++        chart_data = data
++
+     for instruction in topic_d['data_tools']:
+         if instruction["method"] not in data_functions:
+             warnings.append(method_not_supported(instruction["method"]))
+@@ -191,9 +199,12 @@ def run_data_tools(topic_d, data):
+         if instruction["field"] not in topic_d["fields"]:
+             warnings.append(field_is_undefined(instruction["field"]))
+             continue
++        is_chart = instruction["method"] in CHART_FUNCS
+ 
+         result = data_functions[instruction.get("method")](
+-            data, instruction.get("field"), instruction.get("parameters")
++            data if not is_chart else chart_data,
++            instruction.get("field"),
++            instruction.get("parameters")
+         )
+         if result is not None:
+             result["payload"]["topic_name"] = topic_d["name"]
+diff --git a/fdbk/server/_server_handlers.py b/fdbk/server/_server_handlers.py
+index a651cc3..b80865a 100644
+--- a/fdbk/server/_server_handlers.py
++++ b/fdbk/server/_server_handlers.py
+@@ -11,13 +11,23 @@ def _parse_param(param, parser):
+         return None
+ 
+ 
+-def parse_filter_parameters(args):
+-    return dict(
++def parse_filter_parameters(args, include_aggregate=False):
++    query = dict(
+         since=_parse_param(args.get('since'), isoparse),
+         until=_parse_param(args.get('until'), isoparse),
+-        limit=_parse_param(args.get('limit'), int),
++        limit=_parse_param(args.get('limit'), int)
+     )
+ 
++    if not include_aggregate:
++        return query
++
++    aggregate = dict(
++        aggregate_to=_parse_param(args.get('aggregate_to'), int),
++        aggregate_with=args.get('aggregate_with')
++    )
++
++    return {**aggregate, **query}
++
+ 
+ def _get_response_or_not_found(function, args, kwargs=None):
+     if not kwargs:
+@@ -94,7 +104,7 @@ class ServerHandlers:
+         return _get_response_or_not_found(
+             self._db_connection.get_summary,
+             (topic_id,),
+-            parse_filter_parameters(query_args))
++            parse_filter_parameters(query_args, include_aggregate=True))
+ 
+     def get_comparison(self, topic_ids=None, query_args=None):
+         topic_ids_a = topic_ids.split(',') if topic_ids else None
+@@ -102,8 +112,10 @@ class ServerHandlers:
+             query_args = {}
+ 
+         try:
++            params = parse_filter_parameters(
++                query_args, include_aggregate=True)
+             data = self._db_connection.get_comparison(
+-                topic_ids_a, **parse_filter_parameters(query_args))
++                topic_ids_a, **params)
+             return data, 200
+         except KeyError as error:
+             return {
+@@ -115,8 +127,10 @@ class ServerHandlers:
+             query_args = {}
+ 
+         try:
++            params = parse_filter_parameters(
++                query_args, include_aggregate=True)
+             data = self._db_connection.get_overview(
+-                type_=type_, **parse_filter_parameters(query_args))
++                type_=type_, **params)
+             return data, 200
+         except KeyError as error:
+             return {
+diff --git a/setup.py b/setup.py
+index d66ef0a..d4ca26c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -30,6 +30,7 @@ setuptools.setup(
+         "importlib_resources; python_version<'3.7'",
+         "jsonschema",
+         "flask",
++        "python-dateutil",
+         "requests"
+     ],
+     python_requires='>=3.6',

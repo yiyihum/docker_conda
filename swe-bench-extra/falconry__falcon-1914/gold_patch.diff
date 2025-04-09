@@ -1,0 +1,326 @@
+diff --git a/docs/_newsfragments/1902.bugfix.rst b/docs/_newsfragments/1902.bugfix.rst
+index 2d0ebd8..9821288 100644
+--- a/docs/_newsfragments/1902.bugfix.rst
++++ b/docs/_newsfragments/1902.bugfix.rst
+@@ -1,2 +1,5 @@
+-Re-add ``api_helpers`` module that was renamed ``app_helpers``.
+-This module is considered deprecated, and will be removed in a future Falcon version.
+\ No newline at end of file
++The ``api_helpers`` module was re-added, since it was renamed to
++``app_helpers`` (and effectively removed) without announcing a corresponding
++breaking change.
++This module is now considered deprecated, and will be removed in a future
++Falcon version.
+diff --git a/docs/_newsfragments/1911.bugfix.rst b/docs/_newsfragments/1911.bugfix.rst
+new file mode 100644
+index 0000000..8dbe2f0
+--- /dev/null
++++ b/docs/_newsfragments/1911.bugfix.rst
+@@ -0,0 +1,3 @@
++ASGI HTTP headers were treated as UTF-8 encoded, not taking the incompatibility
++with WSGI and porting of WSGI applications into consideration.
++This was fixed, and ASGI headers are now decoded and encoded as ISO-8859-1.
+diff --git a/falcon/asgi/_request_helpers.py b/falcon/asgi/_request_helpers.py
+index bb3e3c5..55e7b56 100644
+--- a/falcon/asgi/_request_helpers.py
++++ b/falcon/asgi/_request_helpers.py
+@@ -29,7 +29,10 @@ def header_property(header_name):
+ 
+     def fget(self):
+         try:
+-            return self._asgi_headers[header_name].decode() or None
++            # NOTE(vytas): Supporting ISO-8859-1 for historical reasons as per
++            #   RFC 7230, Section 3.2.4; and to strive for maximum
++            #   compatibility with WSGI.
++            return self._asgi_headers[header_name].decode('latin1') or None
+         except KeyError:
+             return None
+ 
+diff --git a/falcon/asgi/request.py b/falcon/asgi/request.py
+index 8167f70..3cd8d68 100644
+--- a/falcon/asgi/request.py
++++ b/falcon/asgi/request.py
+@@ -456,17 +456,21 @@ class Request(request.Request):
+         # self._cached_uri = None
+ 
+         if self.method == 'GET':
++            # NOTE(vytas): We do not really expect the Content-Type to be
++            #   non-ASCII, however we assume ISO-8859-1 here for maximum
++            #   compatibility with WSGI.
++
+             # PERF(kgriffs): Normally we expect no Content-Type header, so
+             #   use this pattern which is a little bit faster than dict.get()
+             if b'content-type' in req_headers:
+-                self.content_type = req_headers[b'content-type'].decode()
++                self.content_type = req_headers[b'content-type'].decode('latin1')
+             else:
+                 self.content_type = None
+         else:
+             # PERF(kgriffs): This is the most performant pattern when we expect
+             #   the key to be present most of the time.
+             try:
+-                self.content_type = req_headers[b'content-type'].decode()
++                self.content_type = req_headers[b'content-type'].decode('latin1')
+             except KeyError:
+                 self.content_type = None
+ 
+@@ -516,29 +520,34 @@ class Request(request.Request):
+         # NOTE(kgriffs): Per RFC, a missing accept header is
+         # equivalent to '*/*'
+         try:
+-            return self._asgi_headers[b'accept'].decode() or '*/*'
++            return self._asgi_headers[b'accept'].decode('latin1') or '*/*'
+         except KeyError:
+             return '*/*'
+ 
+     @property
+     def content_length(self):
+         try:
+-            value = self._asgi_headers[b'content-length'].decode()
++            value = self._asgi_headers[b'content-length']
+         except KeyError:
+             return None
+ 
+-        # NOTE(kgriffs): Normalize an empty value to behave as if
+-        # the header were not included; wsgiref, at least, inserts
+-        # an empty CONTENT_LENGTH value if the request does not
+-        # set the header. Gunicorn and uWSGI do not do this, but
+-        # others might if they are trying to match wsgiref's
+-        # behavior too closely.
+-        if not value:
+-            return None
+-
+         try:
++            # PERF(vytas): int() also works with a bytestring argument.
+             value_as_int = int(value)
+         except ValueError:
++            # PERF(vytas): Check for an empty value in the except clause,
++            #   because we do not expect ASGI servers to inject any headers
++            #   that the client did not provide.
++
++            # NOTE(kgriffs): Normalize an empty value to behave as if
++            # the header were not included; wsgiref, at least, inserts
++            # an empty CONTENT_LENGTH value if the request does not
++            # set the header. Gunicorn and uWSGI do not do this, but
++            # others might if they are trying to match wsgiref's
++            # behavior too closely.
++            if not value:
++                return None
++
+             msg = 'The value of the header must be a number.'
+             raise errors.HTTPInvalidHeader(msg, 'Content-Length')
+ 
+@@ -612,7 +621,7 @@ class Request(request.Request):
+             # first. Note also that the indexing operator is
+             # slightly faster than using get().
+             try:
+-                scheme = self._asgi_headers[b'x-forwarded-proto'].decode().lower()
++                scheme = self._asgi_headers[b'x-forwarded-proto'].decode('latin1').lower()
+             except KeyError:
+                 scheme = self.scheme
+ 
+@@ -624,7 +633,7 @@ class Request(request.Request):
+             # NOTE(kgriffs): Prefer the host header; the web server
+             # isn't supposed to mess with it, so it should be what
+             # the client actually sent.
+-            host_header = self._asgi_headers[b'host'].decode()
++            host_header = self._asgi_headers[b'host'].decode('latin1')
+             host, __ = parse_host(host_header)
+         except KeyError:
+             host, __ = self._asgi_server
+@@ -647,7 +656,7 @@ class Request(request.Request):
+             # just go for it without wasting time checking it
+             # first.
+             try:
+-                host = self._asgi_headers[b'x-forwarded-host'].decode()
++                host = self._asgi_headers[b'x-forwarded-host'].decode('latin1')
+             except KeyError:
+                 host = self.netloc
+ 
+@@ -682,10 +691,10 @@ class Request(request.Request):
+                         host, __ = parse_host(hop.src)
+                         self._cached_access_route.append(host)
+             elif b'x-forwarded-for' in headers:
+-                addresses = headers[b'x-forwarded-for'].decode().split(',')
++                addresses = headers[b'x-forwarded-for'].decode('latin1').split(',')
+                 self._cached_access_route = [ip.strip() for ip in addresses]
+             elif b'x-real-ip' in headers:
+-                self._cached_access_route = [headers[b'x-real-ip'].decode()]
++                self._cached_access_route = [headers[b'x-real-ip'].decode('latin1')]
+ 
+             if self._cached_access_route:
+                 if self._cached_access_route[-1] != client:
+@@ -703,7 +712,7 @@ class Request(request.Request):
+     @property
+     def port(self):
+         try:
+-            host_header = self._asgi_headers[b'host'].decode()
++            host_header = self._asgi_headers[b'host'].decode('latin1')
+             default_port = 443 if self._secure_scheme else 80
+             __, port = parse_host(host_header, default_port=default_port)
+         except KeyError:
+@@ -716,7 +725,7 @@ class Request(request.Request):
+         # PERF(kgriffs): try..except is faster than get() when we
+         # expect the key to be present most of the time.
+         try:
+-            netloc_value = self._asgi_headers[b'host'].decode()
++            netloc_value = self._asgi_headers[b'host'].decode('latin1')
+         except KeyError:
+             netloc_value, port = self._asgi_server
+ 
+@@ -825,7 +834,7 @@ class Request(request.Request):
+         if self._cached_if_match is None:
+             header_value = self._asgi_headers.get(b'if-match')
+             if header_value:
+-                self._cached_if_match = helpers._parse_etags(header_value.decode())
++                self._cached_if_match = helpers._parse_etags(header_value.decode('latin1'))
+ 
+         return self._cached_if_match
+ 
+@@ -834,7 +843,7 @@ class Request(request.Request):
+         if self._cached_if_none_match is None:
+             header_value = self._asgi_headers.get(b'if-none-match')
+             if header_value:
+-                self._cached_if_none_match = helpers._parse_etags(header_value.decode())
++                self._cached_if_none_match = helpers._parse_etags(header_value.decode('latin1'))
+ 
+         return self._cached_if_none_match
+ 
+@@ -844,7 +853,7 @@ class Request(request.Request):
+         # have to do is clone it in the future.
+         if self._cached_headers is None:
+             self._cached_headers = {
+-                name.decode(): value.decode()
++                name.decode('latin1'): value.decode('latin1')
+                 for name, value in self._asgi_headers.items()
+             }
+ 
+@@ -885,7 +894,7 @@ class Request(request.Request):
+         try:
+             asgi_name = _name_cache[name]
+         except KeyError:
+-            asgi_name = name.lower().encode()
++            asgi_name = name.lower().encode('latin1')
+             if len(_name_cache) < 64:  # Somewhat arbitrary ceiling to mitigate abuse
+                 _name_cache[name] = asgi_name
+ 
+@@ -894,7 +903,7 @@ class Request(request.Request):
+             # Don't take the time to cache beforehand, using HTTP naming.
+             # This will be faster, assuming that most headers are looked
+             # up only once, and not all headers will be requested.
+-            return self._asgi_headers[asgi_name].decode()
++            return self._asgi_headers[asgi_name].decode('latin1')
+ 
+         except KeyError:
+             if not required:
+diff --git a/falcon/asgi/response.py b/falcon/asgi/response.py
+index e19a8f7..15ebfb0 100644
+--- a/falcon/asgi/response.py
++++ b/falcon/asgi/response.py
+@@ -20,7 +20,7 @@ from inspect import iscoroutinefunction
+ 
+ from falcon import response
+ from falcon.constants import _UNSET
+-from falcon.util.misc import is_python_func
++from falcon.util.misc import _encode_items_to_latin1, is_python_func
+ 
+ __all__ = ['Response']
+ 
+@@ -415,8 +415,18 @@ class Response(response.Response):
+             headers['content-type'] = media_type
+ 
+         try:
+-            items = [(n.encode('ascii'), v.encode('ascii')) for n, v in headers.items()]
++            # NOTE(vytas): Supporting ISO-8859-1 for historical reasons as per
++            #   RFC 7230, Section 3.2.4; and to strive for maximum
++            #   compatibility with WSGI.
++
++            # PERF(vytas): On CPython, _encode_items_to_latin1 is implemented
++            #   in Cython (with a pure Python fallback), where the resulting
++            #   C code speeds up the method substantially by directly invoking
++            #   CPython's C API functions such as PyUnicode_EncodeLatin1.
++            items = _encode_items_to_latin1(headers)
+         except UnicodeEncodeError as ex:
++            # TODO(vytas): In 3.1.0, update this error message to highlight the
++            #   fact that we decided to allow ISO-8859-1?
+             raise ValueError(
+                 'The modern series of HTTP standards require that header names and values '
+                 f'use only ASCII characters: {ex}'
+diff --git a/falcon/cyutil/misc.pyx b/falcon/cyutil/misc.pyx
+index 095dddd..f4e2b12 100644
+--- a/falcon/cyutil/misc.pyx
++++ b/falcon/cyutil/misc.pyx
+@@ -1,4 +1,4 @@
+-# Copyright 2020 by Vytautas Liuolia.
++# Copyright 2020-2021 by Vytautas Liuolia.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -38,3 +38,14 @@ def isascii(unicode string not None):
+             return False
+ 
+     return True
++
++
++def encode_items_to_latin1(dict data not None):
++    cdef list result = []
++    cdef unicode key
++    cdef unicode value
++
++    for key, value in data.items():
++        result.append((key.encode('latin1'), value.encode('latin1')))
++
++    return result
+diff --git a/falcon/util/misc.py b/falcon/util/misc.py
+index bf6e112..f25ba00 100644
+--- a/falcon/util/misc.py
++++ b/falcon/util/misc.py
+@@ -39,11 +39,17 @@ from falcon.uri import encode_value
+ # public Falcon interface.
+ from .deprecation import deprecated
+ 
++try:
++    from falcon.cyutil.misc import encode_items_to_latin1 as _cy_encode_items_to_latin1
++except ImportError:
++    _cy_encode_items_to_latin1 = None
++
+ try:
+     from falcon.cyutil.misc import isascii as _cy_isascii
+ except ImportError:
+     _cy_isascii = None
+ 
++
+ __all__ = (
+     'is_python_func',
+     'deprecated',
+@@ -470,6 +476,24 @@ def code_to_http_status(status):
+         return '{} {}'.format(code, _DEFAULT_HTTP_REASON)
+ 
+ 
++def _encode_items_to_latin1(data):
++    """Decode all key/values of a dict to Latin-1.
++
++    Args:
++        data (dict): A dict of string key/values to encode to a list of
++        bytestring items.
++
++    Returns:
++        A list of (bytes, bytes) tuples.
++    """
++    result = []
++
++    for key, value in data.items():
++        result.append((key.encode('latin1'), value.encode('latin1')))
++
++    return result
++
++
+ def _isascii(string):
+     """Return ``True`` if all characters in the string are ASCII.
+ 
+@@ -495,4 +519,5 @@ def _isascii(string):
+         return False
+ 
+ 
++_encode_items_to_latin1 = _cy_encode_items_to_latin1 or _encode_items_to_latin1
+ isascii = getattr(str, 'isascii', _cy_isascii or _isascii)

@@ -1,0 +1,202 @@
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index d6aa7c4fe7..2246d1b5a9 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -31,7 +31,7 @@ jobs:
+ 
+   check_static_analysis:
+     docker:
+-      - image: python:3.7
++      - image: python:3.8
+         auth:
+           username: $DOCKER_HUB_USER
+           password: $DOCKER_HUB_PW
+@@ -97,7 +97,7 @@ jobs:
+           command: pytest docs -vvrfEsx
+ 
+   # test a standard install of prefect
+-  # with all requriements pinned to their lowest allowed versions
++  # with all requirements pinned to their lowest allowed versions
+   # to ensure our requirements.txt file is accurate
+   test_lower_prefect:
+     docker:
+@@ -271,6 +271,38 @@ jobs:
+           name: Run tests
+           command: pytest tests -vvrfEsx
+ 
++  test_39:
++    docker:
++      - image: python:3.9.0
++        auth:
++          username: $DOCKER_HUB_USER
++          password: $DOCKER_HUB_PW
++    steps:
++      - checkout
++      - setup_remote_docker
++      - run:
++          name: Install zsh for tests
++          command: apt-get update && apt-get install -y zsh
++
++      - run:
++          name: Install graphviz
++          command: apt-get update && apt-get install -y graphviz
++
++      - run:
++          name: Upgrade pip
++          command: pip install -U pip
++
++      - run:
++          name: Install Prefect
++          # All extras cannot be tested because they do not support 3.9 yet, until then
++          # we will just guarantee that we pass the core test suite
++          # See https://github.com/PrefectHQ/prefect/pull/3441#issuecomment-708419324
++          command: pip install ".[test]"
++
++      - run:
++          name: Run tests
++          command: pytest tests -vvrfEsx
++
+   upload_coverage:
+     docker:
+       - image: python:3.7
+@@ -283,7 +315,6 @@ jobs:
+           name: Upload Coverage
+           command: bash <(curl -s https://codecov.io/bash) -cF python -s "/tmp/workspace/coverage/"
+ 
+-
+   build_docker_image:
+     docker:
+       - image: docker
+@@ -525,13 +556,14 @@ workflows:
+       - test_36
+       - test_37
+       - test_38
++      - test_39
+       - test_lower_prefect
+       - test_vanilla_prefect
+       - upload_coverage:
+           requires:
+             - test_36
+             - test_37
+-            - test_38
++            - test_39
+             - test_vanilla_prefect
+ 
+   'Check code style and docs':
+diff --git a/changes/issue3655.yaml b/changes/issue3655.yaml
+new file mode 100644
+index 0000000000..dd6f835024
+--- /dev/null
++++ b/changes/issue3655.yaml
+@@ -0,0 +1,23 @@
++# An example changelog entry
++#
++# 1. Choose one (or more if a PR encompasses multiple changes) of the following headers:
++#   - feature
++#   - enhancement
++#   - task
++#   - fix
++#   - deprecation
++#   - breaking (for breaking changes)
++#
++# 2. Fill in one (or more) bullet points under the heading, describing the change.
++#    Markdown syntax may be used.
++#
++# 3. If you would like to be credited as helping with this release, add a
++#    contributor section with your name and github username.
++#
++# Here's an example of a PR that adds an enhancement
++
++fix:
++  - "Fixes Flow.replace freezing reference tasks - [#3655](https://github.com/PrefectHQ/prefect/issues/3655)"
++
++contributor:
++  - "[Ben Fogelson](https://github.com/benfogelson)"
+diff --git a/changes/pr3411.yaml b/changes/pr3411.yaml
+new file mode 100644
+index 0000000000..8bc8021ea4
+--- /dev/null
++++ b/changes/pr3411.yaml
+@@ -0,0 +1,2 @@
++enhancement:
++  - "Experimental support for Python 3.9 - [#3411](https://github.com/PrefectHQ/prefect/pull/3411)"
+diff --git a/changes/pr3654.yaml b/changes/pr3654.yaml
+new file mode 100644
+index 0000000000..b5c8ed15d2
+--- /dev/null
++++ b/changes/pr3654.yaml
+@@ -0,0 +1,2 @@
++fix:
++  - "Fixed bug where `flow.serialized_hash()` could return inconsistent values across new python instances - [#3654](https://github.com/PrefectHQ/prefect/pull/3654)"
+diff --git a/docs/core/getting_started/installation.md b/docs/core/getting_started/installation.md
+index c79bb445f8..7eebf46a55 100644
+--- a/docs/core/getting_started/installation.md
++++ b/docs/core/getting_started/installation.md
+@@ -52,6 +52,10 @@ Examples of extra packages include:
+ - `spacy`: tools for building NLP pipelines using Spacy
+ - `redis`: tools for interacting with a Redis database
+ 
++:::warning Python 3.9
++Prefect support for Python 3.9 is experimental and extras are not expected to work yet as we wait for required packages to be updated.
++:::
++
+ ## Running the local server and UI
+ 
+ Prefect includes an open-source server and UI for orchestrating and managing flows. The local server stores flow metadata in a Postgres database and exposes a GraphQL API. The local server requires [Docker](https://www.docker.com/) and [Docker Compose](https://docs.docker.com/compose/install/) to be installed. If you have [Docker Desktop](https://www.docker.com/products/docker-desktop) on your machine, you've got both of these.
+diff --git a/src/prefect/core/flow.py b/src/prefect/core/flow.py
+index 641617f220..c2afb76bee 100644
+--- a/src/prefect/core/flow.py
++++ b/src/prefect/core/flow.py
+@@ -333,12 +333,13 @@ class Flow:
+                 validate=False,
+             )
+ 
+-        # update auxiliary task collections
+-        ref_tasks = self.reference_tasks()
+-        new_refs = [t for t in ref_tasks if t != old] + (
+-            [new] if old in ref_tasks else []
+-        )
+-        self.set_reference_tasks(new_refs)
++        if self._reference_tasks:
++            # update auxiliary task collections
++            ref_tasks = self.reference_tasks()
++            new_refs = [t for t in ref_tasks if t != old] + (
++                [new] if old in ref_tasks else []
++            )
++            self.set_reference_tasks(new_refs)
+ 
+         if validate:
+             self.validate()
+@@ -1478,7 +1479,9 @@ class Flow:
+         Returns:
+             - str: the hash of the serialized flow
+         """
+-        return hashlib.sha256(json.dumps(self.serialize(build)).encode()).hexdigest()
++        return hashlib.sha256(
++            json.dumps(self.serialize(build), sort_keys=True).encode()
++        ).hexdigest()
+ 
+     # Diagnostics  ----------------------------------------------------------------
+ 
+diff --git a/src/prefect/engine/executors/dask.py b/src/prefect/engine/executors/dask.py
+index 6f3f563034..50f770b122 100644
+--- a/src/prefect/engine/executors/dask.py
++++ b/src/prefect/engine/executors/dask.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import logging
+ import uuid
++import sys
+ import warnings
+ import weakref
+ from contextlib import contextmanager
+@@ -245,6 +246,9 @@ class DaskExecutor(Executor):
+ 
+         Creates a `dask.distributed.Client` and yields it.
+         """
++        if sys.platform != "win32":
++            # Fix for https://github.com/dask/distributed/issues/4168
++            import multiprocessing.popen_spawn_posix  # noqa
+         from distributed import Client
+ 
+         try:

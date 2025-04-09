@@ -1,0 +1,141 @@
+diff --git a/docs/source/backends.rst b/docs/source/backends.rst
+index d297b19..7e48678 100644
+--- a/docs/source/backends.rst
++++ b/docs/source/backends.rst
+@@ -325,3 +325,47 @@ so again just the ``backend`` keyword needs to be supplied:
+            [-462.52362  , -121.12659  ,  -67.84769  ,  624.5455   ],
+            [   5.2839584,   36.44155  ,   81.62852  ,  703.15784  ]],
+           dtype=float32)
++
++
++Contracting arbitrary objects
++=============================
++
++There is one more explicit backend that can handle arbitrary arrays of objects,
++so long the *objects themselves* just support multiplication and addition (
++``__mul__`` and ``__add__`` dunder methods respectively). Use it by supplying
++``backend='object'``.
++
++For example, imagine we want to perform a contraction of arrays made up of
++`sympy <www.sympy.org>`_ symbols:
++
++.. code-block:: python
++
++  >>> import opt_einsum as oe
++  >>> import numpy as np
++  >>> import sympy
++
++  >>> # define the symbols
++  >>> a, b, c, d, e, f, g, h, i, j, k, l = [sympy.symbols(oe.get_symbol(i)) for i in range(12)]
++  >>> a * b + c * d
++  𝑎𝑏+𝑐𝑑
++
++  >>> # define the tensors (you might explicitly specify ``dtype=object``)
++  >>> X = np.array([[a, b], [c, d]])
++  >>> Y = np.array([[e, f], [g, h]])
++  >>> Z = np.array([[i, j], [k, l]])
++
++  >>> # contract the tensors!
++  >>> oe.contract('uv,vw,wu->u', X, Y, Z, backend='object')
++  array([i*(a*e + b*g) + k*(a*f + b*h), j*(c*e + d*g) + l*(c*f + d*h)],
++        dtype=object)
++
++There are a few things to note here:
++
++* The returned array is a ``numpy.ndarray`` but since it has ``dtype=object``
++  it can really hold *any* python objects
++* We had to explicitly use ``backend='object'``, since :func:`numpy.einsum`
++  would have otherwise been dispatched to, which can't handle ``dtype=object``
++  (though :func:`numpy.tensordot` in fact can)
++* Although an optimized pairwise contraction order is used, the looping in each
++  single contraction is **performed in python so performance will be
++  drastically lower than for numeric dtypes!**
+diff --git a/opt_einsum/backends/dispatch.py b/opt_einsum/backends/dispatch.py
+index 85a6ceb..f5777ae 100644
+--- a/opt_einsum/backends/dispatch.py
++++ b/opt_einsum/backends/dispatch.py
+@@ -8,6 +8,7 @@ import importlib
+ 
+ import numpy
+ 
++from . import object_arrays
+ from . import cupy as _cupy
+ from . import jax as _jax
+ from . import tensorflow as _tensorflow
+@@ -49,6 +50,10 @@ _cached_funcs = {
+     ('tensordot', 'numpy'): numpy.tensordot,
+     ('transpose', 'numpy'): numpy.transpose,
+     ('einsum', 'numpy'): numpy.einsum,
++    # also pre-populate with the arbitrary object backend
++    ('tensordot', 'object'): numpy.tensordot,
++    ('transpose', 'object'): numpy.transpose,
++    ('einsum', 'object'): object_arrays.object_einsum,
+ }
+ 
+ 
+diff --git a/opt_einsum/backends/object_arrays.py b/opt_einsum/backends/object_arrays.py
+new file mode 100644
+index 0000000..3b394e1
+--- /dev/null
++++ b/opt_einsum/backends/object_arrays.py
+@@ -0,0 +1,60 @@
++"""
++Functions for performing contractions with array elements which are objects.
++"""
++
++import numpy as np
++import functools
++import operator
++
++
++def object_einsum(eq, *arrays):
++    """A ``einsum`` implementation for ``numpy`` arrays with object dtype.
++    The loop is performed in python, meaning the objects themselves need
++    only to implement ``__mul__`` and ``__add__`` for the contraction to be
++    computed. This may be useful when, for example, computing expressions of
++    tensors with symbolic elements, but note it will be very slow when compared
++    to ``numpy.einsum`` and numeric data types!
++
++    Parameters
++    ----------
++    eq : str
++        The contraction string, should specify output.
++    arrays : sequence of arrays
++        These can be any indexable arrays as long as addition and
++        multiplication is defined on the elements.
++
++    Returns
++    -------
++    out : numpy.ndarray
++        The output tensor, with ``dtype=object``.
++    """
++
++    # when called by ``opt_einsum`` we will always be given a full eq
++    lhs, output = eq.split('->')
++    inputs = lhs.split(',')
++
++    sizes = {}
++    for term, array in zip(inputs, arrays):
++        for k, d in zip(term, array.shape):
++            sizes[k] = d
++
++    out_size = tuple(sizes[k] for k in output)
++    out = np.empty(out_size, dtype=object)
++
++    inner = tuple(k for k in sizes if k not in output)
++    inner_size = tuple(sizes[k] for k in inner)
++
++    for coo_o in np.ndindex(*out_size):
++
++        coord = dict(zip(output, coo_o))
++
++        def gen_inner_sum():
++            for coo_i in np.ndindex(*inner_size):
++                coord.update(dict(zip(inner, coo_i)))
++                locs = (tuple(coord[k] for k in term) for term in inputs)
++                elements = (array[loc] for array, loc in zip(arrays, locs))
++                yield functools.reduce(operator.mul, elements)
++
++        out[coo_o] = functools.reduce(operator.add, gen_inner_sum())
++
++    return out

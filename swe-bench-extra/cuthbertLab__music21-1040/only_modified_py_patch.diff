@@ -1,0 +1,333 @@
+diff --git a/music21/_version.py b/music21/_version.py
+index 11bcdd872..1813a2d94 100644
+--- a/music21/_version.py
++++ b/music21/_version.py
+@@ -42,7 +42,7 @@ When changing, update the single test case in base.py.
+ Changing this number invalidates old pickles -- do it if the old pickles create a problem.
+ '''
+ 
+-__version_info__ = (7, 0, 6, 'a1')  # can be 4-tuple: (7, 0, 5, 'a2')
++__version_info__ = (7, 0, 7)  # can be 4-tuple: (7, 0, 5, 'a2')
+ 
+ v = '.'.join(str(x) for x in __version_info__[0:3])
+ if len(__version_info__) > 3 and __version_info__[3]:
+diff --git a/music21/base.py b/music21/base.py
+index b6e695578..f3b5de021 100644
+--- a/music21/base.py
++++ b/music21/base.py
+@@ -28,7 +28,7 @@ available after importing `music21`.
+ <class 'music21.base.Music21Object'>
+ 
+ >>> music21.VERSION_STR
+-'7.0.6a1'
++'7.0.7'
+ 
+ Alternatively, after doing a complete import, these classes are available
+ under the module "base":
+diff --git a/music21/musicxml/m21ToXml.py b/music21/musicxml/m21ToXml.py
+index f402b223d..8ab3c71b3 100644
+--- a/music21/musicxml/m21ToXml.py
++++ b/music21/musicxml/m21ToXml.py
+@@ -1400,7 +1400,7 @@ class ScoreExporter(XMLExporterBase, PartStaffExporterMixin):
+         the main function to call.
+ 
+         If self.stream is empty, call self.emptyObject().  Otherwise,
+-
++        convert sounding to written pitch,
+         set scorePreliminaries(), call parsePartlikeScore or parseFlatScore, then postPartProcess(),
+         clean up circular references for garbage collection, and returns the <score-partwise>
+         object.
+@@ -1415,6 +1415,10 @@ class ScoreExporter(XMLExporterBase, PartStaffExporterMixin):
+         if not s:
+             return self.emptyObject()
+ 
++        if s.atSoundingPitch is True:
++            # A copy was already made or elected NOT to be made.
++            s.toWrittenPitch(inPlace=True)
++
+         self.scorePreliminaries()
+ 
+         if s.hasPartLikeStreams():
+@@ -2434,11 +2438,12 @@ class PartExporter(XMLExporterBase):
+ 
+     def parse(self):
+         '''
+-        Set up instruments, create a partId (if no good one exists) and sets it on
+-        <part>, fixes up the notation (:meth:`fixupNotationFlat` or :meth:`fixupNotationMeasured`,
+-        if :attr:`makeNotation` is True),
+-        setsIdLocals on spanner bundle. runs parse() on each measure's MeasureExporter and
+-        appends the output to the <part> object.
++        Set up instruments, convert sounding pitch to written pitch,
++        create a partId (if no good one exists) and set it on
++        <part>, fixes up the notation
++        (:meth:`fixupNotationFlat` or :meth:`fixupNotationMeasured`),
++        setIdLocals() on spanner bundle. Run parse() on each measure's MeasureExporter and
++        append the output to the <part> object.
+ 
+         In other words, one-stop shopping.
+ 
+@@ -2447,6 +2452,8 @@ class PartExporter(XMLExporterBase):
+         on the Part. Generally this attribute is set on `GeneralObjectExporter`
+         or `ScoreExporter` and read from there. Running with `makeNotation`
+         as False will raise `MusicXMLExportException` if no measures are present.
++        If `makeNotation` is False, the transposition to written pitch is still
++        performed and thus will be done in place.
+ 
+         >>> from music21.musicxml.m21ToXml import PartExporter
+         >>> noMeasures = stream.Part(note.Note())
+@@ -2457,6 +2464,13 @@ class PartExporter(XMLExporterBase):
+         music21.musicxml.xmlObjects.MusicXMLExportException:
+         Cannot export with makeNotation=False if there are no measures
+         '''
++        # A copy has already been made
++        # unless makeNotation=False, but the user
++        # should have called toWrittenPitch() first
++        # and is explicitly asking for no further copies to be made
++        if self.stream.atSoundingPitch is True:
++            self.stream.toWrittenPitch(inPlace=True)
++
+         self.instrumentSetup()
+ 
+         self.xmlRoot.set('id', str(self.firstInstrumentObject.partId))
+@@ -6239,8 +6253,6 @@ class MeasureExporter(XMLExporterBase):
+             return None
+         if self.parent.stream is None:
+             return None
+-        if self.parent.stream.atSoundingPitch is True:
+-            return None
+ 
+         m = self.stream
+         self.measureOffsetStart = m.getOffsetBySite(self.parent.stream)
+@@ -6517,6 +6529,29 @@ class Test(unittest.TestCase):
+         # Measures should have been made
+         self.assertIsNotNone(tree.find('.//measure'))
+ 
++    def testFromSoundingPitch(self):
++        '''
++        A score with mixed sounding and written parts.
++        '''
++        from music21.instrument import Clarinet, Bassoon
++
++        m = stream.Measure([Clarinet(), note.Note('C')])
++        p1 = stream.Part(m)
++        p1.atSoundingPitch = True
++        p2 = stream.Part(stream.Measure([Bassoon(), note.Note()]))
++        s = stream.Score([p1, p2])
++        self.assertEqual(s.atSoundingPitch, 'unknown')
++        gex = GeneralObjectExporter(s)
++        root = ET.fromstring(gex.parse().decode('utf-8'))
++        self.assertEqual(len(root.findall('.//transpose')), 1)
++        self.assertEqual(root.find('.//step').text, 'D')
++
++        s.atSoundingPitch = True
++        gex = GeneralObjectExporter(s)
++        root = ET.fromstring(gex.parse().decode('utf-8'))
++        self.assertEqual(len(root.findall('.//transpose')), 1)
++        self.assertEqual(root.find('.//step').text, 'D')
++
+     def testMidiInstrumentNoName(self):
+         from music21 import converter, instrument
+ 
+diff --git a/music21/spanner.py b/music21/spanner.py
+index ba3a7423d..41a4d7094 100644
+--- a/music21/spanner.py
++++ b/music21/spanner.py
+@@ -1397,6 +1397,21 @@ class Ottava(Spanner):
+ 
+     >>> ottava.validOttavaTypes
+     ('8va', '8vb', '15ma', '15mb', '22da', '22db')
++
++    OMIT_FROM_DOCS
++
++    Test the round-trip back:
++
++    >>> s3 = s2.toWrittenPitch()
++    >>> s3.show('text')
++    {0.0} <music21.spanner.Ottava 8vb transposing<music21.note.Note D><music21.note.Note E>>
++    {0.0} <music21.note.Note D>
++    {2.0} <music21.note.Note E>
++
++    >>> for n in s3.notes:
++    ...    print(n.nameWithOctave)
++    D4
++    E4
+     '''
+     validOttavaTypes = ('8va', '8vb', '15ma', '15mb', '22da', '22db')
+ 
+diff --git a/music21/stream/base.py b/music21/stream/base.py
+index bd00c2531..e452f7a80 100644
+--- a/music21/stream/base.py
++++ b/music21/stream/base.py
+@@ -4898,7 +4898,6 @@ class Stream(core.StreamCoreMixin, base.Music21Object):
+         else:
+             raise StreamException(f'not a valid at sounding pitch value: {value}')
+ 
+-
+     def _transposeByInstrument(self,
+                                reverse=False,
+                                inPlace=False,
+@@ -4918,11 +4917,9 @@ class Stream(core.StreamCoreMixin, base.Music21Object):
+         else:
+             returnObj = self
+ 
+-        # this will change the working Stream; not sure if a problem
+-        try:
+-            boundaries = returnObj.extendDurationAndGetBoundaries('Instrument')
+-        except StreamException:
+-            return returnObj  # there are no instruments in the Stream.
++        instrument_stream = returnObj.getInstruments(recurse=True)
++        instrument_stream.duration = returnObj.duration
++        instrument_stream.extendDuration('Instrument', inPlace=True)
+ 
+         # store class filter list for transposition
+         if transposeKeySignature:
+@@ -4930,22 +4927,63 @@ class Stream(core.StreamCoreMixin, base.Music21Object):
+         else:
+             classFilterList = ('Note', 'Chord')
+ 
+-        for k in boundaries:
+-            i = boundaries[k]
+-            if i.transposition is None:
++        for inst in instrument_stream:
++            if inst.transposition is None:
+                 continue
+-            start, end = k
+-            focus = returnObj.getElementsByOffset(start, end,
+-                                                  includeEndBoundary=False, mustFinishInSpan=False,
+-                                                  mustBeginInSpan=True).stream()
+-            trans = i.transposition
++            start = inst.offset
++            end = start + inst.quarterLength
++            focus = returnObj.flat.getElementsByOffset(
++                start,
++                end,
++                includeEndBoundary=False,
++                mustFinishInSpan=False,
++                mustBeginInSpan=True).stream()
++            trans = inst.transposition
+             if reverse:
+                 trans = trans.reverse()
+             focus.transpose(trans, inPlace=True,
+                             classFilterList=classFilterList)
+-            # print(k, i.transposition)
++
+         return returnObj
+ 
++    def _treatAtSoundingPitch(self) -> Union[bool, str]:
++        '''
++        `atSoundingPitch` might be True, False, or 'unknown'. Given that
++        setting the property does not automatically synchronize the corresponding
++        property on contained or containing streams, any time a method relying on the
++        value of `atSoundingPitch` such as :meth:`toSoundingPitch` visits a stream,
++        it will need to resolve 'unknown' values or even possibly conflicting values.
++
++        If this stream's `.atSoundingPitch` is 'unknown', this helper method searches
++        this stream's sites until a True or False
++        value for `.atSoundingPitch` is found, since it is possible a user only manipulated
++        the value on the top-level stream.
++
++        Then, contained streams are searched to verify that they do not contain
++        conflicting values (i.e. .atSoundingPitch = True when the container has
++        .atSoundingPitch = False). Conflicting values are resolved by converting
++        the inner streams to written or sounding pitch as necessary to match this
++        stream's value.
++        '''
++        at_sounding = self.atSoundingPitch
++        if self.atSoundingPitch == 'unknown':
++            for site in self.sites:
++                if site.isStream and site.atSoundingPitch != 'unknown':
++                    at_sounding = site.atSoundingPitch
++                    break
++            else:
++                raise StreamException('atSoundingPitch is unknown: cannot transpose')
++
++        for substream in self.recurse(streamsOnly=True, includeSelf=False):
++            if substream.atSoundingPitch == 'unknown':
++                continue
++            if substream.atSoundingPitch is False and at_sounding is True:
++                substream.toSoundingPitch(inPlace=True)
++            elif substream.atSoundingPitch is True and at_sounding is False:
++                substream.toWrittenPitch(inPlace=True)
++
++        return at_sounding
++
+     def toSoundingPitch(self, *, inPlace=False):
+         # noinspection PyShadowingNames
+         '''
+@@ -5001,27 +5039,20 @@ class Stream(core.StreamCoreMixin, base.Music21Object):
+         else:
+             returnObj = self
+ 
+-        if returnObj.hasPartLikeStreams():
+-            for p in returnObj.getElementsByClass('Stream'):
++        if returnObj.hasPartLikeStreams() or 'Opus' in returnObj.classSet:
++            for partLike in returnObj.getElementsByClass(Stream):
+                 # call on each part
+-                p.toSoundingPitch(inPlace=True)
+-                returnObj.atSoundingPitch = True
+-            return returnObj
++                partLike.toSoundingPitch(inPlace=True)
++            returnObj.atSoundingPitch = True
++            return returnObj if not inPlace else None
+ 
+-        # else...
+-        atSoundingPitch = self.atSoundingPitch
+-        if atSoundingPitch == 'unknown':
+-            for site in self.sites:
+-                if hasattr(site, 'atSoundingPitch') and site.atSoundingPitch != 'unknown':
+-                    atSoundingPitch = site.atSoundingPitch
+-                    break
+-            else:
+-                raise StreamException('atSoundingPitch is unknown: cannot transpose')
++        at_sounding = returnObj._treatAtSoundingPitch()
+ 
+-        if atSoundingPitch is False:
++        if at_sounding is False:
+             # transposition defined on instrument goes from written to sounding
+             returnObj._transposeByInstrument(reverse=False, inPlace=True)
+-            returnObj.atSoundingPitch = True
++            for container in returnObj.recurse(streamsOnly=True, includeSelf=True):
++                container.atSoundingPitch = True
+ 
+         for ottava in returnObj.recurse().getElementsByClass('Ottava'):
+             ottava.performTransposition()
+@@ -5063,31 +5094,20 @@ class Stream(core.StreamCoreMixin, base.Music21Object):
+         else:
+             returnObj = self
+ 
+-        if returnObj.hasPartLikeStreams():
+-            for partLike in returnObj.getElementsByClass('Stream'):
++        if returnObj.hasPartLikeStreams() or 'Opus' in returnObj.classSet:
++            for partLike in returnObj.getElementsByClass(Stream):
+                 # call on each part
+                 partLike.toWrittenPitch(inPlace=True)
+             returnObj.atSoundingPitch = False
+-            if inPlace:
+-                return None
+-            else:
+-                return returnObj
++            return returnObj if not inPlace else None
+ 
+-        # else...
+-        atSoundingPitch = self.atSoundingPitch
+-        if atSoundingPitch == 'unknown':
+-            for site in self.sites:
+-                if hasattr(site, 'atSoundingPitch') and site.atSoundingPitch != 'unknown':
+-                    atSoundingPitch = site.atSoundingPitch
+-                    break
+-            else:
+-                raise StreamException('atSoundingPitch is unknown: cannot transpose')
++        at_sounding = returnObj._treatAtSoundingPitch()
+ 
+-        if atSoundingPitch is True:
+-            # transposition defined on instrument goes from written to sounding
++        if at_sounding is True:
+             # need to reverse to go to written
+             returnObj._transposeByInstrument(reverse=True, inPlace=True)
+-            returnObj.atSoundingPitch = False
++            for container in returnObj.recurse(streamsOnly=True, includeSelf=True):
++                container.atSoundingPitch = False
+ 
+         for ottava in returnObj.recurse().getElementsByClass('Ottava'):
+             ottava.undoTransposition()
+

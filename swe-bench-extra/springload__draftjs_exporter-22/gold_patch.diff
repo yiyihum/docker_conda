@@ -1,0 +1,126 @@
+diff --git a/docs/README.md b/docs/README.md
+index 919d5dc..f460bf8 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -23,7 +23,6 @@ draftjs_exporter documentation
+ 
+ ### Unsupported markup
+ 
+-* Nested blocks where nesting jumps one level of depth (depth = 0, then depth = 2).
+ 
+ ## R&D notes
+ 
+diff --git a/draftjs_exporter/wrapper_state.py b/draftjs_exporter/wrapper_state.py
+index 2879d99..d81e4ce 100644
+--- a/draftjs_exporter/wrapper_state.py
++++ b/draftjs_exporter/wrapper_state.py
+@@ -33,7 +33,7 @@ class WrapperState:
+         elt_options = self.map_element_options(block_options.get('element'))
+         elt = DOM.create_element(elt_options[0], elt_options[1])
+ 
+-        parent = self.parent_for(type_, depth)
++        parent = self.parent_for(block_options, depth)
+         DOM.append_child(parent, elt)
+ 
+         # At level 0, the element is added to the document.
+@@ -48,22 +48,41 @@ class WrapperState:
+     def __str__(self):
+         return '<WrapperState: %s>' % self.to_string()
+ 
+-    def set_wrapper(self, options=None, depth=0):
+-        if not options:
+-            element = DOM.create_document_fragment()
+-        else:
+-            element = DOM.create_element(options[0], options[1])
++    def set_wrapper(self, options=None, elt_options=None, depth=0):
++        if depth >= len(self.wrapper_stack):
++            for d in range(len(self.wrapper_stack), depth + 1):
++                wrapper_elt = self.create_wrapper_elt(options)
++                new_wrapper = [wrapper_elt, d, options]
+ 
+-        new_wrapper = [element, depth, options]
++                wrapper_children = DOM.get_children(self.get_wrapper_elt())
+ 
+-        if depth >= len(self.wrapper_stack):
+-            DOM.append_child(DOM.get_children(self.get_wrapper_elt())[-1], element)
++                # Determine where to append the new wrapper.
++                if len(wrapper_children) > 0:
++                    wrapper_parent = wrapper_children[-1]
++                else:
++                    # If there is no content in the current wrapper, we need
++                    # to add an intermediary node.
++                    wrapper_parent = DOM.create_element(elt_options[0], elt_options[1])
++                    DOM.append_child(self.get_wrapper_elt(), wrapper_parent)
+ 
+-            self.wrapper_stack.append(new_wrapper)
++                DOM.append_child(wrapper_parent, wrapper_elt)
++
++                self.wrapper_stack.append(new_wrapper)
+         else:
++            wrapper_elt = self.create_wrapper_elt(options)
++            new_wrapper = [wrapper_elt, depth, options]
++
+             # Cut the stack to where it now stops, and add new wrapper.
+             self.wrapper_stack = self.wrapper_stack[:depth] + [new_wrapper]
+ 
++    def create_wrapper_elt(self, options):
++        if options:
++            wrapper_elt = DOM.create_element(options[0], options[1])
++        else:
++            wrapper_elt = DOM.create_document_fragment()
++
++        return wrapper_elt
++
+     def get_wrapper_elt(self, depth=-1):
+         return self.wrapper_stack[depth][0]
+ 
+@@ -73,12 +92,12 @@ class WrapperState:
+     def get_wrapper_options(self, depth=-1):
+         return self.wrapper_stack[depth][2]
+ 
+-    def parent_for(self, type_, depth):
+-        block_options = self.get_block_options(type_)
++    def parent_for(self, block_options, depth):
++        elt_options = self.map_element_options(block_options.get('element'))
+         wrapper_options = block_options.get('wrapper', None)
+ 
+         if wrapper_options:
+-            parent = self.get_wrapper(wrapper_options, depth)
++            parent = self.get_wrapper(self.map_element_options(wrapper_options), elt_options, depth)
+         else:
+             parent = self.reset_wrapper_stack()
+ 
+@@ -112,11 +131,9 @@ class WrapperState:
+ 
+         return block_options
+ 
+-    def get_wrapper(self, wrapper_options, depth):
+-        new_options = self.map_element_options(wrapper_options)
+-
+-        if depth > self.get_wrapper_depth() or new_options != self.get_wrapper_options():
+-            self.set_wrapper(new_options, depth)
++    def get_wrapper(self, wrapper_options, elt_options, depth):
++        if depth > self.get_wrapper_depth() or wrapper_options != self.get_wrapper_options():
++            self.set_wrapper(wrapper_options, elt_options, depth)
+ 
+         # If depth is lower than the maximum, we need to cut the stack.
+         if depth < self.get_wrapper_depth():
+diff --git a/example.py b/example.py
+index c55cfcc..25e7d5f 100644
+--- a/example.py
++++ b/example.py
+@@ -21,7 +21,7 @@ config = {
+     'block_map': dict(BLOCK_MAP, **{
+         BLOCK_TYPES.HEADER_TWO: {
+             'element': ['h2', {'className': 'c-amazing-heading'}],
+-            'wrapper': 'hgroup',
++            'wrapper': 'div',
+         },
+         BLOCK_TYPES.UNORDERED_LIST_ITEM: {
+             'element': 'li',
+@@ -275,4 +275,4 @@ print(pretty)
+ 
+ # Output to a file
+ with codecs.open('example.html', 'w', 'utf-8') as file:
+-    file.write('<meta charset="utf-8" />\n' + pretty)
++    file.write('<!DOCTYPE html><html><head><meta charset="utf-8" /><title>Test</title></head><body>\n{pretty}\n</body></html>'.format(pretty=pretty))

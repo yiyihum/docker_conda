@@ -1,0 +1,311 @@
+diff --git a/pyventory/asset.py b/pyventory/asset.py
+index 1d58aa6..2b9a962 100644
+--- a/pyventory/asset.py
++++ b/pyventory/asset.py
+@@ -7,71 +7,119 @@ from pyventory import errors
+ __all__ = ['Asset']
+ 
+ 
+-class Asset:
++class SKIP_ATTR:
++    pass
++
++
++class AssetAttr:
++    _value = None
++    _name = None
++
++    def __init__(self, value):
++        self._value = value
++
++    def __get__(self, instance, owner):
++        if instance:
++            return self._value
++
++        if not isinstance(self._value, (str, Mapping, Sequence)):
++            return self._value
++
++        def get_attr(value):
++            return owner._get_attr(owner, self._name, strict=True)
++
++        value_type = type(self._value)
++        return type(
++            value_type.__name__,
++            (value_type,),
++            {'__call__': get_attr}
++        )(self._value)
++
++    def __set_name__(self, owner, name):
++        self._name = name
++
++
++class AssetMeta(type):
++
++    def __new__(cls, name, bases, namespace, **kwds):
++        new_namespace = {
++            '_name': f'{namespace["__module__"]}.{name}',
++        }
++
++        for key, value in namespace.items():
++            if not key.startswith('_'):
++                value = AssetAttr(value)
++            new_namespace[key] = value
++
++        return super().__new__(cls, name, bases, new_namespace, **kwds)
++
++
++class Asset(metaclass=AssetMeta):
++
+     _string_format_regex = re.compile(r'{([\w_]+)}')
+ 
+-    def __init__(self, **kwargs):
+-        for name, value in kwargs.items():
+-            setattr(self, name, value)
+-
+-    def _vars(self):
+-        return self.__build_vars(self, strict_format=True)
+-
+-    @classmethod
+-    def _cls_vars(cls):
+-        return cls.__build_vars(cls)
+-
+-    @classmethod
+-    def _name(cls):
+-        return '{module}.{name}'.format(
+-            module=cls.__module__, name=cls.__name__)
+-
+-    @classmethod
+-    def __build_vars(cls, obj, strict_format=False):
+-        _vars = {
+-            attr_name: getattr(obj, attr_name)
+-            for attr_name in dir(obj)
+-            if not attr_name.startswith('_')}
+-
+-        for name, value in _vars.copy().items():
+-            try:
+-                _vars[name] = cls.__format_value(value, _vars, name)
+-            except NotImplementedError:
+-                if strict_format:
+-                    raise errors.PropertyIsNotImplementedError(
+-                        f'Var "{name}" is not implemented in "{obj._name()}"'
+-                        ' asset instance')
+-                else:
+-                    del _vars[name]
+-            except KeyError as e:
+-                if strict_format:
+-                    raise errors.ValueSubstitutionError(
+-                        f'Attribute "{e.args[0]}" must be available for'
+-                        ' "{obj._name()}" asset instance')
+-                else:
+-                    del _vars[name]
+-            except errors.ValueSubstitutionInfiniteLoopError:
+-                raise errors.ValueSubstitutionInfiniteLoopError(
+-                    f'Attribute "{name}" has an infinite string substitution'
+-                    f' loop for "{obj._name()}" asset instance')
+-
+-        return _vars
+-
+-    @classmethod
+-    def __format_value(cls, value, context, start_key):
++    def __new__(cls, **kwargs):
++        self = super().__new__(cls)
++        self.__dict__.update(kwargs)
++        self.__dict__.update(self._vars(self, strict=True))
++        return self
++
++    @staticmethod
++    def _attrs(obj):
++        return [name for name in dir(obj) if not name.startswith('_')]
++
++    @staticmethod
++    def _context(obj):
++        return {name: getattr(obj, name) for name in obj._attrs(obj)}
++
++    @staticmethod
++    def _vars(obj, strict=False):
++        return {
++            name: value
++            for name, value in (
++                (name, obj._get_attr(obj, name, strict=strict))
++                for name in obj._attrs(obj))
++            if value is not SKIP_ATTR}
++
++    @staticmethod
++    def _get_attr(obj, name, strict=False):
++        try:
++            context = obj._context(obj).copy()
++            return obj._format_value(obj, context, context[name], name)
++        except NotImplementedError:
++            if strict:
++                raise errors.PropertyIsNotImplementedError(
++                    f'Var "{name}" is not implemented in "{obj._name}" asset')
++            else:
++                return SKIP_ATTR
++        except KeyError as e:
++            if strict:
++                raise errors.ValueSubstitutionError(
++                    f'Attribute "{e.args[0]}" must be available for'
++                    f' "{obj._name}" asset instance')
++            else:
++                return SKIP_ATTR
++        except errors.ValueSubstitutionInfiniteLoopError:
++            raise errors.ValueSubstitutionInfiniteLoopError(
++                f'Attribute "{name}" has an infinite string substitution'
++                f' loop in "{obj._name}" asset instance')
++
++    @staticmethod
++    def _format_value(obj, context, value, start_key):
+         if value is NotImplemented:
+             raise NotImplementedError
+         if isinstance(value, str):
+-            for key in cls._string_format_regex.findall(value):
++            for key in obj._string_format_regex.findall(value):
+                 if key == start_key:
+                     raise errors.ValueSubstitutionInfiniteLoopError
+-                context[key] = cls.__format_value(
+-                    context[key], context, start_key)
++                context[key] = obj._format_value(
++                    obj, context, context[key], start_key)
+             return value.format(**context)
+         if isinstance(value, Mapping):
+             return {
+-                k: cls.__format_value(v, context, start_key)
++                k: obj._format_value(obj, context, v, start_key)
+                 for k, v in value.items()}
+         if isinstance(value, Sequence):
+-            return [cls.__format_value(v, context, start_key) for v in value]
++            return [
++                obj._format_value(obj, context, v, start_key) for v in value]
+         return value
+diff --git a/pyventory/export.py b/pyventory/export.py
+index 1ea2c70..dddf750 100644
+--- a/pyventory/export.py
++++ b/pyventory/export.py
+@@ -11,48 +11,54 @@ from pyventory.inventory import Inventory
+ __all__ = ['pyventory_data', 'ansible_inventory', 'terraform_vars']
+ 
+ 
+-def pyventory_data(hosts):
++def pyventory_data(instances):
+     """Provides raw inventory data as Python `dict` containing Asset data in
+-    `assets` key and hosts data in `hosts` key.
++    `assets` key and instances data in `instances` key.
+     """
+-    inventory = Inventory(hosts)
++    inventory = Inventory(instances)
+ 
+     assets = {
+         name: attr.asdict(asset)
+         for name, asset in inventory.assets.items()}
+ 
+     for asset in assets.values():
+-        for attr_name in ('hosts', 'vars', 'children',):
++        for attr_name in ('instances', 'vars', 'children',):
+             if not asset[attr_name]:
+                 del asset[attr_name]
+ 
+-    hosts = inventory.hosts.copy()
++    instances = inventory.instances.copy()
+ 
+-    return {'assets': assets, 'hosts': hosts}
++    return {'assets': assets, 'instances': instances}
+ 
+ 
+-def ansible_inventory(hosts, out=sys.stdout, indent=None):
++def ansible_inventory(instances, out=sys.stdout, indent=None):
+     """Dumps inventory in the Ansible's Dynamic Inventory JSON format to `out`.
+     """
+-    raw_data = pyventory_data(hosts)
++    raw_data = pyventory_data(instances)
+ 
+-    data = raw_data['assets']
+-    data['_meta'] = {'hostvars': raw_data['hosts']}
++    data = {}
++
++    for key, value in raw_data['assets'].items():
++        if 'instances' in value:
++            value['hosts'] = value.pop('instances')
++        data[key] = value
++
++    data['_meta'] = {'hostvars': raw_data['instances']}
+ 
+     json.dump(data, out, indent=indent, default=list)
+ 
+ 
+-def terraform_vars(hosts, filename_base='pyventory', indent=None):
++def terraform_vars(instances, filename_base='pyventory', indent=None):
+     """Dumps inventory in the Terraform's JSON format to `<filename_base>.tf`
+     setting their values as defaults.
+     """
+     tf_config_path = pathlib.Path(filename_base).with_suffix('.tf')
+ 
+-    raw_data = pyventory_data(hosts)
++    raw_data = pyventory_data(instances)
+ 
+     tf_config = {}
+ 
+-    for asset_name, asset_data in raw_data['hosts'].items():
++    for asset_name, asset_data in raw_data['instances'].items():
+ 
+         for name, value in asset_data.items():
+ 
+diff --git a/pyventory/inventory.py b/pyventory/inventory.py
+index b789166..d8a43c5 100644
+--- a/pyventory/inventory.py
++++ b/pyventory/inventory.py
+@@ -1,5 +1,5 @@
+-from ordered_set import OrderedSet
+ import attr
++from ordered_set import OrderedSet
+ 
+ from pyventory.asset import Asset
+ 
+@@ -11,28 +11,28 @@ __all__ = []
+ class AssetData:
+     vars = attr.ib(default=attr.Factory(dict))
+     children = attr.ib(default=attr.Factory(OrderedSet))
+-    hosts = attr.ib(default=attr.Factory(OrderedSet))
++    instances = attr.ib(default=attr.Factory(OrderedSet))
+ 
+ 
+ class Inventory:
+ 
+-    def __init__(self, hosts):
++    def __init__(self, instances):
+         self.assets = {}
+-        self.hosts = {}
++        self.instances = {}
+ 
+-        for name, host in sorted(hosts.items()):
+-            self.add_host(name, host)
++        for name, instance in sorted(instances.items()):
++            self.add_instance(name, instance)
+ 
+-    def add_host(self, name, host):
+-        if not isinstance(host, Asset):
++    def add_instance(self, name, instance):
++        if not isinstance(instance, Asset):
+             return
+ 
+-        self.hosts[name] = host._vars()
+-        self.add_asset(host.__class__)
+-        self.assets[host._name()].hosts.add(name)
++        self.instances[name] = instance._vars(instance, strict=True)
++        self.add_asset(instance.__class__)
++        self.assets[instance._name].instances.add(name)
+ 
+     def add_asset(self, asset):
+-        if asset._name() in self.assets:
++        if asset._name in self.assets:
+             return
+ 
+         for parent_asset in asset.__bases__:
+@@ -44,6 +44,6 @@ class Inventory:
+                 continue
+ 
+             self.add_asset(parent_asset)
+-            self.assets[parent_asset._name()].children.add(asset._name())
++            self.assets[parent_asset._name].children.add(asset._name)
+ 
+-        self.assets[asset._name()] = AssetData(vars=asset._cls_vars())
++        self.assets[asset._name] = AssetData(vars=asset._vars(asset))

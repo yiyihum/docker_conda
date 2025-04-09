@@ -1,0 +1,124 @@
+diff --git a/tests/test_base_config.py b/tests/test_base_config.py
+index 3b8ad4b..a0c6a0d 100644
+--- a/tests/test_base_config.py
++++ b/tests/test_base_config.py
+@@ -434,7 +434,7 @@ def test_not_implemented() -> None:
+ def test_resolve_str_interpolation(query: str, result: Any) -> None:
+     cfg = OmegaConf.create({"foo": 10, "bar": "${foo}"})
+     assert (
+-        cfg._resolve_str_interpolation(
++        cfg._resolve_interpolation(
+             key=None,
+             value=StringNode(value=query),
+             throw_on_missing=False,
+diff --git a/tests/test_basic_ops_dict.py b/tests/test_basic_ops_dict.py
+index b8ee516..8145d7b 100644
+--- a/tests/test_basic_ops_dict.py
++++ b/tests/test_basic_ops_dict.py
+@@ -237,13 +237,23 @@ def test_pickle_get_root() -> None:
+ 
+ 
+ def test_iterate_dictionary() -> None:
+-    c = OmegaConf.create(dict(a=1, b=2))
++    c = OmegaConf.create({"a": 1, "b": 2})
+     m2 = {}
+     for key in c:
+         m2[key] = c[key]
+     assert m2 == c
+ 
+ 
++def test_iterate_dict_with_interpolation() -> None:
++    c = OmegaConf.create({"a": "${b}", "b": 2})
++    expected = [("a", 2), ("b", 2)]
++    i = 0
++    for k, v in c.items():
++        assert k == expected[i][0]
++        assert v == expected[i][1]
++        i = i + 1
++
++
+ @pytest.mark.parametrize(  # type: ignore
+     "cfg, key, default_, expected",
+     [
+diff --git a/tests/test_basic_ops_list.py b/tests/test_basic_ops_list.py
+index 1566ce3..5af36e3 100644
+--- a/tests/test_basic_ops_list.py
++++ b/tests/test_basic_ops_list.py
+@@ -6,6 +6,7 @@ import pytest
+ 
+ from omegaconf import AnyNode, ListConfig, OmegaConf
+ from omegaconf.errors import (
++    ConfigKeyError,
+     ConfigTypeError,
+     KeyValidationError,
+     MissingMandatoryValue,
+@@ -57,11 +58,11 @@ def test_list_get_with_default() -> None:
+ 
+ 
+ @pytest.mark.parametrize(  # type: ignore
+-    "input_, list_key",
++    "input_, expected, list_key",
+     [
+-        ([1, 2], None),
+-        (["${1}", 2], None),
+-        (
++        pytest.param([1, 2], [1, 2], None, id="simple"),
++        pytest.param(["${1}", 2], [2, 2], None, id="interpolation"),
++        pytest.param(
+             {
+                 "defaults": [
+                     {"optimizer": "adam"},
+@@ -69,25 +70,36 @@ def test_list_get_with_default() -> None:
+                     {"foo": "${defaults.0.optimizer}_${defaults.1.dataset}"},
+                 ]
+             },
++            [{"optimizer": "adam"}, {"dataset": "imagenet"}, {"foo": "adam_imagenet"}],
+             "defaults",
++            id="str_interpolation",
+         ),
+-        ([1, 2, "${missing}"], None),
+     ],
+ )
+-def test_iterate_list(input_: Any, list_key: str) -> None:
++def test_iterate_list(input_: Any, expected: Any, list_key: str) -> None:
+     c = OmegaConf.create(input_)
+     if list_key is not None:
+         lst = c.get(list_key)
+     else:
+         lst = c
+     items = [x for x in lst]
+-    assert items == lst
++    assert items == expected
++
++
++def test_iterate_list_with_missing_interpolation() -> None:
++    c = OmegaConf.create([1, "${10}"])
++    itr = iter(c)
++    assert 1 == next(itr)
++    with pytest.raises(ConfigKeyError):
++        next(itr)
+ 
+ 
+-def test_iterate_interpolated_list() -> None:
+-    cfg = OmegaConf.create({"inter": "${list}", "list": [1, 2, 3]})
+-    items = [x for x in cfg.inter]
+-    assert items == [1, 2, 3]
++def test_iterate_list_with_missing() -> None:
++    c = OmegaConf.create([1, "???"])
++    itr = iter(c)
++    assert 1 == next(itr)
++    with pytest.raises(MissingMandatoryValue):
++        next(itr)
+ 
+ 
+ def test_items_with_interpolation() -> None:
+@@ -198,7 +210,8 @@ def test_list_append() -> None:
+ def test_pretty_without_resolve() -> None:
+     c = OmegaConf.create([100, "${0}"])
+     # without resolve, references are preserved
+-    c2 = OmegaConf.create(c.pretty(resolve=False))
++    yaml_str = c.pretty(resolve=False)
++    c2 = OmegaConf.create(yaml_str)
+     assert isinstance(c2, ListConfig)
+     c2[0] = 1000
+     assert c2[1] == 1000

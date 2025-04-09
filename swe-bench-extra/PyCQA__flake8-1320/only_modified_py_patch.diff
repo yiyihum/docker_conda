@@ -1,0 +1,181 @@
+diff --git a/src/flake8/checker.py b/src/flake8/checker.py
+index bfd3f4d..7130df3 100644
+--- a/src/flake8/checker.py
++++ b/src/flake8/checker.py
+@@ -424,13 +424,23 @@ class FileChecker:
+             )
+ 
+     @staticmethod
+-    def _extract_syntax_information(exception):
+-        token = ()
+-        if len(exception.args) > 1:
++    def _extract_syntax_information(exception: Exception) -> Tuple[int, int]:
++        if (
++            len(exception.args) > 1
++            and exception.args[1]
++            and len(exception.args[1]) > 2
++        ):
+             token = exception.args[1]
+-            if token and len(token) > 2:
+-                row, column = token[1:3]
++            row, column = token[1:3]
++        elif (
++            isinstance(exception, tokenize.TokenError)
++            and len(exception.args) == 2
++            and len(exception.args[1]) == 2
++        ):
++            token = ()
++            row, column = exception.args[1]
+         else:
++            token = ()
+             row, column = (1, 0)
+ 
+         if column > 0 and token and isinstance(exception, SyntaxError):
+@@ -463,14 +473,7 @@ class FileChecker:
+     def run_ast_checks(self) -> None:
+         """Run all checks expecting an abstract syntax tree."""
+         assert self.processor is not None
+-        try:
+-            ast = self.processor.build_ast()
+-        except (ValueError, SyntaxError, TypeError) as e:
+-            row, column = self._extract_syntax_information(e)
+-            self.report(
+-                "E999", row, column, f"{type(e).__name__}: {e.args[0]}"
+-            )
+-            return
++        ast = self.processor.build_ast()
+ 
+         for plugin in self.checks["ast_plugins"]:
+             checker = self.run_check(plugin, tree=ast)
+@@ -548,7 +551,6 @@ class FileChecker:
+     def process_tokens(self):
+         """Process tokens and trigger checks.
+ 
+-        This can raise a :class:`flake8.exceptions.InvalidSyntax` exception.
+         Instead of using this directly, you should use
+         :meth:`flake8.checker.FileChecker.run_checks`.
+         """
+@@ -578,15 +580,13 @@ class FileChecker:
+         """Run checks against the file."""
+         assert self.processor is not None
+         try:
+-            self.process_tokens()
+             self.run_ast_checks()
+-        except exceptions.InvalidSyntax as exc:
+-            self.report(
+-                exc.error_code,
+-                exc.line_number,
+-                exc.column_number,
+-                exc.error_message,
+-            )
++            self.process_tokens()
++        except (SyntaxError, tokenize.TokenError) as e:
++            code = "E902" if isinstance(e, tokenize.TokenError) else "E999"
++            row, column = self._extract_syntax_information(e)
++            self.report(code, row, column, f"{type(e).__name__}: {e.args[0]}")
++            return
+ 
+         logical_lines = self.processor.statistics["logical lines"]
+         self.statistics["logical lines"] = logical_lines
+diff --git a/src/flake8/exceptions.py b/src/flake8/exceptions.py
+index 4b0ddd1..45db94d 100644
+--- a/src/flake8/exceptions.py
++++ b/src/flake8/exceptions.py
+@@ -33,23 +33,6 @@ class FailedToLoadPlugin(Flake8Exception):
+         }
+ 
+ 
+-class InvalidSyntax(Flake8Exception):
+-    """Exception raised when tokenizing a file fails."""
+-
+-    def __init__(self, exception: Exception) -> None:
+-        """Initialize our InvalidSyntax exception."""
+-        self.original_exception = exception
+-        self.error_message = f"{type(exception).__name__}: {exception.args[0]}"
+-        self.error_code = "E902"
+-        self.line_number = 1
+-        self.column_number = 0
+-        super().__init__(exception)
+-
+-    def __str__(self) -> str:
+-        """Format our exception message."""
+-        return self.error_message
+-
+-
+ class PluginRequestedUnknownParameters(Flake8Exception):
+     """The plugin requested unknown parameters."""
+ 
+diff --git a/src/flake8/processor.py b/src/flake8/processor.py
+index 86709c1..fdc47c6 100644
+--- a/src/flake8/processor.py
++++ b/src/flake8/processor.py
+@@ -13,7 +13,6 @@ from typing import Tuple
+ 
+ import flake8
+ from flake8 import defaults
+-from flake8 import exceptions
+ from flake8 import utils
+ 
+ LOG = logging.getLogger(__name__)
+@@ -125,20 +124,12 @@ class FileProcessor:
+ 
+     @property
+     def file_tokens(self) -> List[_Token]:
+-        """Return the complete set of tokens for a file.
+-
+-        Accessing this attribute *may* raise an InvalidSyntax exception.
+-
+-        :raises: flake8.exceptions.InvalidSyntax
+-        """
++        """Return the complete set of tokens for a file."""
+         if self._file_tokens is None:
+             line_iter = iter(self.lines)
+-            try:
+-                self._file_tokens = list(
+-                    tokenize.generate_tokens(lambda: next(line_iter))
+-                )
+-            except (tokenize.TokenError, SyntaxError) as exc:
+-                raise exceptions.InvalidSyntax(exception=exc)
++            self._file_tokens = list(
++                tokenize.generate_tokens(lambda: next(line_iter))
++            )
+ 
+         return self._file_tokens
+ 
+@@ -274,20 +265,12 @@ class FileProcessor:
+         return arguments
+ 
+     def generate_tokens(self) -> Generator[_Token, None, None]:
+-        """Tokenize the file and yield the tokens.
+-
+-        :raises flake8.exceptions.InvalidSyntax:
+-            If a :class:`tokenize.TokenError` is raised while generating
+-            tokens.
+-        """
+-        try:
+-            for token in tokenize.generate_tokens(self.next_line):
+-                if token[2][0] > self.total_lines:
+-                    break
+-                self.tokens.append(token)
+-                yield token
+-        except (tokenize.TokenError, SyntaxError) as exc:
+-            raise exceptions.InvalidSyntax(exception=exc)
++        """Tokenize the file and yield the tokens."""
++        for token in tokenize.generate_tokens(self.next_line):
++            if token[2][0] > self.total_lines:
++                break
++            self.tokens.append(token)
++            yield token
+ 
+     def _noqa_line_range(self, min_line: int, max_line: int) -> Dict[int, str]:
+         line_range = range(min_line, max_line + 1)
+@@ -299,7 +282,7 @@ class FileProcessor:
+         if self._noqa_line_mapping is None:
+             try:
+                 file_tokens = self.file_tokens
+-            except exceptions.InvalidSyntax:
++            except (tokenize.TokenError, SyntaxError):
+                 # if we failed to parse the file tokens, we'll always fail in
+                 # the future, so set this so the code does not try again
+                 self._noqa_line_mapping = {}
+

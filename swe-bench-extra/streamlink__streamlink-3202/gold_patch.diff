@@ -1,0 +1,261 @@
+diff --git a/.codecov.yml b/.codecov.yml
+new file mode 100644
+index 00000000..1df71070
+--- /dev/null
++++ b/.codecov.yml
+@@ -0,0 +1,44 @@
++codecov:
++  notify:
++    require_ci_to_pass: true
++    # wait until at all test runners have uploaded a report (see the test job's build matrix)
++    # otherwise, coverage failures may be shown while some reports are still missing
++    after_n_builds: 10
++comment:
++  # this also configures the layout of PR check summaries / comments
++  layout: "reach, diff, flags, files"
++  # don't ever let the codecov bot comment on PRs
++  after_n_builds: 999999999
++coverage:
++  range: "50...100"
++  precision: 2
++  round: down
++  status:
++    changes: false
++    patch: false
++    # split up coverage reports by path
++    # don't set coverage targets and instead set coverage thresholds
++    project:
++      # we can't disable the overall default project, because only this will have PR check summaries / comments
++      # this replaces the PR comment
++      default:
++        target: 50
++      streamlink:
++        threshold: 1
++        paths:
++          - "src/streamlink/"
++          - "!src/streamlink/plugins/"
++      streamlink_cli:
++        threshold: 1
++        paths:
++          - "src/streamlink_cli/"
++      plugins:
++        # don't set a threshold on plugins
++        target: 30
++        paths:
++          - "src/streamlink/plugins/"
++      tests:
++        # new tests should always be fully covered
++        threshold: 0
++        paths:
++          - "tests/"
+diff --git a/.coveragerc b/.coveragerc
+index 742386c4..f99370cf 100644
+--- a/.coveragerc
++++ b/.coveragerc
+@@ -1,6 +1,7 @@
+ [run]
+ source =
+     src
++    tests
+ 
+ [report]
+ omit =
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 3200d07a..a74d6186 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -17,7 +17,8 @@ jobs:
+     name: Test
+     strategy:
+       fail-fast: false
+-      # when changing the build matrix, the `after_n_builds` value in codecov.yml may need to be updated
++      # please remember to change the `codecov.notify.after_n_builds` value in .codecov.yml
++      # when changing the build matrix and changing the number of test runners
+       matrix:
+         os: [ubuntu-latest, windows-latest]
+         python: [2.7, 3.5, 3.6, 3.7, 3.8]
+@@ -36,7 +37,7 @@ jobs:
+         run: bash ./script/install-dependencies.sh
+       - name: Test
+         continue-on-error: ${{ matrix.continue || false }}
+-        run: pytest -r a --cov --cov-report=xml
++        run: pytest -r a --cov --cov-branch --cov-report=xml
+       - name: Lint
+         continue-on-error: ${{ matrix.continue || false }}
+         run: flake8
+diff --git a/codecov.yml b/codecov.yml
+deleted file mode 100644
+index 3d94e1bb..00000000
+--- a/codecov.yml
++++ /dev/null
+@@ -1,21 +0,0 @@
+-codecov:
+-  notify:
+-    require_ci_to_pass: true
+-    # wait until at least one linux and one windows build has succeeded (see the test job's build matrix)
+-    after_n_builds: 6
+-comment:
+-  behavior: default
+-  layout: header, diff
+-  require_changes: false
+-coverage:
+-  precision: 2
+-  range:
+-  - 50.0
+-  - 100.0
+-  round: down
+-  status:
+-    changes: false
+-    patch: false
+-    project:
+-      default:
+-        target: 30
+diff --git a/docs/plugin_matrix.rst b/docs/plugin_matrix.rst
+index 48371bf2..08eb88bc 100644
+--- a/docs/plugin_matrix.rst
++++ b/docs/plugin_matrix.rst
+@@ -118,6 +118,7 @@ lrt                     lrt.lt               Yes   No
+ ltv_lsm_lv              ltv.lsm.lv           Yes   No    Streams may be geo-restricted to Latvia.
+ mediaklikk              mediaklikk.hu        Yes   No    Streams may be geo-restricted to Hungary.
+ metube                  metube.id            Yes   Yes
++mico                    micous.com           Yes   --
+ mitele                  mitele.es            Yes   No    Streams may be geo-restricted to Spain.
+ mjunoon                 mjunoon.tv           Yes   Yes
+ mrtmk                   play.mrt.com.mk      Yes   Yes   Streams may be geo-restricted to North Macedonia.
+diff --git a/src/streamlink/plugins/mico.py b/src/streamlink/plugins/mico.py
+new file mode 100644
+index 00000000..2f2b40bb
+--- /dev/null
++++ b/src/streamlink/plugins/mico.py
+@@ -0,0 +1,72 @@
++import logging
++import re
++
++from streamlink.plugin import Plugin
++from streamlink.plugin.api import validate
++from streamlink.stream import HLSStream
++from streamlink.utils import parse_json
++from streamlink.utils.url import update_scheme
++
++log = logging.getLogger(__name__)
++
++
++class Mico(Plugin):
++    author = None
++    category = None
++    title = None
++
++    url_re = re.compile(r'https?://(?:www\.)?micous\.com/live/\d+')
++    json_data_re = re.compile(r'win._profile\s*=\s*({.*})')
++
++    _json_data_schema = validate.Schema(
++        validate.transform(json_data_re.search),
++        validate.any(None, validate.all(
++            validate.get(1),
++            validate.transform(parse_json),
++            validate.any(None, validate.all({
++                'mico_id': int,
++                'nickname': validate.text,
++                'h5_url': validate.all(
++                    validate.transform(lambda x: update_scheme('http:', x)),
++                    validate.url(),
++                ),
++                'is_live': bool,
++            })),
++        )),
++    )
++
++    @classmethod
++    def can_handle_url(cls, url):
++        return cls.url_re.match(url) is not None
++
++    def get_author(self):
++        if self.author is not None:
++            return self.author
++
++    def get_category(self):
++        if self.category is not None:
++            return self.category
++
++    def get_title(self):
++        if self.title is not None:
++            return self.title
++
++    def _get_streams(self):
++        json_data = self.session.http.get(self.url, schema=self._json_data_schema)
++
++        if not json_data:
++            log.error('Failed to get JSON data')
++            return
++
++        if not json_data['is_live']:
++            log.info('This stream is no longer online')
++            return
++
++        self.author = json_data['mico_id']
++        self.category = 'Live'
++        self.title = json_data['nickname']
++
++        return HLSStream.parse_variant_playlist(self.session, json_data['h5_url'])
++
++
++__plugin__ = Mico
+diff --git a/src/streamlink/plugins/zattoo.py b/src/streamlink/plugins/zattoo.py
+index b845c305..ce79fe98 100644
+--- a/src/streamlink/plugins/zattoo.py
++++ b/src/streamlink/plugins/zattoo.py
+@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
+ class Zattoo(Plugin):
+     API_CHANNELS = '{0}/zapi/v2/cached/channels/{1}?details=False'
+     API_HELLO = '{0}/zapi/session/hello'
++    API_HELLO_V2 = '{0}/zapi/v2/session/hello'
+     API_HELLO_V3 = '{0}/zapi/v3/session/hello'
+     API_LOGIN = '{0}/zapi/v2/account/login'
+     API_LOGIN_V3 = '{0}/zapi/v3/account/login'
+@@ -158,18 +159,21 @@ class Zattoo(Plugin):
+         # a new session is required for the app_token
+         self.session.http.cookies = cookiejar_from_dict({})
+         if self.base_url == 'https://zattoo.com':
+-            app_token_url = 'https://zattoo.com/int/'
++            app_token_url = 'https://zattoo.com/client/token-2fb69f883fea03d06c68c6e5f21ddaea.json'
+         elif self.base_url == 'https://www.quantum-tv.com':
+             app_token_url = 'https://www.quantum-tv.com/token-4d0d61d4ce0bf8d9982171f349d19f34.json'
+         else:
+             app_token_url = self.base_url
+-        res = self.session.http.get(app_token_url)
+-        match = self._app_token_re.search(res.text)
+ 
++        res = self.session.http.get(app_token_url)
+         if self.base_url == 'https://www.quantum-tv.com':
+             app_token = self.session.http.json(res)["session_token"]
+             hello_url = self.API_HELLO_V3.format(self.base_url)
++        elif self.base_url == 'https://zattoo.com':
++            app_token = self.session.http.json(res)['app_tid']
++            hello_url = self.API_HELLO_V2.format(self.base_url)
+         else:
++            match = self._app_token_re.search(res.text)
+             app_token = match.group(1)
+             hello_url = self.API_HELLO.format(self.base_url)
+ 
+@@ -180,10 +184,17 @@ class Zattoo(Plugin):
+             self._session_attributes.set(
+                 'uuid', __uuid, expires=self.TIME_SESSION)
+ 
+-        params = {
+-            'client_app_token': app_token,
+-            'uuid': __uuid,
+-        }
++        if self.base_url == 'https://zattoo.com':
++            params = {
++                'uuid': __uuid,
++                'app_tid': app_token,
++                'app_version': '1.0.0'
++            }
++        else:
++            params = {
++                'client_app_token': app_token,
++                'uuid': __uuid,
++            }
+ 
+         if self.base_url == 'https://www.quantum-tv.com':
+             params['app_version'] = '3.2028.3'

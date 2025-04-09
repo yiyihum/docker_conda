@@ -1,0 +1,154 @@
+diff --git a/kolibri/core/tasks/utils.py b/kolibri/core/tasks/utils.py
+index 2150613d96..6df4b0d13f 100644
+--- a/kolibri/core/tasks/utils.py
++++ b/kolibri/core/tasks/utils.py
+@@ -4,7 +4,7 @@ import time
+ import uuid
+ 
+ from kolibri.core.tasks import compat
+-from kolibri.core.utils.cache import get_process_lock
++from kolibri.core.utils.cache import ProcessLock
+ 
+ 
+ # An object on which to store data about the current job
+@@ -120,4 +120,4 @@ class InfiniteLoopThread(compat.Thread):
+         self.stop()
+ 
+ 
+-db_task_write_lock = get_process_lock("db_task_write_lock")
++db_task_write_lock = ProcessLock("db_task_write_lock")
+diff --git a/kolibri/core/utils/cache.py b/kolibri/core/utils/cache.py
+index 43c6bf9a5a..110faba1de 100644
+--- a/kolibri/core/utils/cache.py
++++ b/kolibri/core/utils/cache.py
+@@ -22,32 +22,52 @@ def __get_process_cache():
+ process_cache = SimpleLazyObject(__get_process_cache)
+ 
+ 
+-def get_process_lock(key, expire=None):
+-    """
+-    Return Lock object that's appropriate given current cache backend
+-
+-    :param key: The lock key
+-    :param expire: The cache key expiration in seconds
+-    :type key: str
+-    :type expire: int
+-    :rtype: redis.lock.Lock|diskcache.recipes.RLock
+-    """
+-    if OPTIONS["Cache"]["CACHE_BACKEND"] == "redis":
+-        expire = expire * 1000 if expire is not None else None
+-        # if we're using Redis, be sure we use Redis' locking mechanism which uses
+-        # `SET NX` under the hood. See redis.lock.Lock
+-        return process_cache.lock(
+-            key,
+-            timeout=expire,  # milliseconds
+-            sleep=0.01,  # seconds
+-            blocking_timeout=100,  # seconds
+-            thread_local=True,
+-        )
+-    else:
+-        # we can't pass in the `process_cache` because it's an instance of DjangoCache
+-        # and we need a Cache instance
+-        cache = process_cache.cache("locks")
+-        return RLock(cache, key, expire=expire)
++class ProcessLock(object):
++    def __init__(self, key, expire=None):
++        """
++        :param key: The lock key
++        :param expire: The cache key expiration in seconds
++        :type key: str
++        :type expire: int
++        """
++        self.key = key
++        self.expire = expire
++
++        self._lock_object = None
++
++    @property
++    def _lock(self):
++        if self._lock_object is None:
++            if OPTIONS["Cache"]["CACHE_BACKEND"] == "redis":
++                expire = self.expire * 1000 if self.expire is not None else None
++                # if we're using Redis, be sure we use Redis' locking mechanism which uses
++                # `SET NX` under the hood. See redis.lock.Lock
++                # The Django RedisCache backend provide the lock method to proxy this
++                self._lock_object = process_cache.lock(
++                    self.key,
++                    timeout=expire,  # milliseconds
++                    sleep=0.01,  # seconds
++                    blocking_timeout=100,  # seconds
++                    thread_local=True,
++                )
++            else:
++                # we can't pass in the `process_cache` because it's an instance of DjangoCache
++                # and we need a DiskCache Cache instance
++                cache = process_cache.cache("locks")
++                self._lock_object = RLock(cache, self.key, expire=self.expire)
++        return self._lock_object
++
++    def acquire(self):
++        self._lock.acquire()
++
++    def release(self):
++        self._lock.release()
++
++    def __enter__(self):
++        self.acquire()
++
++    def __exit__(self, *exc_info):
++        self.release()
+ 
+ 
+ class NamespacedCacheProxy(BaseCache):
+@@ -64,7 +84,7 @@ class NamespacedCacheProxy(BaseCache):
+         params.update(KEY_PREFIX=namespace)
+         super(NamespacedCacheProxy, self).__init__(params)
+         self.cache = cache
+-        self._lock = get_process_lock("namespaced_cache_{}".format(namespace))
++        self._lock = ProcessLock("namespaced_cache_{}".format(namespace))
+ 
+     def _get_keys(self):
+         """
+diff --git a/kolibri/plugins/__init__.py b/kolibri/plugins/__init__.py
+index 7fbf8c6831..95dfa117e9 100644
+--- a/kolibri/plugins/__init__.py
++++ b/kolibri/plugins/__init__.py
+@@ -242,7 +242,15 @@ class KolibriPluginBase(with_metaclass(SingletonMeta)):
+     def _return_module(self, module_name):
+         if module_has_submodule(sys.modules[self.module_path], module_name):
+             models_module_name = "%s.%s" % (self.module_path, module_name)
+-            return import_module(models_module_name)
++            try:
++                return import_module(models_module_name)
++            except Exception as e:
++                logging.warn(
++                    "Tried to import module {module_name} from {plugin} but an error was raised".format(
++                        plugin=self.module_path, module_name=module_name,
++                    )
++                )
++                logging.exception(e)
+ 
+         return None
+ 
+diff --git a/kolibri/utils/server.py b/kolibri/utils/server.py
+index cd7f28a54b..86ebd1ca68 100644
+--- a/kolibri/utils/server.py
++++ b/kolibri/utils/server.py
+@@ -11,7 +11,6 @@ from django.conf import settings
+ from zeroconf import get_all_addresses
+ 
+ import kolibri
+-from .conf import OPTIONS
+ from .system import kill_pid
+ from .system import pid_exists
+ from kolibri.core.content.utils import paths
+@@ -87,7 +86,7 @@ class ServicesPlugin(SimplePlugin):
+         # Initialize the iceqube scheduler to handle scheduled tasks
+         scheduler.clear_scheduler()
+ 
+-        if not OPTIONS["Deployment"]["DISABLE_PING"]:
++        if not conf.OPTIONS["Deployment"]["DISABLE_PING"]:
+ 
+             # schedule the pingback job
+             from kolibri.core.analytics.utils import schedule_ping
+

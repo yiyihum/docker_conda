@@ -1,0 +1,225 @@
+diff --git a/action.yml b/action.yml
+index a27269dd..111acc93 100644
+--- a/action.yml
++++ b/action.yml
+@@ -13,6 +13,10 @@ inputs:
+     description: 'File containing the config, defaults to {package}/pyproject.toml'
+     required: false
+     default: ''
++  only:
++    description: 'Build a specific wheel only. No need for arch/platform if this is set'
++    required: false
++    default: ''
+ branding:
+   icon: package
+   color: yellow
+@@ -36,5 +40,6 @@ runs:
+         ${{ inputs.package-dir }}
+         --output-dir ${{ inputs.output-dir }}
+         --config-file "${{ inputs.config-file }}"
++        --only "${{ inputs.only }}"
+         2>&1
+       shell: bash
+diff --git a/cibuildwheel/__main__.py b/cibuildwheel/__main__.py
+index f3b44261..4d1402d8 100644
+--- a/cibuildwheel/__main__.py
++++ b/cibuildwheel/__main__.py
+@@ -6,6 +6,7 @@
+ import sys
+ import tarfile
+ import textwrap
++import typing
+ from pathlib import Path
+ from tempfile import mkdtemp
+ 
+@@ -40,7 +41,7 @@ def main() -> None:
+     parser.add_argument(
+         "--platform",
+         choices=["auto", "linux", "macos", "windows"],
+-        default=os.environ.get("CIBW_PLATFORM", "auto"),
++        default=None,
+         help="""
+             Platform to build for. Use this option to override the
+             auto-detected platform or to run cibuildwheel on your development
+@@ -64,6 +65,16 @@ def main() -> None:
+         """,
+     )
+ 
++    parser.add_argument(
++        "--only",
++        default=None,
++        help="""
++            Force a single wheel build when given an identifier. Overrides
++            CIBW_BUILD/CIBW_SKIP. --platform and --arch cannot be specified
++            if this is given.
++        """,
++    )
++
+     parser.add_argument(
+         "--output-dir",
+         type=Path,
+@@ -154,10 +165,40 @@ def main() -> None:
+ 
+ 
+ def build_in_directory(args: CommandLineArguments) -> None:
++    platform_option_value = args.platform or os.environ.get("CIBW_PLATFORM", "auto")
+     platform: PlatformName
+ 
+-    if args.platform != "auto":
+-        platform = args.platform
++    if args.only:
++        if "linux_" in args.only:
++            platform = "linux"
++        elif "macosx_" in args.only:
++            platform = "macos"
++        elif "win_" in args.only:
++            platform = "windows"
++        else:
++            print(
++                f"Invalid --only='{args.only}', must be a build selector with a known platform",
++                file=sys.stderr,
++            )
++            sys.exit(2)
++        if args.platform is not None:
++            print(
++                "--platform cannot be specified with --only, it is computed from --only",
++                file=sys.stderr,
++            )
++            sys.exit(2)
++        if args.archs is not None:
++            print(
++                "--arch cannot be specified with --only, it is computed from --only",
++                file=sys.stderr,
++            )
++            sys.exit(2)
++    elif platform_option_value != "auto":
++        if platform_option_value not in PLATFORMS:
++            print(f"cibuildwheel: Unsupported platform: {platform_option_value}", file=sys.stderr)
++            sys.exit(2)
++
++        platform = typing.cast(PlatformName, platform_option_value)
+     else:
+         ci_provider = detect_ci_provider()
+         if ci_provider is None:
+@@ -187,10 +228,6 @@ def build_in_directory(args: CommandLineArguments) -> None:
+             )
+             sys.exit(2)
+ 
+-    if platform not in PLATFORMS:
+-        print(f"cibuildwheel: Unsupported platform: {platform}", file=sys.stderr)
+-        sys.exit(2)
+-
+     options = compute_options(platform=platform, command_line_arguments=args)
+ 
+     package_dir = options.globals.package_dir
+diff --git a/cibuildwheel/options.py b/cibuildwheel/options.py
+index 241f0e0e..75e367c6 100644
+--- a/cibuildwheel/options.py
++++ b/cibuildwheel/options.py
+@@ -42,9 +42,10 @@
+ 
+ @dataclass
+ class CommandLineArguments:
+-    platform: Literal["auto", "linux", "macos", "windows"]
++    platform: Literal["auto", "linux", "macos", "windows"] | None
+     archs: str | None
+     output_dir: Path
++    only: str | None
+     config_file: str
+     package_dir: Path
+     print_build_identifiers: bool
+@@ -403,6 +404,15 @@ def globals(self) -> GlobalOptions:
+         )
+         requires_python = None if requires_python_str is None else SpecifierSet(requires_python_str)
+ 
++        archs_config_str = args.archs or self.reader.get("archs", sep=" ")
++        architectures = Architecture.parse_config(archs_config_str, platform=self.platform)
++
++        # Process `--only`
++        if args.only:
++            build_config = args.only
++            skip_config = ""
++            architectures = Architecture.all_archs(self.platform)
++
+         build_selector = BuildSelector(
+             build_config=build_config,
+             skip_config=skip_config,
+@@ -411,9 +421,6 @@ def globals(self) -> GlobalOptions:
+         )
+         test_selector = TestSelector(skip_config=test_skip)
+ 
+-        archs_config_str = args.archs or self.reader.get("archs", sep=" ")
+-        architectures = Architecture.parse_config(archs_config_str, platform=self.platform)
+-
+         container_engine_str = self.reader.get("container-engine")
+ 
+         if container_engine_str not in ["docker", "podman"]:
+@@ -588,6 +595,9 @@ def summary(self, identifiers: list[str]) -> str:
+         ]
+ 
+         build_option_defaults = self.build_options(identifier=None)
++        build_options_for_identifier = {
++            identifier: self.build_options(identifier) for identifier in identifiers
++        }
+ 
+         for option_name, default_value in sorted(asdict(build_option_defaults).items()):
+             if option_name == "globals":
+@@ -597,7 +607,7 @@ def summary(self, identifiers: list[str]) -> str:
+ 
+             # if any identifiers have an overridden value, print that too
+             for identifier in identifiers:
+-                option_value = getattr(self.build_options(identifier=identifier), option_name)
++                option_value = getattr(build_options_for_identifier[identifier], option_name)
+                 if option_value != default_value:
+                     lines.append(f"  {identifier}: {option_value!r}")
+ 
+diff --git a/cibuildwheel/util.py b/cibuildwheel/util.py
+index 4b3d4fb9..e494929d 100644
+--- a/cibuildwheel/util.py
++++ b/cibuildwheel/util.py
+@@ -145,7 +145,7 @@ def shell(*commands: str, env: dict[str, str] | None = None, cwd: PathOrStr | No
+     subprocess.run(command, env=env, cwd=cwd, shell=True, check=True)
+ 
+ 
+-def format_safe(template: str, **kwargs: Any) -> str:
++def format_safe(template: str, **kwargs: str | os.PathLike[str]) -> str:
+     """
+     Works similarly to `template.format(**kwargs)`, except that unmatched
+     fields in `template` are passed through untouched.
+@@ -173,11 +173,9 @@ def format_safe(template: str, **kwargs: Any) -> str:
+             re.VERBOSE,
+         )
+ 
+-        # we use a function for repl to prevent re.sub interpreting backslashes
+-        # in repl as escape sequences.
+         result = re.sub(
+             pattern=find_pattern,
+-            repl=lambda _: str(value),  # pylint: disable=cell-var-from-loop
++            repl=str(value).replace("\\", r"\\"),
+             string=result,
+         )
+ 
+diff --git a/docs/options.md b/docs/options.md
+index cc093079..498b15d0 100644
+--- a/docs/options.md
++++ b/docs/options.md
+@@ -113,7 +113,7 @@ ### Configuration file {: #configuration-file}
+ 
+ !!! tip
+     Static configuration works across all CI systems, and can be used locally if
+-    you run `cibuildwheel --plat linux`. This is preferred, but environment
++    you run `cibuildwheel --platform linux`. This is preferred, but environment
+     variables are better if you need to change per-matrix element
+     (`CIBW_BUILD` is often in this category, for example), or if you cannot or do
+     not want to change a `pyproject.toml` file. You can specify a different file to
+@@ -202,6 +202,10 @@ ### `CIBW_PLATFORM` {: #platform}
+ 
+     This is even more convenient if you store your cibuildwheel config in [`pyproject.toml`](#configuration-file).
+ 
++    You can also run a single identifier with `--only <identifier>`. This will
++    not require `--platform` or `--arch`, and will override any build/skip
++    configuration.
++
+ ### `CIBW_BUILD`, `CIBW_SKIP` {: #build-skip}
+ 
+ > Choose the Python versions to build

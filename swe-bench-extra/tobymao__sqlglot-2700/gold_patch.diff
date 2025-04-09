@@ -1,0 +1,168 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+index e9aa45db..b7eef451 100644
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -126,6 +126,7 @@ class _Dialect(type):
+         klass.BIT_START, klass.BIT_END = get_start_end(TokenType.BIT_STRING)
+         klass.HEX_START, klass.HEX_END = get_start_end(TokenType.HEX_STRING)
+         klass.BYTE_START, klass.BYTE_END = get_start_end(TokenType.BYTE_STRING)
++        klass.UNICODE_START, klass.UNICODE_END = get_start_end(TokenType.UNICODE_STRING)
+ 
+         if enum not in ("", "bigquery"):
+             klass.generator_class.SELECT_KINDS = ()
+@@ -240,13 +241,15 @@ class Dialect(metaclass=_Dialect):
+     IDENTIFIER_START = '"'
+     IDENTIFIER_END = '"'
+ 
+-    # Delimiters for bit, hex and byte literals
++    # Delimiters for bit, hex, byte and unicode literals
+     BIT_START: t.Optional[str] = None
+     BIT_END: t.Optional[str] = None
+     HEX_START: t.Optional[str] = None
+     HEX_END: t.Optional[str] = None
+     BYTE_START: t.Optional[str] = None
+     BYTE_END: t.Optional[str] = None
++    UNICODE_START: t.Optional[str] = None
++    UNICODE_END: t.Optional[str] = None
+ 
+     @classmethod
+     def get_or_raise(cls, dialect: DialectType) -> Dialect:
+diff --git a/sqlglot/dialects/presto.py b/sqlglot/dialects/presto.py
+index 88f4f539..5e6d444d 100644
+--- a/sqlglot/dialects/presto.py
++++ b/sqlglot/dialects/presto.py
+@@ -222,6 +222,12 @@ class Presto(Dialect):
+     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE
+ 
+     class Tokenizer(tokens.Tokenizer):
++        UNICODE_STRINGS = [
++            (prefix + q, q)
++            for q in t.cast(t.List[str], tokens.Tokenizer.QUOTES)
++            for prefix in ("U&", "u&")
++        ]
++
+         KEYWORDS = {
+             **tokens.Tokenizer.KEYWORDS,
+             "START": TokenType.BEGIN,
+diff --git a/sqlglot/dialects/snowflake.py b/sqlglot/dialects/snowflake.py
+index fca42d48..36bbcc50 100644
+--- a/sqlglot/dialects/snowflake.py
++++ b/sqlglot/dialects/snowflake.py
+@@ -33,6 +33,21 @@ def _check_int(s: str) -> bool:
+     return s.isdigit()
+ 
+ 
++def _parse_to_array(args: t.List) -> exp.Expression:
++    arg = seq_get(args, 0)
++    if isinstance(arg, exp.Expression):
++        from sqlglot.optimizer.annotate_types import annotate_types
++
++        # https://docs.snowflake.com/en/sql-reference/functions/to_array
++        arg = annotate_types(arg)
++        if arg.is_type(exp.DataType.Type.ARRAY):
++            return arg
++        if arg.is_type(exp.DataType.Type.VARIANT):
++            return exp.Anonymous(this="TO_ARRAY", expressions=[arg])
++
++    return exp.Array.from_arg_list(args)
++
++
+ # from https://docs.snowflake.com/en/sql-reference/functions/to_timestamp.html
+ def _parse_to_timestamp(args: t.List) -> t.Union[exp.StrToTime, exp.UnixToTime, exp.TimeStrToTime]:
+     if len(args) == 2:
+@@ -293,7 +308,7 @@ class Snowflake(Dialect):
+             "SQUARE": lambda args: exp.Pow(this=seq_get(args, 0), expression=exp.Literal.number(2)),
+             "TIMEDIFF": _parse_datediff,
+             "TIMESTAMPDIFF": _parse_datediff,
+-            "TO_ARRAY": exp.Array.from_arg_list,
++            "TO_ARRAY": _parse_to_array,
+             "TO_TIMESTAMP": _parse_to_timestamp,
+             "TO_VARCHAR": exp.ToChar.from_arg_list,
+             "ZEROIFNULL": _zeroifnull_to_if,
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 6990344e..e2839576 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1206,6 +1206,10 @@ class RawString(Condition):
+     pass
+ 
+ 
++class UnicodeString(Condition):
++    arg_types = {"this": True, "escape": False}
++
++
+ class Column(Condition):
+     arg_types = {"this": True, "table": False, "db": False, "catalog": False, "join_mark": False}
+ 
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 665538eb..add02d06 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -915,6 +915,14 @@ class Generator:
+             return f"{self.dialect.BYTE_START}{this}{self.dialect.BYTE_END}"
+         return this
+ 
++    def unicodestring_sql(self, expression: exp.UnicodeString) -> str:
++        this = self.sql(expression, "this")
++        if self.dialect.UNICODE_START:
++            escape = self.sql(expression, "escape")
++            escape = f" UESCAPE {escape}" if escape else ""
++            return f"{self.dialect.UNICODE_START}{this}{self.dialect.UNICODE_END}{escape}"
++        return this
++
+     def rawstring_sql(self, expression: exp.RawString) -> str:
+         string = self.escape_str(expression.this.replace("\\", "\\\\"))
+         return f"{self.dialect.QUOTE_START}{string}{self.dialect.QUOTE_END}"
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index bee2cff8..c4062e1d 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -635,6 +635,11 @@ class Parser(metaclass=_Parser):
+         TokenType.HEREDOC_STRING: lambda self, token: self.expression(
+             exp.RawString, this=token.text
+         ),
++        TokenType.UNICODE_STRING: lambda self, token: self.expression(
++            exp.UnicodeString,
++            this=token.text,
++            escape=self._match_text_seq("UESCAPE") and self._parse_string(),
++        ),
+         TokenType.SESSION_PARAMETER: lambda self, _: self._parse_session_parameter(),
+     }
+ 
+@@ -3599,7 +3604,7 @@ class Parser(metaclass=_Parser):
+                     exp.DataType, this=exp.DataType.Type.INTERVAL, expressions=span
+                 )
+             else:
+-                this = self.expression(exp.Interval, unit=unit)
++                this = self.expression(exp.DataType, this=self.expression(exp.Interval, unit=unit))
+ 
+         if maybe_func and check_func:
+             index2 = self._index
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index aaeafb1c..de9d4c4a 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -97,6 +97,7 @@ class TokenType(AutoName):
+     NATIONAL_STRING = auto()
+     RAW_STRING = auto()
+     HEREDOC_STRING = auto()
++    UNICODE_STRING = auto()
+ 
+     # types
+     BIT = auto()
+@@ -450,6 +451,7 @@ class _Tokenizer(type):
+             **_quotes_to_format(TokenType.HEX_STRING, klass.HEX_STRINGS),
+             **_quotes_to_format(TokenType.RAW_STRING, klass.RAW_STRINGS),
+             **_quotes_to_format(TokenType.HEREDOC_STRING, klass.HEREDOC_STRINGS),
++            **_quotes_to_format(TokenType.UNICODE_STRING, klass.UNICODE_STRINGS),
+         }
+ 
+         klass._STRING_ESCAPES = set(klass.STRING_ESCAPES)
+@@ -557,6 +559,7 @@ class Tokenizer(metaclass=_Tokenizer):
+     HEX_STRINGS: t.List[str | t.Tuple[str, str]] = []
+     RAW_STRINGS: t.List[str | t.Tuple[str, str]] = []
+     HEREDOC_STRINGS: t.List[str | t.Tuple[str, str]] = []
++    UNICODE_STRINGS: t.List[str | t.Tuple[str, str]] = []
+     IDENTIFIERS: t.List[str | t.Tuple[str, str]] = ['"']
+     IDENTIFIER_ESCAPES = ['"']
+     QUOTES: t.List[t.Tuple[str, str] | str] = ["'"]

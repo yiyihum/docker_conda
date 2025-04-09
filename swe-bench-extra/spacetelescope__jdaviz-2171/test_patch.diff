@@ -1,0 +1,86 @@
+diff --git a/jdaviz/configs/default/plugins/model_fitting/tests/test_fitting.py b/jdaviz/configs/default/plugins/model_fitting/tests/test_fitting.py
+index 583c409a..41d418a0 100644
+--- a/jdaviz/configs/default/plugins/model_fitting/tests/test_fitting.py
++++ b/jdaviz/configs/default/plugins/model_fitting/tests/test_fitting.py
+@@ -7,6 +7,7 @@ from astropy.io import fits
+ from astropy.io.registry.base import IORegistryError
+ from astropy.modeling import models, parameters as params
+ from astropy.nddata import StdDevUncertainty
++from astropy.tests.helper import assert_quantity_allclose
+ from astropy.wcs import WCS
+ from numpy.testing import assert_allclose, assert_array_equal
+ from specutils.spectra import Spectrum1D
+@@ -77,6 +78,30 @@ def test_model_ids(cubeviz_helper, spectral_cube_wcs):
+         plugin.vue_add_model({})
+ 
+ 
++@pytest.mark.filterwarnings(r"ignore:Model is linear in parameters.*")
++def test_parameter_retrieval(cubeviz_helper, spectral_cube_wcs):
++    flux = np.ones((3, 4, 5))
++    flux[2, 2, :] = [1, 2, 3, 4, 5]
++    cubeviz_helper.load_data(Spectrum1D(flux=flux * u.nJy, wcs=spectral_cube_wcs),
++                             data_label='test')
++    plugin = cubeviz_helper.plugins["Model Fitting"]
++    plugin.create_model_component("Linear1D", "L")
++    plugin.cube_fit = True
++    plugin.calculate_fit()
++
++    params = cubeviz_helper.get_model_parameters()
++    slope_res = np.zeros((4, 3))
++    slope_res[2, 2] = 1.0
++    slope_res = slope_res * u.nJy / u.Hz
++    intercept_res = np.ones((4, 3))
++    intercept_res[2, 2] = 0
++    intercept_res = intercept_res * u.nJy
++    assert_quantity_allclose(params['cube-fit model']['slope'], slope_res,
++                             atol=1e-10 * u.nJy / u.Hz)
++    assert_quantity_allclose(params['cube-fit model']['intercept'], intercept_res,
++                             atol=1e-10 * u.nJy)
++
++
+ @pytest.mark.parametrize('unc', ('zeros', None))
+ def test_fitting_backend(unc):
+     np.random.seed(42)
+diff --git a/jdaviz/configs/imviz/tests/test_regions.py b/jdaviz/configs/imviz/tests/test_regions.py
+index 10072c7a..38a60fbc 100644
+--- a/jdaviz/configs/imviz/tests/test_regions.py
++++ b/jdaviz/configs/imviz/tests/test_regions.py
+@@ -1,14 +1,18 @@
++import glue_astronomy
+ import numpy as np
+ from astropy import units as u
+ from astropy.coordinates import SkyCoord, Angle
+ from astropy.utils.data import get_pkg_data_filename
++from packaging.version import Version
+ from photutils.aperture import CircularAperture, SkyCircularAperture
+ from regions import (PixCoord, CircleSkyRegion, RectanglePixelRegion, CirclePixelRegion,
+                      EllipsePixelRegion, PointSkyRegion, PolygonPixelRegion,
+-                     CircleAnnulusSkyRegion, Regions)
++                     CircleAnnulusPixelRegion, CircleAnnulusSkyRegion, Regions)
+ 
+ from jdaviz.configs.imviz.tests.utils import BaseImviz_WCS_NoWCS
+ 
++GLUE_ASTRONOMY_LT_0_7_1 = not (Version(glue_astronomy.__version__) >= Version("0.7.1.dev"))
++
+ 
+ class BaseRegionHandler:
+     """Test to see if region is loaded.
+@@ -230,10 +234,16 @@ class TestGetInteractiveRegions(BaseImviz_WCS_NoWCS):
+         new_subset = subset_groups[0].subset_state & ~subset_groups[1].subset_state
+         self.viewer.apply_subset_state(new_subset)
+ 
+-        # Annulus is no longer accessible by API but also should not crash Imviz.
++        # In older glue-astronomy, annulus is no longer accessible by API
++        # but also should not crash Imviz.
+         subsets = self.imviz.get_interactive_regions()
+         assert len(self.imviz.app.data_collection.subset_groups) == 3
+-        assert list(subsets.keys()) == ['Subset 1', 'Subset 2'], subsets
++        if GLUE_ASTRONOMY_LT_0_7_1:
++            expected_subset_keys = ['Subset 1', 'Subset 2']
++        else:
++            expected_subset_keys = ['Subset 1', 'Subset 2', 'Subset 3']
++            assert isinstance(subsets['Subset 3'], CircleAnnulusPixelRegion)
++        assert list(subsets.keys()) == expected_subset_keys, subsets
+         assert isinstance(subsets['Subset 1'], CirclePixelRegion)
+         assert isinstance(subsets['Subset 2'], CirclePixelRegion)
+ 

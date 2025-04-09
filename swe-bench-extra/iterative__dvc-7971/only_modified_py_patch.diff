@@ -1,0 +1,207 @@
+diff --git a/dvc/commands/gc.py b/dvc/commands/gc.py
+--- a/dvc/commands/gc.py
++++ b/dvc/commands/gc.py
+@@ -11,17 +11,22 @@
+ 
+ class CmdGC(CmdBase):
+     def run(self):
+-        from dvc.repo.gc import _raise_error_if_all_disabled
++        from dvc.repo.gc import _validate_args
+ 
+-        _raise_error_if_all_disabled(
++        _validate_args(
+             all_branches=self.args.all_branches,
+             all_tags=self.args.all_tags,
+             all_commits=self.args.all_commits,
+             all_experiments=self.args.all_experiments,
+             commit_date=self.args.commit_date,
+             workspace=self.args.workspace,
++            rev=self.args.rev,
++            num=self.args.num,
+         )
+ 
++        if self.args.rev:
++            self.args.num = self.args.num or 1
++
+         msg = "This will remove all cache except items used in "
+ 
+         msg += "the workspace"
+@@ -39,10 +44,13 @@ def run(self):
+                     " and all git commits before date "
+                     f"{self.args.commit_date}"
+                 )
++            if self.args.rev:
++                msg += (
++                    f" and last {self.args.num} commits from {self.args.rev}"
++                )
+ 
+         if self.args.all_experiments:
+             msg += " and all experiments"
+-
+         if self.args.repos:
+             msg += " of the current and the following repos:"
+ 
+@@ -69,6 +77,8 @@ def run(self):
+             jobs=self.args.jobs,
+             repos=self.args.repos,
+             workspace=self.args.workspace,
++            rev=self.args.rev,
++            num=self.args.num,
+         )
+         return 0
+ 
+@@ -93,6 +103,26 @@ def add_parser(subparsers, parent_parser):
+         default=False,
+         help="Keep data files used in the current workspace.",
+     )
++    gc_parser.add_argument(
++        "--rev",
++        type=str,
++        default=None,
++        help="Keep data files used in the specified <commit>.",
++        metavar="<commit>",
++    )
++    gc_parser.add_argument(
++        "-n",
++        "--num",
++        type=int,
++        dest="num",
++        metavar="<num>",
++        help=(
++            "Keep data files used in the last `num` commits "
++            "starting from the `--rev` <commit>. "
++            "Only used if `--rev` is also provided. "
++            "Defaults to `1`."
++        ),
++    )
+     gc_parser.add_argument(
+         "-a",
+         "--all-branches",
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -393,6 +393,7 @@ def used_objs(
+         recursive=False,
+         used_run_cache=None,
+         revs=None,
++        num=1,
+     ):
+         """Get the stages related to the given target and collect
+         the `info` of its outputs.
+@@ -418,6 +419,7 @@ def used_objs(
+             all_commits=all_commits,
+             all_experiments=all_experiments,
+             commit_date=commit_date,
++            num=num,
+         ):
+             for odb, objs in self.index.used_objs(
+                 targets,
+diff --git a/dvc/repo/brancher.py b/dvc/repo/brancher.py
+--- a/dvc/repo/brancher.py
++++ b/dvc/repo/brancher.py
+@@ -12,6 +12,7 @@ def brancher(  # noqa: E302
+     all_experiments=False,
+     commit_date: Optional[str] = None,
+     sha_only=False,
++    num=1,
+ ):
+     """Generator that iterates over specified revisions.
+ 
+@@ -69,6 +70,7 @@ def brancher(  # noqa: E302
+         all_commits=all_commits,
+         all_experiments=all_experiments,
+         commit_date=commit_date,
++        num=num,
+     )
+ 
+     try:
+diff --git a/dvc/repo/gc.py b/dvc/repo/gc.py
+--- a/dvc/repo/gc.py
++++ b/dvc/repo/gc.py
+@@ -1,48 +1,60 @@
+ import logging
+-from typing import Optional
++from typing import TYPE_CHECKING, List, Optional
+ 
+ from dvc.exceptions import InvalidArgumentError
+ 
+ from . import locked
+ 
++if TYPE_CHECKING:
++    from dvc.repo import Repo
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def _raise_error_if_all_disabled(**kwargs):
++def _validate_args(**kwargs):
+     if not any(kwargs.values()):
+         raise InvalidArgumentError(
+             "Either of `-w|--workspace`, `-a|--all-branches`, `-T|--all-tags` "
+-            "`--all-experiments`, `--all-commits` or `--date` needs to be set."
++            "`--all-experiments`, `--all-commits`, `--date` or `--rev` "
++            "needs to be set."
++        )
++    if kwargs.get("num") and not kwargs.get("rev"):
++        raise InvalidArgumentError(
++            "`--num` can only be used alongside `--rev`"
+         )
+ 
+ 
+ @locked
+ def gc(
+-    self,
+-    all_branches=False,
+-    cloud=False,
+-    remote=None,
+-    with_deps=False,
+-    all_tags=False,
+-    all_commits=False,
+-    all_experiments=False,
++    self: "Repo",
++    all_branches: bool = False,
++    cloud: bool = False,
++    remote: Optional[str] = None,
++    with_deps: bool = False,
++    all_tags: bool = False,
++    all_commits: bool = False,
++    all_experiments: bool = False,
++    force: bool = False,
++    jobs: int = None,
++    repos: Optional[List[str]] = None,
++    workspace: bool = False,
+     commit_date: Optional[str] = None,
+-    force=False,
+-    jobs=None,
+-    repos=None,
+-    workspace=False,
++    rev: Optional[str] = None,
++    num: Optional[int] = None,
+ ):
+ 
+     # require `workspace` to be true to come into effect.
+     # assume `workspace` to be enabled if any of `all_tags`, `all_commits`,
+     # `all_experiments` or `all_branches` are enabled.
+-    _raise_error_if_all_disabled(
++    _validate_args(
+         workspace=workspace,
+         all_tags=all_tags,
+         all_commits=all_commits,
+         all_branches=all_branches,
+         all_experiments=all_experiments,
+         commit_date=commit_date,
++        rev=rev,
++        num=num,
+     )
+ 
+     from contextlib import ExitStack
+@@ -71,6 +83,8 @@ def gc(
+                 remote=remote,
+                 force=force,
+                 jobs=jobs,
++                revs=[rev] if rev else None,
++                num=num or 1,
+             ).values():
+                 used_obj_ids.update(obj_ids)
+ 
+

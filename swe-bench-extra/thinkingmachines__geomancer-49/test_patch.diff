@@ -1,0 +1,206 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5953f3f..65193fd 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -10,3 +10,9 @@ def sample_points():
+     """Return a set of POINTS in a pandas.DataFrame"""
+     df = pd.read_csv("tests/data/sample_points.csv")
+     return df
++
++
++@pytest.fixture
++def spellbook_json():
++    with open("tests/data/spellbook.json") as f:
++        return f.read()
+diff --git a/tests/data/spellbook.json b/tests/data/spellbook.json
+new file mode 100644
+index 0000000..80f4339
+--- /dev/null
++++ b/tests/data/spellbook.json
+@@ -0,0 +1,1 @@
++{"column": "WKT", "spells": [{"source_table": "gis_osm_pois_free_1", "feature_name": "dist_supermarket", "source_id": "osm_id", "dburl": "sqlite:///tests/data/source.sqlite", "options": null, "source_column": "fclass", "source_filter": "supermarket", "within": 10000, "module": "geomancer.spells.distance_to_nearest", "type": "DistanceToNearest"}, {"source_table": "gis_osm_pois_free_1", "feature_name": "num_embassy", "source_id": "osm_id", "dburl": "sqlite:///tests/data/source.sqlite", "options": null, "source_column": "fclass", "source_filter": "embassy", "within": 10000, "module": "geomancer.spells.number_of", "type": "NumberOf"}], "author": null, "description": null}
+\ No newline at end of file
+diff --git a/tests/spellbook/test_spellbook.py b/tests/spellbook/test_spellbook.py
+new file mode 100644
+index 0000000..ca65cea
+--- /dev/null
++++ b/tests/spellbook/test_spellbook.py
+@@ -0,0 +1,109 @@
++# -*- coding: utf-8 -*-
++
++# Import modules
++import pandas as pd
++import pytest
++
++# Import from package
++from geomancer.spellbook import SpellBook
++from geomancer.spells import DistanceToNearest, NumberOf
++
++
++@pytest.mark.usefixtures("sample_points")
++def test_spell_dburl(sample_points):
++    with pytest.raises(ValueError, match="dburl was not supplied"):
++        spell = DistanceToNearest(
++            on="embassy",
++            source_table="gis_osm_pois_free_1",
++            feature_name="dist_embassy",
++        )
++        spell.cast(sample_points)
++
++
++@pytest.mark.usefixtures("sample_points")
++def test_spell_keep_index(sample_points):
++    spell = DistanceToNearest(
++        on="embassy",
++        source_table="gis_osm_pois_free_1",
++        feature_name="dist_embassy",
++    )
++    df = spell.cast(
++        sample_points,
++        dburl="sqlite:///tests/data/source.sqlite",
++        keep_index=True,
++    )
++    assert "__index_level_0__" in df.columns
++    df = spell.cast(
++        sample_points,
++        dburl="sqlite:///tests/data/source.sqlite",
++        keep_index=False,
++    )
++    assert "__index_level_0__" not in df.columns
++
++
++@pytest.mark.usefixtures("sample_points")
++def test_spell_features_only(sample_points):
++    spell = DistanceToNearest(
++        on="embassy",
++        source_table="gis_osm_pois_free_1",
++        feature_name="dist_embassy",
++    )
++    df = spell.cast(
++        sample_points,
++        dburl="sqlite:///tests/data/source.sqlite",
++        features_only=True,
++    )
++    assert ["__index_level_0__", "dist_embassy"] == df.columns.tolist()
++
++
++@pytest.fixture
++def spellbook():
++    return SpellBook(
++        [
++            DistanceToNearest(
++                "supermarket",
++                source_table="gis_osm_pois_free_1",
++                feature_name="dist_supermarket",
++                dburl="sqlite:///tests/data/source.sqlite",
++            ),
++            NumberOf(
++                on="embassy",
++                source_table="gis_osm_pois_free_1",
++                feature_name="num_embassy",
++                dburl="sqlite:///tests/data/source.sqlite",
++            ),
++        ]
++    )
++
++
++@pytest.mark.usefixtures("spellbook", "sample_points")
++def test_spellbook_spells(spellbook, sample_points):
++    df = spellbook.cast(sample_points)
++    assert "dist_supermarket" in df.columns
++    assert "num_embassy" in df.columns
++
++
++@pytest.mark.usefixtures("spellbook", "spellbook_json")
++def test_spellbook_to_json(spellbook, spellbook_json):
++    assert spellbook.to_json() == spellbook_json
++
++
++@pytest.mark.usefixtures("spellbook", "spellbook_json")
++def test_spellbook_to_json_file(spellbook, spellbook_json, tmpdir):
++    filename = "spellbook.json"
++    f = tmpdir.mkdir(__name__).join(filename)
++    spellbook.to_json(f.strpath)
++    f.read() == spellbook_json
++
++
++@pytest.mark.usefixtures("spellbook", "spellbook_json")
++def test_spellbook_read_json(spellbook, spellbook_json, tmpdir):
++    filename = "spellbook.json"
++    f = tmpdir.mkdir(__name__).join(filename)
++    f.write(spellbook_json)
++    _spellbook = SpellBook.read_json(f.strpath)
++    assert _spellbook.column == spellbook.column
++    assert _spellbook.author == spellbook.author
++    assert _spellbook.description == spellbook.description
++    for i, spell in enumerate(_spellbook.spells):
++        assert spell.__dict__ == spellbook.spells[i].__dict__
+diff --git a/tests/spells/base_test_spell.py b/tests/spells/base_test_spell.py
+index c8d0e3c..ec67e14 100644
+--- a/tests/spells/base_test_spell.py
++++ b/tests/spells/base_test_spell.py
+@@ -38,7 +38,9 @@ class BaseTestSpell:
+             engine=engine,
+         )
+         # Perform the test
+-        query = spelldb.spell.query(source=source, target=target, core=core)
++        query = spelldb.spell.query(
++            source=source, target=target, core=core, column="WKT"
++        )
+         assert isinstance(query, ClauseElement)
+ 
+     @pytest.mark.usefixtures("spelldb", "sample_points")
+diff --git a/tests/spells/test_distance_to_nearest.py b/tests/spells/test_distance_to_nearest.py
+index 43106e7..1bde1ed 100644
+--- a/tests/spells/test_distance_to_nearest.py
++++ b/tests/spells/test_distance_to_nearest.py
+@@ -16,13 +16,16 @@ params = [
+         ),
+         dburl="sqlite:///tests/data/source.sqlite",
+     ),
+-    SpellDB(
+-        spell=DistanceToNearest(
+-            on="primary",
+-            source_table="gis_osm_roads_free_1",
+-            feature_name="dist_primary",
++    pytest.param(
++        SpellDB(
++            spell=DistanceToNearest(
++                on="primary",
++                source_table="gis_osm_roads_free_1",
++                feature_name="dist_primary",
++            ),
++            dburl="sqlite:///tests/data/source.sqlite",
+         ),
+-        dburl="sqlite:///tests/data/source.sqlite",
++        marks=pytest.mark.slow,
+     ),
+     pytest.param(
+         SpellDB(
+diff --git a/tests/spells/test_number_of.py b/tests/spells/test_number_of.py
+index 9680f5e..2371e37 100644
+--- a/tests/spells/test_number_of.py
++++ b/tests/spells/test_number_of.py
+@@ -17,13 +17,16 @@ params = [
+         ),
+         dburl="sqlite:///tests/data/source.sqlite",
+     ),
+-    SpellDB(
+-        spell=NumberOf(
+-            on="primary",
+-            source_table="gis_osm_roads_free_1",
+-            feature_name="num_primary",
++    pytest.param(
++        SpellDB(
++            spell=NumberOf(
++                on="primary",
++                source_table="gis_osm_roads_free_1",
++                feature_name="num_primary",
++            ),
++            dburl="sqlite:///tests/data/source.sqlite",
+         ),
+-        dburl="sqlite:///tests/data/source.sqlite",
++        marks=pytest.mark.slow,
+     ),
+     pytest.param(
+         SpellDB(

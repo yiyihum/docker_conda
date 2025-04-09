@@ -1,0 +1,78 @@
+diff --git a/submitit/auto/test_auto.py b/submitit/auto/test_auto.py
+index 79733da..defb232 100644
+--- a/submitit/auto/test_auto.py
++++ b/submitit/auto/test_auto.py
+@@ -40,6 +40,7 @@ def test_local_executor() -> None:
+     with test_slurm.mocked_slurm():
+         executor = auto.AutoExecutor(folder=".", cluster="local")
+     assert executor.cluster == "local"
++    executor.update_parameters(local_cpus_per_task=2)
+ 
+ 
+ def test_executor_argument() -> None:
+@@ -79,10 +80,12 @@ def test_overriden_arguments() -> None:
+     with test_slurm.mocked_slurm():
+         slurm_ex = auto.AutoExecutor(folder=".", cluster="slurm")
+ 
+-    slurm_ex.update_parameters(timeout_min=60, slurm_time=120)
++    slurm_ex.update_parameters(
++        timeout_min=60, slurm_timeout_min=120, tasks_per_node=2, slurm_ntasks_per_node=3
++    )
+     slurm_params = slurm_ex._executor.parameters
+     # slurm use time
+-    assert slurm_params == {"time": 120}
++    assert slurm_params == {"time": 120, "ntasks_per_node": 3}
+ 
+     # others use timeout_min
+     local_ex = auto.AutoExecutor(folder=".", cluster="local")
+diff --git a/submitit/core/test_core.py b/submitit/core/test_core.py
+index 0aa467a..acf232f 100644
+--- a/submitit/core/test_core.py
++++ b/submitit/core/test_core.py
+@@ -190,7 +190,7 @@ def test_fake_executor_batch(tmp_path: Path) -> None:
+             job = executor.submit(_three_time, 8)
+             job.job_id  # pylint: disable=pointless-statement
+     # empty context
+-    with pytest.raises(RuntimeError):
++    with pytest.warns(RuntimeWarning):
+         with executor.batch():
+             pass
+     # multi context
+diff --git a/submitit/core/test_plugins.py b/submitit/core/test_plugins.py
+index 98d7c79..2ac0009 100644
+--- a/submitit/core/test_plugins.py
++++ b/submitit/core/test_plugins.py
+@@ -19,7 +19,6 @@ from .job_environment import JobEnvironment
+ @pytest.mark.parametrize("env", plugins.get_job_environments().values())
+ def test_env(env: JobEnvironment) -> None:
+     assert isinstance(env, JobEnvironment)
+-    assert type(env).activated is not JobEnvironment.activated, "activated need to be overridden"
+     # We are not inside a submitit job
+     assert not env.activated()
+     assert type(env)._requeue is not JobEnvironment._requeue, "_requeue need to be overridden"
+diff --git a/submitit/slurm/_sbatch_test_record.txt b/submitit/slurm/_sbatch_test_record.txt
+index 2de2d1e..a4e045f 100644
+--- a/submitit/slurm/_sbatch_test_record.txt
++++ b/submitit/slurm/_sbatch_test_record.txt
+@@ -16,4 +16,5 @@
+ #SBATCH --wckey=submitit
+ 
+ # command
++export SUBMITIT_EXECUTOR=slurm
+ srun --output '/tmp/%j_%t_log.out' --error '/tmp/%j_%t_log.err' --unbuffered blublu
+diff --git a/submitit/slurm/test_slurm.py b/submitit/slurm/test_slurm.py
+index 4925792..2b80b8e 100644
+--- a/submitit/slurm/test_slurm.py
++++ b/submitit/slurm/test_slurm.py
+@@ -35,9 +35,8 @@ def mocked_slurm(state: str = "RUNNING", job_id: str = "12", array: int = 0) ->
+         stack.enter_context(
+             test_core.MockedSubprocess(state=state, job_id=job_id, shutil_which="srun", array=array).context()
+         )
+-        stack.enter_context(
+-            utils.environment_variables(**{"_USELESS_TEST_ENV_VAR_": "1", "SLURM_JOB_ID": f"{job_id}"})
+-        )
++        envs = dict(_USELESS_TEST_ENV_VAR_="1", SUBMITIT_EXECUTOR="slurm", SLURM_JOB_ID=str(job_id))
++        stack.enter_context(utils.environment_variables(**envs))
+         tmp = stack.enter_context(tempfile.TemporaryDirectory())
+         yield tmp
+ 

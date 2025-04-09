@@ -1,0 +1,428 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 9f01291d..a6d3f91f 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -31,6 +31,7 @@ alma
+ - Fixed a regression to handle arrays of string input for the ``query`` methods. [#2094]
+ - Throws an error when an unsupported ``kwargs`` (or argument) is passed in to a function. [#2475]
+ - New DataLink API handling. [#2493]
++- Fixed bug #2489 in which blank URLs were being sent to the downloader [#2490]
+ 
+ 
+ astrometry.net
+@@ -88,6 +89,12 @@ linelists.cdms
+ - Fix issues with the line name parser and the line data parser; the original
+   implementation was incomplete and upstream was not fully documented. [#2385, #2411]
+ 
++mast
++^^^^
++
++- Cull duplicate downloads for the same dataURI in ``Observations.download_products()``
++  and duplicate URIs in ``Observations.get_cloud_uris``. [#2497]
++
+ oac
+ ^^^
+ 
+@@ -110,6 +117,9 @@ svo_fps
+ - Queries with invalid parameter names now raise an ``InvalidQueryError``.
+   [#2446]
+ 
++- The default wavelength range used by ``get_filter_index()`` was far too
++  large. The user must now always specify both upper and lower limits. [#2509]
++
+ gaia
+ ^^^^
+ 
+diff --git a/astroquery/alma/core.py b/astroquery/alma/core.py
+index b41734f6..4368bbbf 100644
+--- a/astroquery/alma/core.py
++++ b/astroquery/alma/core.py
+@@ -828,7 +828,15 @@ class AlmaClass(QueryWithLogin):
+             raise TypeError("Datasets must be given as a list of strings.")
+ 
+         files = self.get_data_info(uids)
+-        file_urls = files['access_url']
++        # filter out blank access URLs
++        # it is possible for there to be length-1 lists
++        if len(files) == 1:
++            file_urls = files['access_url']
++            if isinstance(file_urls, str) and file_urls == '':
++                raise ValueError(f"Cannot download uid {uid} because it has no file")
++        else:
++            file_urls = [url for url in files['access_url'] if url]
++
+         totalsize = files['content_length'].sum()*u.B
+ 
+         # each_size, totalsize = self.data_size(files)
+diff --git a/astroquery/exceptions.py b/astroquery/exceptions.py
+index 27651416..8ec2dddf 100644
+--- a/astroquery/exceptions.py
++++ b/astroquery/exceptions.py
+@@ -7,8 +7,9 @@ from astropy.utils.exceptions import AstropyWarning
+ 
+ __all__ = ['TimeoutError', 'InvalidQueryError', 'RemoteServiceError',
+            'TableParseError', 'LoginError', 'ResolverError',
+-           'NoResultsWarning', 'LargeQueryWarning', 'InputWarning',
+-           'AuthenticationWarning', 'MaxResultsWarning', 'CorruptDataWarning']
++           'NoResultsWarning', 'DuplicateResultsWarning', 'LargeQueryWarning',
++           'InputWarning', 'AuthenticationWarning', 'MaxResultsWarning',
++           'CorruptDataWarning']
+ 
+ 
+ class TimeoutError(Exception):
+@@ -67,6 +68,13 @@ class NoResultsWarning(AstropyWarning):
+     pass
+ 
+ 
++class DuplicateResultsWarning(AstropyWarning):
++    """
++    Astroquery warning class to be issued when a query returns no result.
++    """
++    pass
++
++
+ class LargeQueryWarning(AstropyWarning):
+     """
+     Astroquery warning class to be issued when a query is larger than
+diff --git a/astroquery/mast/observations.py b/astroquery/mast/observations.py
+index abe0a0ad..b00f915e 100644
+--- a/astroquery/mast/observations.py
++++ b/astroquery/mast/observations.py
+@@ -19,7 +19,7 @@ from requests import HTTPError
+ import astropy.units as u
+ import astropy.coordinates as coord
+ 
+-from astropy.table import Table, Row, vstack, MaskedColumn
++from astropy.table import Table, Row, unique, vstack, MaskedColumn
+ from astroquery import log
+ 
+ from astropy.utils import deprecated
+@@ -31,7 +31,7 @@ from ..query import QueryWithLogin
+ from ..utils import commons, async_to_sync
+ from ..utils.class_or_instance import class_or_instance
+ from ..exceptions import (TimeoutError, InvalidQueryError, RemoteServiceError,
+-                          ResolverError, MaxResultsWarning,
++                          ResolverError, MaxResultsWarning, DuplicateResultsWarning,
+                           NoResultsWarning, InputWarning, AuthenticationWarning)
+ 
+ from . import conf, utils
+@@ -716,6 +716,9 @@ class ObservationsClass(MastQueryWithLogin):
+ 
+             products = vstack(product_lists)
+ 
++        # Remove duplicate products
++        products = self._remove_duplicate_products(products)
++
+         # apply filters
+         products = self.filter_products(products, mrp_only=mrp_only, **filters)
+ 
+@@ -767,6 +770,9 @@ class ObservationsClass(MastQueryWithLogin):
+             raise RemoteServiceError('Please enable anonymous cloud access by calling `enable_cloud_dataset` method. '
+                                      'See MAST Labs documentation for an example: https://mast-labs.stsci.io/#example-data-access-with-astroquery-observations')
+ 
++        # Remove duplicate products
++        data_products = self._remove_duplicate_products(data_products)
++
+         return self._cloud_connection.get_cloud_uri_list(data_products, include_bucket, full_url)
+ 
+     def get_cloud_uri(self, data_product, *, include_bucket=True, full_url=False):
+@@ -802,6 +808,30 @@ class ObservationsClass(MastQueryWithLogin):
+         # Query for product URIs
+         return self._cloud_connection.get_cloud_uri(data_product, include_bucket, full_url)
+ 
++    def _remove_duplicate_products(self, data_products):
++        """
++        Removes duplicate data products that have the same dataURI.
++
++        Parameters
++        ----------
++        data_products : `~astropy.table.Table`
++            Table containing products to be checked for duplicates.
++
++        Returns
++        -------
++        unique_products : `~astropy.table.Table`
++            Table containing products with unique dataURIs.
++
++        """
++        number = len(data_products)
++        unique_products = unique(data_products, keys="dataURI")
++        number_unique = len(unique_products)
++        if number_unique < number:
++            warnings.warn(f"{number - number_unique} of {number} products were duplicates."
++                          f"Only downloading {number_unique} unique product(s).", DuplicateResultsWarning)
++
++        return unique_products
++
+ 
+ @async_to_sync
+ class MastClass(MastQueryWithLogin):
+diff --git a/astroquery/svo_fps/core.py b/astroquery/svo_fps/core.py
+index 31bf1d61..6a94b5d8 100644
+--- a/astroquery/svo_fps/core.py
++++ b/astroquery/svo_fps/core.py
+@@ -9,13 +9,11 @@ from astropy.io.votable import parse_single_table
+ from . import conf
+ 
+ from ..query import BaseQuery
+-from astroquery.exceptions import InvalidQueryError
++from astroquery.exceptions import InvalidQueryError, TimeoutError
+ 
+ 
+ __all__ = ['SvoFpsClass', 'SvoFps']
+ 
+-FLOAT_MAX = np.finfo(np.float64).max
+-
+ # Valid query parameters taken from
+ # http://svo2.cab.inta-csic.es/theory/fps/index.php?mode=voservice
+ _params_with_range = {"WavelengthRef", "WavelengthMean", "WavelengthEff",
+@@ -80,19 +78,17 @@ class SvoFpsClass(BaseQuery):
+             # If no table element found in VOTable
+             raise IndexError(error_msg)
+ 
+-    def get_filter_index(self, wavelength_eff_min=0*u.angstrom,
+-                         wavelength_eff_max=FLOAT_MAX*u.angstrom, **kwargs):
++    def get_filter_index(self, wavelength_eff_min, wavelength_eff_max, **kwargs):
+         """Get master list (index) of all filters at SVO
+         Optional parameters can be given to get filters data for specified
+         Wavelength Effective range from SVO
+ 
+         Parameters
+         ----------
+-        wavelength_eff_min : `~astropy.units.Quantity` with units of length, optional
+-            Minimum value of Wavelength Effective (default is 0 angstrom)
+-        wavelength_eff_max : `~astropy.units.Quantity` with units of length, optional
+-            Maximum value of Wavelength Effective (default is a very large
+-            quantity FLOAT_MAX angstroms i.e. maximum value of np.float64)
++        wavelength_eff_min : `~astropy.units.Quantity` with units of length
++            Minimum value of Wavelength Effective
++        wavelength_eff_max : `~astropy.units.Quantity` with units of length
++            Maximum value of Wavelength Effective
+         kwargs : dict
+             Passed to `data_from_svo`.  Relevant arguments include ``cache``
+ 
+@@ -104,7 +100,13 @@ class SvoFpsClass(BaseQuery):
+         query = {'WavelengthEff_min': wavelength_eff_min.to_value(u.angstrom),
+                  'WavelengthEff_max': wavelength_eff_max.to_value(u.angstrom)}
+         error_msg = 'No filter found for requested Wavelength Effective range'
+-        return self.data_from_svo(query=query, error_msg=error_msg, **kwargs)
++        try:
++            return self.data_from_svo(query=query, error_msg=error_msg, **kwargs)
++        except requests.ReadTimeout:
++            raise TimeoutError(
++                "Query did not finish fast enough. A smaller wavelength range might "
++                "succeed. Try increasing the timeout limit if a large range is needed."
++            )
+ 
+     def get_transmission_data(self, filter_id, **kwargs):
+         """Get transmission data for the requested Filter ID from SVO
+diff --git a/docs/svo_fps/svo_fps.rst b/docs/svo_fps/svo_fps.rst
+index 05fcb6bc..3ec9084e 100644
+--- a/docs/svo_fps/svo_fps.rst
++++ b/docs/svo_fps/svo_fps.rst
+@@ -1,5 +1,3 @@
+-.. doctest-skip-all
+-
+ .. _astroquery.svo_fps:
+ 
+ **********************************************************
+@@ -17,17 +15,19 @@ from the service as astropy tables.
+ Get index list of all Filters
+ -----------------------------
+ 
+-The filter index (all available filters with their properties) can be listed
+-with `~astroquery.svo_fps.SvoFpsClass.get_filter_index`:
++The filter index (the properties of all available filters in a wavelength
++range) can be listed with
++:meth:`~astroquery.svo_fps.SvoFpsClass.get_filter_index`:
+ 
+-.. code-block:: python
++.. doctest-remote-data::
+ 
++    >>> from astropy import units as u
+     >>> from astroquery.svo_fps import SvoFps
+-    >>> index = SvoFps.get_filter_index()
++    >>> index = SvoFps.get_filter_index(12_000*u.angstrom, 12_100*u.angstrom)
+     >>> index.info
+-    <Table masked=True length=5139>
+-            name          dtype  unit
+-    -------------------- ------- ----
++    <Table length=14>
++            name          dtype        unit
++    -------------------- ------- ---------------
+     FilterProfileService  object
+                 filterID  object
+           WavelengthUnit  object
+@@ -41,28 +41,31 @@ with `~astroquery.svo_fps.SvoFpsClass.get_filter_index`:
+     CalibrationReference  object
+              Description  object
+                 Comments  object
+-          WavelengthMean float32   AA
+-           WavelengthEff float32   AA
+-           WavelengthMin float32   AA
+-           WavelengthMax float32   AA
+-                WidthEff float32   AA
+-           WavelengthCen float32   AA
+-         WavelengthPivot float32   AA
+-          WavelengthPeak float32   AA
+-          WavelengthPhot float32   AA
+-                    FWHM float32   AA
++           WavelengthRef float64              AA
++          WavelengthMean float64              AA
++           WavelengthEff float64              AA
++           WavelengthMin float64              AA
++           WavelengthMax float64              AA
++                WidthEff float64              AA
++           WavelengthCen float64              AA
++         WavelengthPivot float64              AA
++          WavelengthPeak float64              AA
++          WavelengthPhot float64              AA
++                    FWHM float64              AA
++                    Fsun float64 erg s / (A cm2)
+                PhotCalID  object
+                   MagSys  object
+-               ZeroPoint float32   Jy
++               ZeroPoint float64              Jy
+            ZeroPointUnit  object
+-                    Mag0 float32
++                    Mag0 float64
+            ZeroPointType  object
+-               AsinhSoft float32
++               AsinhSoft float64
+         TrasmissionCurve  object
+ 
+-There are options to downselect based on the minimum
+-and maximum effective wavelength (``wavelength_eff_min``
+-and ``wavelength_eff_max``, respectively).
++If the wavelength range contains too many entries then a ``TimeoutError`` will
++occur. A smaller wavelength range might succeed, but if a large range really is
++required then you can use the ``timeout`` argument to allow for a longer
++response time.
+ 
+ Get list of Filters under a specified Facilty and Instrument
+ ------------------------------------------------------------
+@@ -72,14 +75,13 @@ Filters for an arbitrary combination of Facility & Instrument (the Facility
+ must be specified, but the Instrument is optional).  The data table returned
+ is of the same form as that from `~astroquery.svo_fps.SvoFpsClass.get_filter_index`:
+ 
+-.. code-block:: python
++.. doctest-remote-data::
+ 
+     >>> filter_list = SvoFps.get_filter_list(facility='Keck', instrument='NIRC2')
+     >>> filter_list.info
+-
+-    <Table masked=True length=11>
+-            name          dtype  unit
+-    -------------------- ------- ----
++    <Table length=11>
++            name          dtype        unit
++    -------------------- ------- ---------------
+     FilterProfileService  object
+                 filterID  object
+           WavelengthUnit  object
+@@ -93,26 +95,27 @@ is of the same form as that from `~astroquery.svo_fps.SvoFpsClass.get_filter_ind
+     CalibrationReference  object
+              Description  object
+                 Comments  object
+-          WavelengthMean float32   AA
+-           WavelengthEff float32   AA
+-           WavelengthMin float32   AA
+-           WavelengthMax float32   AA
+-                WidthEff float32   AA
+-           WavelengthCen float32   AA
+-         WavelengthPivot float32   AA
+-          WavelengthPeak float32   AA
+-          WavelengthPhot float32   AA
+-                    FWHM float32   AA
++           WavelengthRef float64              AA
++          WavelengthMean float64              AA
++           WavelengthEff float64              AA
++           WavelengthMin float64              AA
++           WavelengthMax float64              AA
++                WidthEff float64              AA
++           WavelengthCen float64              AA
++         WavelengthPivot float64              AA
++          WavelengthPeak float64              AA
++          WavelengthPhot float64              AA
++                    FWHM float64              AA
++                    Fsun float64 erg s / (A cm2)
+                PhotCalID  object
+                   MagSys  object
+-               ZeroPoint float32   Jy
++               ZeroPoint float64              Jy
+            ZeroPointUnit  object
+-                    Mag0 float32
++                    Mag0 float64
+            ZeroPointType  object
+-               AsinhSoft float32
++               AsinhSoft float64
+         TrasmissionCurve  object
+ 
+-
+ Get transmission data for a specific Filter
+ -------------------------------------------
+ 
+@@ -122,40 +125,39 @@ If you know the ``filterID`` of the filter (which you can determine with
+ transmission curve data using
+ `~astroquery.svo_fps.SvoFpsClass.get_transmission_data`:
+ 
+-.. code-block:: python
++.. doctest-remote-data::
+ 
+     >>> data = SvoFps.get_transmission_data('2MASS/2MASS.H')
+     >>> print(data)
+     Wavelength Transmission
+         AA
+     ---------- ------------
+-    12890.0          0.0
+-    13150.0          0.0
+-    13410.0          0.0
+-    13680.0          0.0
+-    13970.0          0.0
+-    14180.0          0.0
+-    14400.0       0.0005
+-    14620.0       0.0028
+-    14780.0       0.0081
+-    14860.0       0.0287
+-        ...          ...
+-    18030.0       0.1077
+-    18100.0       0.0707
+-    18130.0       0.0051
+-    18180.0         0.02
+-    18280.0       0.0004
+-    18350.0          0.0
+-    18500.0        1e-04
+-    18710.0          0.0
+-    18930.0          0.0
+-    19140.0          0.0
++       12890.0          0.0
++       13150.0          0.0
++       13410.0          0.0
++       13680.0          0.0
++       13970.0          0.0
++       14180.0          0.0
++       14400.0       0.0005
++       14620.0 0.0027999999
++       14780.0 0.0081000002
++       14860.0 0.0286999997
++           ...          ...
++       18030.0 0.1076999977
++       18100.0 0.0706999972
++       18130.0 0.0051000002
++       18180.0 0.0199999996
++       18280.0       0.0004
++       18350.0          0.0
++       18500.0       0.0001
++       18710.0          0.0
++       18930.0          0.0
++       19140.0          0.0
+     Length = 58 rows
+ 
+-
+ These are the data needed to plot the transmission curve for filter:
+ 
+-.. code-block:: python
++.. doctest-skip::
+ 
+     >>> import matplotlib.pyplot as plt
+     >>> plt.plot(data['Wavelength'], data['Transmission'])

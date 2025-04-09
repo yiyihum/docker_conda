@@ -1,0 +1,100 @@
+diff --git a/docs/responses.md b/docs/responses.md
+index 2072bb6..be23a3d 100644
+--- a/docs/responses.md
++++ b/docs/responses.md
+@@ -86,6 +86,51 @@ class App:
+         await response(receive, send)
+ ```
+ 
++### TemplateResponse
++
++The `TemplateResponse` class return plain text responses generated
++from a template instance, and a dictionary of context to render into the
++template.
++
++A `request` argument must always be included in the context. Responses default
++to `text/html` unless an alternative `media_type` is specified.
++
++```python
++from starlette.responses import TemplateResponse
++from starlette.requests import Request
++
++from jinja2 import Environment, FileSystemLoader
++
++
++env = Environment(loader=FileSystemLoader('templates'))
++
++
++class App:
++    def __init__(self, scope):
++        self.scope = scope
++
++    async def __call__(self, receive, send):
++        template = env.get_template('index.html')
++        context = {
++            'request': Request(self.scope),
++        }
++        response = TemplateResponse(template, context)
++        await response(receive, send)
++```
++
++The advantage with using `TemplateResponse` over `HTMLResponse` is that
++it will make `template` and `context` properties available on response instances
++returned by the test client.
++
++```python
++def test_app():
++    client = TestClient(App)
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.template.name == "index.html"
++    assert "request" in response.context
++```
++
+ ### JSONResponse
+ 
+ Takes some data and returns an `application/json` encoded response.
+diff --git a/starlette/responses.py b/starlette/responses.py
+index 35062ba..542e800 100644
+--- a/starlette/responses.py
++++ b/starlette/responses.py
+@@ -138,6 +138,39 @@ class PlainTextResponse(Response):
+     media_type = "text/plain"
+ 
+ 
++class TemplateResponse(Response):
++    media_type = "text/html"
++
++    def __init__(
++        self,
++        template: typing.Any,
++        context: dict,
++        status_code: int = 200,
++        headers: dict = None,
++        media_type: str = None,
++        background: BackgroundTask = None,
++    ):
++        if "request" not in context:
++            raise ValueError('context must include a "request" key')
++        self.template = template
++        self.context = context
++        content = template.render(context)
++        super().__init__(content, status_code, headers, media_type, background)
++
++    async def __call__(self, receive: Receive, send: Send) -> None:
++        request = self.context["request"]
++        extensions = request.get("extensions", {})
++        if "http.response.template" in extensions:
++            await send(
++                {
++                    "type": "http.response.template",
++                    "template": self.template,
++                    "context": self.context,
++                }
++            )
++        await super().__call__(receive, send)
++
++
+ class JSONResponse(Response):
+     media_type = "application/json"
+ 

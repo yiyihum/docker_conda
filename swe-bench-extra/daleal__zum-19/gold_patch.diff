@@ -1,0 +1,183 @@
+diff --git a/zum/constants.py b/zum/constants.py
+index a6d45ef..951f5db 100644
+--- a/zum/constants.py
++++ b/zum/constants.py
+@@ -20,3 +20,6 @@ HTTP_METHODS = [
+     "patch",
+     "trace",
+ ]
++
++# Request body value types
++REQUEST_BODY_VALUE_TYPES = ["string", "integer", "float", "boolean", "null"]
+diff --git a/zum/requests/core.py b/zum/requests/core.py
+index fa01709..0326a9c 100644
+--- a/zum/requests/core.py
++++ b/zum/requests/core.py
+@@ -2,9 +2,9 @@
+ Module for the core requests logic of zum.
+ """
+ 
+-from typing import Any, Dict, List, Optional, Tuple
++from typing import Any, Dict, List
+ 
+-from zum.requests.errors import MissingEndpointParamsError
++from zum.requests.helpers import reduce_arguments
+ from zum.requests.models import Request
+ 
+ 
+@@ -18,23 +18,3 @@ def generate_request(raw_endpoint: Dict[str, Any], arguments: List[str]) -> Requ
+     )
+     body, _ = reduce_arguments(raw_endpoint.get("body"), remaining_arguments)
+     return Request(raw_endpoint["route"], raw_endpoint["method"], params, body)
+-
+-
+-def reduce_arguments(
+-    keys: Optional[List[str]], arguments: List[Any]
+-) -> Tuple[Dict[str, Any], List[Any]]:
+-    """
+-    Given a :keys array of strings, maps the first :keys.length elements
+-    of the :arguments array to the :keys elements as keys, returning the
+-    mapped elements and the rest of the :arguments array.
+-    """
+-    if keys is None:
+-        return {}, arguments
+-    if len(arguments) < len(keys):
+-        raise MissingEndpointParamsError(
+-            "Invalid amount of arguments passed to the command."
+-        )
+-    return (
+-        {x[0]: x[1] for x in zip(keys, arguments)},
+-        arguments[len(keys) :],
+-    )
+diff --git a/zum/requests/errors.py b/zum/requests/errors.py
+index 17067fc..12b7366 100644
+--- a/zum/requests/errors.py
++++ b/zum/requests/errors.py
+@@ -10,3 +10,10 @@ class MissingEndpointParamsError(Exception):
+ 
+ class InvalidEndpointDefinitionError(Exception):
+     """An exception for when an endpoint is defined incorrectly."""
++
++
++class InvalidBodyParameterTypeError(Exception):
++    """
++    An exception for when a body parameter tries to be casted to a
++    type that doesn't match its intrinsec type.
++    """
+diff --git a/zum/requests/helpers.py b/zum/requests/helpers.py
+new file mode 100644
+index 0000000..7370d0e
+--- /dev/null
++++ b/zum/requests/helpers.py
+@@ -0,0 +1,74 @@
++"""
++Module for the requests helpers of zum.
++"""
++
++from typing import Any, Dict, List, Optional, Tuple, Union
++
++from zum.requests.errors import (
++    InvalidBodyParameterTypeError,
++    MissingEndpointParamsError,
++)
++from zum.requests.validations import validate_body_parameter_definition
++
++
++def reduce_arguments(
++    keys: Optional[List[str]], arguments: List[Any]
++) -> Tuple[Dict[str, Any], List[Any]]:
++    """
++    Given a :keys array of strings, maps the first :keys.length elements
++    of the :arguments array to the :keys elements as keys, returning the
++    mapped elements and the rest of the :arguments array.
++    """
++    if keys is None:
++        return {}, arguments
++    if len(arguments) < len(keys):
++        raise MissingEndpointParamsError(
++            "Invalid amount of arguments passed to the command."
++        )
++    casted_params = [cast_parameter(*x) for x in zip(keys, arguments)]
++    return (
++        # The next line is equivalent to `{**param for param in casted_params}`
++        {key: value for param in casted_params for key, value in param.items()},
++        arguments[len(keys) :],
++    )
++
++
++def cast_parameter(
++    definition: Union[str, Dict[str, str]], value: str
++) -> Dict[str, Any]:
++    """
++    Casts a value to its parameter definition and returns a dictionary with the
++    required key name and the value casted to its right type.
++    """
++    validate_body_parameter_definition(definition)
++    if isinstance(definition, str):
++        return {definition: value}
++    if "type" not in definition:
++        return {definition["name"]: value}
++    try:
++        return {definition["name"]: cast_value(value, definition["type"])}
++    except ValueError:
++        raise InvalidBodyParameterTypeError(  # pylint: disable=W0707
++            f"Parameter '{value}' can't be casted to '{definition['type']}'"
++        )
++
++
++def cast_value(value: str, casting_type: str) -> Any:
++    """Casts value depending on the casting type."""
++    if casting_type == "integer":
++        return int(value)
++    if casting_type == "float":
++        return float(value)
++    if casting_type == "boolean":
++        if value not in ["true", "false"]:
++            raise InvalidBodyParameterTypeError(
++                f"Booleans can't be '{value}', only 'true' or 'false'"
++            )
++        return value == "true"
++    if casting_type == "null":
++        if value != "null":
++            raise InvalidBodyParameterTypeError(
++                f"Null parameters can't be '{value}', only 'null'"
++            )
++        return None
++    return value  # String
+diff --git a/zum/requests/validations.py b/zum/requests/validations.py
+index e77a763..bef74f5 100644
+--- a/zum/requests/validations.py
++++ b/zum/requests/validations.py
+@@ -2,9 +2,9 @@
+ Module for the requests validations of zum.
+ """
+ 
+-from typing import Any, Dict
++from typing import Any, Dict, Union
+ 
+-from zum.constants import HTTP_METHODS
++from zum.constants import HTTP_METHODS, REQUEST_BODY_VALUE_TYPES
+ from zum.requests.errors import InvalidEndpointDefinitionError
+ 
+ 
+@@ -42,3 +42,20 @@ def validate_raw_endpoint_method(raw_endpoint: Dict[str, Any]) -> None:
+         raise InvalidEndpointDefinitionError(
+             "Invalid 'method' value for the endpoint (not a valid HTTP method)"
+         )
++
++
++def validate_body_parameter_definition(definition: Union[str, Dict[str, str]]) -> None:
++    """Validates a body parameter definition."""
++    if not isinstance(definition, str) and not isinstance(definition, dict):
++        raise InvalidEndpointDefinitionError(
++            "Each endpoint body parameter should be a string or an object"
++        )
++    if isinstance(definition, dict):
++        if "name" not in definition:
++            raise InvalidEndpointDefinitionError(
++                "A name is required for every endpoint body parameter"
++            )
++        if "type" in definition and definition["type"] not in REQUEST_BODY_VALUE_TYPES:
++            raise InvalidEndpointDefinitionError(
++                f"Invalid type definition for body parameter '{definition['name']}'"
++            )

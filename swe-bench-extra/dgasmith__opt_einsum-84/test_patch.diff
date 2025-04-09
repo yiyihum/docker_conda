@@ -1,0 +1,81 @@
+diff --git a/opt_einsum/tests/test_backends.py b/opt_einsum/tests/test_backends.py
+index ca046e4..b596cf1 100644
+--- a/opt_einsum/tests/test_backends.py
++++ b/opt_einsum/tests/test_backends.py
+@@ -2,6 +2,7 @@ import numpy as np
+ import pytest
+ 
+ from opt_einsum import contract, helpers, contract_expression, backends, sharing
++from opt_einsum.contract import infer_backend, parse_backend, Shaped
+ 
+ try:
+     import cupy
+@@ -337,3 +338,10 @@ def test_torch_with_constants():
+     assert isinstance(res_got3, torch.Tensor)
+     res_got3 = res_got3.numpy() if res_got3.device.type == 'cpu' else res_got3.cpu().numpy()
+     assert np.allclose(res_exp, res_got3)
++
++
++def test_auto_backend_custom_array_no_tensordot():
++    x = Shaped((1, 2, 3))
++    # Shaped is an array-like object defined by opt_einsum - which has no TDOT
++    assert infer_backend(x) == 'opt_einsum'
++    assert parse_backend([x], 'auto') == 'numpy'
+diff --git a/opt_einsum/tests/test_contract.py b/opt_einsum/tests/test_contract.py
+index 7227e2d..775aac0 100644
+--- a/opt_einsum/tests/test_contract.py
++++ b/opt_einsum/tests/test_contract.py
+@@ -257,3 +257,9 @@ def test_linear_vs_ssa(equation):
+     ssa_path = linear_to_ssa(linear_path)
+     linear_path2 = ssa_to_linear(ssa_path)
+     assert linear_path2 == linear_path
++
++
++def test_contract_path_supply_shapes():
++    eq = 'ab,bc,cd'
++    shps = [(2, 3), (3, 4), (4, 5)]
++    contract_path(eq, *shps, shapes=True)
+diff --git a/opt_einsum/tests/test_paths.py b/opt_einsum/tests/test_paths.py
+index a860ee7..33b876b 100644
+--- a/opt_einsum/tests/test_paths.py
++++ b/opt_einsum/tests/test_paths.py
+@@ -108,6 +108,16 @@ def test_flop_cost():
+     assert 2000 == oe.helpers.flop_count("abc", True, 2, size_dict)
+ 
+ 
++def test_bad_path_option():
++    with pytest.raises(KeyError):
++        oe.contract("a,b,c", [1], [2], [3], optimize='optimall')
++
++
++def test_explicit_path():
++    x = oe.contract("a,b,c", [1], [2], [3], optimize=[(1, 2), (0, 1)])
++    assert x.item() == 6
++
++
+ def test_path_optimal():
+ 
+     test_func = oe.paths.optimal
+@@ -353,3 +363,22 @@ def test_custom_random_optimizer():
+     assert optimizer.was_used
+ 
+     assert len(optimizer.costs) == 16
++
++
++def test_optimizer_registration():
++
++    def custom_optimizer(inputs, output, size_dict, memory_limit):
++        return [(0, 1)] * (len(inputs) - 1)
++
++    with pytest.raises(KeyError):
++        oe.paths.register_path_fn('optimal', custom_optimizer)
++
++    oe.paths.register_path_fn('custom', custom_optimizer)
++    assert 'custom' in oe.paths._PATH_OPTIONS
++
++    eq = 'ab,bc,cd'
++    shapes = [(2, 3), (3, 4), (4, 5)]
++    path, path_info = oe.contract_path(eq, *shapes, shapes=True,
++                                       optimize='custom')
++    assert path == [(0, 1), (0, 1)]
++    del oe.paths._PATH_OPTIONS['custom']

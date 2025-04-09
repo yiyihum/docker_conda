@@ -1,0 +1,244 @@
+diff --git a/tests/integration/test_orders_api.py b/tests/integration/test_orders_api.py
+index 53f991d..c542ece 100644
+--- a/tests/integration/test_orders_api.py
++++ b/tests/integration/test_orders_api.py
+@@ -113,9 +113,7 @@ async def test_list_orders_basic(order_descriptions, session):
+ 
+     cl = OrdersClient(session, base_url=TEST_URL)
+     orders = await cl.list_orders()
+-
+-    oids = list(o.id for o in orders)
+-    assert oids == ['oid1', 'oid2', 'oid3']
++    assert order_descriptions == [o async for o in orders]
+ 
+ 
+ @respx.mock
+@@ -138,9 +136,7 @@ async def test_list_orders_state(order_descriptions, session):
+     # if the value of state doesn't get sent as a url parameter,
+     # the mock will fail and this test will fail
+     orders = await cl.list_orders(state='failed')
+-
+-    oids = list(o.id for o in orders)
+-    assert oids == ['oid1', 'oid2']
++    assert [order1, order2] == [o async for o in orders]
+ 
+ 
+ @pytest.mark.asyncio
+@@ -172,23 +168,7 @@ async def test_list_orders_limit(order_descriptions, session):
+     # since nono_page_url is not mocked, an error will occur if the client
+     # attempts to access the next page when the limit is already reached
+     orders = await cl.list_orders(limit=1)
+-
+-    oids = [o.id for o in orders]
+-    assert oids == ['oid1']
+-
+-
+-@respx.mock
+-@pytest.mark.asyncio
+-async def test_list_orders_asjson(order_descriptions, session):
+-    order1, order2, order3 = order_descriptions
+-
+-    page1_response = {"_links": {"_self": "string"}, "orders": [order1]}
+-    mock_resp1 = httpx.Response(HTTPStatus.OK, json=page1_response)
+-    respx.get(TEST_ORDERS_URL).return_value = mock_resp1
+-
+-    cl = OrdersClient(session, base_url=TEST_URL)
+-    orders = await cl.list_orders(as_json=True)
+-    assert orders[0]['id'] == 'oid1'
++    assert [order1] == [o async for o in orders]
+ 
+ 
+ @respx.mock
+@@ -200,7 +180,7 @@ async def test_create_order(oid, order_description, order_request, session):
+     cl = OrdersClient(session, base_url=TEST_URL)
+     order = await cl.create_order(order_request)
+ 
+-    assert order.json == order_description
++    assert order == order_description
+ 
+ 
+ @respx.mock
+@@ -259,8 +239,7 @@ async def test_get_order(oid, order_description, session):
+ 
+     cl = OrdersClient(session, base_url=TEST_URL)
+     order = await cl.get_order(oid)
+-
+-    assert order.state == 'queued'
++    assert order_description == order
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/integration/test_orders_cli.py b/tests/integration/test_orders_cli.py
+index 9d22d7a..4faa4dd 100644
+--- a/tests/integration/test_orders_cli.py
++++ b/tests/integration/test_orders_cli.py
+@@ -231,21 +231,6 @@ def test_cli_orders_wait_max_attempts(invoke, order_description, oid):
+         'Error: Maximum number of attempts (1) reached.\n')
+ 
+ 
+-@respx.mock
+-def test_cli_orders_wait_quiet(invoke, order_description, oid):
+-    get_url = f'{TEST_ORDERS_URL}/{oid}'
+-
+-    order_description['state'] = 'success'
+-
+-    route = respx.get(get_url)
+-    route.side_effect = [httpx.Response(HTTPStatus.OK, json=order_description)]
+-
+-    runner = CliRunner()
+-    result = invoke(['wait', '--delay', '0', '--quiet', oid], runner=runner)
+-    assert not result.exception
+-    assert result.output == 'success\n'
+-
+-
+ @pytest.fixture
+ def mock_download_response(oid, order_description):
+ 
+@@ -347,16 +332,6 @@ def test_cli_orders_download_overwrite(invoke,
+         assert json.load(open(filepath)) == {'key': 'value'}
+ 
+ 
+-@respx.mock
+-def test_cli_orders_download_quiet(invoke, mock_download_response, oid):
+-    mock_download_response()
+-
+-    runner = CliRunner()
+-    with runner.isolated_filesystem():
+-        result = invoke(['download', '--quiet', oid], runner=runner)
+-        assert not result.exception
+-
+-
+ @respx.mock
+ def test_cli_orders_download_state(invoke, order_description, oid):
+     get_url = f'{TEST_ORDERS_URL}/{oid}'
+diff --git a/tests/unit/test_cli_main.py b/tests/unit/test_cli_main.py
+index 9fb3715..8a90ab4 100644
+--- a/tests/unit/test_cli_main.py
++++ b/tests/unit/test_cli_main.py
+@@ -28,6 +28,26 @@ def debug_input():
+     return ['debug', ' debug ', 'debu', 45]
+ 
+ 
++def test_cli_orders_quiet():
++
++    runner = CliRunner()
++
++    # Valid and invalid inputs for the "quiet" flag
++    valid_quiet_inputs = ['--quiet', ' --quiet', ' --quiet ']
++    invalid_quiet_inputs = ['--quiet ', '-q', '--not_a_valid_input', 123]
++
++    # Test the valid quiet inputs
++    for quiet_input in valid_quiet_inputs:
++        valid_result = runner.invoke(cli.main, args=[quiet_input, 'orders'])
++        assert not valid_result.exception
++        assert valid_result.exit_code == 0
++    # Test the invalid quiet inputs
++    for quiet_input in invalid_quiet_inputs:
++        invalid_result = runner.invoke(cli.main, args=[quiet_input, 'orders'])
++        assert invalid_result.exception
++        assert invalid_result.exit_code != 0
++
++
+ def test_cli_info_verbosity(monkeypatch):
+     log_level = None
+ 
+diff --git a/tests/unit/test_models.py b/tests/unit/test_models.py
+index fea2549..38b6f70 100644
+--- a/tests/unit/test_models.py
++++ b/tests/unit/test_models.py
+@@ -11,7 +11,6 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-import copy
+ import logging
+ import math
+ from unittest.mock import MagicMock
+@@ -179,59 +178,7 @@ def get_pages():
+     return do_get
+ 
+ 
+-@pytest.mark.asyncio
+-async def test_Paged_iterator(get_pages):
+-    req = MagicMock()
+-    paged = models.Paged(req, get_pages)
+-    assert [1, 2, 3, 4] == [i async for i in paged]
+-
+-
+-@pytest.mark.asyncio
+-async def test_Paged_limit(get_pages):
+-    req = MagicMock()
+-    paged = models.Paged(req, get_pages, limit=3)
+-    assert [1, 2, 3] == [i async for i in paged]
+-
+-
+-@pytest.fixture
+-def get_orders_pages(orders_page):
+-    page2 = copy.deepcopy(orders_page)
+-    del page2['_links']['next']
+-    responses = [
+-        mock_http_response(json=orders_page), mock_http_response(json=page2)
+-    ]
+-
+-    async def do_get(req):
+-        return responses.pop(0)
+-
+-    return do_get
+-
+-
+-@pytest.mark.asyncio
+-async def test_Orders(get_orders_pages):
+-    req = MagicMock()
+-    orders = models.Orders(req, get_orders_pages)
+-    expected_ids = [
+-        'f05b1ed7-11f0-43da-960c-a624f7c355c8',
+-        '8d4799c4-5291-40c0-a7f5-adb9a974455d',
+-        'f05b1ed7-11f0-43da-960c-a624f7c355c8',
+-        '8d4799c4-5291-40c0-a7f5-adb9a974455d'
+-    ]
+-    assert expected_ids == [o.id async for o in orders]
+-
+-
+-def test_Order_results(order_description):
+-    order = models.Order(order_description)
+-    assert len(order.results) == 3
+-
+-
+-def test_Order_locations(order_description):
+-    order = models.Order(order_description)
+-    expected_locations = ['location1', 'location2', 'location3']
+-    assert order.locations == expected_locations
+-
+-
+-def test_last_modified_emptyheader():
++def test_StreamingBody_last_modified_emptyheader():
+     '''This function tests the last_modified function for an empty header, by
+     seeing if the last_modified is None.
+     '''
+@@ -252,7 +199,7 @@ def test_last_modified_emptyheader():
+     assert output == expected
+ 
+ 
+-def test_last_modified_completeheader():
++def test_StreamingBody_last_modified_completeheader():
+     '''This function tests the last_modified function for an existing header,
+     by comparing the last_modified date to
+     an expected output.
+@@ -274,3 +221,17 @@ def test_last_modified_completeheader():
+     expected = datetime.strptime(hr.headers['last-modified'],
+                                  '%a, %d %b %Y %H:%M:%S GMT')
+     assert output == expected
++
++
++@pytest.mark.asyncio
++async def test_Paged_iterator(get_pages):
++    req = MagicMock()
++    paged = models.Paged(req, get_pages)
++    assert [1, 2, 3, 4] == [i async for i in paged]
++
++
++@pytest.mark.asyncio
++async def test_Paged_limit(get_pages):
++    req = MagicMock()
++    paged = models.Paged(req, get_pages, limit=3)
++    assert [1, 2, 3] == [i async for i in paged]

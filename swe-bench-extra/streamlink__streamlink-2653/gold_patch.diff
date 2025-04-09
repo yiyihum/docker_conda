@@ -1,0 +1,361 @@
+diff --git a/.travis.yml b/.travis.yml
+index 0a83c747..6f9a25b8 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -33,7 +33,7 @@ before_install:
+       pip install doctr;
+     fi
+   - if [[ $BUILD_INSTALLER == 'yes' ]]; then
+-      pip install git+https://github.com/takluyver/pynsist.git@88f56f9e86af9c55522147a67f8b7806ac2ca55b;
++      pip install pynsist==2.4;
+     fi
+ 
+ install:
+diff --git a/docs/plugin_matrix.rst b/docs/plugin_matrix.rst
+index 7ffd8bd5..6f3f327f 100644
+--- a/docs/plugin_matrix.rst
++++ b/docs/plugin_matrix.rst
+@@ -16,6 +16,9 @@ abematv                 abema.tv             Yes   Yes   Streams are geo-restric
+ abweb                   abweb.com            Yes   No    Requires a login and a subscription.
+ adultswim               adultswim.com        Yes   Yes   Streams may be geo-restricted, some VOD streams are protected by DRM.
+ afreeca                 play.afreecatv.com   Yes   No
++albavision              - tvc.com.ec         Yes   No    Some streams are geo-restricted.
++                        - rts.com.ec
++                        - elnueve.com.ar
+ aljazeeraen             aljazeera.com        Yes   Yes   English version of the site.
+ animelab                animelab.com         --    Yes   Requires a login. Streams may be geo-restricted to Australia and New Zealand.
+ app17                   17app.co             Yes   --
+@@ -261,6 +264,7 @@ viasat                  - juicyplay.dk       Yes   Yes   Streams may be geo-rest
+ vidio                   vidio.com            Yes   Yes
+ vimeo                   vimeo.com            Yes   Yes   Password-protected videos are not supported.
+ vinhlongtv              thvli.vn             Yes   No    Streams are geo-restricted to Vietnam
++viutv                   viu.tv               Yes   No    Streams are geo-restricted to Hong Kong
+ vk                      vk.com               Yes   Yes
+ vrtbe                   vrt.be/vrtnu         Yes   Yes
+ vtvgo                   vtvgo.vn             Yes   No
+diff --git a/src/streamlink/plugins/albavision.py b/src/streamlink/plugins/albavision.py
+new file mode 100644
+index 00000000..6d8d4625
+--- /dev/null
++++ b/src/streamlink/plugins/albavision.py
+@@ -0,0 +1,117 @@
++"""
++Support for the live streams on Albavision sites
++    - http://www.tvc.com.ec
++    - http://www.rts.com.ec
++    - https://www.elnueve.com.ar
++"""
++import logging
++import re
++import time
++
++from streamlink import PluginError
++from streamlink.compat import quote, urlencode
++from streamlink.plugin import Plugin
++from streamlink.plugin.api.utils import itertags
++from streamlink.stream import HLSStream
++from streamlink.utils import update_scheme
++
++log = logging.getLogger(__name__)
++
++
++class Albavision(Plugin):
++    _url_re = re.compile(r"https?://(?:www\.)?(tvc.com.ec|rts.com.ec|elnueve.com.ar)/en-?vivo")
++    _token_input_re = re.compile(r"Math.floor\(Date.now\(\) / 3600000\),'([a-f0-9OK]+)'")
++    _live_url_re = re.compile(r"LIVE_URL = '(.*?)';")
++    _playlist_re = re.compile(r"file:\s*'(http.*m3u8)'")
++    _token_url_re = re.compile(r"https://.*/token/.*?\?rsk=")
++
++    _channel_urls = {
++        'Quito': 'http://d3aacg6baj4jn0.cloudfront.net/reproductor_rts_o_quito.html?iut=',
++        'Guayaquil': 'http://d2a6tcnofawcbm.cloudfront.net/player_rts.html?iut=',
++        'Canal5': 'http://dxejh4fchgs18.cloudfront.net/player_televicentro.html?iut='
++    }
++
++    def __init__(self, url):
++        super(Albavision, self).__init__(url)
++        self._page = None
++
++    @classmethod
++    def can_handle_url(cls, url):
++        return cls._url_re.match(url) is not None
++
++    @property
++    def page(self):
++        if not self._page:
++            self._page = self.session.http.get(self.url)
++        return self._page
++
++    def _get_token_url(self):
++        token = self._get_live_url_token()
++        if token:
++            m = self._token_url_re.search(self.page.text)
++            token_url = m and m.group(0)
++            if token_url:
++                log.debug("token_url={0}{1}".format(token_url, token))
++                return token_url + token
++        else:
++            log.error("Could not find site token")
++
++    @staticmethod
++    def transform_token(token_in, date):
++        token_out = list(token_in)
++        offset = len(token_in)
++        for i in range(offset - 1, -1, -1):
++            p = (i * date) % offset
++            # swap chars at p and i
++            token_out[i], token_out[p] = token_out[p], token_out[i]
++        token_out = ''.join(token_out)
++        if token_out.endswith("OK"):
++            return token_out[:-2]  # return token without OK suffix
++        else:
++            log.error("Invalid site token: {0} => {1}".format(token_in, token_out))
++
++    def _get_live_url_token(self):
++        m = self._token_input_re.search(self.page.text)
++        if m:
++            date = int(time.time()//3600)
++            return self.transform_token(m.group(1), date) or self.transform_token(m.group(1), date - 1)
++
++    def _get_token(self):
++        token_url = self._get_token_url()
++        if token_url:
++            res = self.session.http.get(token_url)
++            data = self.session.http.json(res)
++            if data['success']:
++                return data['token']
++
++    def _get_streams(self):
++        m = self._live_url_re.search(self.page.text)
++        playlist_url = m and update_scheme(self.url, m.group(1))
++        player_url = self.url
++        token = self._get_token()
++
++        if playlist_url:
++            log.debug("Found playlist URL in the page")
++        else:
++            live_channel = None
++            for div in itertags(self.page.text, "div"):
++                if div.attributes.get("id") == "botonLive":
++                    live_channel = div.attributes.get("data-canal")
++
++            if live_channel:
++                log.debug("Live channel: {0}".format(live_channel))
++                player_url = self._channel_urls[live_channel]+quote(token)
++                page = self.session.http.get(player_url, raise_for_status=False)
++                if "block access from your country." in page.text:
++                    raise PluginError("Content is geo-locked")
++                m = self._playlist_re.search(page.text)
++                playlist_url = m and update_scheme(self.url, m.group(1))
++            else:
++                log.error("Could not find the live channel")
++
++        if playlist_url:
++            stream_url = "{0}?{1}".format(playlist_url, urlencode({"iut": token}))
++            return HLSStream.parse_variant_playlist(self.session, stream_url, headers={"referer": player_url})
++
++
++__plugin__ = Albavision
+diff --git a/src/streamlink/plugins/bloomberg.py b/src/streamlink/plugins/bloomberg.py
+index 638151a6..1d768ce7 100644
+--- a/src/streamlink/plugins/bloomberg.py
++++ b/src/streamlink/plugins/bloomberg.py
+@@ -1,11 +1,14 @@
+-from functools import partial
++import logging
+ import re
++from functools import partial
+ 
+ from streamlink.plugin import Plugin
+-from streamlink.plugin.api import validate
++from streamlink.plugin.api import validate, useragents
+ from streamlink.stream import HDSStream, HLSStream, HTTPStream
+ from streamlink.utils import parse_json, update_scheme
+ 
++log = logging.getLogger(__name__)
++
+ 
+ class Bloomberg(Plugin):
+     VOD_API_URL = 'https://www.bloomberg.com/api/embed?id={0}'
+@@ -21,23 +24,26 @@ class Bloomberg(Plugin):
+     }
+ 
+     _url_re = re.compile(r'''
+-        https?://www\.bloomberg\.com/(
+-            news/videos/[^/]+/[^/]+ |
+-            (?P<channel>live/(?:stream|emea|asia_stream|europe|us|asia)|audio)/?
++        https?://(?:www\.)?bloomberg\.com/
++        (?:
++            news/videos/[^/]+/[^/]+|
++            live/(?P<channel>.+)/?
+         )
+ ''', re.VERBOSE)
+     _live_player_re = re.compile(r'{APP_BUNDLE:"(?P<live_player_url>.+?/app.js)"')
+     _js_to_json_re = partial(re.compile(r'(\w+):(["\']|\d?\.?\d+,|true|false|\[|{)').sub, r'"\1":\2')
+     _video_id_re = re.compile(r'data-bmmr-id=\\"(?P<video_id>.+?)\\"')
+     _mp4_bitrate_re = re.compile(r'.*_(?P<bitrate>[0-9]+)\.mp4')
++    _preload_state_re = re.compile(r'window.__PRELOADED_STATE__\s*=\s*({.*});', re.DOTALL)
++    _live_stream_info_re = re.compile(r'12:.*t.exports=({.*})},{}],13:', re.DOTALL)
+ 
+     _live_streams_schema = validate.Schema(
+         validate.transform(_js_to_json_re),
+         validate.transform(lambda x: x.replace(':.', ':0.')),
+         validate.transform(parse_json),
+-        validate.Schema(
+-            {
+-                'cdns': validate.all(
++        validate.Schema({
++            validate.text: {
++                validate.optional('cdns'): validate.all(
+                     [
+                         validate.Schema(
+                             {
+@@ -54,11 +60,21 @@ class Bloomberg(Plugin):
+                     ],
+                     validate.transform(lambda x: [i for y in x for i in y])
+                 )
+-            },
+-            validate.get('cdns')
++            }
++        },
+         )
+     )
+ 
++    _channel_list_schema = validate.Schema(
++        validate.transform(parse_json),
++        {"live": {"channels": {"byChannelId": {
++            validate.text: validate.all({"liveId": validate.text}, validate.get("liveId"))
++        }}}},
++        validate.get("live"),
++        validate.get("channels"),
++        validate.get("byChannelId"),
++    )
++
+     _vod_api_schema = validate.Schema(
+         {
+             'secureStreams': validate.all([
+@@ -87,23 +103,39 @@ class Bloomberg(Plugin):
+         match = self._url_re.match(self.url)
+         channel = match.group('channel')
+ 
+-        # Retrieve live player URL
+-        res = self.session.http.get(self.PLAYER_URL)
+-        match = self._live_player_re.search(res.text)
+-        if match is None:
+-            return []
+-        live_player_url = update_scheme(self.url, match.group('live_player_url'))
+-
+-        # Extract streams from the live player page
+-        res = self.session.http.get(live_player_url)
+-        stream_datas = re.findall(r'{0}(?:_MINI)?:({{.+?}}]}}]}})'.format(self.CHANNEL_MAP[channel]), res.text)
+-        streams = []
+-        for s in stream_datas:
+-            for u in self._live_streams_schema.validate(s):
+-                if u not in streams:
+-                    streams.append(u)
+-
+-        return streams
++        res = self.session.http.get(self.url, headers={
++            "authority": "www.bloomberg.com",
++            "upgrade-insecure-requests": "1",
++            "dnt": "1",
++            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3"
++        })
++        if "Are you a robot?" in res.text:
++            log.error("Are you a robot?")
++        match = self._preload_state_re.search(res.text)
++        if match:
++            live_ids = self._channel_list_schema.validate(match.group(1))
++            live_id = live_ids.get(channel)
++            if live_id:
++                log.debug("Found liveId = {0}".format(live_id))
++                # Retrieve live player URL
++                res = self.session.http.get(self.PLAYER_URL)
++                match = self._live_player_re.search(res.text)
++                if match is None:
++                    return []
++                live_player_url = update_scheme(self.url, match.group('live_player_url'))
++
++                # Extract streams from the live player page
++                log.debug("Player URL: {0}".format(live_player_url))
++                res = self.session.http.get(live_player_url)
++                match = self._live_stream_info_re.search(res.text)
++                if match:
++                    stream_info = self._live_streams_schema.validate(match.group(1))
++                    data = stream_info.get(live_id, {})
++                    return data.get('cdns', [])
++            else:
++                log.error("Could not find liveId for channel '{0}'".format(channel))
++
++        return []
+ 
+     def _get_vod_streams(self):
+         # Retrieve URL page and search for video ID
+@@ -118,6 +150,7 @@ class Bloomberg(Plugin):
+         return streams
+ 
+     def _get_streams(self):
++        self.session.http.headers.update({"User-Agent": useragents.CHROME})
+         if '/news/videos/' in self.url:
+             # VOD
+             streams = self._get_vod_streams()
+@@ -126,6 +159,7 @@ class Bloomberg(Plugin):
+             streams = self._get_live_streams()
+ 
+         for video_url in streams:
++            log.debug("Found stream: {0}".format(video_url))
+             if '.f4m' in video_url:
+                 for stream in HDSStream.parse_manifest(self.session, video_url).items():
+                     yield stream
+diff --git a/src/streamlink/plugins/viutv.py b/src/streamlink/plugins/viutv.py
+new file mode 100644
+index 00000000..24b6cbb9
+--- /dev/null
++++ b/src/streamlink/plugins/viutv.py
+@@ -0,0 +1,46 @@
++import datetime
++import logging
++import random
++import re
++import json
++
++from streamlink.plugin import Plugin
++from streamlink.stream import HLSStream
++
++log = logging.getLogger(__name__)
++
++
++class ViuTV(Plugin):
++    _url_re = re.compile(r"https?://viu\.tv/ch/(\d+)")
++    api_url = "https://api.viu.now.com/p8/2/getLiveURL"
++
++    @classmethod
++    def can_handle_url(cls, url):
++        return cls._url_re.match(url) is not None
++
++    @property
++    def device_id(self):
++        return "".join(random.choice("abcdef0123456789") for _ in range(18))
++
++    @property
++    def channel_id(self):
++        return self._url_re.match(self.url).group(1)
++
++    def _get_streams(self):
++        api_res = self.session.http.post(self.api_url,
++                                         headers={"Content-Type": 'application/json'},
++                                         data=json.dumps({"callerReferenceNo": datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
++                                                          "channelno": self.channel_id.zfill(3),
++                                                          "mode": "prod",
++                                                          "deviceId": self.device_id,
++                                                          "deviceType": "5",
++                                                          "format": "HLS"}))
++        data = self.session.http.json(api_res)
++        if data['responseCode'] == 'SUCCESS':
++            for stream_url in data.get("asset", {}).get("hls", {}).get("adaptive", []):
++                return HLSStream.parse_variant_playlist(self.session, stream_url)
++        else:
++            log.error("Failed to get stream URL: {0}".format(data['responseCode']))
++
++
++__plugin__ = ViuTV

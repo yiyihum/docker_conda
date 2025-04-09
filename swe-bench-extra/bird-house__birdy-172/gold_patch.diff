@@ -1,0 +1,109 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index bf4ed82..613a7d0 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,6 +1,14 @@
+ Change History
+ **************
+ 
++0.6.7 (2020-03-10)
++==================
++
++Changes:
++
++* Fixed passing Path objects (#169)
++* Trying to guess mime type of inputs rather than taking the first value (#171)
++
+ 0.6.6 (2020-03-03)
+ ==================
+ 
+diff --git a/birdy/client/base.py b/birdy/client/base.py
+index d220a83..9bbf39f 100644
+--- a/birdy/client/base.py
++++ b/birdy/client/base.py
+@@ -11,7 +11,7 @@ from owslib.wps import WPS_DEFAULT_VERSION, WebProcessingService, SYNC, ASYNC, C
+ 
+ from birdy.exceptions import UnauthorizedException
+ from birdy.client import utils
+-from birdy.utils import sanitize, fix_url, embed
++from birdy.utils import sanitize, fix_url, embed, guess_type
+ from birdy.client import notebook
+ from birdy.client.outputs import WPSResult
+ 
+@@ -243,21 +243,35 @@ class WPSClient(object):
+                 continue
+ 
+             values = [arg, ] if not isinstance(arg, (list, tuple)) else arg
++            supported_mimetypes = [v.mimeType for v in input_param.supportedValues]
+ 
+             for value in values:
++                #  if input_param.dataType == "ComplexData": seems simpler
+                 if isinstance(input_param.defaultValue, ComplexData):
+-                    encoding = input_param.defaultValue.encoding
+-                    mimetype = input_param.defaultValue.mimeType
++
++                    # Guess the mimetype of the input value
++                    mimetype, encoding = guess_type(value)
++
++                    # If unrecognized, default to the first supported mimetype
++                    if mimetype is None:
++                        mimetype = supported_mimetypes[0]
++                    else:
++                        if mimetype not in supported_mimetypes:
++                            raise ValueError(f"mimetype {mimetype} not in supported mimetypes {supported_mimetypes}.")
++
++                    if encoding is None:
++                        encoding = input_param.defaultValue.encoding
+ 
+                     if isinstance(value, ComplexData):
+                         inp = value
+ 
++                    # Either embed the file content or just the reference.
+                     else:
+                         if utils.is_embedded_in_request(self._wps.url, value):
+                             # If encoding is None, this will return the actual encoding used (utf-8 or base64).
+                             value, encoding = embed(value, mimetype, encoding=encoding)
+                         else:
+-                            value = fix_url(value)
++                            value = fix_url(str(value))
+ 
+                         inp = utils.to_owslib(value,
+                                               data_type=input_param.dataType,
+diff --git a/birdy/utils.py b/birdy/utils.py
+index fbdba72..b892acf 100644
+--- a/birdy/utils.py
++++ b/birdy/utils.py
+@@ -120,3 +120,33 @@ def _encode(content, mimetype, encoding):
+             return content, encoding
+         # Do we need to escape content that is not HTML safe ?
+         # return u'<![CDATA[{}]]>'.format(content)
++
++
++def guess_type(url):
++    """Guess the mime type of the file link.
++
++    Returns
++    -------
++    mimetype, encoding
++    """
++    import mimetypes
++
++    try:
++        mime, enc = mimetypes.guess_type(url, strict=False)
++    except TypeError:
++        mime, enc = None, None
++
++    # Special cases
++    # -------------
++
++    # netCDF
++    if mime == "application/x-netcdf" and "dodsC" in url:
++        mime = "application/x-ogc-dods"
++
++    # application/zip vs application/x-zipped-shp
++    # TODO
++
++    # All the various XML schemes
++    # TODO
++
++    return mime, enc

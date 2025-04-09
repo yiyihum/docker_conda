@@ -1,0 +1,107 @@
+diff --git a/newt/main.py b/newt/main.py
+index f44243e..3910850 100644
+--- a/newt/main.py
++++ b/newt/main.py
+@@ -16,9 +16,9 @@ def open_json_file(json_path):
+         return json.load(fp)
+ 
+ 
+-def write_output(bundles: typing.Iterator[Bundle], out_file):
++def write_output(bundles: typing.Iterator[Bundle], out_file, pretty_print):
+     with open(out_file, 'w') as fp:
+-        json.dump(list(bundles), fp)
++        json.dump(list(bundles), fp, indent=2 if pretty_print else None)
+ 
+ 
+ def add_parser_to_subparser(sub_parser, parse_name, parse_help):
+@@ -29,6 +29,8 @@ def add_parser_to_subparser(sub_parser, parse_name, parse_help):
+     parser.add_argument('--output-json', dest='output_json',
+                         help='where to write transformed output.', required=False,
+                         default='out.json')
++    parser.add_argument('--pp', action='store_true', default=False,
++                        help='pretty print output json.')
+ 
+ 
+ def main(argv=None):
+@@ -61,4 +63,4 @@ def main(argv=None):
+         raise ValueError(f'Invalid metadata source format {options.transform_source}')
+ 
+     bundle_iterator = transformer.transform()
+-    write_output(bundle_iterator, options.output_json)
++    write_output(bundle_iterator, options.output_json, options.pp)
+diff --git a/newt/transform/gen3standard.py b/newt/transform/gen3standard.py
+index c68389d..4c48f91 100644
+--- a/newt/transform/gen3standard.py
++++ b/newt/transform/gen3standard.py
+@@ -51,7 +51,10 @@ class Bundle(dict):
+         :param linked_field_name: the metadata field that is linked to
+         :param link_name: the actual name of the link in the source_field. Usually there is some subtle variation
+         """
+-        if source_field_name in self.metadata.keys():
++        if linked_field_name == 'program':
++            # Since gen3 export exports a single program, we just grab the only value
++            self.metadata[linked_field_name] = list(metadata_source[linked_field_name].values())[0]
++        elif source_field_name in self.metadata.keys():
+             # Get the id of the specific item we want to add
+             linked_field_key = self.metadata[source_field_name]['link_fields'][link_name]
+             # Get the dictionary that goes with that specific item
+@@ -130,7 +133,8 @@ class Gen3Transformer(AbstractTransformer):
+                                 MetadataLink('sample', 'case', 'cases.id'),
+                                 MetadataLink('case', 'study', 'studies.id#1'),
+                                 MetadataLink('demographic', 'case', 'cases.id'),
+-                                MetadataLink('study', 'project', 'projects.id')
++                                MetadataLink('study', 'project', 'projects.id'),
++                                MetadataLink('project', 'program', 'id')
+                                 ]
+ 
+     def _build_bundle(self, metadata_dict: dict):
+diff --git a/scripts/data_bleach.py b/scripts/data_bleach.py
+index 8a9be24..6f51f70 100644
+--- a/scripts/data_bleach.py
++++ b/scripts/data_bleach.py
+@@ -26,8 +26,9 @@ PUBLIC_FIELDS = [x.split('.') for x in [
+     "aliquot.analyte_isolation_method",
+     "sample.biospecimen_anatomic_site_detail",
+     "sample.biospecimen_anatomic_site",
+-    "project.code",
+-    "project.name"]]
++    "project.name",
++    "program.code",
++    "project.dbgap_accession_number"]]
+ 
+ 
+ def error(*args, **kwargs):
+@@ -39,6 +40,23 @@ def is_protected_field(key, context):
+     return not any([context + [key] == field for field in PUBLIC_FIELDS])
+ 
+ 
++def get_sanitized_value(value):
++    result = None
++    if value is None:
++        result = None
++    elif isinstance(value, str):
++        result = "--------" if len(value) > 0 else ""
++    elif isinstance(value, bool):
++        result = False
++    elif isinstance(value, float):
++        result = 0.0
++    elif isinstance(value, int):
++        result = 0
++    elif isinstance(value, list):
++        result = []
++    return result
++
++
+ def recursive_clear(d, context=None):
+     """
+     clear the values of a dictionary unless the value is another dictionary
+@@ -53,7 +71,7 @@ def recursive_clear(d, context=None):
+             recursive_clear(val, context=context + [key])
+         else:
+             if is_protected_field(key, context):
+-                d[key] = ''
++                d[key] = get_sanitized_value(d[key])
+ 
+ 
+ def sanitize_bundle(bundle):
+

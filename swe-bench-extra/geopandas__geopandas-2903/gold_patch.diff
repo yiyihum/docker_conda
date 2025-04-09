@@ -1,0 +1,177 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e301b30..e712a80 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,7 +4,8 @@
+ 
+ New methods:
+ 
+-- Added ``offset_curve`` method from shapely to GeoSeries/GeoDataframe.
++- Added ``concave_hull`` method from shapely to GeoSeries/GeoDataframe. (#2903)
++- Added ``offset_curve`` method from shapely to GeoSeries/GeoDataframe. (#2902)
+ 
+ New features and improvements:
+ 
+diff --git a/doc/source/docs/reference/geoseries.rst b/doc/source/docs/reference/geoseries.rst
+index e661a33..a248a3e 100644
+--- a/doc/source/docs/reference/geoseries.rst
++++ b/doc/source/docs/reference/geoseries.rst
+@@ -87,6 +87,7 @@ Constructive methods and attributes
+    GeoSeries.buffer
+    GeoSeries.boundary
+    GeoSeries.centroid
++   GeoSeries.concave_hull
+    GeoSeries.convex_hull
+    GeoSeries.envelope
+    GeoSeries.make_valid
+diff --git a/doc/source/docs/user_guide/geometric_manipulations.rst b/doc/source/docs/user_guide/geometric_manipulations.rst
+index cf9861b..f3b944a 100644
+--- a/doc/source/docs/user_guide/geometric_manipulations.rst
++++ b/doc/source/docs/user_guide/geometric_manipulations.rst
+@@ -24,6 +24,13 @@ Constructive methods
+ 
+   Returns a :class:`~geopandas.GeoSeries` of points for each geometric centroid.
+ 
++.. attribute:: GeoSeries.concave_hull
++
++  Returns a :class:`~geopandas.GeoSeries` of geometries representing the smallest
++  concave `Polygon` containing all the points in each object unless the
++  number of points in the object is less than three. For two points,
++  the concave hull collapses to a `LineString`; for 1, a `Point`.
++
+ .. attribute:: GeoSeries.convex_hull
+ 
+   Returns a :class:`~geopandas.GeoSeries` of geometries representing the smallest
+diff --git a/geopandas/_vectorized.py b/geopandas/_vectorized.py
+index 7642b82..e185f28 100644
+--- a/geopandas/_vectorized.py
++++ b/geopandas/_vectorized.py
+@@ -611,6 +611,23 @@ def centroid(data):
+         return _unary_geo("centroid", data)
+ 
+ 
++def concave_hull(data, **kwargs):
++    if compat.USE_SHAPELY_20:
++        return shapely.concave_hull(data, **kwargs)
++    if compat.USE_PYGEOS and compat.SHAPELY_GE_20:
++        warnings.warn(
++            "PyGEOS does not support concave_hull, and Shapely >= 2 is installed, "
++            "thus using Shapely and not PyGEOS for calculating the concave_hull.",
++            stacklevel=4,
++        )
++        return shapely.concave_hull(to_shapely(data), **kwargs)
++    else:
++        raise NotImplementedError(
++            f"shapely >= 2.0 is required, "
++            f"version {shapely.__version__} is installed"
++        )
++
++
+ def convex_hull(data):
+     if compat.USE_SHAPELY_20:
+         return shapely.convex_hull(data)
+diff --git a/geopandas/array.py b/geopandas/array.py
+index bd26c11..81acfb5 100644
+--- a/geopandas/array.py
++++ b/geopandas/array.py
+@@ -29,7 +29,6 @@ from . import _compat as compat
+ from . import _vectorized as vectorized
+ from .sindex import _get_sindex_class
+ 
+-
+ TransformerFromCRS = lru_cache(Transformer.from_crs)
+ 
+ 
+@@ -513,6 +512,9 @@ class GeometryArray(ExtensionArray):
+         self.check_geographic_crs(stacklevel=5)
+         return GeometryArray(vectorized.centroid(self._data), crs=self.crs)
+ 
++    def concave_hull(self, ratio, allow_holes):
++        return vectorized.concave_hull(self._data, ratio=ratio, allow_holes=allow_holes)
++
+     @property
+     def convex_hull(self):
+         return GeometryArray(vectorized.convex_hull(self._data), crs=self.crs)
+diff --git a/geopandas/base.py b/geopandas/base.py
+index e8733d7..fac044d 100644
+--- a/geopandas/base.py
++++ b/geopandas/base.py
+@@ -492,6 +492,70 @@ GeometryCollection
+         """
+         return _delegate_property("centroid", self)
+ 
++    def concave_hull(self, ratio=0.0, allow_holes=False):
++        """Returns a ``GeoSeries`` of geometries representing the concave hull
++        of each geometry.
++
++        The concave hull of a geometry is the smallest concave `Polygon`
++        containing all the points in each geometry, unless the number of points
++        in the geometric object is less than three. For two points, the concave
++        hull collapses to a `LineString`; for 1, a `Point`.
++
++        The hull is constructed by removing border triangles of the Delaunay
++        Triangulation of the points as long as their "size" is larger than the
++        maximum edge length ratio and optionally allowing holes. The edge length factor
++        is a fraction of the length difference between the longest and shortest edges
++        in the Delaunay Triangulation of the input points. For further information
++        on the algorithm used, see
++        https://libgeos.org/doxygen/classgeos_1_1algorithm_1_1hull_1_1ConcaveHull.html
++
++        Parameters
++        ----------
++        ratio : float, (optional, default 0.0)
++            Number in the range [0, 1]. Higher numbers will include fewer vertices
++            in the hull.
++        allow_holes : bool, (optional, default False)
++            If set to True, the concave hull may have holes.
++
++        Examples
++        --------
++
++        >>> from shapely.geometry import Polygon, LineString, Point, MultiPoint
++        >>> s = geopandas.GeoSeries(
++        ...     [
++        ...         Polygon([(0, 0), (1, 1), (0, 1)]),
++        ...         LineString([(0, 0), (1, 1), (1, 0)]),
++        ...         MultiPoint([(0, 0), (1, 1), (0, 1), (1, 0), (0.5, 0.5)]),
++        ...         MultiPoint([(0, 0), (1, 1)]),
++        ...         Point(0, 0),
++        ...     ],
++        ...     crs=3857
++        ... )
++        >>> s
++        0    POLYGON ((0.000 0.000, 1.000 1.000, 0.000 1.00...
++        1    LINESTRING (0.000 0.000, 1.000 1.000, 1.000 0....
++        2    MULTIPOINT (0.000 0.000, 1.000 1.000, 0.000 1....
++        3                MULTIPOINT (0.000 0.000, 1.000 1.000)
++        4                                  POINT (0.000 0.000)
++        dtype: geometry
++
++        >>> s.concave_hull()
++        0    POLYGON ((0.000 1.000, 1.000 1.000, 0.000 0.00...
++        1    POLYGON ((0.000 0.000, 1.000 1.000, 1.000 0.00...
++        2    POLYGON ((0.500 0.500, 0.000 1.000, 1.000 1.00...
++        3                LINESTRING (0.000 0.000, 1.000 1.000)
++        4                                  POINT (0.000 0.000)
++        dtype: geometry
++
++        See also
++        --------
++        GeoSeries.convex_hull : convex hull geometry
++
++        """
++        return _delegate_geo_method(
++            "concave_hull", self, ratio=ratio, allow_holes=allow_holes
++        )
++
+     @property
+     def convex_hull(self):
+         """Returns a ``GeoSeries`` of geometries representing the convex hull
+@@ -533,6 +597,7 @@ GeometryCollection
+ 
+         See also
+         --------
++        GeoSeries.concave_hull : concave hull geometry
+         GeoSeries.envelope : bounding rectangle geometry
+ 
+         """

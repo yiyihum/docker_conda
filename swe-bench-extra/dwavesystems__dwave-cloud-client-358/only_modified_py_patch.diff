@@ -1,0 +1,265 @@
+diff --git a/dwave/cloud/client.py b/dwave/cloud/client.py
+index 2605872..ec06111 100644
+--- a/dwave/cloud/client.py
++++ b/dwave/cloud/client.py
+@@ -161,6 +161,7 @@ class Client(object):
+     _SUBMISSION_THREAD_COUNT = 5
+     _UPLOAD_PROBLEM_THREAD_COUNT = 1
+     _UPLOAD_PART_THREAD_COUNT = 10
++    _ENCODE_PROBLEM_THREAD_COUNT = _UPLOAD_PROBLEM_THREAD_COUNT
+     _CANCEL_THREAD_COUNT = 1
+     _POLL_THREAD_COUNT = 2
+     _LOAD_THREAD_COUNT = 5
+@@ -481,6 +482,9 @@ class Client(object):
+         self._upload_part_executor = \
+             PriorityThreadPoolExecutor(self._UPLOAD_PART_THREAD_COUNT)
+ 
++        self._encode_problem_executor = \
++            ThreadPoolExecutor(self._ENCODE_PROBLEM_THREAD_COUNT)
++
+         dispatch_event(
+             'after_client_init', obj=self, args=args, return_value=None)
+ 
+@@ -549,6 +553,8 @@ class Client(object):
+         self._upload_problem_executor.shutdown()
+         logger.debug("Shutting down problem part upload executor")
+         self._upload_part_executor.shutdown()
++        logger.debug("Shutting down problem encoder executor")
++        self._encode_problem_executor.shutdown()
+ 
+         # Send kill-task to all worker threads
+         # Note: threads can't be 'killed' in Python, they have to die by
+@@ -1072,6 +1078,38 @@ class Client(object):
+         Note:
+             This method is always run inside of a daemon thread.
+         """
++
++        def task_done():
++            self._submission_queue.task_done()
++
++        def filter_ready(item):
++            """Pass-through ready (encoded) problems, re-enqueue ones for which
++            the encoding is in progress, and fail the ones for which encoding
++            failed.
++            """
++
++            # body is a `concurrent.futures.Future`, so make sure
++            # it's ready for submitting
++            if item.body.done():
++                exc = item.body.exception()
++                if exc:
++                    # encoding failed, submit should fail as well
++                    logger.info("Problem encoding prior to submit "
++                                "failed with: %r", exc)
++                    item.future._set_error(exc)
++                    task_done()
++
++                else:
++                    # problem ready for submit
++                    return [item]
++
++            else:
++                # body not ready, return the item to queue
++                self._submission_queue.put(item)
++                task_done()
++
++            return []
++
+         session = self.create_session()
+         try:
+             while True:
+@@ -1083,19 +1121,25 @@ class Client(object):
+                 item = self._submission_queue.get()
+ 
+                 if item is None:
++                    task_done()
+                     break
+ 
+-                ready_problems = [item]
++                ready_problems = filter_ready(item)
+                 while len(ready_problems) < self._SUBMIT_BATCH_SIZE:
+                     try:
+-                        ready_problems.append(self._submission_queue.get_nowait())
++                        item = self._submission_queue.get_nowait()
+                     except queue.Empty:
+                         break
+ 
++                    ready_problems.extend(filter_ready(item))
++
++                if not ready_problems:
++                    continue
++
+                 # Submit the problems
+                 logger.debug("Submitting %d problems", len(ready_problems))
+-                body = '[' + ','.join(mess.body for mess in ready_problems) + ']'
+                 try:
++                    body = '[' + ','.join(mess.body.result() for mess in ready_problems) + ']'
+                     try:
+                         response = session.post('problems/', body)
+                         localtime_of_response = epochnow()
+@@ -1115,14 +1159,14 @@ class Client(object):
+ 
+                     for mess in ready_problems:
+                         mess.future._set_error(exception, sys.exc_info())
+-                        self._submission_queue.task_done()
++                        task_done()
+                     continue
+ 
+                 # Pass on the information
+                 for submission, res in zip(ready_problems, message):
+                     submission.future._set_clock_diff(response, localtime_of_response)
+                     self._handle_problem_status(res, submission.future)
+-                    self._submission_queue.task_done()
++                    task_done()
+ 
+                 # this is equivalent to a yield to scheduler in other threading libraries
+                 time.sleep(0)
+diff --git a/dwave/cloud/concurrency.py b/dwave/cloud/concurrency.py
+index fb39b97..b0a2676 100644
+--- a/dwave/cloud/concurrency.py
++++ b/dwave/cloud/concurrency.py
+@@ -111,3 +111,21 @@ class PriorityThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+     def __init__(self, *args, **kwargs):
+         super(PriorityThreadPoolExecutor, self).__init__(*args, **kwargs)
+         self._work_queue = _PrioritizingQueue()
++
++
++class Present(concurrent.futures.Future):
++    """Already resolved :class:`~concurrent.futures.Future` object.
++
++    Users should treat this class as just another
++    :class:`~concurrent.futures.Future`, the difference being an implementation
++    detail: :class:`Present` is "resolved" at construction time.
++    """
++
++    def __init__(self, result=None, exception=None):
++        super(Present, self).__init__()
++        if result is not None:
++            self.set_result(result)
++        elif exception is not None:
++            self.set_exception(exception)
++        else:
++            raise ValueError("can't provide both 'result' and 'exception'")
+diff --git a/dwave/cloud/solver.py b/dwave/cloud/solver.py
+index d153453..43e9611 100644
+--- a/dwave/cloud/solver.py
++++ b/dwave/cloud/solver.py
+@@ -35,12 +35,15 @@ import logging
+ import warnings
+ from collections import Mapping
+ 
++import six
++
+ from dwave.cloud.exceptions import *
+ from dwave.cloud.coders import (
+     encode_problem_as_qp, encode_problem_as_bq,
+     decode_qp_numpy, decode_qp, decode_bq)
+ from dwave.cloud.utils import uniform_iterator, reformat_qubo_as_ising
+ from dwave.cloud.computation import Future
++from dwave.cloud.concurrency import Present
+ from dwave.cloud.events import dispatch_event
+ 
+ # Use numpy if available for fast encoding/decoding
+@@ -300,6 +303,40 @@ class UnstructuredSolver(BaseSolver):
+         bqm = dimod.BinaryQuadraticModel.from_qubo(qubo)
+         return self.sample_bqm(bqm, **params)
+ 
++    def _encode_any_problem_as_bqm_ref(self, problem, params):
++        """Encode `problem` for submitting in `bqm-ref` format. Upload the
++        problem if it's not already uploaded.
++
++        Args:
++            problem (:class:`~dimod.BinaryQuadraticModel`/str):
++                A binary quadratic model, or a reference to one (Problem ID).
++
++            params (dict):
++                Parameters for the sampling method, solver-specific.
++
++        Returns:
++            str:
++                JSON-encoded problem submit body
++
++        """
++
++        if isinstance(problem, six.string_types):
++            problem_id = problem
++        else:
++            logger.debug("To encode the problem for submit via 'bqm-ref', "
++                         "we need to upload it first.")
++            problem_id = self.upload_bqm(problem).result()
++
++        body = json.dumps({
++            'solver': self.id,
++            'data': encode_problem_as_bq(problem_id),
++            'type': 'bqm',
++            'params': params
++        })
++        logger.trace("Sampling request encoded as: %s", body)
++
++        return body
++
+     def sample_bqm(self, bqm, **params):
+         """Sample from the specified :term:`BQM`.
+ 
+@@ -317,21 +354,19 @@ class UnstructuredSolver(BaseSolver):
+         Note:
+             To use this method, dimod package has to be installed.
+         """
+-        # encode the request
+-        body = json.dumps({
+-            'solver': self.id,
+-            'data': encode_problem_as_bq(bqm),
+-            'type': 'bqm',
+-            'params': params
+-        })
+-        logger.trace("Encoded sample request: %s", body)
+ 
+-        future = Future(solver=self, id_=None, return_matrix=self.return_matrix)
++        # encode the request (body as future)
++        body = self.client._encode_problem_executor.submit(
++            self._encode_any_problem_as_bqm_ref,
++            problem=bqm, params=params)
++
++        # computation future holds a reference to the remote job
++        computation = Future(solver=self, id_=None, return_matrix=self.return_matrix)
+ 
+         logger.debug("Submitting new problem to: %s", self.id)
+-        self.client._submit(body, future)
++        self.client._submit(body, computation)
+ 
+-        return future
++        return computation
+ 
+     def upload_bqm(self, bqm):
+         """Upload the specified :term:`BQM` to SAPI, returning a Problem ID
+@@ -631,22 +666,23 @@ class StructuredSolver(BaseSolver):
+         # transform some of the parameters in-place
+         self._format_params(type_, combined_params)
+ 
+-        body = json.dumps({
++        body_data = json.dumps({
+             'solver': self.id,
+             'data': encode_problem_as_qp(self, linear, quadratic),
+             'type': type_,
+             'params': combined_params
+         })
+-        logger.trace("Encoded sample request: %s", body)
++        logger.trace("Encoded sample request: %s", body_data)
+ 
+-        future = Future(solver=self, id_=None, return_matrix=self.return_matrix)
++        body = Present(result=body_data)
++        computation = Future(solver=self, id_=None, return_matrix=self.return_matrix)
+ 
+         logger.debug("Submitting new problem to: %s", self.id)
+-        self.client._submit(body, future)
++        self.client._submit(body, computation)
+ 
+-        dispatch_event('after_sample', obj=self, args=args, return_value=future)
++        dispatch_event('after_sample', obj=self, args=args, return_value=computation)
+ 
+-        return future
++        return computation
+ 
+     def _format_params(self, type_, params):
+         """Reformat some of the parameters for sapi."""
+

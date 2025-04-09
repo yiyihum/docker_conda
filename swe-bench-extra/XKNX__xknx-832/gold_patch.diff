@@ -1,0 +1,243 @@
+diff --git a/changelog.md b/changelog.md
+index e312e426..35e3c87c 100644
+--- a/changelog.md
++++ b/changelog.md
+@@ -4,7 +4,8 @@
+ 
+ ### Connection
+ 
+-- Fix rate limiter wait time. Don't add time waiting for ACK or L_DATA.con frames to the rate_limit.
++- Handle separate Tunneling control and data endpoints
++- Fix rate limiter wait time: don't add time waiting for ACK or L_DATA.con frames to the rate_limit
+ 
+ ## Internals
+ 
+diff --git a/xknx/io/request_response/connect.py b/xknx/io/request_response/connect.py
+index ec97d58a..b5ae8696 100644
+--- a/xknx/io/request_response/connect.py
++++ b/xknx/io/request_response/connect.py
+@@ -27,6 +27,7 @@ class Connect(RequestResponse):
+         self.route_back = route_back
+         super().__init__(xknx, self.udp_client, ConnectResponse)
+         self.communication_channel = 0
++        self.data_endpoint = HPAI()
+         self.identifier = 0
+ 
+     def create_knxipframe(self) -> KNXIPFrame:
+@@ -48,6 +49,6 @@ class Connect(RequestResponse):
+     def on_success_hook(self, knxipframe: KNXIPFrame) -> None:
+         """Set communication channel and identifier after having received a valid answer."""
+         assert isinstance(knxipframe.body, ConnectResponse)
+-        assert isinstance(knxipframe.body.identifier, int)
+         self.communication_channel = knxipframe.body.communication_channel
++        self.data_endpoint = knxipframe.body.data_endpoint
+         self.identifier = knxipframe.body.identifier
+diff --git a/xknx/io/request_response/tunnelling.py b/xknx/io/request_response/tunnelling.py
+index 6a295bea..f7fc0e60 100644
+--- a/xknx/io/request_response/tunnelling.py
++++ b/xknx/io/request_response/tunnelling.py
+@@ -26,6 +26,7 @@ class Tunnelling(RequestResponse):
+         self,
+         xknx: XKNX,
+         udp_client: UDPClient,
++        data_endpoint: tuple[str, int] | None,
+         telegram: Telegram,
+         src_address: IndividualAddress,
+         sequence_counter: int,
+@@ -34,6 +35,7 @@ class Tunnelling(RequestResponse):
+         """Initialize Tunnelling class."""
+         self.xknx = xknx
+         self.udp_client = udp_client
++        self.data_endpoint_addr = data_endpoint
+         self.src_address = src_address
+ 
+         super().__init__(xknx, self.udp_client, TunnellingAck)
+@@ -42,6 +44,10 @@ class Tunnelling(RequestResponse):
+         self.sequence_counter = sequence_counter
+         self.communication_channel_id = communication_channel_id
+ 
++    async def send_request(self) -> None:
++        """Build knxipframe (within derived class) and send via UDP."""
++        self.udpclient.send(self.create_knxipframe(), addr=self.data_endpoint_addr)
++
+     def create_knxipframe(self) -> KNXIPFrame:
+         """Create KNX/IP Frame object to be sent to device."""
+         cemi = CEMIFrame.init_from_telegram(
+diff --git a/xknx/io/tunnel.py b/xknx/io/tunnel.py
+index 65752e0a..cd555a13 100644
+--- a/xknx/io/tunnel.py
++++ b/xknx/io/tunnel.py
+@@ -69,6 +69,7 @@ class Tunnel(Interface):
+         self.init_udp_client()
+ 
+         self._src_address = xknx.own_address
++        self._data_endpoint_addr: tuple[str, int] | None = None
+         self.sequence_number = 0
+         self.communication_channel: int | None = None
+         self.number_heartbeat_failed = 0
+@@ -144,6 +145,7 @@ class Tunnel(Interface):
+             )
+         )
+         self.stop_heartbeat()
++        self._data_endpoint_addr = None
+         if self.auto_reconnect:
+             self._reconnect_task = asyncio.create_task(self._reconnect())
+         else:
+@@ -172,6 +174,7 @@ class Tunnel(Interface):
+             XknxConnectionState.DISCONNECTED
+         )
+         self.stop_heartbeat()
++        self._data_endpoint_addr = None
+         self._stop_reconnect()
+         await self._disconnect_request(False)
+         await self.udp_client.stop()
+@@ -188,6 +191,11 @@ class Tunnel(Interface):
+         await connect.start()
+         if connect.success:
+             self.communication_channel = connect.communication_channel
++            # assign data_endpoint received from server
++            self._data_endpoint_addr = (
++                connect.data_endpoint.ip_addr,
++                connect.data_endpoint.port,
++            )
+             # Use the individual address provided by the tunnelling server
+             self._src_address = IndividualAddress(connect.identifier)
+             self.xknx.current_address = self._src_address
+@@ -274,6 +282,7 @@ class Tunnel(Interface):
+         tunnelling = Tunnelling(
+             self.xknx,
+             self.udp_client,
++            self._data_endpoint_addr,
+             telegram,
+             self._src_address,
+             self.sequence_number,
+@@ -355,7 +364,9 @@ class Tunnel(Interface):
+             communication_channel_id=communication_channel_id,
+             sequence_counter=sequence_counter,
+         )
+-        self.udp_client.send(KNXIPFrame.init_from_body(ack))
++        self.udp_client.send(
++            KNXIPFrame.init_from_body(ack), addr=self._data_endpoint_addr
++        )
+ 
+     def _disconnect_request_received(
+         self, disconnect_request: DisconnectRequest
+diff --git a/xknx/io/udp_client.py b/xknx/io/udp_client.py
+index 2637a73f..1aeee391 100644
+--- a/xknx/io/udp_client.py
++++ b/xknx/io/udp_client.py
+@@ -116,7 +116,7 @@ class UDPClient:
+                 )
+             else:
+                 knx_logger.debug(
+-                    "Received from %s:%s at %s:\n%s",
++                    "Received from %s:%s at %s:\n %s",
+                     source[0],
+                     source[1],
+                     time.time(),
+@@ -213,27 +213,28 @@ class UDPClient:
+             (transport, _) = await loop.create_datagram_endpoint(
+                 lambda: udp_client_factory,
+                 local_addr=self.local_addr,
+-                remote_addr=self.remote_addr,
+             )
+             # TODO: typing - remove cast - loop.create_datagram_endpoint should return a DatagramTransport
+             self.transport = cast(asyncio.DatagramTransport, transport)
+ 
+-    def send(self, knxipframe: KNXIPFrame) -> None:
++    def send(self, knxipframe: KNXIPFrame, addr: tuple[str, int] | None = None) -> None:
+         """Send KNXIPFrame to socket."""
++        _addr = addr or self.remote_addr
+         knx_logger.debug(
+-            "Sending to %s:%s at %s:\n%s",
+-            self.remote_addr[0],
+-            self.remote_addr[1],
+-            time.time(),
+-            knxipframe,
++            "Sending to %s:%s at %s:\n %s", _addr[0], _addr[1], time.time(), knxipframe
+         )
+         if self.transport is None:
+             raise XKNXException("Transport not connected")
+ 
+         if self.multicast:
++            if addr is not None:
++                logger.warning(
++                    "Multicast send to specific address is invalid. %s",
++                    knxipframe,
++                )
+             self.transport.sendto(bytes(knxipframe.to_knx()), self.remote_addr)
+         else:
+-            self.transport.sendto(bytes(knxipframe.to_knx()))
++            self.transport.sendto(bytes(knxipframe.to_knx()), addr=_addr)
+ 
+     def getsockname(self) -> tuple[str, int]:
+         """Return socket IP and port."""
+diff --git a/xknx/knxip/connect_response.py b/xknx/knxip/connect_response.py
+index 3f9c3835..865923ef 100644
+--- a/xknx/knxip/connect_response.py
++++ b/xknx/knxip/connect_response.py
+@@ -32,8 +32,8 @@ class ConnectResponse(KNXIPBodyResponse):
+         communication_channel: int = 0,
+         status_code: ErrorCode = ErrorCode.E_NO_ERROR,
+         request_type: ConnectRequestType = ConnectRequestType.TUNNEL_CONNECTION,
+-        control_endpoint: HPAI = HPAI(),
+-        identifier: int | None = None,
++        data_endpoint: HPAI = HPAI(),
++        identifier: int = 0,
+     ):
+         """Initialize ConnectResponse class."""
+         super().__init__(xknx)
+@@ -41,7 +41,7 @@ class ConnectResponse(KNXIPBodyResponse):
+         self.communication_channel = communication_channel
+         self.status_code = status_code
+         self.request_type = request_type
+-        self.control_endpoint = control_endpoint
++        self.data_endpoint = data_endpoint
+         # identifier shall contain KNX Individual Address assigned to this KNXnet/IP Tunnelling connection
+         self.identifier = identifier
+ 
+@@ -67,11 +67,11 @@ class ConnectResponse(KNXIPBodyResponse):
+         pos = 2
+ 
+         if self.status_code == ErrorCode.E_NO_ERROR:
+-            pos += self.control_endpoint.from_knx(raw[pos:])
++            pos += self.data_endpoint.from_knx(raw[pos:])
+             pos += crd_from_knx(raw[pos:])
+         else:
+             # do not parse HPAI and CRD in case of errors - just check length
+-            pos += len(raw[pos:])
++            pos = len(raw)
+         return pos
+ 
+     def to_knx(self) -> list[int]:
+@@ -91,7 +91,7 @@ class ConnectResponse(KNXIPBodyResponse):
+         data = []
+         data.append(self.communication_channel)
+         data.append(self.status_code.value)
+-        data.extend(self.control_endpoint.to_knx())
++        data.extend(self.data_endpoint.to_knx())
+         data.extend(crd_to_knx())
+ 
+         return data
+@@ -102,7 +102,7 @@ class ConnectResponse(KNXIPBodyResponse):
+             "<ConnectResponse "
+             f'communication_channel="{self.communication_channel}" '
+             f'status_code="{self.status_code}" '
+-            f'control_endpoint="{self.control_endpoint}" '
++            f'data_endpoint="{self.data_endpoint}" '
+             f'request_type="{self.request_type}" '
+             f'identifier="{self.identifier}" />'
+         )
+diff --git a/xknx/knxip/knxip.py b/xknx/knxip/knxip.py
+index b5425a86..ed333e0a 100644
+--- a/xknx/knxip/knxip.py
++++ b/xknx/knxip/knxip.py
+@@ -101,7 +101,7 @@ class KNXIPFrame:
+         data.extend(self.body.to_knx())
+         return data
+ 
+-    def __str__(self) -> str:
++    def __repr__(self) -> str:
+         """Return object as readable string."""
+         return f'<KNXIPFrame {self.header}\n body="{self.body}" />'
+ 

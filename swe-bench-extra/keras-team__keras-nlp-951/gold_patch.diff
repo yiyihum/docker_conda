@@ -1,0 +1,166 @@
+diff --git a/keras_nlp/models/gpt2/gpt2_causal_lm.py b/keras_nlp/models/gpt2/gpt2_causal_lm.py
+index e674d54..09c2962 100644
+--- a/keras_nlp/models/gpt2/gpt2_causal_lm.py
++++ b/keras_nlp/models/gpt2/gpt2_causal_lm.py
+@@ -28,6 +28,7 @@ from keras_nlp.models.task import Task
+ from keras_nlp.samplers.serialization import get as get_sampler
+ from keras_nlp.utils.keras_utils import is_xla_compatible
+ from keras_nlp.utils.python_utils import classproperty
++from keras_nlp.utils.tf_utils import tensor_to_string_list
+ from keras_nlp.utils.tf_utils import truncate_at_token
+ 
+ 
+@@ -447,4 +448,9 @@ class GPT2CausalLM(Task):
+             outputs.append(output)
+ 
+         outputs = tf.concat(outputs, axis=0)
+-        return tf.squeeze(outputs, 0) if input_is_scalar else outputs
++        outputs = tf.squeeze(outputs, 0) if input_is_scalar else outputs
++        # Convert outputs to a friendly pythonic type. For numerical outputs
++        # that is numpy, for string outputs that is `list` and `str`.
++        if outputs.dtype == tf.string:
++            return tensor_to_string_list(outputs)
++        return outputs.numpy()
+diff --git a/keras_nlp/samplers/beam_sampler.py b/keras_nlp/samplers/beam_sampler.py
+index cbb6b73..2830640 100644
+--- a/keras_nlp/samplers/beam_sampler.py
++++ b/keras_nlp/samplers/beam_sampler.py
+@@ -97,8 +97,9 @@ class BeamSampler(Sampler):
+         self,
+         num_beams=5,
+         return_all_beams=False,
++        **kwargs,
+     ):
+-        super().__init__()
++        super().__init__(**kwargs)
+         self.num_beams = num_beams
+         self.return_all_beams = return_all_beams
+ 
+@@ -156,7 +157,7 @@ class BeamSampler(Sampler):
+             # Compute the softmax distribution for the next token.
+             logits, _, cache = next(prompt, cache, index)
+             vocab_size = tf.shape(logits)[-1]
+-            probs = keras.activations.softmax(logits)
++            probs = keras.activations.softmax(logits / self.temperature)
+ 
+             # Compute the running log-likelihood of each new candidate.
+             next_log_probs = tf.math.log(probs) + log_probs[..., tf.newaxis]
+diff --git a/keras_nlp/samplers/greedy_sampler.py b/keras_nlp/samplers/greedy_sampler.py
+index 9d4cf73..6064270 100644
+--- a/keras_nlp/samplers/greedy_sampler.py
++++ b/keras_nlp/samplers/greedy_sampler.py
+@@ -55,8 +55,11 @@ class GreedySampler(Sampler):
+     ```
+     """
+ 
+-    def __init__(self):
+-        super().__init__()
++    def __init__(
++        self,
++        **kwargs,
++    ):
++        super().__init__(**kwargs)
+ 
+     def get_next_token(self, probabilities):
+         return tf.argmax(probabilities, axis=-1)
+diff --git a/keras_nlp/samplers/random_sampler.py b/keras_nlp/samplers/random_sampler.py
+index 9d2c731..a0a945c 100644
+--- a/keras_nlp/samplers/random_sampler.py
++++ b/keras_nlp/samplers/random_sampler.py
+@@ -62,8 +62,9 @@ class RandomSampler(Sampler):
+     def __init__(
+         self,
+         seed=None,
++        **kwargs,
+     ):
+-        super().__init__()
++        super().__init__(**kwargs)
+         self.seed = seed
+ 
+     def get_next_token(self, probabilities):
+diff --git a/keras_nlp/samplers/sampler.py b/keras_nlp/samplers/sampler.py
+index 7ccb35b..e1c5ae5 100644
+--- a/keras_nlp/samplers/sampler.py
++++ b/keras_nlp/samplers/sampler.py
+@@ -48,6 +48,11 @@ call_args_docstring = """
+ class Sampler:
+     """Base sampler class.
+ 
++    Args:
++        temperature: float. optional. defaults to '1.0'. Used to control the
++            randomness of the sampling. The higher the temperature, the
++            more diverse the samples.
++
+     Call Args:
+         {{call_args}}
+ 
+@@ -84,6 +89,12 @@ class Sampler:
+     ```
+     """
+ 
++    def __init__(
++        self,
++        temperature=1.0,
++    ):
++        self.temperature = temperature
++
+     def __call__(
+         self,
+         next,
+@@ -115,7 +126,7 @@ class Sampler:
+         def body(prompt, cache, index):
+             # Compute the softmax distribution for the next token.
+             logits, _, cache = next(prompt, cache, index)
+-            probabilities = keras.activations.softmax(logits)
++            probabilities = keras.activations.softmax(logits / self.temperature)
+             # Compute the next token.
+             next_token = self.get_next_token(probabilities)
+             # Don't overwrite anywhere mask is True.
+@@ -140,11 +151,9 @@ class Sampler:
+ 
+     def get_next_token(self, probabilities):
+         """Get the next token.
+-
+         Args:
+             probabilities: a Tensor, the probability distribution for next
+                 token over all vocab tokens.
+-
+         Get the next token based on given probability distribution over tokens.
+         Subclasses must implement this method.
+         """
+@@ -155,4 +164,4 @@ class Sampler:
+         return cls(**config)
+ 
+     def get_config(self):
+-        return {}
++        return {"temperature": self.temperature}
+diff --git a/keras_nlp/samplers/top_k_sampler.py b/keras_nlp/samplers/top_k_sampler.py
+index 68f369a..a3369c4 100644
+--- a/keras_nlp/samplers/top_k_sampler.py
++++ b/keras_nlp/samplers/top_k_sampler.py
+@@ -64,8 +64,9 @@ class TopKSampler(Sampler):
+         self,
+         k=5,
+         seed=None,
++        **kwargs,
+     ):
+-        super().__init__()
++        super().__init__(**kwargs)
+         self.k = k
+         self.seed = seed
+ 
+diff --git a/keras_nlp/samplers/top_p_sampler.py b/keras_nlp/samplers/top_p_sampler.py
+index ec5c4be..2ef90d3 100644
+--- a/keras_nlp/samplers/top_p_sampler.py
++++ b/keras_nlp/samplers/top_p_sampler.py
+@@ -73,8 +73,9 @@ class TopPSampler(Sampler):
+         p=0.1,
+         k=None,
+         seed=None,
++        **kwargs,
+     ):
+-        super().__init__()
++        super().__init__(**kwargs)
+         self.p = p
+         self.k = k
+         self.seed = seed

@@ -1,0 +1,350 @@
+diff --git a/dvc/annotations.py b/dvc/annotations.py
+--- a/dvc/annotations.py
++++ b/dvc/annotations.py
+@@ -2,6 +2,7 @@
+ from typing import Any, ClassVar, Dict, List, Optional
+ 
+ from funcy import compact
++from voluptuous import Required
+ 
+ 
+ @dataclass
+@@ -26,6 +27,12 @@ def to_dict(self) -> Dict[str, str]:
+         return compact(asdict(self))
+ 
+ 
++@dataclass
++class Artifact(Annotation):
++    PARAM_PATH: ClassVar[str] = "path"
++    path: Optional[str] = None
++
++
+ ANNOTATION_FIELDS = [field.name for field in fields(Annotation)]
+ ANNOTATION_SCHEMA = {
+     Annotation.PARAM_DESC: str,
+@@ -33,3 +40,7 @@ def to_dict(self) -> Dict[str, str]:
+     Annotation.PARAM_LABELS: [str],
+     Annotation.PARAM_META: object,
+ }
++ARTIFACT_SCHEMA = {
++    Required(Artifact.PARAM_PATH): str,
++    **ANNOTATION_SCHEMA,  # type: ignore[arg-type]
++}
+diff --git a/dvc/api/data.py b/dvc/api/data.py
+--- a/dvc/api/data.py
++++ b/dvc/api/data.py
+@@ -1,6 +1,6 @@
+ from contextlib import _GeneratorContextManager as GCM
+ from contextlib import contextmanager
+-from typing import Optional
++from typing import Any, Dict, Optional
+ 
+ from funcy import reraise
+ 
+@@ -214,7 +214,11 @@ def open(  # noqa, pylint: disable=redefined-builtin
+ 
+ 
+ def _open(path, repo=None, rev=None, remote=None, mode="r", encoding=None):
+-    with Repo.open(repo, rev=rev, subrepos=True, uninitialized=True) as _repo:
++    repo_kwargs: Dict[str, Any] = {"subrepos": True, "uninitialized": True}
++    if remote:
++        repo_kwargs["config"] = {"core": {"remote": remote}}
++
++    with Repo.open(repo, rev=rev, **repo_kwargs) as _repo:
+         with _wrap_exceptions(_repo, path):
+             import os
+             from typing import TYPE_CHECKING, Union
+@@ -235,12 +239,6 @@ def _open(path, repo=None, rev=None, remote=None, mode="r", encoding=None):
+                 fs_path = fs.from_os_path(path)
+ 
+             try:
+-                if remote:
+-                    remote_odb = _repo.cloud.get_remote_odb(name=remote)
+-                    oid = fs.info(fs_path)["dvc_info"]["md5"]
+-                    fs = remote_odb.fs
+-                    fs_path = remote_odb.oid_to_path(oid)
+-
+                 with fs.open(
+                     fs_path,
+                     mode=mode,
+diff --git a/dvc/dvcfile.py b/dvc/dvcfile.py
+--- a/dvc/dvcfile.py
++++ b/dvc/dvcfile.py
+@@ -192,6 +192,7 @@ class SingleStageFile(FileMixin):
+     metrics: List[str] = []
+     plots: Any = {}
+     params: List[str] = []
++    artifacts: Dict[str, Optional[Dict[str, Any]]] = {}
+ 
+     @property
+     def stage(self) -> "Stage":
+@@ -323,6 +324,10 @@ def plots(self) -> Any:
+     def params(self) -> List[str]:
+         return self.contents.get("params", [])
+ 
++    @property
++    def artifacts(self) -> Dict[str, Optional[Dict[str, Any]]]:
++        return self.contents.get("artifacts", {})
++
+     def remove(self, force=False):
+         if not force:
+             logger.warning("Cannot remove pipeline file.")
+diff --git a/dvc/external_repo.py b/dvc/external_repo.py
+--- a/dvc/external_repo.py
++++ b/dvc/external_repo.py
+@@ -43,6 +43,7 @@ def external_repo(
+ 
+     config = _get_remote_config(url) if os.path.isdir(url) else {}
+     config.update(cache_config)
++    config.update(kwargs.pop("config", None) or {})
+ 
+     main_root = "/"
+     if for_write:
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -151,6 +151,7 @@ def __init__(  # noqa: PLR0915
+         from dvc.data_cloud import DataCloud
+         from dvc.fs import GitFileSystem, LocalFileSystem, localfs
+         from dvc.lock import LockNoop, make_lock
++        from dvc.repo.artifacts import Artifacts
+         from dvc.repo.metrics import Metrics
+         from dvc.repo.params import Params
+         from dvc.repo.plots import Plots
+@@ -224,6 +225,7 @@ def __init__(  # noqa: PLR0915
+         self.metrics: Metrics = Metrics(self)
+         self.plots: Plots = Plots(self)
+         self.params: Params = Params(self)
++        self.artifacts: Artifacts = Artifacts(self)
+ 
+         self.stage_collection_error_handler: Optional[
+             Callable[[str, Exception], None]
+diff --git a/dvc/repo/artifacts.py b/dvc/repo/artifacts.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/repo/artifacts.py
+@@ -0,0 +1,67 @@
++import logging
++import os
++import re
++from typing import TYPE_CHECKING, Dict
++
++from dvc.annotations import Artifact
++from dvc.dvcfile import FileMixin
++from dvc.utils import relpath
++
++if TYPE_CHECKING:
++    from dvc.repo import Repo
++
++logger = logging.getLogger(__name__)
++
++
++NAME_RE = re.compile(r"^[a-z]([a-z0-9-]*[a-z0-9])?$")
++
++
++def name_is_compatible(name: str) -> bool:
++    return bool(NAME_RE.search(name))
++
++
++def check_name_format(name: str) -> None:
++    if not name_is_compatible(name):
++        logger.warning(
++            "Can't use '%s' as artifact name (ID)."
++            " You can use letters and numbers, and use '-' as separator"
++            " (but not at the start or end). The first character must be a letter.",
++            name,
++        )
++
++
++class ArtifactsFile(FileMixin):
++    from dvc.schema import SINGLE_ARTIFACT_SCHEMA as SCHEMA
++
++    def dump(self, stage, **kwargs):
++        raise NotImplementedError
++
++    def merge(self, ancestor, other, allowed=None):
++        raise NotImplementedError
++
++
++class Artifacts:
++    def __init__(self, repo: "Repo") -> None:
++        self.repo = repo
++
++    def read(self) -> Dict[str, Dict[str, Artifact]]:
++        artifacts: Dict[str, Dict[str, Artifact]] = {}
++        for (
++            dvcfile,
++            dvcfile_artifacts,
++        ) in self.repo.index._artifacts.items():  # pylint: disable=protected-access
++            # read the artifacts.yaml file if needed
++            if isinstance(dvcfile_artifacts, str):
++                dvcfile_artifacts = ArtifactsFile(
++                    self.repo,
++                    os.path.join(os.path.dirname(dvcfile), dvcfile_artifacts),
++                    verify=False,
++                ).load()
++            if not dvcfile_artifacts:
++                continue
++            dvcyaml = relpath(dvcfile, self.repo.root_dir)
++            artifacts[dvcyaml] = {}
++            for name, value in dvcfile_artifacts.items():
++                check_name_format(name)
++                artifacts[dvcyaml][name] = Artifact(**value)
++        return artifacts
+diff --git a/dvc/repo/experiments/push.py b/dvc/repo/experiments/push.py
+--- a/dvc/repo/experiments/push.py
++++ b/dvc/repo/experiments/push.py
+@@ -58,7 +58,7 @@ def notify_refs_to_studio(
+ 
+     _, repo_url = get_remote_repo(repo.scm.dulwich.repo, git_remote)
+     studio_url = config.get("studio_url")
+-    d = studio.notify_refs(repo_url, token, studio_url=studio_url, **refs)
++    d = studio.notify_refs(repo_url, token, base_url=studio_url, **refs)
+     return d.get("url")
+ 
+ 
+diff --git a/dvc/repo/experiments/run.py b/dvc/repo/experiments/run.py
+--- a/dvc/repo/experiments/run.py
++++ b/dvc/repo/experiments/run.py
+@@ -11,7 +11,7 @@
+ 
+ 
+ @locked
+-def run(  # noqa: C901
++def run(  # noqa: C901, PLR0912
+     repo,
+     targets: Optional[Iterable[str]] = None,
+     params: Optional[Iterable[str]] = None,
+@@ -36,6 +36,18 @@ def run(  # noqa: C901
+         from dvc.utils.hydra import to_hydra_overrides
+ 
+         path_overrides = to_path_overrides(params)
++
++        if tmp_dir or queue:
++            untracked = repo.scm.untracked_files()
++            for path in path_overrides:
++                if path in untracked:
++                    logger.debug(
++                        "'%s' is currently untracked but will be modified by DVC. "
++                        "Adding it to git.",
++                        path,
++                    )
++                    repo.scm.add([path])
++
+         hydra_sweep = any(
+             x.is_sweep_override()
+             for param_file in path_overrides
+diff --git a/dvc/repo/index.py b/dvc/repo/index.py
+--- a/dvc/repo/index.py
++++ b/dvc/repo/index.py
+@@ -174,12 +174,14 @@ def __init__(
+         metrics: Optional[Dict[str, List[str]]] = None,
+         plots: Optional[Dict[str, List[str]]] = None,
+         params: Optional[Dict[str, Any]] = None,
++        artifacts: Optional[Dict[str, Any]] = None,
+     ) -> None:
+         self.repo = repo
+         self.stages = stages or []
+         self._metrics = metrics or {}
+         self._plots = plots or {}
+         self._params = params or {}
++        self._artifacts = artifacts or {}
+         self._collected_targets: Dict[int, List["StageInfo"]] = {}
+ 
+     @cached_property
+@@ -202,6 +204,7 @@ def from_repo(
+         metrics = {}
+         plots = {}
+         params = {}
++        artifacts = {}
+ 
+         onerror = onerror or repo.stage_collection_error_handler
+         for _, idx in collect_files(repo, onerror=onerror):
+@@ -210,12 +213,14 @@ def from_repo(
+             metrics.update(idx._metrics)
+             plots.update(idx._plots)
+             params.update(idx._params)
++            artifacts.update(idx._artifacts)
+         return cls(
+             repo,
+             stages=stages,
+             metrics=metrics,
+             plots=plots,
+             params=params,
++            artifacts=artifacts,
+         )
+ 
+     @classmethod
+@@ -229,6 +234,7 @@ def from_file(cls, repo: "Repo", path: str) -> "Index":
+             metrics={path: dvcfile.metrics} if dvcfile.metrics else {},
+             plots={path: dvcfile.plots} if dvcfile.plots else {},
+             params={path: dvcfile.params} if dvcfile.params else {},
++            artifacts={path: dvcfile.artifacts} if dvcfile.artifacts else {},
+         )
+ 
+     def update(self, stages: Iterable["Stage"]) -> "Index":
+@@ -242,6 +248,7 @@ def update(self, stages: Iterable["Stage"]) -> "Index":
+             metrics=self._metrics,
+             plots=self._plots,
+             params=self._params,
++            artifacts=self._artifacts,
+         )
+ 
+     @cached_property
+diff --git a/dvc/schema.py b/dvc/schema.py
+--- a/dvc/schema.py
++++ b/dvc/schema.py
+@@ -3,7 +3,7 @@
+ from voluptuous import Any, Optional, Required, Schema
+ 
+ from dvc import dependency, output
+-from dvc.annotations import ANNOTATION_SCHEMA
++from dvc.annotations import ANNOTATION_SCHEMA, ARTIFACT_SCHEMA
+ from dvc.output import (
+     CHECKSUMS_SCHEMA,
+     CLOUD_SCHEMA,
+@@ -114,6 +114,9 @@ def validator(data):
+     Output.PARAM_PLOT_TEMPLATE: str,
+ }
+ SINGLE_PLOT_SCHEMA = {str: Any(PLOT_DEFINITION, None)}
++ARTIFACTS = "artifacts"
++SINGLE_ARTIFACT_SCHEMA = Schema({str: ARTIFACT_SCHEMA})
++ARTIFACTS_SCHEMA = Any(str, SINGLE_ARTIFACT_SCHEMA)
+ FOREACH_IN = {
+     Required(FOREACH_KWD): Any(dict, list, str),
+     Required(DO_KWD): STAGE_DEFINITION,
+@@ -127,6 +130,7 @@ def validator(data):
+     VARS_KWD: VARS_SCHEMA,
+     StageParams.PARAM_PARAMS: [str],
+     StageParams.PARAM_METRICS: [str],
++    ARTIFACTS: ARTIFACTS_SCHEMA,
+ }
+ 
+ COMPILED_SINGLE_STAGE_SCHEMA = Schema(SINGLE_STAGE_SCHEMA)
+diff --git a/dvc/utils/studio.py b/dvc/utils/studio.py
+--- a/dvc/utils/studio.py
++++ b/dvc/utils/studio.py
+@@ -40,7 +40,7 @@ def notify_refs(
+     repo_url: str,
+     token: str,
+     *,
+-    studio_url: Optional[str] = STUDIO_URL,
++    base_url: Optional[str] = STUDIO_URL,
+     **refs: List[str],
+ ) -> Dict[str, Any]:
+     extra_keys = refs.keys() - {"pushed", "removed"}
+@@ -52,12 +52,12 @@ def notify_refs(
+ 
+     logger.debug(
+         "notifying Studio%s about updated experiments",
+-        f" ({studio_url})" if studio_url else "",
++        f" ({base_url})" if base_url else "",
+     )
+     data = {"repo_url": repo_url, "client": "dvc", "refs": refs}
+ 
+     try:
+-        r = post("/webhook/dvc", token, data, base_url=studio_url)
++        r = post("/webhook/dvc", token, data, base_url=base_url)
+     except requests.RequestException as e:
+         logger.trace("", exc_info=True)  # type: ignore[attr-defined]
+ 

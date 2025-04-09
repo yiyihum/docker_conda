@@ -1,0 +1,196 @@
+diff --git a/doc/constraints.rst b/doc/constraints.rst
+index dbe439e3..cc82bb98 100644
+--- a/doc/constraints.rst
++++ b/doc/constraints.rst
+@@ -13,7 +13,7 @@ highly desirable to place mathematical constraints on parameter values.
+ For example, one might want to require that two Gaussian peaks have the
+ same width, or have amplitudes that are constrained to add to some value.
+ Of course, one could rewrite the objective or model function to place such
+-requirements, but this is somewhat error prone, and limits the flexibility
++requirements, but this is somewhat error-prone, and limits the flexibility
+ so that exploring constraints becomes laborious.
+ 
+ To simplify the setting of constraints, Parameters can be assigned a
+diff --git a/doc/fitting.rst b/doc/fitting.rst
+index 60e66548..50a05c8c 100644
+--- a/doc/fitting.rst
++++ b/doc/fitting.rst
+@@ -129,7 +129,7 @@ Choosing Different Fitting Methods
+ By default, the `Levenberg-Marquardt
+ <https://en.wikipedia.org/wiki/Levenberg-Marquardt_algorithm>`_ algorithm is
+ used for fitting. While often criticized, including the fact it finds a
+-*local* minima, this approach has some distinct advantages. These include
++*local* minimum, this approach has some distinct advantages. These include
+ being fast, and well-behaved for most curve-fitting needs, and making it
+ easy to estimate uncertainties for and correlations between pairs of fit
+ variables, as discussed in :ref:`fit-results-label`.
+@@ -476,7 +476,7 @@ be used to abort a fit.
+    :type  resid:  numpy.ndarray
+    :param args:  Positional arguments. Must match ``args`` argument to :func:`minimize`
+    :param kws:   Keyword arguments. Must match ``kws`` argument to :func:`minimize`
+-   :return:      Residual array (generally ``data-model``) to be minimized in the least-squares sense.
++   :return:      Iteration abort flag.
+    :rtype:    None for normal behavior, any value like ``True`` to abort the fit.
+ 
+ 
+diff --git a/doc/model.rst b/doc/model.rst
+index b38254cd..3400cc15 100644
+--- a/doc/model.rst
++++ b/doc/model.rst
+@@ -378,7 +378,7 @@ Parameters if the supplied default value was a valid number (but not
+ .. jupyter-execute::
+ 
+     def decay2(t, tau, N=10, check_positive=False):
+-        if check_small:
++        if check_positive:
+             arg = abs(t)/max(1.e-9, abs(tau))
+         else:
+             arg = t/tau
+diff --git a/lmfit/lineshapes.py b/lmfit/lineshapes.py
+index 761d7e2a..7ecdc42d 100644
+--- a/lmfit/lineshapes.py
++++ b/lmfit/lineshapes.py
+@@ -1,7 +1,7 @@
+ """Basic model lineshapes and distribution functions."""
+ 
+-from numpy import (arctan, copysign, cos, exp, isclose, isnan, log, log1p, pi,
+-                   real, sin, sqrt, where)
++from numpy import (arctan, copysign, cos, exp, isclose, isnan, log, log1p,
++                   maximum, minimum, pi, real, sin, sqrt, where)
+ from scipy.special import betaln as betalnfcn
+ from scipy.special import erf, erfc
+ from scipy.special import gamma as gamfcn
+@@ -431,13 +431,11 @@ def step(x, amplitude=1.0, center=0.0, sigma=1.0, form='linear'):
+     if form == 'erf':
+         out = 0.5*(1 + erf(out))
+     elif form == 'logistic':
+-        out = (1. - 1./(1. + exp(out)))
++        out = 1. - 1./(1. + exp(out))
+     elif form in ('atan', 'arctan'):
+         out = 0.5 + arctan(out)/pi
+     elif form == 'linear':
+-        out = out + 0.5
+-        out[out < 0] = 0.0
+-        out[out > 1] = 1.0
++        out = minimum(1, maximum(0, out + 0.5))
+     else:
+         msg = (f"Invalid value ('{form}') for argument 'form'; should be one "
+                "of 'erf', 'logistic', 'atan', 'arctan', or 'linear'.")
+@@ -471,15 +469,11 @@ def rectangle(x, amplitude=1.0, center1=0.0, sigma1=1.0,
+     if form == 'erf':
+         out = 0.5*(erf(arg1) + erf(arg2))
+     elif form == 'logistic':
+-        out = (1. - 1./(1. + exp(arg1)) - 1./(1. + exp(arg2)))
++        out = 1. - 1./(1. + exp(arg1)) - 1./(1. + exp(arg2))
+     elif form in ('atan', 'arctan'):
+         out = (arctan(arg1) + arctan(arg2))/pi
+     elif form == 'linear':
+-        arg1[arg1 < 0] = 0.0
+-        arg1[arg1 > 1] = 1.0
+-        arg2[arg2 > 0] = 0.0
+-        arg2[arg2 < -1] = -1.0
+-        out = arg1 + arg2
++        out = 0.5*(minimum(1, maximum(-1, arg1)) + minimum(1, maximum(-1, arg2)))
+     else:
+         msg = (f"Invalid value ('{form}') for argument 'form'; should be one "
+                "of 'erf', 'logistic', 'atan', 'arctan', or 'linear'.")
+diff --git a/lmfit/minimizer.py b/lmfit/minimizer.py
+index e9c3c0b7..11d874dc 100644
+--- a/lmfit/minimizer.py
++++ b/lmfit/minimizer.py
+@@ -710,6 +710,7 @@ class Minimizer:
+         # and which are defined expressions.
+         result.var_names = []  # note that this *does* belong to self...
+         result.init_vals = []
++        result._init_vals_internal = []
+         result.params.update_constraints()
+         result.nfev = 0
+         result.call_kws = {}
+@@ -725,7 +726,8 @@ class Minimizer:
+                 par.vary = False
+             if par.vary:
+                 result.var_names.append(name)
+-                result.init_vals.append(par.setup_bounds())
++                result._init_vals_internal.append(par.setup_bounds())
++                result.init_vals.append(par.value)
+ 
+             par.init_value = par.value
+             if par.name is None:
+@@ -953,11 +955,12 @@ class Minimizer:
+         """
+         result = self.prepare_fit(params=params)
+         result.method = method
+-        variables = result.init_vals
++        variables = result._init_vals_internal
+         params = result.params
+ 
+         self.set_max_nfev(max_nfev, 2000*(result.nvarys+1))
+         fmin_kws = dict(method=method, options={'maxiter': 2*self.max_nfev})
++        # fmin_kws = dict(method=method, options={'maxfun': 2*self.max_nfev})
+         fmin_kws.update(self.kws)
+ 
+         if 'maxiter' in kws:
+@@ -1661,7 +1664,7 @@ class Minimizer:
+         result = self.prepare_fit(params=params)
+         result.method = 'leastsq'
+         result.nfev -= 2  # correct for "pre-fit" initialization/checks
+-        variables = result.init_vals
++        variables = result._init_vals_internal
+ 
+         # note we set the max number of function evaluations here, and send twice that
+         # value to the solver so it essentially never stops on its own
+@@ -1779,7 +1782,7 @@ class Minimizer:
+         basinhopping_kws.update(self.kws)
+         basinhopping_kws.update(kws)
+ 
+-        x0 = result.init_vals
++        x0 = result._init_vals_internal
+         result.call_kws = basinhopping_kws
+         try:
+             ret = scipy_basinhopping(self.penalty, x0, **basinhopping_kws)
+@@ -2072,7 +2075,7 @@ class Minimizer:
+         ampgo_kws.update(self.kws)
+         ampgo_kws.update(kws)
+ 
+-        values = result.init_vals
++        values = result._init_vals_internal
+         result.method = f"ampgo, with {ampgo_kws['local']} as local solver"
+         result.call_kws = ampgo_kws
+         try:
+@@ -2212,8 +2215,7 @@ class Minimizer:
+         result.method = 'dual_annealing'
+         self.set_max_nfev(max_nfev, 200000*(result.nvarys+1))
+ 
+-        da_kws = dict(maxiter=1000, local_search_options={},
+-                      initial_temp=5230.0, restart_temp_ratio=2e-05,
++        da_kws = dict(initial_temp=5230.0, restart_temp_ratio=2e-05,
+                       visit=2.62, accept=-5.0, maxfun=2*self.max_nfev,
+                       seed=None, no_local_search=False, callback=None,
+                       x0=None)
+diff --git a/lmfit/models.py b/lmfit/models.py
+index 7c2d3d1d..090c2dce 100644
+--- a/lmfit/models.py
++++ b/lmfit/models.py
+@@ -1480,7 +1480,7 @@ class StepModel(Model):
+         & f(x; A, \mu, \sigma, {\mathrm{form={}'linear{}'}})  & = A \min{[1, \max{(0, \alpha + 1/2)}]} \\
+         & f(x; A, \mu, \sigma, {\mathrm{form={}'arctan{}'}})  & = A [1/2 + \arctan{(\alpha)}/{\pi}] \\
+         & f(x; A, \mu, \sigma, {\mathrm{form={}'erf{}'}})     & = A [1 + {\operatorname{erf}}(\alpha)]/2 \\
+-        & f(x; A, \mu, \sigma, {\mathrm{form={}'logistic{}'}})& = A [1 - \frac{1}{1 + e^{\alpha}} ]
++        & f(x; A, \mu, \sigma, {\mathrm{form={}'logistic{}'}})& = A \left[1 - \frac{1}{1 + e^{\alpha}} \right]
+         \end{eqnarray*}
+ 
+     where :math:`\alpha = (x - \mu)/{\sigma}`.
+@@ -1535,10 +1535,10 @@ class RectangleModel(Model):
+         :nowrap:
+ 
+         \begin{eqnarray*}
+-        &f(x; A, \mu, \sigma, {\mathrm{form={}'linear{}'}})   &= A \{ \min{[1, \max{(0, \alpha_1)}]} + \min{[-1, \max{(0, \alpha_2)}]} \} \\
++        &f(x; A, \mu, \sigma, {\mathrm{form={}'linear{}'}})   &= A \{ \min{[1, \max{(-1, \alpha_1)}]} + \min{[1, \max{(-1, \alpha_2)}]} \}/2 \\
+         &f(x; A, \mu, \sigma, {\mathrm{form={}'arctan{}'}})   &= A [\arctan{(\alpha_1)} + \arctan{(\alpha_2)}]/{\pi} \\
+-        &f(x; A, \mu, \sigma, {\mathrm{form={}'erf{}'}})      &= A [{\operatorname{erf}}(\alpha_1) + {\operatorname{erf}}(\alpha_2)]/2 \\
+-        &f(x; A, \mu, \sigma, {\mathrm{form={}'logistic{}'}}) &= A [1 - \frac{1}{1 + e^{\alpha_1}} - \frac{1}{1 + e^{\alpha_2}} ]
++        &f(x; A, \mu, \sigma, {\mathrm{form={}'erf{}'}})      &= A \left[{\operatorname{erf}}(\alpha_1) + {\operatorname{erf}}(\alpha_2)\right]/2 \\
++        &f(x; A, \mu, \sigma, {\mathrm{form={}'logistic{}'}}) &= A \left[1 - \frac{1}{1 + e^{\alpha_1}} - \frac{1}{1 + e^{\alpha_2}} \right]
+         \end{eqnarray*}
+ 
+ 

@@ -1,0 +1,103 @@
+diff --git a/zulipterminal/api_types.py b/zulipterminal/api_types.py
+index 8acf4d0..9bf3b5b 100644
+--- a/zulipterminal/api_types.py
++++ b/zulipterminal/api_types.py
+@@ -50,10 +50,12 @@ MessageType = Union[DirectMessageString, StreamMessageString]
+ #
+ # NOTE: `to` field could be email until ZFL 11/3.0; ids were possible from 2.0+
+ 
+-# Timing parameters for when notifications should occur
+-TYPING_STARTED_WAIT_PERIOD: Final = 10
+-TYPING_STOPPED_WAIT_PERIOD: Final = 5
+-TYPING_STARTED_EXPIRY_PERIOD: Final = 15  # TODO: Needs implementation in ZT
++# In ZFL 204, these values were made server-configurable
++# Before this feature level, these values were fixed as follows:
++# Timing parameters for when notifications should occur (in milliseconds)
++TYPING_STARTED_WAIT_PERIOD: Final = 10000
++TYPING_STOPPED_WAIT_PERIOD: Final = 5000
++TYPING_STARTED_EXPIRY_PERIOD: Final = 15000  # TODO: Needs implementation in ZT
+ 
+ TypingStatusChange = Literal["start", "stop"]
+ 
+diff --git a/zulipterminal/model.py b/zulipterminal/model.py
+index 9c6fce6..22988c6 100644
+--- a/zulipterminal/model.py
++++ b/zulipterminal/model.py
+@@ -34,6 +34,9 @@ from zulipterminal.api_types import (
+     MAX_MESSAGE_LENGTH,
+     MAX_STREAM_NAME_LENGTH,
+     MAX_TOPIC_NAME_LENGTH,
++    TYPING_STARTED_EXPIRY_PERIOD,
++    TYPING_STARTED_WAIT_PERIOD,
++    TYPING_STOPPED_WAIT_PERIOD,
+     Composition,
+     CustomFieldValue,
+     DirectTypingNotification,
+@@ -214,6 +217,7 @@ class Model:
+         self._draft: Optional[Composition] = None
+ 
+         self._store_content_length_restrictions()
++        self._store_typing_duration_settings()
+ 
+         self.active_emoji_data, self.all_emoji_names = self.generate_all_emoji_data(
+             self.initial_data["realm_emoji"]
+@@ -791,6 +795,25 @@ class Model:
+             "max_message_length", MAX_MESSAGE_LENGTH
+         )
+ 
++    def _store_typing_duration_settings(self) -> None:
++        """
++        Store typing duration fields in model.
++        In ZFL 204, these values were made server-configurable.
++        Uses default values if not received from server.
++        """
++        self.typing_started_wait_period = self.initial_data.get(
++            "server_typing_started_wait_period_milliseconds",
++            TYPING_STARTED_WAIT_PERIOD,
++        )
++        self.typing_stopped_wait_period = self.initial_data.get(
++            "server_typing_stopped_wait_period_milliseconds",
++            TYPING_STOPPED_WAIT_PERIOD,
++        )
++        self.typing_started_expiry_period = self.initial_data.get(
++            "server_typing_started_expiry_period_milliseconds",
++            TYPING_STARTED_EXPIRY_PERIOD,
++        )
++
+     @staticmethod
+     def modernize_message_response(message: Message) -> Message:
+         """
+diff --git a/zulipterminal/ui_tools/boxes.py b/zulipterminal/ui_tools/boxes.py
+index db5f396..6867d5a 100644
+--- a/zulipterminal/ui_tools/boxes.py
++++ b/zulipterminal/ui_tools/boxes.py
+@@ -13,13 +13,7 @@ import urwid
+ from typing_extensions import Literal
+ from urwid_readline import ReadlineEdit
+ 
+-from zulipterminal.api_types import (
+-    TYPING_STARTED_WAIT_PERIOD,
+-    TYPING_STOPPED_WAIT_PERIOD,
+-    Composition,
+-    PrivateComposition,
+-    StreamComposition,
+-)
++from zulipterminal.api_types import Composition, PrivateComposition, StreamComposition
+ from zulipterminal.config.keys import (
+     is_command_key,
+     keys_for_command,
+@@ -237,8 +231,12 @@ class WriteBox(urwid.Pile):
+         ]
+         self.focus_position = self.FOCUS_CONTAINER_MESSAGE
+ 
+-        start_period_delta = timedelta(seconds=TYPING_STARTED_WAIT_PERIOD)
+-        stop_period_delta = timedelta(seconds=TYPING_STOPPED_WAIT_PERIOD)
++        start_period_delta = timedelta(
++            milliseconds=self.model.typing_started_wait_period
++        )
++        stop_period_delta = timedelta(
++            milliseconds=self.model.typing_stopped_wait_period
++        )
+ 
+         def on_type_send_status(edit: object, new_edit_text: str) -> None:
+             if new_edit_text and self.typing_recipient_user_ids:

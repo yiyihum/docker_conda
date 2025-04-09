@@ -1,0 +1,99 @@
+diff --git a/flake8_annotations_complexity/ast_helpres.py b/flake8_annotations_complexity/ast_helpres.py
+index f4bdc83..24a7e2a 100644
+--- a/flake8_annotations_complexity/ast_helpres.py
++++ b/flake8_annotations_complexity/ast_helpres.py
+@@ -18,7 +18,27 @@ def get_annotation_complexity(annotation_node, default_complexity: int = 1) -> i
+     return default_complexity
+ 
+ 
+-def validate_annotations_in_ast_node(node, max_annotations_complexity) -> List[Tuple[Any, int]]:
++def get_annotation_len(annotation_node) -> int:
++    if isinstance(annotation_node, ast.Str):
++        try:
++            annotation_node = ast.parse(annotation_node.s).body[0].value  # type: ignore
++        except (SyntaxError, IndexError):
++            return 0
++    if isinstance(annotation_node, ast.Subscript):
++        try:
++            if sys.version_info >= (3, 9):
++                return len(annotation_node.slice.elts)  # type: ignore
++            return len(annotation_node.slice.value.elts)  # type: ignore
++        except AttributeError:
++            return 0
++    return 0
++
++
++def validate_annotations_in_ast_node(
++    node,
++    max_annotations_complexity,
++    max_annotations_len,
++) -> List[Tuple[Any, str]]:
+     too_difficult_annotations = []
+     func_defs = [
+         f for f in ast.walk(node)
+@@ -35,6 +55,12 @@ def validate_annotations_in_ast_node(node, max_annotations_complexity) -> List[T
+         if complexity > max_annotations_complexity:
+             too_difficult_annotations.append((
+                 annotation,
+-                complexity,
++                'TAE002 too complex annotation ({0} > {1})'.format(complexity, max_annotations_complexity),
++            ))
++        annotation_len = get_annotation_len(annotation)
++        if annotation_len > 7:
++            too_difficult_annotations.append((
++                annotation,
++                'TAE003 too long annotation ({0} > {1})'.format(annotation_len, max_annotations_len),
+             ))
+     return too_difficult_annotations
+diff --git a/flake8_annotations_complexity/checker.py b/flake8_annotations_complexity/checker.py
+index 45c88ba..6f1344b 100644
+--- a/flake8_annotations_complexity/checker.py
++++ b/flake8_annotations_complexity/checker.py
+@@ -11,13 +11,16 @@ class AnnotationsComplexityChecker:
+     max_annotations_complexity = None
+     default_max_annotations_complexity = 3
+ 
+-    _error_message_template = 'TAE002 too complex annotation ({0} > {1})'
++    max_annotations_len = None
++    default_max_annotations_len = 7
+ 
+     def __init__(self, tree, filename: str):
+         self.filename = filename
+         self.tree = tree
+         if AnnotationsComplexityChecker.max_annotations_complexity is None:
+             AnnotationsComplexityChecker.max_annotations_complexity = self.default_max_annotations_complexity
++        if AnnotationsComplexityChecker.max_annotations_len is None:
++            AnnotationsComplexityChecker.max_annotations_len = self.default_max_annotations_len
+ 
+     @classmethod
+     def add_options(cls, parser) -> None:
+@@ -27,6 +30,12 @@ class AnnotationsComplexityChecker:
+             parse_from_config=True,
+             default=cls.default_max_annotations_complexity,
+         )
++        parser.add_option(
++            '--max-annotations-len',
++            type=int,
++            parse_from_config=True,
++            default=cls.default_max_annotations_len,
++        )
+ 
+     @classmethod
+     def parse_options(cls, options) -> None:
+@@ -36,12 +45,13 @@ class AnnotationsComplexityChecker:
+         too_difficult_annotations = validate_annotations_in_ast_node(
+             self.tree,
+             self.max_annotations_complexity,
++            self.max_annotations_len,
+         )
+ 
+-        for annotation, complexity in too_difficult_annotations:
++        for annotation, error_msg in too_difficult_annotations:
+             yield (
+                 annotation.lineno,
+                 annotation.col_offset,
+-                self._error_message_template.format(complexity, self.max_annotations_complexity),
++                error_msg,
+                 type(self),
+             )
+

@@ -1,0 +1,134 @@
+diff --git a/dvc/command/machine.py b/dvc/command/machine.py
+--- a/dvc/command/machine.py
++++ b/dvc/command/machine.py
+@@ -3,6 +3,7 @@
+ from dvc.command.base import CmdBase, append_doc_link, fix_subparsers
+ from dvc.command.config import CmdConfig
+ from dvc.config import ConfigError
++from dvc.exceptions import DvcException
+ from dvc.ui import ui
+ from dvc.utils import format_link
+ 
+@@ -104,6 +105,54 @@ def run(self):
+         return 0
+ 
+ 
++class CmdMachineRename(CmdBase):
++    def _check_exists(self, conf):
++        if self.args.name not in conf["machine"]:
++            raise ConfigError(f"machine '{self.args.name}' doesn't exist.")
++
++    def _rename_default(self, conf):
++        if conf["core"].get("machine") == self.args.name:
++            conf["core"]["machine"] = self.args.new
++
++    def _check_before_rename(self):
++        from dvc.machine import validate_name
++
++        validate_name(self.args.new)
++
++        all_config = self.config.load_config_to_level(None)
++        if self.args.new in all_config.get("machine", {}):
++            raise ConfigError(
++                "Rename failed. Machine '{}' already exists.".format(
++                    self.args.new
++                )
++            )
++        ui.write(f"Rename machine '{self.args.name}' to '{self.args.new}'.")
++
++    def run(self):
++
++        self._check_before_rename()
++
++        with self.config.edit(self.args.level) as conf:
++            self._check_exists(conf)
++            conf["machine"][self.args.new] = conf["machine"][self.args.name]
++            try:
++                self.repo.machine.rename(self.args.name, self.args.new)
++            except DvcException as error:
++                del conf["machine"][self.args.new]
++                raise ConfigError("terraform rename failed") from error
++            del conf["machine"][self.args.name]
++            self._rename_default(conf)
++
++        up_to_level = self.args.level or "repo"
++        for level in reversed(self.config.LEVELS):
++            if level == up_to_level:
++                break
++            with self.config.edit(level) as level_conf:
++                self._rename_default(level_conf)
++
++        return 0
++
++
+ class CmdMachineDefault(CmdMachineConfig):
+     def run(self):
+         if self.args.name is None and not self.args.unset:
+@@ -296,6 +345,18 @@ def add_parser(subparsers, parent_parser):
+     )
+     machine_modify_parser.set_defaults(func=CmdMachineModify)
+ 
++    machine_RENAME_HELP = "Rename a machine "
++    machine_rename_parser = machine_subparsers.add_parser(
++        "rename",
++        parents=[parent_config_parser, parent_parser],
++        description=append_doc_link(machine_RENAME_HELP, "remote/rename"),
++        help=machine_RENAME_HELP,
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++    )
++    machine_rename_parser.add_argument("name", help="Machine to be renamed")
++    machine_rename_parser.add_argument("new", help="New name of the machine")
++    machine_rename_parser.set_defaults(func=CmdMachineRename)
++
+     machine_REMOVE_HELP = "Remove an machine."
+     machine_remove_parser = machine_subparsers.add_parser(
+         "remove",
+diff --git a/dvc/machine/__init__.py b/dvc/machine/__init__.py
+--- a/dvc/machine/__init__.py
++++ b/dvc/machine/__init__.py
+@@ -206,3 +206,8 @@ def run_shell(self, name: Optional[str]):
+     def status(self, name: str) -> Iterator[Dict[Any, Any]]:
+         config, backend = self.get_config_and_backend(name)
+         return backend.instances(**config)
++
++    def rename(self, name: str, new: str):
++        """move configuration to a new location if the machine is running."""
++        config, backend = self.get_config_and_backend(name)
++        return backend.rename(new=new, **config)
+diff --git a/dvc/machine/backend/base.py b/dvc/machine/backend/base.py
+--- a/dvc/machine/backend/base.py
++++ b/dvc/machine/backend/base.py
+@@ -48,3 +48,7 @@ def get_sshfs(
+     ) -> Iterator["SSHFileSystem"]:
+         """Return an sshfs instance for the default directory on the
+         specified machine."""
++
++    @abstractmethod
++    def rename(self, name: str, new: str, **config):
++        """Rename a machine instance."""
+diff --git a/dvc/machine/backend/terraform.py b/dvc/machine/backend/terraform.py
+--- a/dvc/machine/backend/terraform.py
++++ b/dvc/machine/backend/terraform.py
+@@ -72,3 +72,22 @@ def get_sshfs(  # pylint: disable=unused-argument
+                 keyfile=pem,
+             )
+             yield fs
++
++    def rename(self, name: str, new: str, **config):
++        """rename a dvc machine instance to a new name"""
++        import shutil
++
++        mtype = "iterative_machine"
++
++        new_dir = os.path.join(self.tmp_dir, new)
++        old_dir = os.path.join(self.tmp_dir, name)
++        if os.path.exists(new_dir):
++            raise DvcException(f"rename failed: path {new_dir} already exists")
++
++        if not os.path.exists(old_dir):
++            return
++
++        with self.make_tpi(name) as tpi:
++            tpi.state_mv(f"{mtype}.{name}", f"{mtype}.{new}", **config)
++
++        shutil.move(old_dir, new_dir)

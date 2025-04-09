@@ -1,0 +1,381 @@
+diff --git a/src/sqlfluff/cli/commands.py b/src/sqlfluff/cli/commands.py
+index 3aac14db..c5efaddc 100644
+--- a/src/sqlfluff/cli/commands.py
++++ b/src/sqlfluff/cli/commands.py
+@@ -6,9 +6,9 @@ import click
+ 
+ from ..dialects import dialect_selector
+ from ..linter import Linter
+-from .formatters import (format_config, format_linting_result,
+-                         format_linting_violations, format_rules,
+-                         format_violation)
++from .formatters import (format_config, format_rules,
++                         format_violation, format_linting_result_header,
++                         format_linting_result_footer)
+ from .helpers import cli_table, get_package_version
+ 
+ 
+@@ -21,7 +21,7 @@ def common_options(f):
+     return f
+ 
+ 
+-def get_linter(dialiect_string, rule_string, exclude_rule_string):
++def get_linter(dialiect_string, rule_string, exclude_rule_string, color=False):
+     """ A generic way of getting hold of a linter """
+     try:
+         dialect_obj = dialect_selector(dialiect_string)
+@@ -38,8 +38,9 @@ def get_linter(dialiect_string, rule_string, exclude_rule_string):
+         excluded_rule_list = exclude_rule_string.split(',')
+     else:
+         excluded_rule_list = None
+-    # Instantiate the linter and return
+-    return Linter(dialect=dialect_obj, rule_whitelist=rule_list, rule_blacklist=excluded_rule_list)
++    # Instantiate the linter and return (with an output function)
++    return Linter(dialect=dialect_obj, rule_whitelist=rule_list, rule_blacklist=excluded_rule_list,
++                  output_func=lambda m: click.echo(m, color=color))
+ 
+ 
+ @click.group()
+@@ -56,7 +57,8 @@ def version(verbose, nocolor, dialect, rules, exclude_rules):
+     color = False if nocolor else None
+     if verbose > 0:
+         # Instantiate the linter
+-        lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules)
++        lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules,
++                         color=color)
+         click.echo(format_config(lnt, verbose=verbose))
+     else:
+         click.echo(get_package_version(), color=color)
+@@ -69,7 +71,8 @@ def rules(verbose, nocolor, dialect, rules, exclude_rules):
+     # Configure Color
+     color = False if nocolor else None
+     # Instantiate the linter
+-    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules)
++    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules,
++                     color=color)
+     click.echo(format_rules(lnt), color=color)
+ 
+ 
+@@ -95,21 +98,22 @@ def lint(verbose, nocolor, dialect, rules, exclude_rules, paths):
+     # Configure Color
+     color = False if nocolor else None
+     # Instantiate the linter
+-    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules)
++    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules, color=color)
+     config_string = format_config(lnt, verbose=verbose)
+     if len(config_string) > 0:
+-        click.echo(config_string, color=color)
++        lnt.log(config_string)
+     # Lint the paths
+     if verbose > 1:
+-        click.echo("==== logging ====")
++        lnt.log("==== logging ====")
+     # add stdin if specified via lone '-'
+     if ('-',) == paths:
+         result = lnt.lint_string(sys.stdin.read(), name='stdin', verbosity=verbose)
+     else:
++        # Output the results as we go
++        lnt.log(format_linting_result_header(verbose=verbose))
+         result = lnt.lint_paths(paths, verbosity=verbose)
+-    # Output the results
+-    output = format_linting_result(result, verbose=verbose)
+-    click.echo(output, color=color)
++        # Output the final stats
++        lnt.log(format_linting_result_footer(result, verbose=verbose))
+     sys.exit(result.stats()['exit code'])
+ 
+ 
+@@ -121,22 +125,21 @@ def fix(verbose, nocolor, dialect, rules, exclude_rules, force, paths):
+     """ Fix SQL files """
+     # Configure Color
+     color = False if nocolor else None
+-    # Instantiate the linter
+-    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules)
++    # Instantiate the linter (with an output function)
++    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules, color=color)
+     config_string = format_config(lnt, verbose=verbose)
+     if len(config_string) > 0:
+-        click.echo(config_string, color=color)
++        lnt.log(config_string)
+     # Check that if fix is specified, that we have picked only a subset of rules
+     if lnt.rule_whitelist is None:
+-        click.echo(("The fix option is only available in combination"
+-                    " with --rules. This is for your own safety!"))
++        lnt.log(("The fix option is only available in combination"
++                 " with --rules. This is for your own safety!"))
+         sys.exit(1)
+-    # Lint the paths (not with the fix argument at this stage)
+-    result = lnt.lint_paths(paths)
++    # Lint the paths (not with the fix argument at this stage), outputting as we go.
++    lnt.log("==== finding violations ====")
++    result = lnt.lint_paths(paths, verbosity=verbose)
+ 
+     if result.num_violations() > 0:
+-        click.echo("==== violations found ====")
+-        click.echo(format_linting_violations(result, verbose=verbose), color=color)
+         click.echo("==== fixing violations ====")
+         click.echo("{0} violations found of rule{1} {2}".format(
+             result.num_violations(),
+@@ -185,29 +188,25 @@ def parse(verbose, nocolor, dialect, rules, exclude_rules, path, recurse):
+     if recurse == 0:
+         recurse = True
+     # Instantiate the linter
+-    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules)
++    lnt = get_linter(dialiect_string=dialect, rule_string=rules, exclude_rule_string=exclude_rules, color=color)
+     config_string = format_config(lnt, verbose=verbose)
+     if len(config_string) > 0:
+-        click.echo(config_string, color=color)
++        lnt.log(config_string)
+ 
+     nv = 0
+     # A single path must be specified for this command
+     for parsed, violations, time_dict in lnt.parse_path(path, verbosity=verbose, recurse=recurse):
+-        click.echo('=== [\u001b[30;1m{0}\u001b[0m] ==='.format(path), color=color)
+         if parsed:
+-            click.echo(parsed.stringify())
++            lnt.log(parsed.stringify())
+         else:
+             # TODO: Make this prettier
+-            click.echo('...Failed to Parse...', color=color)
++            lnt.log('...Failed to Parse...')
+         nv += len(violations)
+         for v in violations:
+-            click.echo(
+-                format_violation(v, verbose=verbose),
+-                color=color
+-            )
++            lnt.log(format_violation(v, verbose=verbose))
+         if verbose >= 2:
+-            click.echo("==== timings ====")
+-            click.echo(cli_table(time_dict.items()))
++            lnt.log("==== timings ====")
++            lnt.log(cli_table(time_dict.items()))
+     if nv > 0:
+         sys.exit(66)
+     else:
+diff --git a/src/sqlfluff/cli/formatters.py b/src/sqlfluff/cli/formatters.py
+index 352b3601..45a3f27a 100644
+--- a/src/sqlfluff/cli/formatters.py
++++ b/src/sqlfluff/cli/formatters.py
+@@ -18,6 +18,10 @@ def format_filename(filename, success=False, verbose=0, success_text='PASS'):
+         + "] " + status_string)
+ 
+ 
++def format_path(path):
++    return '=== [ path: {0} ] ===\n'.format(colorize(path, 'lightgrey'))
++
++
+ def format_violation(violation, verbose=0):
+     if isinstance(violation, SQLBaseError):
+         code, line, pos, desc = violation.get_info_tuple()
+@@ -51,26 +55,37 @@ def format_fix(fix, verbose=0):
+     )
+ 
+ 
+-def format_violations(violations, verbose=0):
++def format_file_violations(fname, res, verbose=0):
++    text_buffer = StringIO()
++    # Success is having no violations
++    success = len(res) == 0
++
++    # Only print the filename if it's either a failure or verbosity > 1
++    if verbose > 1 or not success:
++        text_buffer.write(format_filename(fname, success=success, verbose=verbose))
++        text_buffer.write('\n')
++
++    # If we have violations, print them
++    if not success:
++        # sort by position in file
++        s = sorted(res, key=lambda v: v.char_pos())
++        for violation in s:
++            text_buffer.write(format_violation(violation, verbose=verbose))
++            text_buffer.write('\n')
++    str_buffer = text_buffer.getvalue()
++    # Remove the trailing newline if there is one
++    if len(str_buffer) > 0 and str_buffer[-1] == '\n':
++        str_buffer = str_buffer[:-1]
++    return str_buffer
++
++
++def format_path_violations(violations, verbose=0):
+     # Violations should be a dict
+     keys = sorted(violations.keys())
+     text_buffer = StringIO()
+     for key in keys:
+-        # Success is having no violations
+-        success = len(violations[key]) == 0
+-
+-        # Only print the filename if it's either a failure or verbosity > 1
+-        if verbose > 1 or not success:
+-            text_buffer.write(format_filename(key, success=success, verbose=verbose))
+-            text_buffer.write('\n')
+-
+-        # If we have violations, print them
+-        if not success:
+-            # sort by position in file
+-            s = sorted(violations[key], key=lambda v: v.char_pos())
+-            for violation in s:
+-                text_buffer.write(format_violation(violation, verbose=verbose))
+-                text_buffer.write('\n')
++        text_buffer.write(format_file_violations(key, violations[key], verbose=verbose))
++        text_buffer.write('\n')
+     str_buffer = text_buffer.getvalue()
+     # Remove the trailing newline if there is one
+     if len(str_buffer) > 0 and str_buffer[-1] == '\n':
+@@ -101,27 +116,58 @@ def format_linting_stats(result, verbose=0):
+     return text_buffer.getvalue()
+ 
+ 
++def format_linting_path(p, verbose=0):
++    text_buffer = StringIO()
++    if verbose > 0:
++        text_buffer.write(format_path(p))
++    return text_buffer.getvalue()
++
++
++def _format_path_linting_violations(result, verbose=0):
++    text_buffer = StringIO()
++    text_buffer.write(format_linting_path(result.path))
++    text_buffer.write(format_path_violations(result.violations(), verbose=verbose))
++    return text_buffer.getvalue()
++
++
+ def format_linting_violations(result, verbose=0):
+     """ Assume we're passed a LintingResult """
+     text_buffer = StringIO()
+-    for path in result.paths:
+-        if verbose > 0:
+-            text_buffer.write('=== [ path: {0} ] ===\n'.format(colorize(path.path, 'lightgrey')))
+-        text_buffer.write(format_violations(path.violations(), verbose=verbose))
++    if hasattr(result, 'paths'):
++        # We've got a full path
++        for path in result.paths:
++            text_buffer.write(_format_path_linting_violations(path, verbose=verbose))
++    else:
++        # We've got an individual
++        text_buffer.write(_format_path_linting_violations(result, verbose=verbose))
+     return text_buffer.getvalue()
+ 
+ 
+-def format_linting_result(result, verbose=0):
++def format_linting_result_header(verbose=0):
+     """ Assume we're passed a LintingResult """
+     text_buffer = StringIO()
+     if verbose >= 1:
+         text_buffer.write("==== readout ====\n")
+-    text_buffer.write(format_linting_violations(result, verbose=verbose))
++    return text_buffer.getvalue()
++
++
++def format_linting_result_footer(result, verbose=0):
++    """ Assume we're passed a LintingResult """
++    text_buffer = StringIO()
+     text_buffer.write('\n')
+     text_buffer.write(format_linting_stats(result, verbose=verbose))
+     return text_buffer.getvalue()
+ 
+ 
++def format_linting_result(result, verbose=0):
++    """ Assume we're passed a LintingResult """
++    text_buffer = StringIO()
++    text_buffer.write(format_linting_result_header(verbose=verbose))
++    text_buffer.write(format_linting_violations(result, verbose=verbose))
++    text_buffer.write(format_linting_result_footer(result, verbose=verbose))
++    return text_buffer.getvalue()
++
++
+ def format_config(linter, verbose=0):
+     text_buffer = StringIO()
+     # Only show version information if verbosity is high enough
+diff --git a/src/sqlfluff/linter.py b/src/sqlfluff/linter.py
+index af97e26d..4a954d74 100644
+--- a/src/sqlfluff/linter.py
++++ b/src/sqlfluff/linter.py
+@@ -12,6 +12,8 @@ from .parser.segments_file import FileSegment
+ from .parser.segments_base import verbosity_logger, frame_msg, ParseContext
+ from .rules.std import standard_rule_set
+ 
++from .cli.formatters import format_linting_path, format_file_violations
++
+ 
+ class LintedFile(namedtuple('ProtoFile', ['path', 'violations', 'time_dict', 'tree'])):
+     __slots__ = ()
+@@ -131,7 +133,8 @@ class LintingResult(object):
+ 
+ 
+ class Linter(object):
+-    def __init__(self, dialect=None, sql_exts=('.sql',), rule_whitelist=None, rule_blacklist=None):
++    def __init__(self, dialect=None, sql_exts=('.sql',), rule_whitelist=None,
++                 rule_blacklist=None, output_func=None):
+         # NB: dialect defaults to ansi if "none" supplied
+         if isinstance(dialect, str) or dialect is None:
+             dialect = dialect_selector(dialect)
+@@ -141,6 +144,14 @@ class Linter(object):
+         # assume that this is a list of rule codes
+         self.rule_whitelist = rule_whitelist
+         self.rule_blacklist = rule_blacklist
++        # Used for logging as we go
++        self.output_func = output_func
++
++    def log(self, msg):
++        if self.output_func:
++            # Check we've actually got a meaningful message
++            if msg.strip(' \n\t'):
++                self.output_func(msg)
+ 
+     def get_ruleset(self):
+         """
+@@ -286,7 +297,10 @@ class Linter(object):
+ 
+             vs += linting_errors
+ 
+-        return LintedFile(fname, vs, time_dict, parsed)
++        res = LintedFile(fname, vs, time_dict, parsed)
++        # Do the logging as appropriate
++        self.log(format_file_violations(fname, res.violations, verbose=verbosity))
++        return res
+ 
+     def paths_from_path(self, path):
+         # take a path (potentially a directory) and return just the sql files
+@@ -324,6 +338,7 @@ class Linter(object):
+ 
+     def lint_path(self, path, verbosity=0, fix=False):
+         linted_path = LintedPath(path)
++        self.log(format_linting_path(path, verbose=verbosity))
+         for fname in self.paths_from_path(path):
+             with open(fname, 'r') as f:
+                 linted_path.add(self.lint_file(f, fname=fname, verbosity=verbosity, fix=fix))
+@@ -343,5 +358,6 @@ class Linter(object):
+ 
+     def parse_path(self, path, verbosity=0, recurse=True):
+         for fname in self.paths_from_path(path):
++            self.log('=== [\u001b[30;1m{0}\u001b[0m] ==='.format(fname))
+             with open(fname, 'r') as f:
+                 yield self.parse_file(f, fname=fname, verbosity=verbosity, recurse=recurse)
+diff --git a/src/sqlfluff/parser/grammar.py b/src/sqlfluff/parser/grammar.py
+index 6823e412..ea2ed0ae 100644
+--- a/src/sqlfluff/parser/grammar.py
++++ b/src/sqlfluff/parser/grammar.py
+@@ -251,7 +251,7 @@ class BaseGrammar(object):
+ 
+         # Have we been passed an empty list?
+         if len(segments) == 0:
+-            return MatchResult.from_empty()
++            return ((), MatchResult.from_unmatched(segments), None)
+ 
+         # Get hold of the bracket matchers from the dialect, and append them
+         # to the list of matchers.
+diff --git a/src/sqlfluff/parser/lexer.py b/src/sqlfluff/parser/lexer.py
+index cfe708d8..edc959ba 100644
+--- a/src/sqlfluff/parser/lexer.py
++++ b/src/sqlfluff/parser/lexer.py
+@@ -178,7 +178,7 @@ class Lexer(object):
+         res = self.matcher.match(raw, start_pos)
+         if len(res.new_string) > 0:
+             raise SQLLexError(
+-                "Unable to lex characters: '{0}...'".format(
++                "Unable to lex characters: '{0!r}...'".format(
+                     res.new_string[:10]),
+                 pos=res.new_pos
+             )
+

@@ -1,0 +1,177 @@
+diff --git a/quickbooks/mixins.py b/quickbooks/mixins.py
+index 9b51a42..2083139 100644
+--- a/quickbooks/mixins.py
++++ b/quickbooks/mixins.py
+@@ -119,6 +119,53 @@ class SendMixin(object):
+ 
+ 
+ class VoidMixin(object):
++
++    def get_void_params(self):
++        qb_object_params_map = {
++            "Payment": {
++                "operation": "update",
++                "include": "void"
++            },
++            "SalesReceipt": {
++                "operation": "update",
++                "include": "void"
++            },
++            "BillPayment": {
++                "operation": "update",
++                "include": "void"
++            },
++            "Invoice": {
++                "operation": "void",
++            },
++        }
++        # setting the default operation to void (the original behavior)
++        return qb_object_params_map.get(self.qbo_object_name, {"operation": "void"})
++
++    def get_void_data(self):
++        qb_object_params_map = {
++            "Payment": {
++                "Id": self.Id,
++                "SyncToken": self.SyncToken,
++                "sparse": True
++            },
++            "SalesReceipt": {
++                "Id": self.Id,
++                "SyncToken": self.SyncToken,
++                "sparse": True
++            },
++            "BillPayment": {
++                "Id": self.Id,
++                "SyncToken": self.SyncToken,
++                "sparse": True
++            },
++            "Invoice": {
++                "Id": self.Id,
++                "SyncToken": self.SyncToken,
++            },
++        }
++        # setting the default operation to void (the original behavior)
++        return qb_object_params_map.get(self.qbo_object_name, {"operation": "void"})
++
+     def void(self, qb=None):
+         if not qb:
+             qb = QuickBooks()
+@@ -126,14 +173,12 @@ class VoidMixin(object):
+         if not self.Id:
+             raise QuickbooksException('Cannot void unsaved object')
+ 
+-        data = {
+-            'Id': self.Id,
+-            'SyncToken': self.SyncToken,
+-        }
+-
+         endpoint = self.qbo_object_name.lower()
+         url = "{0}/company/{1}/{2}".format(qb.api_url, qb.company_id, endpoint)
+-        results = qb.post(url, json.dumps(data), params={'operation': 'void'})
++
++        data = self.get_void_data()
++        params = self.get_void_params()
++        results = qb.post(url, json.dumps(data), params=params)
+ 
+         return results
+ 
+diff --git a/quickbooks/objects/attachable.py b/quickbooks/objects/attachable.py
+index e7d23d0..23e7132 100644
+--- a/quickbooks/objects/attachable.py
++++ b/quickbooks/objects/attachable.py
+@@ -58,7 +58,7 @@ class Attachable(DeleteMixin, QuickbooksManagedObject, QuickbooksTransactionEnti
+         else:
+             json_data = qb.create_object(self.qbo_object_name, self.to_json(), _file_path=self._FilePath)
+ 
+-        if self.FileName:
++        if self.Id is None and self.FileName:
+             obj = type(self).from_json(json_data['AttachableResponse'][0]['Attachable'])
+         else:
+             obj = type(self).from_json(json_data['Attachable'])
+diff --git a/quickbooks/objects/billpayment.py b/quickbooks/objects/billpayment.py
+index 3f175d9..64569d9 100644
+--- a/quickbooks/objects/billpayment.py
++++ b/quickbooks/objects/billpayment.py
+@@ -1,6 +1,6 @@
+ from .base import QuickbooksBaseObject, Ref, LinkedTxn, QuickbooksManagedObject, LinkedTxnMixin, \
+     QuickbooksTransactionEntity
+-from ..mixins import DeleteMixin
++from ..mixins import DeleteMixin, VoidMixin
+ 
+ 
+ class CheckPayment(QuickbooksBaseObject):
+@@ -47,7 +47,7 @@ class BillPaymentLine(QuickbooksBaseObject):
+         return str(self.Amount)
+ 
+ 
+-class BillPayment(DeleteMixin, QuickbooksManagedObject, QuickbooksTransactionEntity, LinkedTxnMixin):
++class BillPayment(DeleteMixin, QuickbooksManagedObject, QuickbooksTransactionEntity, LinkedTxnMixin, VoidMixin):
+     """
+     QBO definition: A BillPayment entity represents the financial transaction of payment
+     of bills that the business owner receives from a vendor for goods or services purchased
+diff --git a/quickbooks/objects/payment.py b/quickbooks/objects/payment.py
+index 07e1522..75cbf57 100644
+--- a/quickbooks/objects/payment.py
++++ b/quickbooks/objects/payment.py
+@@ -3,7 +3,7 @@ from .base import QuickbooksBaseObject, Ref, LinkedTxn, \
+     LinkedTxnMixin, MetaData
+ from ..client import QuickBooks
+ from .creditcardpayment import CreditCardPayment
+-from ..mixins import DeleteMixin
++from ..mixins import DeleteMixin, VoidMixin
+ import json
+ 
+ 
+@@ -21,7 +21,7 @@ class PaymentLine(QuickbooksBaseObject):
+         return str(self.Amount)
+ 
+ 
+-class Payment(DeleteMixin, QuickbooksManagedObject, QuickbooksTransactionEntity, LinkedTxnMixin):
++class Payment(DeleteMixin, QuickbooksManagedObject, QuickbooksTransactionEntity, LinkedTxnMixin, VoidMixin):
+     """
+     QBO definition: A Payment entity records a payment in QuickBooks. The payment can be
+     applied for a particular customer against multiple Invoices and Credit Memos. It can also
+@@ -81,24 +81,5 @@ class Payment(DeleteMixin, QuickbooksManagedObject, QuickbooksTransactionEntity,
+         # These fields are for minor version 4
+         self.TransactionLocationType = None
+ 
+-    def void(self, qb=None):
+-        if not qb:
+-            qb = QuickBooks()
+-
+-        if not self.Id:
+-            raise qb.QuickbooksException('Cannot void unsaved object')
+-
+-        data = {
+-            'Id': self.Id,
+-            'SyncToken': self.SyncToken,
+-            'sparse': True
+-        }
+-
+-        endpoint = self.qbo_object_name.lower()
+-        url = "{0}/company/{1}/{2}".format(qb.api_url, qb.company_id, endpoint)
+-        results = qb.post(url, json.dumps(data), params={'operation': 'update', 'include': 'void'})
+-
+-        return results
+-
+     def __str__(self):
+         return str(self.TotalAmt)
+diff --git a/quickbooks/objects/salesreceipt.py b/quickbooks/objects/salesreceipt.py
+index 83b55a2..0a42925 100644
+--- a/quickbooks/objects/salesreceipt.py
++++ b/quickbooks/objects/salesreceipt.py
+@@ -2,11 +2,11 @@ from .base import Ref, CustomField, QuickbooksManagedObject, LinkedTxnMixin, Add
+     EmailAddress, QuickbooksTransactionEntity, LinkedTxn
+ from .tax import TxnTaxDetail
+ from .detailline import DetailLine
+-from ..mixins import QuickbooksPdfDownloadable, DeleteMixin
++from ..mixins import QuickbooksPdfDownloadable, DeleteMixin, VoidMixin
+ 
+ 
+ class SalesReceipt(DeleteMixin, QuickbooksPdfDownloadable, QuickbooksManagedObject,
+-                   QuickbooksTransactionEntity, LinkedTxnMixin):
++                   QuickbooksTransactionEntity, LinkedTxnMixin, VoidMixin):
+     """
+     QBO definition: SalesReceipt represents the sales receipt that is given to a customer.
+     A sales receipt is similar to an invoice. However, for a sales receipt, payment is received
+

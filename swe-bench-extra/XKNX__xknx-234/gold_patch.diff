@@ -1,0 +1,187 @@
+diff --git a/examples/example_light_rgbw.py b/examples/example_light_rgbw.py
+new file mode 100644
+index 00000000..dd060c98
+--- /dev/null
++++ b/examples/example_light_rgbw.py
+@@ -0,0 +1,49 @@
++"""Example for setting different colors on a RGBW light."""
++import asyncio
++
++from xknx import XKNX
++from xknx.devices import RemoteValueColorRGBW
++
++
++async def main():
++    """Connect to KNX/IP bus and set different colors."""
++    xknx = XKNX()
++    await xknx.start()
++
++    rgbw = RemoteValueColorRGBW(xknx,
++                                group_address='1/1/40',
++                                group_address_state='1/1/41',
++                                device_name="RGBWLight")
++
++    await rgbw.set([255, 255, 255, 0, 15])  # cold-white
++    await asyncio.sleep(1)
++    await rgbw.set([0, 0, 0, 255, 15])  # warm-white
++    await asyncio.sleep(1)
++    await rgbw.set([0, 0, 0, 0, 15])  # off
++    await asyncio.sleep(1)
++
++    await rgbw.set([255, 0, 0, 0])  # red
++    await asyncio.sleep(1)
++    await rgbw.set([0, 255, 0, 0])  # green
++    await asyncio.sleep(1)
++    await rgbw.set([0, 0, 255, 0])  # blue
++    await asyncio.sleep(1)
++    await rgbw.set([0, 0, 0, 0, 15])  # off
++    await asyncio.sleep(1)
++
++    await rgbw.set([255, 255, 0, 0, 15])
++    await asyncio.sleep(1)
++    await rgbw.set([0, 255, 255, 0, 15])
++    await asyncio.sleep(1)
++    await rgbw.set([255, 0, 255, 0, 15])
++    await asyncio.sleep(1)
++    await rgbw.set([0, 0, 0, 0, 15])  # off
++    await asyncio.sleep(1)
++
++    await xknx.stop()
++
++
++# pylint: disable=invalid-name
++loop = asyncio.get_event_loop()
++loop.run_until_complete(main())
++loop.close()
+diff --git a/xknx/devices/remote_value_color_rgbw.py b/xknx/devices/remote_value_color_rgbw.py
+index 6c2e436e..beea0ca9 100644
+--- a/xknx/devices/remote_value_color_rgbw.py
++++ b/xknx/devices/remote_value_color_rgbw.py
+@@ -35,19 +35,23 @@ class RemoteValueColorRGBW(RemoteValue):
+         Convert value (4-6 bytes) to payload (6 bytes).
+ 
+         * Structure of DPT 251.600
+-        ** Bytes 0, 1:
+-        *** Bit 0-11: 0
+-        *** Bit 12,13,14,15: R,G,B,W value valid?
+-        ** Byte 2: R value
+-        ** Byte 3: G value
+-        ** Byte 4: B value
+-        ** Byte 5: W value
++        ** Byte 0: R value
++        ** Byte 1: G value
++        ** Byte 2: B value
++        ** Byte 3: W value
++        ** Byte 4: 0x00 (reserved)
++        ** Byte 5:
++        *** Bit 0: W value valid?
++        *** Bit 1: B value valid?
++        *** Bit 2: G value valid?
++        *** Bit 3: R value valid?
++        *** Bit 4-7: 0
+ 
+         In case we receive
+         * > 6 bytes: error
+         * 6 bytes: all bytes are passed through
+-        * 5 bytes: 0x00 left padding
+-        * 4 bytes: 0x000f left padding
++        * 5 bytes: 0x00?? fill up to 6 bytes
++        * 4 bytes: 0x000f right padding to 6 bytes
+         * < 4 bytes: error
+         """
+         if not isinstance(value, (list, tuple)):
+@@ -56,12 +60,16 @@ class RemoteValueColorRGBW(RemoteValue):
+         if len(value) < 4 or len(value) > 6:
+             raise ConversionError("Cannot serialize value to DPT 251.600 (wrong length, expecting list of 4-6 bytes)",
+                                   value=value, type=type(value))
+-        rgbw = value[len(value)-4:]
++        rgbw = value[:4]
+         if any(not isinstance(color, int) for color in rgbw) \
+                 or any(color < 0 for color in rgbw) \
+                 or any(color > 255 for color in rgbw):
+             raise ConversionError("Cannot serialize DPT 251.600 (wrong RGBW values)", value=value)
+-        return DPTArray([0x00, 0x0f][:6-len(value)] + list(value))
++        if len(value) < 5:
++            return DPTArray(list(rgbw) + [0x00, 0x0f])
++        if len(value) < 6:
++            return DPTArray(list(rgbw) + [0x00] + list(value[4:]))
++        return DPTArray(value)
+ 
+     def from_knx(self, payload):
+         """
+@@ -72,7 +80,7 @@ class RemoteValueColorRGBW(RemoteValue):
+         """
+         result = []
+         for i in range(0, len(payload.value) - 2):
+-            valid = payload.value[1] & (0x08 >> i) != 0
+-            result.append(payload.value[2 + i] if valid else self.previous_value[i])
++            valid = (payload.value[5] & (0x08 >> i)) != 0  # R,G,B,W value valid?
++            result.append(payload.value[i] if valid else self.previous_value[i])
+         self.previous_value = result
+         return result
+diff --git a/xknx/exceptions/exception.py b/xknx/exceptions/exception.py
+index 879e14b2..626299bd 100644
+--- a/xknx/exceptions/exception.py
++++ b/xknx/exceptions/exception.py
+@@ -6,7 +6,15 @@ class XKNXException(Exception):
+ 
+     def __eq__(self, other):
+         """Equal operator."""
+-        return self.__dict__ == other.__dict__
++        return repr(self) == repr(other)
++
++    def __hash__(self):
++        """Hash function."""
++        return hash(str(self))
++
++    def __repr__(self):
++        """Representation of object."""
++        return str(self)
+ 
+ 
+ class CouldNotParseTelegram(XKNXException):
+@@ -14,7 +22,7 @@ class CouldNotParseTelegram(XKNXException):
+ 
+     def __init__(self, description, **kwargs):
+         """Initialize CouldNotParseTelegram class."""
+-        super().__init__("Could not parse Telegram")
++        super().__init__()
+         self.description = description
+         self.parameter = kwargs
+ 
+@@ -32,7 +40,7 @@ class CouldNotParseKNXIP(XKNXException):
+ 
+     def __init__(self, description=""):
+         """Initialize CouldNotParseTelegram class."""
+-        super().__init__("Could not parse KNXIP")
++        super().__init__()
+         self.description = description
+ 
+     def __str__(self):
+@@ -46,7 +54,7 @@ class ConversionError(XKNXException):
+ 
+     def __init__(self, description, **kwargs):
+         """Initialize ConversionError class."""
+-        super().__init__("Conversion Error")
++        super().__init__()
+         self.description = description
+         self.parameter = kwargs
+ 
+@@ -63,7 +71,7 @@ class CouldNotParseAddress(XKNXException):
+ 
+     def __init__(self, address=None):
+         """Initialize CouldNotParseAddress class."""
+-        super().__init__("Could not parse address")
++        super().__init__()
+         self.address = address
+ 
+     def __str__(self):
+@@ -76,7 +84,7 @@ class DeviceIllegalValue(XKNXException):
+ 
+     def __init__(self, value, description):
+         """Initialize DeviceIllegalValue class."""
+-        super().__init__("Illegal value for device")
++        super().__init__()
+         self.value = value
+         self.description = description
+ 

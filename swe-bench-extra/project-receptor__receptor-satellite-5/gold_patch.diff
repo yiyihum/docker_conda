@@ -1,0 +1,134 @@
+diff --git a/receptor_satellite/response/messages.py b/receptor_satellite/response/messages.py
+index 23ee860..b16de05 100644
+--- a/receptor_satellite/response/messages.py
++++ b/receptor_satellite/response/messages.py
+@@ -30,12 +30,21 @@ def playbook_run_cancel_ack(playbook_run_id, status):
+     }
+ 
+ 
+-def playbook_run_finished(host, playbook_run_id, result=RESULT_SUCCESS):
++def playbook_run_finished(
++    host,
++    playbook_run_id,
++    result=RESULT_SUCCESS,
++    connection_error=False,
++    execution_code=0,
++):
+     return {
++        "version": 2,
+         "type": "playbook_run_finished",
+         "playbook_run_id": playbook_run_id,
+         "host": host,
+         "status": result,
++        "connection_code": 1 if connection_error else 0,
++        "execution_code": None if connection_error else execution_code,
+     }
+ 
+ 
+diff --git a/receptor_satellite/response/response_queue.py b/receptor_satellite/response/response_queue.py
+index 4cf0f45..dc5dab0 100644
+--- a/receptor_satellite/response/response_queue.py
++++ b/receptor_satellite/response/response_queue.py
+@@ -15,9 +15,18 @@ class ResponseQueue:
+         )
+ 
+     def playbook_run_finished(
+-        self, host, playbook_run_id, result=constants.RESULT_SUCCESS
++        self,
++        host,
++        playbook_run_id,
++        result=constants.RESULT_SUCCESS,
++        connection_error=False,
++        exit_code=0,
+     ):
+-        self.queue.put(messages.playbook_run_finished(host, playbook_run_id, result))
++        self.queue.put(
++            messages.playbook_run_finished(
++                host, playbook_run_id, result, connection_error, exit_code
++            )
++        )
+ 
+     def playbook_run_completed(
+         self, playbook_run_id, status, connection_error=None, infrastructure_error=None
+diff --git a/receptor_satellite/worker.py b/receptor_satellite/worker.py
+index e16b45b..5140766 100644
+--- a/receptor_satellite/worker.py
++++ b/receptor_satellite/worker.py
+@@ -9,7 +9,8 @@ import receptor_satellite.response.constants as constants
+ from .run_monitor import run_monitor
+ 
+ # EXCEPTION means failure between capsule and the target host
+-EXIT_STATUS_RE = re.compile(r"Exit status: ([0-9]+|EXCEPTION)", re.MULTILINE)
++EXIT_STATUS_RE = re.compile(r"Exit status: (([0-9]+)|EXCEPTION)", re.MULTILINE)
++UNREACHABLE_RE = re.compile(r"unreachable=[1-9][0-9]*")
+ 
+ 
+ def receptor_export(func):
+@@ -93,6 +94,8 @@ class Host:
+         self.sequence = 0
+         self.since = None if run.config.text_update_full else 0.0
+         self.result = None
++        self.last_recap_line = ""
++        self.host_recap_re = re.compile(f"^.*{name}.*ok=[0-9]+")
+ 
+     def mark_as_failed(self, message):
+         queue = self.run.queue
+@@ -119,16 +122,32 @@ class Host:
+                     self.name, self.run.playbook_run_id, last_output, self.sequence
+                 )
+                 self.sequence += 1
++
++            possible_recaps = list(
++                filter(
++                    lambda x: re.match(self.host_recap_re, x), last_output.split("\n")
++                )
++            )
++            if len(possible_recaps) > 0:
++                self.last_recap_line = possible_recaps.pop()
++
+             if body["complete"]:
++                connection_error = re.search(UNREACHABLE_RE, self.last_recap_line)
+                 result = constants.HOST_RESULT_FAILURE
+                 matches = re.findall(EXIT_STATUS_RE, last_output)
++                exit_code = None
+                 # This means the job was already running on the host
+                 if matches:
+-                    # If exitcode is 0
+-                    if matches[0] == "0":
+-                        result = constants.HOST_RESULT_SUCCESS
+-                    elif self.run.cancelled:
+-                        result = constants.HOST_RESULT_CANCEL
++                    code = matches[0][1]
++                    # If there was an exit code
++                    if code != "":
++                        exit_code = int(code)
++                        if exit_code == 0:
++                            result = constants.HOST_RESULT_SUCCESS
++                        elif self.run.cancelled:
++                            result = constants.HOST_RESULT_CANCEL
++                        else:
++                            result = constants.HOST_RESULT_FAILURE
+                 elif self.run.cancelled:
+                     result = constants.HOST_RESULT_CANCEL
+                 else:
+@@ -139,6 +158,8 @@ class Host:
+                     constants.HOST_RESULT_FAILURE
+                     if result == constants.HOST_RESULT_INFRA_FAILURE
+                     else result,
++                    connection_error or result == constants.HOST_RESULT_INFRA_FAILURE,
++                    exit_code,
+                 )
+                 self.result = result
+                 break
+diff --git a/setup.cfg b/setup.cfg
+index 849e449..3c1f6ae 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -21,6 +21,7 @@ ignore=E201,E203,E221,E225,E231,E241,E251,E261,E265,E303,W291,W391,W293,E731,F40
+ exclude=.tox,venv,awx/lib/site-packages,awx/plugins/inventory,awx/ui,awx/api/urls.py,awx/main/migrations,awx/main/south_migrations,awx/main/tests/data,node_modules/,awx/projects/,tools/docker,awx/settings/local_*.py,installer/openshift/settings.py,build/,installer/
+ per-file-ignores =
+     tests/constants.py:E501
++    tests/test_run.py:E501
+ 
+ [metadata]
+ license_file=LICENSE.md

@@ -1,0 +1,254 @@
+diff --git a/docs/source/whatsnew.rst b/docs/source/whatsnew.rst
+index 6c246e6..c637790 100644
+--- a/docs/source/whatsnew.rst
++++ b/docs/source/whatsnew.rst
+@@ -6,6 +6,8 @@ What's New
+ 
+ New features, bug fixes, and improvements for each release.
+ 
++.. include:: whatsnew/v0.2.2.rst
++
+ .. include:: whatsnew/v0.2.1.rst
+ 
+ .. include:: whatsnew/v0.2.0.rst
+diff --git a/docs/source/whatsnew/v0.2.2.rst b/docs/source/whatsnew/v0.2.2.rst
+new file mode 100644
+index 0000000..ed0bb99
+--- /dev/null
++++ b/docs/source/whatsnew/v0.2.2.rst
+@@ -0,0 +1,13 @@
++v0.2.1
++------
++
++Highlights
++~~~~~~~~~~
++
++* Fixes bug where ``DailyFilings`` and ``MasterFilings`` does not use correct URLs when calling `save` method (thanks to alpbozkurt!)
++
++Contributors
++~~~~~~~~~~~~
++
++- jackmoody11
++- alpbozkurt
+\ No newline at end of file
+diff --git a/secedgar/__init__.py b/secedgar/__init__.py
+index fc79d63..020ed73 100644
+--- a/secedgar/__init__.py
++++ b/secedgar/__init__.py
+@@ -1,1 +1,1 @@
+-__version__ = '0.2.1'
++__version__ = '0.2.2'
+diff --git a/secedgar/filings/_base.py b/secedgar/filings/_base.py
+index ebbe5e2..ddd526b 100644
+--- a/secedgar/filings/_base.py
++++ b/secedgar/filings/_base.py
+@@ -34,7 +34,8 @@ class AbstractFiling(ABC):
+             kwargs: Anything to be passed to requests when making GET request.
+ 
+         Returns:
+-            urls (list): List of urls for txt files to download.
++            urls (dict): Dictionary of urls for txt files to download.
++                Keys are lookup terms and values are list of URLs.
+         """
+         pass  # pragma: no cover
+ 
+@@ -69,3 +70,19 @@ class AbstractFiling(ABC):
+         allowed = string.digits + string.ascii_letters + string.whitespace
+         stripped = "".join(c for c in path if c in allowed)
+         return stripped.replace(" ", "_")
++
++    def _check_urls_exist(self):
++        """Wrapper around `get_urls` to check if there is a positive number of URLs.
++
++        .. note:: This method will not check if the URLs are valid. Simply if they exist.
++
++        Raises:
++            ValueError: If no URLs exist, then ValueError is raised.
++
++        Returns:
++            urls (dict): Result of `get_urls` method.
++        """
++        urls = self.get_urls()
++        if all(len(urls[cik]) == 0 for cik in urls.keys()):
++            raise ValueError("No filings available.")
++        return urls
+diff --git a/secedgar/filings/_index.py b/secedgar/filings/_index.py
+index 10d4638..95bb216 100644
+--- a/secedgar/filings/_index.py
++++ b/secedgar/filings/_index.py
+@@ -27,7 +27,7 @@ class IndexFilings(AbstractFiling):
+         self._master_idx_file = None
+         self._filings_dict = None
+         self._paths = []
+-        self._urls = []
++        self._urls = {}
+ 
+     @property
+     def client(self):
+@@ -115,16 +115,19 @@ class IndexFilings(AbstractFiling):
+             # Will have CIK as keys and list of FilingEntry namedtuples as values
+             self._filings_dict = {}
+             FilingEntry = namedtuple(
+-                "FilingEntry", ["cik", "company_name", "form_type", "date_filed", "file_name"])
++                "FilingEntry", ["cik", "company_name", "form_type", "date_filed", "file_name",
++                                "path"])
+             # idx file will have lines of the form CIK|Company Name|Form Type|Date Filed|File Name
+             entries = re.findall(r'^[0-9]+[|].+[|].+[|][0-9\-]+[|].+$', idx_file, re.MULTILINE)
+             for entry in entries:
+                 fields = entry.split("|")
++                path = "Archives/{file_name}".format(file_name=fields[-1])
++                entry = FilingEntry(*fields, path=path)
+                 # Add new filing entry to CIK's list
+                 if fields[0] in self._filings_dict:
+-                    self._filings_dict[fields[0]].append(FilingEntry(*fields))
++                    self._filings_dict[fields[0]].append(entry)
+                 else:
+-                    self._filings_dict[fields[0]] = [FilingEntry(*fields)]
++                    self._filings_dict[fields[0]] = [entry]
+         return self._filings_dict
+ 
+     def make_url(self, path):
+@@ -138,28 +141,6 @@ class IndexFilings(AbstractFiling):
+         """
+         return "{base}{path}".format(base=self.client._BASE, path=path)
+ 
+-    def get_paths(self, update_cache=False):
+-        """Gets all paths for given day.
+-
+-        Each path will look something like
+-        "edgar/data/1000228/0001209191-18-064398.txt".
+-
+-        Args:
+-            update_cache (bool, optional): Whether urls should be updated on each method call.
+-                Defaults to False.
+-
+-        Returns:
+-            urls (list of str): List of urls.
+-        """
+-        if len(self._paths) == 0:
+-            for entries in self.get_filings_dict().values():
+-                for entry in entries:
+-                    # Will be of the form
+-                    self._paths.append(
+-                        "Archives/{file_name}".format(
+-                            file_name=entry.file_name))
+-        return self._paths
+-
+     def get_urls(self):
+         """Get all URLs for day.
+ 
+@@ -168,43 +149,38 @@ class IndexFilings(AbstractFiling):
+         Returns:
+             urls (list of str): List of all URLs to get.
+         """
+-        if len(self._urls) == 0:
+-            paths = self.get_paths()
+-            self._urls = [self.make_url(path) for path in paths]
++        if not self._urls:
++            filings_dict = self.get_filings_dict()
++            self._urls = {company: [self.make_url(entry.path) for entry in entries]
++                          for company, entries in filings_dict.items()}
+         return self._urls
+ 
+     def save_filings(self, directory):
+         """Save all filings.
+ 
+-        Will store all filings for each unique company name under a separate subdirectory
++        Will store all filings for each unique CIK under a separate subdirectory
+         within given directory argument.
+ 
+         Ex:
+         my_directory
+         |
+-        ---- Apple Inc.
++        ---- CIK 1
+              |
+              ---- ...txt files
+-        ---- Microsoft Corp.
++        ---- CIK 2
+              |
+              ---- ...txt files
+ 
+         Args:
+-            directory (str): Directory where filings should be stored. Will be broken down
+-                further by company name and form type.
++            directory (str): Directory where filings should be stored.
+         """
+-        self.get_filings_dict()
+-        for filings in self._filings_dict.values():
+-            # take the company name from the first filing and make that the subdirectory name
+-            clean_company_name = self.clean_directory_path(filings[0].company_name)
+-            subdirectory = os.path.join(directory, clean_company_name)
+-            # TODO: Clean company name to make valid directory name (get rid of special characters)
+-            make_path(subdirectory)
+-            for filing in filings:
+-                filename = self.get_accession_number(filing.file_name)
+-                filing_path = os.path.join(
+-                    subdirectory, filename)
+-                url = self.make_url(filename)
+-                data = requests.get(url).text
+-                with open(filing_path, 'w') as f:
++        urls = self._check_urls_exist()
++
++        for company, links in urls.items():
++            for link in links:
++                data = requests.get(link).text
++                path = os.path.join(directory, company)
++                make_path(path)
++                path = os.path.join(path, self.get_accession_number(link))
++                with open(path, "w") as f:
+                     f.write(data)
+diff --git a/secedgar/filings/filing.py b/secedgar/filings/filing.py
+index 3af48af..7759b3a 100644
+--- a/secedgar/filings/filing.py
++++ b/secedgar/filings/filing.py
+@@ -191,23 +191,6 @@ class Filing(AbstractFiling):
+         # Takes `count` filings at most
+         return txt_urls[:self.count]
+ 
+-    def _get_accession_numbers(self, links):
+-        """Gets accession numbers given list of links.
+-
+-        Of the form https://www.sec.gov/Archives/edgar/data/<cik>/
+-        <first part of accession number before '-'>/<accession number>-index.htm.
+-
+-        Args:
+-            links (list): List of links to extract accession numbers from.
+-
+-        Returns:
+-            List of accession numbers for given links.
+-        """
+-        self._accession_numbers = [self.get_accession_number(
+-            link).replace('-index.htm', '') for link in links]
+-        return self._accession_numbers
+-
+-    # TODO: break this method down further
+     def save(self, directory):
+         """Save files in specified directory.
+ 
+@@ -223,9 +206,7 @@ class Filing(AbstractFiling):
+         Raises:
+             ValueError: If no text urls are available for given filing object.
+         """
+-        urls = self.get_urls()
+-        if all(len(urls[cik]) == 0 for cik in urls.keys()):
+-            raise ValueError("No filings available.")
++        urls = self._check_urls_exist()
+ 
+         for cik, links in urls.items():
+             for link in links:
+diff --git a/setup.cfg b/setup.cfg
+index 51b50a0..e749bba 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,2 +1,7 @@
+ [flake8]
+-max-line-length = 100
+\ No newline at end of file
++max-line-length = 100
++
++[tool:pytest]
++markers =
++    smoke: marks tests as smoke tests (deselect with -m not smoke)
++    slow: marks tests as slow (deselect with -m not slow)
+\ No newline at end of file

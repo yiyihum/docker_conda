@@ -1,0 +1,399 @@
+diff --git a/spectacles/cli.py b/spectacles/cli.py
+index 5dcdd5c..e03bfab 100644
+--- a/spectacles/cli.py
++++ b/spectacles/cli.py
+@@ -173,7 +173,7 @@ def main():
+             args.client_secret,
+             args.port,
+             args.api_version,
+-            args.batch,
++            args.mode,
+         )
+ 
+ 
+@@ -285,22 +285,15 @@ def _build_sql_subparser(
+         "--branch", action=EnvVarAction, env_var="LOOKER_GIT_BRANCH", required=True
+     )
+     subparser.add_argument("--explores", nargs="+", default=["*.*"])
+-    subparser.add_argument("--batch", action="store_true")
++    subparser.add_argument(
++        "--mode", choices=["batch", "single", "hybrid"], default="batch"
++    )
+ 
+ 
+ def connect(
+     base_url: str, client_id: str, client_secret: str, port: int, api_version: float
+ ) -> None:
+-    """Tests the connection and credentials for the Looker API.
+-
+-    Args:
+-        base_url: Base URL for the Looker instance, e.g. https://mycompany.looker.com.
+-        client_id: Looker API client ID.
+-        client_secret: Looker API client secret.
+-        port: Desired API port to use for requests.
+-        api_version: Desired API version to use for requests.
+-
+-    """
++    """Tests the connection and credentials for the Looker API."""
+     LookerClient(base_url, client_id, client_secret, port, api_version)
+ 
+ 
+@@ -313,30 +306,13 @@ def sql(
+     client_secret,
+     port,
+     api_version,
+-    batch,
++    mode,
+ ) -> None:
+-    """Runs and validates the SQL for each selected LookML dimension.
+-
+-    Args:
+-        project: Name of the Looker project to use.
+-        branch: Name of the Git branch to check out.
+-        explores: List of selector strings in 'model_name.explore_name' format.
+-            The '*' wildcard selects all models or explores. For instance,
+-            'model_name.*' would select all explores in the 'model_name' model.
+-        base_url: Base URL for the Looker instance, e.g. https://mycompany.looker.com.
+-        client_id: Looker API client ID.
+-        client_secret: Looker API client secret.
+-        port: Desired API port to use for requests.
+-        api_version: Desired API version to use for requests.
+-        batch: When true, runs one query per explore (using all dimensions). When
+-            false, runs one query per dimension. Batch mode increases query speed
+-            but can only return the first error encountered for each dimension.
+-
+-    """
++    """Runs and validates the SQL for each selected LookML dimension."""
+     runner = Runner(
+         base_url, project, branch, client_id, client_secret, port, api_version
+     )
+-    errors = runner.validate_sql(explores, batch)
++    errors = runner.validate_sql(explores, mode)
+     if errors:
+         for error in sorted(errors, key=lambda x: x["path"]):
+             printer.print_sql_error(error)
+diff --git a/spectacles/lookml.py b/spectacles/lookml.py
+index 16c1200..aef3450 100644
+--- a/spectacles/lookml.py
++++ b/spectacles/lookml.py
+@@ -9,11 +9,12 @@ class LookMlObject:
+ 
+ 
+ class Dimension(LookMlObject):
+-    def __init__(self, name: str, type: str, sql: str, url: str):
++    def __init__(self, name: str, type: str, sql: str, url: Optional[str]):
+         self.name = name
+         self.type = type
+         self.sql = sql
+         self.url = url
++        self.queried: bool = False
+         self.error: Optional[SqlError] = None
+         if re.search(r"spectacles\s*:\s*ignore", sql, re.IGNORECASE):
+             self.ignore = True
+@@ -39,7 +40,7 @@ class Dimension(LookMlObject):
+ 
+     @property
+     def errored(self):
+-        return bool(self.error)
++        return bool(self.error) if self.queried else None
+ 
+     @errored.setter
+     def errored(self, value):
+@@ -62,6 +63,7 @@ class Explore(LookMlObject):
+     def __init__(self, name: str, dimensions: List[Dimension] = None):
+         self.name = name
+         self.dimensions = [] if dimensions is None else dimensions
++        self.queried: bool = False
+         self.error: Optional[SqlError] = None
+ 
+     def __eq__(self, other):
+@@ -72,9 +74,12 @@ class Explore(LookMlObject):
+ 
+     @property
+     def errored(self):
+-        return bool(self.error) or any(
+-            dimensions.errored for dimensions in self.dimensions
+-        )
++        if self.queried:
++            return bool(self.error) or any(
++                dimension.errored for dimension in self.dimensions
++            )
++        else:
++            return None
+ 
+     @errored.setter
+     def errored(self, value: bool):
+@@ -83,6 +88,17 @@ class Explore(LookMlObject):
+         for dimensions in self.dimensions:
+             dimensions.errored = value
+ 
++    @property
++    def queried(self):
++        return any(dimension.queried for dimension in self.dimensions)
++
++    @queried.setter
++    def queried(self, value: bool):
++        if not isinstance(value, bool):
++            raise TypeError("Value for queried must be boolean.")
++        for dimensions in self.dimensions:
++            dimensions.queried = value
++
+     def get_errored_dimensions(self):
+         for dimension in self.dimensions:
+             if dimension.errored:
+@@ -115,7 +131,10 @@ class Model(LookMlObject):
+ 
+     @property
+     def errored(self):
+-        return any(explore.errored for explore in self.explores)
++        if self.queried:
++            return any(explore.errored for explore in self.explores)
++        else:
++            return None
+ 
+     @errored.setter
+     def errored(self, value: bool):
+@@ -124,6 +143,17 @@ class Model(LookMlObject):
+         for explore in self.explores:
+             explore.errored = value
+ 
++    @property
++    def queried(self):
++        return any(explore.queried for explore in self.explores)
++
++    @queried.setter
++    def queried(self, value: bool):
++        if not isinstance(value, bool):
++            raise TypeError("Value for queried must be boolean.")
++        for explore in self.explores:
++            explore.queried = value
++
+     def get_errored_explores(self):
+         for explore in self.explores:
+             if explore.errored:
+@@ -150,7 +180,10 @@ class Project(LookMlObject):
+ 
+     @property
+     def errored(self):
+-        return any(model.errored for model in self.models)
++        if self.queried:
++            return any(model.errored for model in self.models)
++        else:
++            return None
+ 
+     @errored.setter
+     def errored(self, value: bool):
+@@ -159,6 +192,17 @@ class Project(LookMlObject):
+         for model in self.models:
+             model.errored = value
+ 
++    @property
++    def queried(self):
++        return any(model.queried for model in self.models)
++
++    @queried.setter
++    def queried(self, value: bool):
++        if not isinstance(value, bool):
++            raise TypeError("Value for queried must be boolean.")
++        for model in self.models:
++            model.queried = value
++
+     def get_errored_models(self):
+         for model in self.models:
+             if model.errored:
+diff --git a/spectacles/runner.py b/spectacles/runner.py
+index 6699a47..8042bcb 100644
+--- a/spectacles/runner.py
++++ b/spectacles/runner.py
+@@ -36,8 +36,8 @@ class Runner:
+         )
+         self.client.update_session(project, branch)
+ 
+-    def validate_sql(self, selectors: List[str], batch: bool = False) -> List[dict]:
++    def validate_sql(self, selectors: List[str], mode: str = "batch") -> List[dict]:
+         sql_validator = SqlValidator(self.client, self.project)
+         sql_validator.build_project(selectors)
+-        errors = sql_validator.validate(batch)
++        errors = sql_validator.validate(mode)
+         return [vars(error) for error in errors]
+diff --git a/spectacles/validators.py b/spectacles/validators.py
+index f56aa11..53033a8 100644
+--- a/spectacles/validators.py
++++ b/spectacles/validators.py
+@@ -159,7 +159,7 @@ class SqlValidator(Validator):
+ 
+         self.project.models = selected_models
+ 
+-    def validate(self, batch: bool = False) -> List[SqlError]:
++    def validate(self, mode: str = "batch") -> List[SqlError]:
+         """Queries selected explores and returns any errors.
+ 
+         Args:
+@@ -175,22 +175,42 @@ class SqlValidator(Validator):
+         printer.print_header(
+             f"Begin testing {explore_count} "
+             f"{'explore' if explore_count == 1 else 'explores'} "
+-            f"[{'batch' if batch else 'single-dimension'} mode]"
++            f"[{mode} mode]"
+         )
+ 
+-        loop = asyncio.get_event_loop()
++        errors = self._query(mode)
++        if mode == "hybrid":
++            errors = self._query(mode)
++
++        for model in sorted(self.project.models, key=lambda x: x.name):
++            for explore in sorted(model.explores, key=lambda x: x.name):
++                if explore.errored:
++                    logger.info(
++                        f"✗ {printer.red(model.name + '.' + explore.name)} failed"
++                    )
++                else:
++                    logger.info(
++                        f"✓ {printer.green(model.name + '.' + explore.name)} passed"
++                    )
++
++        return errors
++
++    def _query(self, mode: str = "batch") -> List[SqlError]:
++        loop = asyncio.new_event_loop()
+         session = aiohttp.ClientSession(
+             loop=loop, headers=self.client.session.headers, timeout=self.timeout
+         )
+         tasks = []
+         for model in self.project.models:
+             for explore in model.explores:
+-                if batch:
++                if mode == "batch" or (mode == "hybrid" and not explore.queried):
++                    logger.debug("Querying one explore at at time")
+                     task = loop.create_task(
+                         self._query_explore(session, model, explore)
+                     )
+                     tasks.append(task)
+-                else:
++                elif mode == "single" or (mode == "hybrid" and explore.errored):
++                    logger.debug("Querying one dimension at at time")
+                     for dimension in explore.dimensions:
+                         task = loop.create_task(
+                             self._query_dimension(session, model, explore, dimension)
+@@ -219,19 +239,38 @@ class SqlValidator(Validator):
+             if tasks_to_check or query_task_ids:
+                 time.sleep(0.5)
+ 
+-        for model in sorted(self.project.models, key=lambda x: x.name):
+-            for explore in sorted(model.explores, key=lambda x: x.name):
+-                if explore.errored:
+-                    logger.info(
+-                        f"✗ {printer.red(model.name + '.' + explore.name)} failed"
+-                    )
+-                else:
+-                    logger.info(
+-                        f"✓ {printer.green(model.name + '.' + explore.name)} passed"
+-                    )
+-
+         return errors
+ 
++    @staticmethod
++    def _extract_error_details(query_result: dict) -> dict:
++        data = query_result["data"]
++        if isinstance(data, dict):
++            errors = data.get("errors") or [data.get("error")]
++            first_error = errors[0]
++            message = first_error["message_details"]
++            if not isinstance(message, str):
++                raise TypeError(
++                    "Unexpected message type. Expected a str, "
++                    f"received type {type(message)}: {message}"
++                )
++            sql = data["sql"]
++            if first_error.get("sql_error_loc"):
++                line_number = first_error["sql_error_loc"]["line"]
++            else:
++                line_number = None
++        elif isinstance(data, list):
++            message = data[0]
++            line_number = None
++            sql = None
++        else:
++            raise TypeError(
++                "Unexpected error response type. "
++                "Expected a dict or a list, "
++                f"received type {type(data)}: {data}"
++            )
++
++        return {"message": message, "sql": sql, "line_number": line_number}
++
+     def _get_query_results(
+         self, query_task_ids: List[str]
+     ) -> Tuple[List[str], List[SqlError]]:
+@@ -245,49 +284,33 @@ class SqlValidator(Validator):
+ 
+             if query_status in ("running", "added", "expired"):
+                 still_running.append(query_task_id)
+-            elif query_status == "complete":
+-                pass
+-            elif query_status == "error":
+-                response = query_result["data"]
+-                if isinstance(response, dict):
+-                    response_error = response["errors"][0]
+-                    message = response_error["message_details"]
+-                    if not isinstance(message, str):
+-                        raise TypeError(
+-                            "Unexpected message type. Expected a str, "
+-                            f"received type {type(message)}: {message}"
+-                        )
+-                    sql = response["sql"]
+-                    if response_error.get("sql_error_loc"):
+-                        line_number = response_error["sql_error_loc"]["line"]
+-                    else:
+-                        line_number = None
+-                elif isinstance(response, list):
+-                    message = response[0]
+-                    line_number = None
+-                    sql = None
+-                else:
+-                    raise TypeError(
+-                        f"Unexpected error response type. Expected a dict or a list, "
+-                        f"received type {type(response)}: {response}"
+-                    )
+-
++                continue
++            elif query_status in ("complete", "error"):
+                 lookml_object = self.query_tasks[query_task_id]
+-                error = SqlError(
+-                    path=lookml_object.name,
+-                    message=message,
+-                    sql=sql,
+-                    line_number=line_number,
+-                    url=getattr(lookml_object, "url", None),
+-                )
+-                lookml_object.error = error
+-                errors.append(error)
++                lookml_object.queried = True
+             else:
+                 raise SpectaclesException(
+                     f'Unexpected query result status "{query_status}" '
+                     "returned by the Looker API"
+                 )
+ 
++            if query_status == "error":
++                try:
++                    details = self._extract_error_details(query_result)
++                except (KeyError, TypeError, IndexError) as error:
++                    raise SpectaclesException(
++                        "Encountered an unexpected API query result format, "
++                        "unable to extract error details. "
++                        f"The query result was: {query_result}"
++                    ) from error
++                sql_error = SqlError(
++                    path=lookml_object.name,
++                    url=getattr(lookml_object, "url", None),
++                    **details,
++                )
++                lookml_object.error = sql_error
++                errors.append(sql_error)
++
+         return still_running, errors
+ 
+     async def _query_explore(
+

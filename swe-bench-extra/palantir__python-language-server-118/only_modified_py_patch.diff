@@ -1,0 +1,220 @@
+diff --git a/pyls/config.py b/pyls/config.py
+index 595caab..311401b 100644
+--- a/pyls/config.py
++++ b/pyls/config.py
+@@ -15,14 +15,25 @@ class Config(object):
+         self._root_uri = root_uri
+         self._init_opts = init_opts
+ 
++        self._disabled_plugins = []
++        self._settings = {}
++
+         self._pm = pluggy.PluginManager(PYLS)
+         self._pm.trace.root.setwriter(log.debug)
+         self._pm.enable_tracing()
+         self._pm.add_hookspecs(hookspecs)
+         self._pm.load_setuptools_entrypoints(PYLS)
++
+         for name, plugin in self._pm.list_name_plugin():
+             log.info("Loaded pyls plugin %s from %s", name, plugin)
+ 
++        for plugin_conf in self._pm.hook.pyls_settings(config=self):
++            self.update(plugin_conf)
++
++    @property
++    def disabled_plugins(self):
++        return self._disabled_plugins
++
+     @property
+     def plugin_manager(self):
+         return self._pm
+@@ -39,6 +50,18 @@ class Config(object):
+         root_path = uris.to_fs_path(self._root_uri)
+         return find_parents(root_path, path, names)
+ 
++    def update(self, settings):
++        """Recursively merge the given settings into the current settings."""
++        self._settings = _merge_dicts(self._settings, settings)
++        log.info("Updated settings to %s", self._settings)
++
++        # All plugins default to enabled
++        self._disabled_plugins = [
++            plugin for name, plugin in self.plugin_manager.list_name_plugin()
++            if not self._settings.get('plugins', {}).get(name, {}).get('enabled', True)
++        ]
++        log.info("Disabled plugins: %s", self._disabled_plugins)
++
+ 
+ def build_config(key, config_files):
+     """Parse configuration from the given files for the given key."""
+@@ -91,3 +114,19 @@ def find_parents(root, path, names):
+ 
+     # Otherwise nothing
+     return []
++
++
++def _merge_dicts(dict_a, dict_b):
++    """Recursively merge dictionary b into dictionary a."""
++    def _merge_dicts_(a, b):
++        for key in set(a.keys()).union(b.keys()):
++            if key in a and key in b:
++                if isinstance(a[key], dict) and isinstance(b[key], dict):
++                    yield (key, dict(_merge_dicts_(a[key], b[key])))
++                else:
++                    yield (key, b[key])
++            elif key in a:
++                yield (key, a[key])
++            else:
++                yield (key, b[key])
++    return dict(_merge_dicts_(dict_a, dict_b))
+diff --git a/pyls/hookspecs.py b/pyls/hookspecs.py
+index 14c2e52..dc89e5b 100644
+--- a/pyls/hookspecs.py
++++ b/pyls/hookspecs.py
+@@ -82,6 +82,11 @@ def pyls_references(config, workspace, document, position, exclude_declaration):
+     pass
+ 
+ 
++@hookspec
++def pyls_settings(config):
++    pass
++
++
+ @hookspec(firstresult=True)
+ def pyls_signature_help(config, workspace, document, position):
+     pass
+diff --git a/pyls/python_ls.py b/pyls/python_ls.py
+index 624e298..ab98c96 100644
+--- a/pyls/python_ls.py
++++ b/pyls/python_ls.py
+@@ -14,12 +14,9 @@ class PythonLanguageServer(LanguageServer):
+     workspace = None
+     config = None
+ 
+-    @property
+-    def _hooks(self):
+-        return self.config.plugin_manager.hook
+-
+-    def _hook(self, hook, doc_uri=None, **kwargs):
++    def _hook(self, hook_name, doc_uri=None, **kwargs):
+         doc = self.workspace.get_document(doc_uri) if doc_uri else None
++        hook = self.config.plugin_manager.subset_hook_caller(hook_name, self.config.disabled_plugins)
+         return hook(config=self.config, workspace=self.workspace, document=doc, **kwargs)
+ 
+     def capabilities(self):
+@@ -37,7 +34,7 @@ class PythonLanguageServer(LanguageServer):
+             'documentSymbolProvider': True,
+             'definitionProvider': True,
+             'executeCommandProvider': {
+-                'commands': flatten(self._hook(self._hooks.pyls_commands))
++                'commands': flatten(self._hook('pyls_commands'))
+             },
+             'hoverProvider': True,
+             'referencesProvider': True,
+@@ -50,60 +47,58 @@ class PythonLanguageServer(LanguageServer):
+     def initialize(self, root_uri, init_opts, _process_id):
+         self.workspace = Workspace(root_uri, lang_server=self)
+         self.config = config.Config(root_uri, init_opts)
+-        self._hook(self._hooks.pyls_initialize)
++        self._hook('pyls_initialize')
+ 
+     def code_actions(self, doc_uri, range, context):
+-        return flatten(self._hook(self._hooks.pyls_code_actions, doc_uri, range=range, context=context))
++        return flatten(self._hook('pyls_code_actions', doc_uri, range=range, context=context))
+ 
+     def code_lens(self, doc_uri):
+-        return flatten(self._hook(self._hooks.pyls_code_lens, doc_uri))
++        return flatten(self._hook('pyls_code_lens', doc_uri))
+ 
+     def completions(self, doc_uri, position):
+-        completions = self._hook(self._hooks.pyls_completions, doc_uri, position=position)
++        completions = self._hook('pyls_completions', doc_uri, position=position)
+         return {
+             'isIncomplete': False,
+             'items': flatten(completions)
+         }
+ 
+     def definitions(self, doc_uri, position):
+-        return flatten(self._hook(self._hooks.pyls_definitions, doc_uri, position=position))
++        return flatten(self._hook('pyls_definitions', doc_uri, position=position))
+ 
+     def document_symbols(self, doc_uri):
+-        return flatten(self._hook(self._hooks.pyls_document_symbols, doc_uri))
++        return flatten(self._hook('pyls_document_symbols', doc_uri))
+ 
+     def execute_command(self, command, arguments):
+-        return self._hook(self._hooks.pyls_execute_command, command=command, arguments=arguments)
++        return self._hook('pyls_execute_command', command=command, arguments=arguments)
+ 
+     def format_document(self, doc_uri):
+-        return self._hook(self._hooks.pyls_format_document, doc_uri)
++        return self._hook('pyls_format_document', doc_uri)
+ 
+     def format_range(self, doc_uri, range):
+-        return self._hook(self._hooks.pyls_format_range, doc_uri, range=range)
++        return self._hook('pyls_format_range', doc_uri, range=range)
+ 
+     def hover(self, doc_uri, position):
+-        return self._hook(self._hooks.pyls_hover, doc_uri, position=position) or {'contents': ''}
++        return self._hook('pyls_hover', doc_uri, position=position) or {'contents': ''}
+ 
+     @_utils.debounce(LINT_DEBOUNCE_S)
+     def lint(self, doc_uri):
+-        self.workspace.publish_diagnostics(doc_uri, flatten(self._hook(
+-            self._hooks.pyls_lint, doc_uri
+-        )))
++        self.workspace.publish_diagnostics(doc_uri, flatten(self._hook('pyls_lint', doc_uri)))
+ 
+     def references(self, doc_uri, position, exclude_declaration):
+         return flatten(self._hook(
+-            self._hooks.pyls_references, doc_uri, position=position,
++            'pyls_references', doc_uri, position=position,
+             exclude_declaration=exclude_declaration
+         ))
+ 
+     def signature_help(self, doc_uri, position):
+-        return self._hook(self._hooks.pyls_signature_help, doc_uri, position=position)
++        return self._hook('pyls_signature_help', doc_uri, position=position)
+ 
+     def m_text_document__did_close(self, textDocument=None, **_kwargs):
+         self.workspace.rm_document(textDocument['uri'])
+ 
+     def m_text_document__did_open(self, textDocument=None, **_kwargs):
+         self.workspace.put_document(textDocument['uri'], textDocument['text'], version=textDocument.get('version'))
+-        self._hook(self._hooks.pyls_document_did_open, textDocument['uri'])
++        self._hook('pyls_document_did_open', textDocument['uri'])
+         self.lint(textDocument['uri'])
+ 
+     def m_text_document__did_change(self, contentChanges=None, textDocument=None, **_kwargs):
+@@ -151,8 +146,15 @@ class PythonLanguageServer(LanguageServer):
+     def m_text_document__signature_help(self, textDocument=None, position=None, **_kwargs):
+         return self.signature_help(textDocument['uri'], position)
+ 
++    def m_workspace__did_change_configuration(self, settings=None):
++        self.config.update((settings or {}).get('pyls'))
++        for doc_uri in self.workspace.documents:
++            self.lint(doc_uri)
++
+     def m_workspace__did_change_watched_files(self, **_kwargs):
+-        pass
++        # Externally changed files may result in changed diagnostics
++        for doc_uri in self.workspace.documents:
++            self.lint(doc_uri)
+ 
+     def m_workspace__execute_command(self, command=None, arguments=None):
+         return self.execute_command(command, arguments)
+diff --git a/pyls/workspace.py b/pyls/workspace.py
+index 4ce913c..caf4124 100644
+--- a/pyls/workspace.py
++++ b/pyls/workspace.py
+@@ -29,6 +29,10 @@ class Workspace(object):
+         self._docs = {}
+         self._lang_server = lang_server
+ 
++    @property
++    def documents(self):
++        return self._docs
++
+     @property
+     def root_path(self):
+         return self._root_path

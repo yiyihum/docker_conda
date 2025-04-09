@@ -1,0 +1,86 @@
+diff --git a/src/tox/config/__init__.py b/src/tox/config/__init__.py
+index 10bc9bef..278d4b2b 100644
+--- a/src/tox/config/__init__.py
++++ b/src/tox/config/__init__.py
+@@ -1,7 +1,9 @@
+ from __future__ import print_function
+ 
+ import argparse
++import io
+ import itertools
++import json
+ import os
+ import random
+ import re
+@@ -302,7 +304,7 @@ def parseconfig(args, plugins=()):
+ 
+ 
+ def get_py_project_toml(path):
+-    with open(str(path)) as file_handler:
++    with io.open(str(path), encoding="UTF-8") as file_handler:
+         config_data = toml.load(file_handler)
+         return config_data
+ 
+@@ -572,6 +574,16 @@ def tox_addoption(parser):
+         action="store_true",
+         help="override alwayscopy setting to True in all envs",
+     )
++    parser.add_argument(
++        "--no-provision",
++        action="store",
++        nargs="?",
++        default=False,
++        const=True,
++        metavar="REQUIRES_JSON",
++        help="do not perform provision, but fail and if a path was provided "
++        "write provision metadata as JSON to it",
++    )
+ 
+     cli_skip_missing_interpreter(parser)
+     parser.add_argument("--workdir", metavar="PATH", help="tox working directory")
+@@ -1318,8 +1330,8 @@ class ParseIni(object):
+         # raise on unknown args
+         self.config._parser.parse_cli(args=self.config.args, strict=True)
+ 
+-    @staticmethod
+-    def ensure_requires_satisfied(config, requires, min_version):
++    @classmethod
++    def ensure_requires_satisfied(cls, config, requires, min_version):
+         missing_requirements = []
+         failed_to_parse = False
+         deps = []
+@@ -1346,12 +1358,33 @@ class ParseIni(object):
+                 missing_requirements.append(str(requirements.Requirement(require)))
+         if failed_to_parse:
+             raise tox.exception.BadRequirement()
++        if config.option.no_provision and missing_requirements:
++            msg = "provisioning explicitly disabled within {}, but missing {}"
++            if config.option.no_provision is not True:  # it's a path
++                msg += " and wrote to {}"
++                cls.write_requires_to_json_file(config)
++            raise tox.exception.Error(
++                msg.format(sys.executable, missing_requirements, config.option.no_provision)
++            )
+         if WITHIN_PROVISION and missing_requirements:
+             msg = "break infinite loop provisioning within {} missing {}"
+             raise tox.exception.Error(msg.format(sys.executable, missing_requirements))
+         config.run_provision = bool(len(missing_requirements))
+         return deps
+ 
++    @staticmethod
++    def write_requires_to_json_file(config):
++        requires_dict = {
++            "minversion": config.minversion,
++            "requires": config.requires,
++        }
++        try:
++            with open(config.option.no_provision, "w", encoding="utf-8") as outfile:
++                json.dump(requires_dict, outfile, indent=4)
++        except TypeError:  # Python 2
++            with open(config.option.no_provision, "w") as outfile:
++                json.dump(requires_dict, outfile, indent=4, encoding="utf-8")
++
+     def parse_build_isolation(self, config, reader):
+         config.isolated_build = reader.getbool("isolated_build", False)
+         config.isolated_build_env = reader.getstring("isolated_build_env", ".package")
+

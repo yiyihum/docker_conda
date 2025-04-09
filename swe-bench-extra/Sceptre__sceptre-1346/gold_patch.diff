@@ -1,0 +1,264 @@
+diff --git a/docs/_source/docs/hooks.rst b/docs/_source/docs/hooks.rst
+index 9adb2fb..a1eeef6 100644
+--- a/docs/_source/docs/hooks.rst
++++ b/docs/_source/docs/hooks.rst
+@@ -1,30 +1,31 @@
+ Hooks
+ =====
+ 
+-Hooks allows the ability for custom commands to be run when Sceptre actions
+-occur.
++Hooks allows the ability for actions to be run when Sceptre actions occur.
+ 
+ A hook is executed at a particular hook point when Sceptre is run.
+ 
+-If required, users can create their own ``hooks``, as described in the section
+-`Custom Hooks`_.
++If required, users can create their own ``hooks``, as described in the section `Custom Hooks`_.
+ 
+ Hook points
+ -----------
+ 
+-``before_generate`` or ``after_generate`` - run hook before or after generating stack template.
+-
+-``before_create`` or ``after_create`` - run hook before or after Stack creation.
+-
+-``before_update`` or ``after_update`` - run hook before or after Stack update.
+-
+-``before_delete`` or ``after_delete`` - run hook before or after Stack deletion.
+-
+-``before_launch`` or ``after_launch`` - run hook before or after Stack launch.
+-
+-``before_validate`` or ``after_validate`` - run hook before or after Stack validation.
+-
+-``before_create_change_set`` or ``after_create_change_set`` - run hook before or after create change set.
++- ``before_create``/``after_create`` - Runs before/after Stack creation.
++- ``before_update``/``after_update`` - Runs before/after Stack update.
++- ``before_delete``/``after_delete`` - Runs before/after Stack deletion.
++- ``before_launch``/``after_launch`` - Runs before/after Stack launch.
++- ``before_create_change_set``/``after_create_change_set`` - Runs before/after create change set.
++- ``before_validate``/``after_validate`` - Runs before/after Stack validation.
++- ``before_diff``/``after_diff`` - Runs before/after diffing the deployed stack with the local
++  configuration.
++- ``before_drift_detect``/``after_drift_detect`` - Runs before/after detecting drift on the stack.
++- ``before_drift_show``/``after_drift_show`` - Runs before/after showing detected drift on the stack.
++- ``before_dump_config``/``after_dump_config`` - Runs before/after dumpint the Stack Config.
++- ``before_dump_template``/``after_dump_template`` - Runs before/after rendering the stack template.
++  This hook point is aliased to ``before/generate``/``after_generate``. This hook point will also
++  be triggered when diffing, since the template needs to be generated to diff the template.
++- ``before_generate``/``after_generate`` - Runs before/after rendering the stack template. This hook
++  point is aliased to ``before_dump_template``/``after_dump_template``.
+ 
+ Syntax:
+ 
+diff --git a/sceptre/cli/template.py b/sceptre/cli/template.py
+index cf81c1b..28ad66c 100644
+--- a/sceptre/cli/template.py
++++ b/sceptre/cli/template.py
+@@ -2,9 +2,7 @@ import logging
+ import webbrowser
+ import click
+ 
+-from deprecation import deprecated
+-
+-from sceptre import __version__
++from sceptre.cli.dump import dump_template
+ from sceptre.cli.helpers import catch_exceptions, write
+ from sceptre.context import SceptreContext
+ from sceptre.helpers import null_context
+@@ -67,35 +65,19 @@ def validate_command(ctx, no_placeholders, path):
+ @click.argument("path")
+ @click.pass_context
+ @catch_exceptions
+-@deprecated("4.2.0", "5.0.0", __version__, "Use dump template instead.")
+-def generate_command(ctx, no_placeholders, path):
++def generate_command(ctx: click.Context, no_placeholders: bool, path: str):
+     """
+     Prints the template used for stack in PATH.
+-    \f
+ 
++    This command is aliased to the dump template command for legacy support reasons. It's the same
++    as running `sceptre dump template`.
++
++    \f
++    :param no_placeholders: If True, will disable placeholders for unresolvable resolvers. By
++        default, placeholders will be active.
+     :param path: Path to execute the command on.
+-    :type path: str
+     """
+-    context = SceptreContext(
+-        command_path=path,
+-        command_params=ctx.params,
+-        project_path=ctx.obj.get("project_path"),
+-        user_variables=ctx.obj.get("user_variables"),
+-        options=ctx.obj.get("options"),
+-        output_format=ctx.obj.get("output_format"),
+-        ignore_dependencies=ctx.obj.get("ignore_dependencies"),
+-    )
+-
+-    plan = SceptrePlan(context)
+-
+-    execution_context = (
+-        null_context() if no_placeholders else use_resolver_placeholders_on_error()
+-    )
+-    with execution_context:
+-        responses = plan.generate()
+-
+-    output = [template for template in responses.values()]
+-    write(output, context.output_format)
++    ctx.forward(dump_template)
+ 
+ 
+ @click.command(name="estimate-cost", short_help="Estimates the cost of the template.")
+diff --git a/sceptre/diffing/stack_differ.py b/sceptre/diffing/stack_differ.py
+index 6712aa6..87ad33e 100644
+--- a/sceptre/diffing/stack_differ.py
++++ b/sceptre/diffing/stack_differ.py
+@@ -313,7 +313,7 @@ class StackDiffer(Generic[DiffType]):
+                 generated_config.parameters[key] = self.NO_ECHO_REPLACEMENT
+ 
+     def _generate_template(self, stack_actions: StackActions) -> str:
+-        return stack_actions.generate()
++        return stack_actions.dump_template()
+ 
+     def _get_deployed_template(
+         self, stack_actions: StackActions, is_deployed: bool
+diff --git a/sceptre/hooks/__init__.py b/sceptre/hooks/__init__.py
+index 56b4df6..1a454fc 100644
+--- a/sceptre/hooks/__init__.py
++++ b/sceptre/hooks/__init__.py
+@@ -1,7 +1,7 @@
+ import abc
+ import logging
+ from functools import wraps
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, List
+ 
+ from sceptre.helpers import _call_func_on_values
+ from sceptre.resolvers import CustomYamlTagBase
+@@ -98,3 +98,33 @@ def add_stack_hooks(func):
+         return response
+ 
+     return decorated
++
++
++def add_stack_hooks_with_aliases(function_aliases: List[str]):
++    """
++    Returns a decorator to trigger the before and after hooks, relative to the decorated function's
++    name AS WELL AS the passed function alias names.
++    :param function_aliases: The list of OTHER functions to trigger hooks around.
++    :return: The hook-triggering decorator.
++    """
++
++    def decorator(func):
++        all_hook_names = [func.__name__] + function_aliases
++
++        @wraps(func)
++        def decorated(self, *args, **kwargs):
++            for hook in all_hook_names:
++                before_hook_name = f"before_{hook}"
++                execute_hooks(self.stack.hooks.get(before_hook_name))
++
++            response = func(self, *args, **kwargs)
++
++            for hook in all_hook_names:
++                after_hook_name = f"after_{hook}"
++                execute_hooks(self.stack.hooks.get(after_hook_name))
++
++            return response
++
++        return decorated
++
++    return decorator
+diff --git a/sceptre/plan/actions.py b/sceptre/plan/actions.py
+index ac9c60e..7495790 100644
+--- a/sceptre/plan/actions.py
++++ b/sceptre/plan/actions.py
+@@ -17,9 +17,7 @@ import botocore
+ from datetime import datetime, timedelta
+ from dateutil.tz import tzutc
+ from os import path
+-from deprecation import deprecated
+ 
+-from sceptre import __version__
+ from sceptre.connection_manager import ConnectionManager
+ 
+ from sceptre.exceptions import (
+@@ -30,7 +28,7 @@ from sceptre.exceptions import (
+     UnknownStackStatusError,
+ )
+ from sceptre.helpers import extract_datetime_from_aws_response_headers
+-from sceptre.hooks import add_stack_hooks
++from sceptre.hooks import add_stack_hooks, add_stack_hooks_with_aliases
+ from sceptre.stack import Stack
+ from sceptre.stack_status import StackChangeSetStatus, StackStatus
+ 
+@@ -627,10 +625,10 @@ class StackActions:
+ 
+         return new_summaries
+ 
+-    @deprecated("4.2.0", "5.0.0", __version__, "Use dump template instead.")
+     def generate(self):
+         """
+-        Returns the Template for the Stack
++        Returns the Template for the Stack. An alias for
++        dump_template for historical reasons.
+         """
+         return self.dump_template()
+ 
+@@ -1155,9 +1153,10 @@ class StackActions:
+         """
+         return self.stack.config
+ 
+-    @add_stack_hooks
++    @add_stack_hooks_with_aliases([generate.__name__])
+     def dump_template(self):
+         """
+-        Returns the Template for the Stack
++        Dump the template for the Stack. An alias for generate
++        for historical reasons.
+         """
+         return self.stack.template.body
+diff --git a/sceptre/plan/plan.py b/sceptre/plan/plan.py
+index 46008af..27e551a 100644
+--- a/sceptre/plan/plan.py
++++ b/sceptre/plan/plan.py
+@@ -11,7 +11,6 @@ import itertools
+ 
+ from os import path, walk
+ from typing import Dict, List, Set, Callable, Iterable, Optional
+-from deprecation import deprecated
+ 
+ from sceptre.config.graph import StackGraph
+ from sceptre.config.reader import ConfigReader
+@@ -21,7 +20,6 @@ from sceptre.exceptions import ConfigFileNotFoundError
+ from sceptre.helpers import sceptreise_path
+ from sceptre.plan.executor import SceptrePlanExecutor
+ from sceptre.stack import Stack
+-from sceptre import __version__
+ 
+ 
+ def require_resolved(func) -> Callable:
+@@ -380,10 +378,10 @@ class SceptrePlan(object):
+         self.resolve(command=self.estimate_cost.__name__)
+         return self._execute(*args)
+ 
+-    @deprecated("4.2.0", "5.0.0", __version__, "Use dump template instead.")
+     def generate(self, *args):
+         """
+-        Returns a generated Template for a given Stack
++        Returns a generated Template for a given Stack. An alias for
++        dump_template for historical reasons.
+ 
+         :returns: A dictionary of Stacks and their template body.
+         :rtype: dict
+@@ -447,7 +445,8 @@ class SceptrePlan(object):
+ 
+     def dump_template(self, *args):
+         """
+-        Returns a generated Template for a given Stack
++        Dump the template for a stack. An alias
++        for generate for historical reasons.
+         """
+         self.resolve(command=self.dump_template.__name__)
+         return self._execute(*args)

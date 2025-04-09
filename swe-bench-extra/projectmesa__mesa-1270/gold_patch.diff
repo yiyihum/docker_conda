@@ -1,0 +1,362 @@
+diff --git a/mesa/batchrunner.py b/mesa/batchrunner.py
+index 0556a38..b4290f2 100644
+--- a/mesa/batchrunner.py
++++ b/mesa/batchrunner.py
+@@ -128,10 +128,14 @@ def _make_model_kwargs(
+     """
+     parameter_list = []
+     for param, values in parameters.items():
+-        try:
+-            all_values = [(param, value) for value in values]
+-        except TypeError:
++        if isinstance(values, str):
++            # The values is a single string, so we shouldn't iterate over it.
+             all_values = [(param, values)]
++        else:
++            try:
++                all_values = [(param, value) for value in values]
++            except TypeError:
++                all_values = [(param, values)]
+         parameter_list.append(all_values)
+     all_kwargs = itertools.product(*parameter_list)
+     kwargs_list = [dict(kwargs) for kwargs in all_kwargs]
+diff --git a/mesa/visualization/ModularVisualization.py b/mesa/visualization/ModularVisualization.py
+index e9d2548..3c302ee 100644
+--- a/mesa/visualization/ModularVisualization.py
++++ b/mesa/visualization/ModularVisualization.py
+@@ -116,7 +116,7 @@ from mesa.visualization.UserParam import UserSettableParameter
+ if platform.system() == "Windows" and platform.python_version_tuple() >= ("3", "7"):
+     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+ 
+-D3_JS_FILE = "external/d3-4.13.0.min.js"
++D3_JS_FILE = "external/d3-7.4.3.min.js"
+ CHART_JS_FILE = "external/chart-3.6.1.min.js"
+ 
+ 
+@@ -125,10 +125,10 @@ class VisualizationElement:
+     Defines an element of the visualization.
+ 
+     Attributes:
+-        package_includes: A list of external JavaScript files to include that
+-                          are part of the Mesa packages.
+-        local_includes: A list of JavaScript files that are local to the
+-                        directory that the server is being run in.
++        package_includes: A list of external JavaScript and CSS files to
++                          include that are part of the Mesa packages.
++        local_includes: A list of JavaScript and CSS files that are local to
++                        the directory that the server is being run in.
+         js_code: A JavaScript code string to instantiate the element.
+ 
+     Methods:
+@@ -174,8 +174,10 @@ class PageHandler(tornado.web.RequestHandler):
+             port=self.application.port,
+             model_name=self.application.model_name,
+             description=self.application.description,
+-            package_includes=self.application.package_includes,
+-            local_includes=self.application.local_includes,
++            package_js_includes=self.application.package_js_includes,
++            package_css_includes=self.application.package_css_includes,
++            local_js_includes=self.application.local_js_includes,
++            local_css_includes=self.application.local_css_includes,
+             scripts=self.application.js_code,
+         )
+ 
+@@ -266,14 +268,22 @@ class ModularServer(tornado.web.Application):
+         """Create a new visualization server with the given elements."""
+         # Prep visualization elements:
+         self.visualization_elements = visualization_elements
+-        self.package_includes = set()
+-        self.local_includes = set()
++        self.package_js_includes = set()
++        self.package_css_includes = set()
++        self.local_js_includes = set()
++        self.local_css_includes = set()
+         self.js_code = []
+         for element in self.visualization_elements:
+             for include_file in element.package_includes:
+-                self.package_includes.add(include_file)
++                if self._is_stylesheet(include_file):
++                    self.package_css_includes.add(include_file)
++                else:
++                    self.package_js_includes.add(include_file)
+             for include_file in element.local_includes:
+-                self.local_includes.add(include_file)
++                if self._is_stylesheet(include_file):
++                    self.local_css_includes.add(include_file)
++                else:
++                    self.local_js_includes.add(include_file)
+             self.js_code.append(element.js_code)
+ 
+         # Initializing the model
+@@ -338,3 +348,7 @@ class ModularServer(tornado.web.Application):
+             webbrowser.open(url)
+         tornado.autoreload.start()
+         tornado.ioloop.IOLoop.current().start()
++
++    @staticmethod
++    def _is_stylesheet(filename):
++        return filename.lower().endswith(".css")
+diff --git a/mesa/visualization/templates/css/visualization.css b/mesa/visualization/templates/css/visualization.css
+index 38d8850..9ae0af8 100644
+--- a/mesa/visualization/templates/css/visualization.css
++++ b/mesa/visualization/templates/css/visualization.css
+@@ -2,7 +2,8 @@
+     margin-bottom: 15px;
+ }
+ 
+-div.tooltip {
++/* This is specific to the Network visualization */
++div.d3tooltip {
+     position: absolute;
+     text-align: center;
+     padding: 1px;
+diff --git a/mesa/visualization/templates/js/NetworkModule_d3.js b/mesa/visualization/templates/js/NetworkModule_d3.js
+index 7d3839a..110322c 100644
+--- a/mesa/visualization/templates/js/NetworkModule_d3.js
++++ b/mesa/visualization/templates/js/NetworkModule_d3.js
+@@ -22,7 +22,7 @@ const NetworkModule = function (svg_width, svg_height) {
+   const tooltip = d3
+     .select("body")
+     .append("div")
+-    .attr("class", "tooltip")
++    .attr("class", "d3tooltip")
+     .style("opacity", 0);
+ 
+   svg.call(
+@@ -38,7 +38,7 @@ const NetworkModule = function (svg_width, svg_height) {
+   this.render = function (data) {
+     const graph = JSON.parse(JSON.stringify(data));
+ 
+-    simulation = d3
++    const simulation = d3
+       .forceSimulation()
+       .nodes(graph.nodes)
+       .force("charge", d3.forceManyBody().strength(-80).distanceMin(2))
+@@ -89,12 +89,12 @@ const NetworkModule = function (svg_width, svg_height) {
+       .data(graph.nodes)
+       .enter()
+       .append("circle")
+-      .on("mouseover", function (d) {
++      .on("mouseover", function (event, d) {
+         tooltip.transition().duration(200).style("opacity", 0.9);
+         tooltip
+           .html(d.tooltip)
+-          .style("left", d3.event.pageX + "px")
+-          .style("top", d3.event.pageY + "px");
++          .style("left", event.pageX + "px")
++          .style("top", event.pageY + "px");
+       })
+       .on("mouseout", function () {
+         tooltip.transition().duration(500).style("opacity", 0);
+diff --git a/mesa/visualization/templates/js/runcontrol.js b/mesa/visualization/templates/js/runcontrol.js
+index e7768aa..89e58ba 100644
+--- a/mesa/visualization/templates/js/runcontrol.js
++++ b/mesa/visualization/templates/js/runcontrol.js
+@@ -190,10 +190,10 @@ const initGUI = function (model_params) {
+     const domID = param + "_id";
+     sidebar.append(
+       [
+-        "<div class='input-group input-group-lg'>",
++        "<div>",
+         "<p><label for='" +
+           domID +
+-          "' class='label label-primary'>" +
++          "' class='badge badge-primary'>" +
+           obj.name +
+           "</label></p>",
+         "<input class='model-parameter' id='" + domID + "' type='checkbox'/>",
+@@ -213,10 +213,10 @@ const initGUI = function (model_params) {
+     const domID = param + "_id";
+     sidebar.append(
+       [
+-        "<div class='input-group input-group-lg'>",
++        "<div>",
+         "<p><label for='" +
+           domID +
+-          "' class='label label-primary'>" +
++          "' class='badge badge-primary'>" +
+           obj.name +
+           "</label></p>",
+         "<input class='model-parameter' id='" + domID + "' type='number'/>",
+@@ -235,11 +235,11 @@ const initGUI = function (model_params) {
+     const tooltipID = domID + "_tooltip";
+     sidebar.append(
+       [
+-        "<div class='input-group input-group-lg'>",
++        "<div>",
+         "<p>",
+         "<a id='" +
+           tooltipID +
+-          "' data-toggle='tooltip' data-placement='top' class='label label-primary'>",
++          "' data-toggle='tooltip' data-placement='top' class='badge badge-primary'>",
+         obj.name,
+         "</a>",
+         "</p>",
+@@ -278,7 +278,7 @@ const initGUI = function (model_params) {
+     const template = [
+       "<p><label for='" +
+         domID +
+-        "' class='label label-primary'>" +
++        "' class='badge badge-primary'>" +
+         obj.name +
+         "</label></p>",
+       "<div class='dropdown'>",
+diff --git a/mesa/visualization/templates/modular_template.html b/mesa/visualization/templates/modular_template.html
+index c185e71..5b75089 100644
+--- a/mesa/visualization/templates/modular_template.html
++++ b/mesa/visualization/templates/modular_template.html
+@@ -1,12 +1,19 @@
+ <!DOCTYPE html>
+ <head>
+ 	<title>{{ model_name }} (Mesa visualization)</title>
+-    <link href="/static/external/bootstrap-3.3.7-dist/css/bootstrap.min.css" type="text/css" rel="stylesheet" />
+-    <link href="/static/external/bootstrap-3.3.7-dist/css/bootstrap-theme.min.css" type="text/css" rel="stylesheet" />
++    <link href="/static/external/bootstrap-4.6.1-dist/css/bootstrap.min.css" type="text/css" rel="stylesheet" />
+     <link href="/static/external/bootstrap-switch-3.3.4/dist/css/bootstrap3/bootstrap-switch.min.css" type="text/css" rel="stylesheet" />
+-    <link href="/static/external/bootstrap-slider-9.8.0/dist/css/bootstrap-slider.min.css" type="text/css" rel="stylesheet" />
++    <link href="/static/external/bootstrap-slider-11.0.2/dist/css/bootstrap-slider.min.css" type="text/css" rel="stylesheet" />
+     <link href="/static/css/visualization.css" type="text/css" rel="stylesheet" />
+ 
++    <!-- CSS includes go here -->
++    {% for file_name in package_css_includes %}
++        <link href="/static/css/{{ file_name }}" type="text/css" rel="stylesheet" />
++    {% end %}
++    {% for file_name in local_css_includes %}
++        <link href="/local/{{ file_name }}" type="text/css" rel="stylesheet" />
++    {% end %}
++
+ 	<!-- This is the Tornado template for the Modular Visualization. The Javascript code opens a WebSocket connection to
+ 	the server (the port is set via the template). On every step, it receives inputs, one per module, and sends
+ 	them to the associated function to render. -->
+@@ -14,42 +21,43 @@
+ <body>
+ 
+     <!-- Navbar -->
+-    <nav class="navbar navbar-inverse navbar-static-top">
++    <nav class="navbar navbar-dark bg-dark navbar-static-top navbar-expand-md mb-3">
+         <div class="container">
+-            <div class="navbar-header">
+-                <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar" aria-expanded="false" aria-controls="navbar">
+-                    <span class="sr-only">Toggle navigation</span>
+-                    <span class="icon-bar"></span>
+-                    <span class="icon-bar"></span>
+-                    <span class="icon-bar"></span>
+-                </button>
++            <button type="button" class="navbar-toggler collapsed" data-toggle="collapse" data-target="#navbar" aria-expanded="false" aria-controls="navbar">
++                <span class="sr-only">Toggle navigation</span>
++                &#x2630;
++            </button>
+             <a class="navbar-brand" href="#">{{ model_name }}</a>
+-            </div>
++
+             <div id="navbar" class="navbar-collapse collapse">
+                 <ul class="nav navbar-nav">
+-                    <li>
+-                        <a href="#" data-toggle="modal" data-target="#about" data-title="About" data-content="#about-content">
++                    <li class="nav-item">
++                        <a href="#" data-toggle="modal" data-target="#about" data-title="About" data-content="#about-content" class="nav-link">
+                             About
+                         </a>
+                     </li>
+                 </ul>
+-                <ul class="nav navbar-nav navbar-right">
+-                    <li id="play-pause"><a href="#">Start</a></li>
+-                    <li id="step"><a href="#">Step</a></li>
+-                    <li id="reset"><a href="#">Reset</a></li>
++                <ul class="nav navbar-nav ml-auto">
++                    <li id="play-pause" class="nav-item"><a href="#" class="nav-link">Start</a>
++                    </li>
++                    <li id="step" class="nav-item"><a href="#" class="nav-link">Step</a>
++                    </li>
++                    <li id="reset" class="nav-item"><a href="#" class="nav-link">Reset</a>
++                    </li>
+                 </ul>
+             </div><!--/.nav-collapse -->
+         </div>
+     </nav>
+-    <div class="container">
+-        <div class="col-lg-4 col-md-4 col-sm-4 col-xs-3" id="sidebar"></div>
+-        <div class="col-lg-8 col-md-8 col-sm-8 col-xs-9" id="elements">
++    <div class="container d-flex flex-row">
++        <div class="col-xl-4 col-lg-4 col-md-4 col-3" id="sidebar"></div>
++        <div class="col-xl-8 col-lg-8 col-md-8 col-9" id="elements">
+             <div id="elements-topbar">
+-                <div class="input-group input-group-lg">
+-                    <label class="label label-primary" for="fps" style="margin-right: 15px">Frames Per Second</label>
+-                    <input id="fps" data-slider-id='fps' type="text" />
+-                    <p>Current Step: <span id="currentStep">0</span></p>
++                <div">
++                    <label class="badge badge-primary" for="fps" style="margin-right: 15px">Frames Per Second</label>
++                    <input id="fps" data-slider-id="fps" type="text">
+                 </div>
++                <p>Current Step: <span id="currentStep">0</span>
++                </p>
+             </div>
+         </div>
+     </div>
+@@ -59,12 +67,13 @@
+         <div class="modal-dialog modal-lg">
+             <div class="modal-content">
+                 <div class="modal-header">
+-                    <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                     <h4 class="modal-title">About {{ model_name }}</h4>
++                    <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&#xD7;</span>
++                    </button>
+                 </div>
+                 <div class="modal-body">
+                     <div>{{ description }}</div>
+-                    <div>&nbsp;</div>
++                    <div>&#xA0;</div>
+                     <div style="clear: both;"></div>
+                 </div>
+             </div>
+@@ -73,15 +82,15 @@
+ 
+     <!-- Bottom-load all JavaScript dependencies -->
+     <script src="/static/js/external/jquery-2.2.4.min.js"></script>
+-    <script src="/static/external/bootstrap-3.3.7-dist/js/bootstrap.min.js"></script>
++    <script src="/static/external/bootstrap-4.6.1-dist/js/bootstrap.bundle.min.js"></script>
+     <script src="/static/external/bootstrap-switch-3.3.4/dist/js/bootstrap-switch.min.js"></script>
+-    <script src="/static/external/bootstrap-slider-9.8.0/dist/bootstrap-slider.min.js"></script>
++    <script src="/static/external/bootstrap-slider-11.0.2/dist/bootstrap-slider.min.js"></script>
+ 
+     <!-- Script includes go here -->
+-	{% for file_name in package_includes %}
++	{% for file_name in package_js_includes %}
+ 		<script src="/static/js/{{ file_name }}" type="text/javascript"></script>
+ 	{% end %}
+-	{% for file_name in local_includes %}
++	{% for file_name in local_js_includes %}
+ 		<script src="/local/{{ file_name }}" type="text/javascript"></script>
+ 	{% end %}
+ 
+diff --git a/setup.py b/setup.py
+index 9556834..044566e 100644
+--- a/setup.py
++++ b/setup.py
+@@ -66,14 +66,14 @@ def ensure_JS_dep_single(url, out_name=None):
+ # hardcoded included files and versions in: mesa/visualization/templates/modular_template.html
+ 
+ # Ensure Bootstrap
+-bootstrap_version = "3.3.7"
++bootstrap_version = "4.6.1"
+ ensure_JS_dep(
+     f"bootstrap-{bootstrap_version}-dist",
+     f"https://github.com/twbs/bootstrap/releases/download/v{bootstrap_version}/bootstrap-{bootstrap_version}-dist.zip",
+ )
+ 
+ # Ensure Bootstrap Slider
+-bootstrap_slider_version = "9.8.0"
++bootstrap_slider_version = "11.0.2"
+ ensure_JS_dep(
+     f"bootstrap-slider-{bootstrap_slider_version}",
+     f"https://github.com/seiyria/bootstrap-slider/archive/refs/tags/v{bootstrap_slider_version}.zip",
+@@ -92,7 +92,7 @@ ensure_JS_dep_single(
+ )
+ # Important: when updating the D3 version, make sure to update the constant
+ # D3_JS_FILE in mesa/visualization/ModularVisualization.py.
+-d3_version = "4.13.0"
++d3_version = "7.4.3"
+ ensure_JS_dep_single(
+     f"https://cdnjs.cloudflare.com/ajax/libs/d3/{d3_version}/d3.min.js",
+     out_name=f"d3-{d3_version}.min.js",

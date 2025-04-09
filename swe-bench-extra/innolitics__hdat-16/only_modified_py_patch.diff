@@ -1,0 +1,111 @@
+diff --git a/hdat/hdat_cli.py b/hdat/hdat_cli.py
+index a995af4..6ac5ca7 100644
+--- a/hdat/hdat_cli.py
++++ b/hdat/hdat_cli.py
+@@ -11,10 +11,13 @@ def parse_arguments(arguments):
+     parser = argparse.ArgumentParser(prog='hdat')
+     subparsers = parser.add_subparsers(dest='command', metavar='<command>')
+ 
++    list_help = 'list available cases, collected in the current working dir'
++    list_parser = subparsers.add_parser('list', help=list_help)
++    list_parser.add_argument('casespecs', nargs='*', default=[''], metavar='<case>')
++
+     run_help = 'run cases, store results in archive, compare against goldens'
+     run_parser = subparsers.add_parser('run', help=run_help)
+     run_parser.add_argument('casespecs', nargs='*', default=[''], metavar='<case>')
+-    run_parser.add_argument('--collect-only', default=False, action='store_true')
+ 
+     show_help = 'visualize a single result'
+     show_parser = subparsers.add_parser('show', help=show_help)
+@@ -53,7 +56,7 @@ def hdat_cli(arguments, suites, golden_store, archive, git_info):
+     if args.command is None:
+         parse_arguments(['-h'])
+ 
+-    if args.command == 'run' and args.collect_only:
++    if args.command == 'list':
+         cases = resolve_casespecs(suites, args.casespecs)
+         print("\n".join(['{}/{}'.format(suite_id, case_id) for suite_id, case_id in cases]))
+     elif args.command == 'run':
+diff --git a/hdat/main.py b/hdat/main.py
+index b35ba0b..23f4828 100755
+--- a/hdat/main.py
++++ b/hdat/main.py
+@@ -11,6 +11,7 @@ from hdat.store import Archive, GoldenStore
+ 
+ def main():
+     cwd = os.getcwd()
++    sys.path.append(cwd)
+ 
+     try:
+         git_info = git_info_from_directory(cwd)
+diff --git a/hdat/suite.py b/hdat/suite.py
+index a45c80c..f67d04d 100644
+--- a/hdat/suite.py
++++ b/hdat/suite.py
+@@ -1,6 +1,9 @@
+-import pydoc
++import importlib
++import sys
++import inspect
++import os
+ 
+-from .util import print_error, find_here_or_in_parents, AbortError
++from .util import print_error, AbortError
+ 
+ 
+ class Suite:
+@@ -10,7 +13,7 @@ class Suite:
+     Is responsible for collecting, running, checking, and visualizing the
+     results of running the algorithm against its test cases.
+     '''
+-    def cases(self):
++    def collect(self):
+         '''
+         Collect all of the cases for this suite, and return them as a dict-like
+         mapping where the keys are the "case ids" and the values are the "case
+@@ -71,24 +74,26 @@ def collect_suites(directory):
+ 
+ 
+ def _collect_suite_classes(directory):
+-    suites_filename = find_here_or_in_parents(directory, '.hdattsuites')
+-    if suites_filename is None:
+-        raise AbortError('Unable to locate a ".hdattsuites" file')
++    hdat_module_suffix = '_hdat.py'
++    hdat_suite_class = Suite
+ 
+     suite_classes = []
+-    with open(suites_filename, 'r') as suites_file:
+-        for line in suites_file:
+-            class_location = line.strip()
+-            try:
+-                test_suite_class = pydoc.locate(class_location)
+-            except pydoc.ErrorDuringImport as e:
+-                print_error(e)
+-                test_suite_class = None
+-
+-            if test_suite_class is None:
+-                msg = 'Unable to import test suite "{}"'
+-                raise AbortError(msg.format(class_location))
+-            else:
+-                suite_classes.append(test_suite_class)
+-
++    for root, dirs, files in os.walk(directory, topdown=True):
++        # prevent os.walk from going into hidden dirs
++        dirs[:] = [subdir for subdir in dirs if not subdir.startswith('.')]
++        for filename in files:
++            if filename.endswith(hdat_module_suffix):
++                module_name = filename.strip(".py")
++
++                module_path = (os.path.relpath(root, start=directory))
++                if module_path == '.':
++                    module_spec = module_name
++                else:
++                    module_spec = os.path.join(module_path, '').replace(os.path.sep, '.') + module_name
++
++                importlib.import_module(module_spec)
++                classes = inspect.getmembers(sys.modules[module_spec], predicate=inspect.isclass)
++                for name, value in classes:
++                    if hdat_suite_class in inspect.getmro(value) and hdat_suite_class != value:
++                        suite_classes.append(value)
+     return suite_classes
+

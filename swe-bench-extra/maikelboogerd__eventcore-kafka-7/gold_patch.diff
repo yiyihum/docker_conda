@@ -1,0 +1,244 @@
+diff --git a/eventcore_kafka/__init__.py b/eventcore_kafka/__init__.py
+index b16a1d8..6edf4ad 100644
+--- a/eventcore_kafka/__init__.py
++++ b/eventcore_kafka/__init__.py
+@@ -1,2 +1,2 @@
+-from .producer import KafkaProducer # noqa
+-from .consumer import KafkaConsumer # noqa
++from .producer import KafkaProducer  # noqa
++from .consumer import KafkaConsumer, BlockingKafkaConsumer  # noqa
+diff --git a/eventcore_kafka/consumer.py b/eventcore_kafka/consumer.py
+index 3d380b4..650bad1 100644
+--- a/eventcore_kafka/consumer.py
++++ b/eventcore_kafka/consumer.py
+@@ -2,8 +2,9 @@ import json
+ import logging
+ 
+ import confluent_kafka as kafka
+-
++from confluent_kafka.cimpl import Message
+ from eventcore import Consumer
++from eventcore.exceptions import FatalConsumerError
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -16,14 +17,13 @@ class KafkaConsumer(Consumer):
+     :param topics: list of topics to consume from.
+     """
+ 
+-    def __init__(self, servers, group_id, topics):
++    def __init__(self, servers, group_id, topics, **kwargs):
+         # Parse the servers to ensure it's a comma-separated string.
+         if isinstance(servers, list):
+             servers = ','.join(servers)
+-        self.kafka_consumer = kafka.Consumer({
+-            'bootstrap.servers': servers,
+-            'group.id': group_id
+-        })
++        settings = {'bootstrap.servers': servers, 'group.id': group_id}
++        settings.update(kwargs)
++        self.kafka_consumer = kafka.Consumer(settings)
+         # Parse the topics to ensure it's a list.
+         if isinstance(topics, str):
+             topics = topics.split(',')
+@@ -32,28 +32,76 @@ class KafkaConsumer(Consumer):
+ 
+     def consume(self):
+         while True:
+-            message = self.kafka_consumer.poll(1.0)
+-            if not message:
+-                continue
+-            if message.error():
+-                # PARTITION_EOF error can be ignored.
+-                if message.error().code() == kafka.KafkaError._PARTITION_EOF:
+-                    continue
+-                else:
+-                    raise kafka.KafkaException(message.error())
+-
+-            try:
+-                message_body = json.loads(message.value())
+-            except TypeError:
+-                message_body = json.loads(message.value().decode('utf-8'))
+-            except:
+-                log.error('@KafkaConsumer.consume Exception:',
+-                          exc_info=True)
+-            try:
+-                subject = message.key().decode('utf-8')
+-            except AttributeError:
+-                subject = message.key()
+-
+-            self.process_event(name=message_body.get('event'),
+-                               subject=subject,
+-                               data=message_body.get('data'))
++            self.poll_and_process()
++
++    def poll_and_process(self):
++        message = self.kafka_consumer.poll()
++        if not self.is_valid_message(message):
++            return
++        subject, message_body = self.parse_message(message)
++        self.process_event(
++            name=message_body.get('event'),
++            subject=subject,
++            data=message_body.get('data'))
++
++    @staticmethod
++    def is_valid_message(message: Message):
++        if not message:
++            return False
++        if message.error():
++            # PARTITION_EOF error can be ignored.
++            if message.error().code() == kafka.KafkaError._PARTITION_EOF:
++                return False
++            else:
++                raise kafka.KafkaException(message.error())
++        return True
++
++    @staticmethod
++    def parse_message(message: Message) -> (str, dict):
++        subject, message_body = None, None
++        try:
++            message_body = json.loads(message.value())
++        except TypeError:
++            message_body = json.loads(message.value().decode('utf-8'))
++        except:
++            log.error('@KafkaConsumer.consume Exception:', exc_info=True)
++        try:
++            subject = message.key().decode('utf-8')
++        except AttributeError:
++            subject = message.key()
++
++        if message_body is None or not isinstance(message_body, dict):
++            raise ValueError("Message body is malformed: {}".format(
++                repr(message_body)))
++
++        return subject, message_body
++
++
++class BlockingKafkaConsumer(KafkaConsumer):
++    """Consumer for Kafka topics, blocks when a message cannot be processed."""
++
++    def __init__(self, servers, group_id, topics, **kwargs):
++        kwargs['enable.auto.commit'] = False
++        kwargs['auto.offset.reset'] = "smallest"  # Start from first failed.
++        super().__init__(servers, group_id, topics, **kwargs)
++
++    def poll_and_process(self):
++        message = self.kafka_consumer.poll()
++        if not self.is_valid_message(message):
++            self.kafka_consumer.commit(message)
++            return
++        try:
++            subject, message_body = self.parse_message(message)
++        except (ValueError, AttributeError, TypeError):
++            self.kafka_consumer.commit(message)
++            return
++        try:
++            self.process_event(
++                name=message_body.get('event'),
++                subject=subject,
++                data=message_body.get('data'))
++            self.kafka_consumer.commit(message)
++        except BaseException:
++            raise FatalConsumerError(
++                "Message with body {} could not be processed and blocks "
++                "the consumer. Manual action required.".format(message_body))
+diff --git a/eventcore_kafka/header.py b/eventcore_kafka/header.py
+new file mode 100644
+index 0000000..e8aa19d
+--- /dev/null
++++ b/eventcore_kafka/header.py
+@@ -0,0 +1,26 @@
++import datetime
++import uuid
++
++
++class Header:
++    """
++    Provides the meta information needed to increase traceability.
++    """
++
++    id = ''
++    source = ''
++    timestamp = ''
++    type = ''
++
++    def __init__(self, source=None, event=None):
++        """
++        Id and timestamps are added automatically. The id is an UUID which
++        identifies the current message, so it can be traced across services.
++        :param source: The source which the message is originated from.
++        :param event: The name of the event which is produced.
++        """
++        self.id = str(uuid.uuid4())
++        self.timestamp = datetime.datetime.now().isoformat()
++        self.source = source
++        self.type = event
++
+diff --git a/eventcore_kafka/producer.py b/eventcore_kafka/producer.py
+index 9214b66..efda89c 100644
+--- a/eventcore_kafka/producer.py
++++ b/eventcore_kafka/producer.py
+@@ -1,5 +1,6 @@
+ import json
+ import confluent_kafka as kafka
++from eventcore_kafka.header import Header
+ 
+ from eventcore import Producer
+ 
+@@ -10,7 +11,18 @@ class KafkaProducer(Producer):
+     :param servers: list of brokers to consume from.
+     """
+ 
+-    def __init__(self, servers):
++    source = ''
++
++    def __init__(self, servers, source=None):
++        """
++        Initialize the producer for Kafka
++        :param servers: The host and port of where Kafka runs.
++        :param source: The source of the application which is producing the
++        messages.
++        """
++
++        self.source = source
++
+         # Parse the servers to ensure it's a comma-separated string.
+         if isinstance(servers, list):
+             servers = ','.join(servers)
+@@ -18,6 +30,15 @@ class KafkaProducer(Producer):
+             'bootstrap.servers': servers
+         })
+ 
++    def get_headers(self, event):
++        """
++        Creates an header which is added to Kafka
++        :param event: the name of the event e.g user.created
++        :return: a json serialized representation of the header
++        """
++        header = Header(source=self.source, event=event)
++        return header.__dict__
++
+     def produce(self, topic, event, subject, data):
+         message_body = json.dumps({
+             'event': event,
+@@ -25,4 +46,5 @@ class KafkaProducer(Producer):
+         })
+         self.kafka_producer.produce(topic=topic,
+                                     key=subject,
+-                                    value=message_body)
++                                    value=message_body,
++                                    headers=self.get_headers(event))
+diff --git a/setup.py b/setup.py
+index 2344fa1..6a16fa1 100644
+--- a/setup.py
++++ b/setup.py
+@@ -3,7 +3,7 @@ import setuptools
+ 
+ setuptools.setup(
+     name='eventcore-kafka',
+-    version='0.3.2',
++    version='0.3.3rc2',
+     description='Produce and consume events with Kafka.',
+     author='Maikel van den Boogerd',
+     author_email='maikelboogerd@gmail.com',

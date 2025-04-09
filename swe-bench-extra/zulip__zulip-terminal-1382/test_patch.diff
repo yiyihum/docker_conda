@@ -1,0 +1,168 @@
+diff --git a/tests/model/test_model.py b/tests/model/test_model.py
+index 2bf150a..fe2ba55 100644
+--- a/tests/model/test_model.py
++++ b/tests/model/test_model.py
+@@ -72,7 +72,6 @@ class TestModel:
+         assert model.stream_dict == stream_dict
+         assert model.recipients == frozenset()
+         assert model.index == initial_index
+-        assert model._last_unread_topic is None
+         assert model.last_unread_pm is None
+         model.get_messages.assert_called_once_with(
+             num_before=30, num_after=10, anchor=None
+@@ -3900,7 +3899,7 @@ class TestModel:
+         assert return_value == is_muted
+ 
+     @pytest.mark.parametrize(
+-        "unread_topics, last_unread_topic, next_unread_topic",
++        "unread_topics, current_topic, next_unread_topic",
+         [
+             case(
+                 {(1, "topic"), (2, "topic2")},
+@@ -3920,10 +3919,10 @@ class TestModel:
+                 (1, "topic"),
+                 id="unread_present_before_previous_topic",
+             ),
+-            case(  # TODO Should be None? (2 other cases)
++            case(
+                 {(1, "topic")},
+                 (1, "topic"),
+-                (1, "topic"),
++                None,
+                 id="unread_still_present_in_topic",
+             ),
+             case(
+@@ -3993,16 +3992,42 @@ class TestModel:
+                 (2, "topic2"),
+                 id="unread_present_after_previous_topic_muted",
+             ),
++            case(
++                {(1, "topic1"), (2, "topic2"), (2, "topic2 muted")},
++                (2, "topic1"),
++                (2, "topic2"),
++                id="unmuted_unread_present_in_same_stream_as_current_topic_not_in_unread_list",
++            ),
++            case(
++                {(1, "topic1"), (2, "topic2 muted"), (4, "topic4")},
++                (2, "topic1"),
++                (4, "topic4"),
++                id="unmuted_unread_present_in_next_stream_as_current_topic_not_in_unread_list",
++            ),
++            case(
++                {(1, "topic1"), (2, "topic2 muted"), (3, "topic3")},
++                (2, "topic1"),
++                (1, "topic1"),
++                id="unmuted_unread_not_present_in_next_stream_as_current_topic_not_in_unread_list",
++            ),
++            case(
++                {(1, "topic1"), (1, "topic11"), (2, "topic2")},
++                (1, "topic11"),
++                (1, "topic1"),
++                id="unread_present_in_same_stream_wrap_around",
++            ),
+         ],
+     )
+-    def test_get_next_unread_topic(
+-        self, model, unread_topics, last_unread_topic, next_unread_topic
++    def test_next_unread_topic_from_message(
++        self, mocker, model, unread_topics, current_topic, next_unread_topic
+     ):
+         # NOTE Not important how many unreads per topic, so just use '1'
+         model.unread_counts = {
+             "unread_topics": {stream_topic: 1 for stream_topic in unread_topics}
+         }
+-        model._last_unread_topic = last_unread_topic
++
++        current_message_id = 10  # Arbitrary value due to mock below
++        model.stream_topic_from_message_id = mocker.Mock(return_value=current_topic)
+ 
+         # Minimal extra streams for muted stream testing (should not exist otherwise)
+         assert {3, 4} & set(model.stream_dict) == set()
+@@ -4020,7 +4045,38 @@ class TestModel:
+             ]
+         }
+ 
+-        unread_topic = model.get_next_unread_topic()
++        unread_topic = model.next_unread_topic_from_message_id(current_message_id)
++
++        assert unread_topic == next_unread_topic
++
++    @pytest.mark.parametrize(
++        "unread_topics, empty_narrow, narrow_stream_id, next_unread_topic",
++        [
++            case(
++                {(1, "topic1"), (1, "topic2"), (2, "topic3")},
++                [["stream", "Stream 1"], ["topic", "topic1.5"]],
++                1,
++                (1, "topic2"),
++            ),
++        ],
++    )
++    def test_next_unread_topic_from_message__empty_narrow(
++        self,
++        mocker,
++        model,
++        unread_topics,
++        empty_narrow,
++        narrow_stream_id,
++        next_unread_topic,
++    ):
++        # NOTE Not important how many unreads per topic, so just use '1'
++        model.unread_counts = {
++            "unread_topics": {stream_topic: 1 for stream_topic in unread_topics}
++        }
++        model.stream_id_from_name = mocker.Mock(return_value=narrow_stream_id)
++        model.narrow = empty_narrow
++
++        unread_topic = model.next_unread_topic_from_message_id(None)
+ 
+         assert unread_topic == next_unread_topic
+ 
+@@ -4043,6 +4099,21 @@ class TestModel:
+         assert return_value is None
+         assert model.last_unread_pm is None
+ 
++    @pytest.mark.parametrize(
++        "message_id, expected_value",
++        [
++            case(537286, (205, "Test"), id="stream_message"),
++            case(537287, None, id="direct_message"),
++            case(537289, None, id="non-existent message"),
++        ],
++    )
++    def test_stream_topic_from_message_id(
++        self, mocker, model, message_id, expected_value, empty_index
++    ):
++        model.index = empty_index
++        current_topic = model.stream_topic_from_message_id(message_id)
++        assert current_topic == expected_value
++
+     @pytest.mark.parametrize(
+         "stream_id, expected_response",
+         [
+diff --git a/tests/ui/test_ui_tools.py b/tests/ui/test_ui_tools.py
+index c04c9c3..324ee04 100644
+--- a/tests/ui/test_ui_tools.py
++++ b/tests/ui/test_ui_tools.py
+@@ -887,9 +887,10 @@ class TestMiddleColumnView:
+     ):
+         size = widget_size(mid_col_view)
+         mocker.patch(MIDCOLVIEW + ".focus_position")
++        mocker.patch.object(self.view, "message_view")
+ 
+         mid_col_view.model.stream_dict = {1: {"name": "stream"}}
+-        mid_col_view.model.get_next_unread_topic.return_value = (1, "topic")
++        mid_col_view.model.next_unread_topic_from_message_id.return_value = (1, "topic")
+ 
+         return_value = mid_col_view.keypress(size, key)
+ 
+@@ -904,7 +905,8 @@ class TestMiddleColumnView:
+     ):
+         size = widget_size(mid_col_view)
+         mocker.patch(MIDCOLVIEW + ".focus_position")
+-        mid_col_view.model.get_next_unread_topic.return_value = None
++        mocker.patch.object(self.view, "message_view")
++        mid_col_view.model.next_unread_topic_from_message_id.return_value = None
+ 
+         return_value = mid_col_view.keypress(size, key)
+ 

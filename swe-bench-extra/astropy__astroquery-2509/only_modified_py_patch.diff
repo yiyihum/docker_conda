@@ -1,0 +1,183 @@
+diff --git a/astroquery/alma/core.py b/astroquery/alma/core.py
+index b41734f6..4368bbbf 100644
+--- a/astroquery/alma/core.py
++++ b/astroquery/alma/core.py
+@@ -828,7 +828,15 @@ class AlmaClass(QueryWithLogin):
+             raise TypeError("Datasets must be given as a list of strings.")
+ 
+         files = self.get_data_info(uids)
+-        file_urls = files['access_url']
++        # filter out blank access URLs
++        # it is possible for there to be length-1 lists
++        if len(files) == 1:
++            file_urls = files['access_url']
++            if isinstance(file_urls, str) and file_urls == '':
++                raise ValueError(f"Cannot download uid {uid} because it has no file")
++        else:
++            file_urls = [url for url in files['access_url'] if url]
++
+         totalsize = files['content_length'].sum()*u.B
+ 
+         # each_size, totalsize = self.data_size(files)
+diff --git a/astroquery/exceptions.py b/astroquery/exceptions.py
+index 27651416..8ec2dddf 100644
+--- a/astroquery/exceptions.py
++++ b/astroquery/exceptions.py
+@@ -7,8 +7,9 @@ from astropy.utils.exceptions import AstropyWarning
+ 
+ __all__ = ['TimeoutError', 'InvalidQueryError', 'RemoteServiceError',
+            'TableParseError', 'LoginError', 'ResolverError',
+-           'NoResultsWarning', 'LargeQueryWarning', 'InputWarning',
+-           'AuthenticationWarning', 'MaxResultsWarning', 'CorruptDataWarning']
++           'NoResultsWarning', 'DuplicateResultsWarning', 'LargeQueryWarning',
++           'InputWarning', 'AuthenticationWarning', 'MaxResultsWarning',
++           'CorruptDataWarning']
+ 
+ 
+ class TimeoutError(Exception):
+@@ -67,6 +68,13 @@ class NoResultsWarning(AstropyWarning):
+     pass
+ 
+ 
++class DuplicateResultsWarning(AstropyWarning):
++    """
++    Astroquery warning class to be issued when a query returns no result.
++    """
++    pass
++
++
+ class LargeQueryWarning(AstropyWarning):
+     """
+     Astroquery warning class to be issued when a query is larger than
+diff --git a/astroquery/mast/observations.py b/astroquery/mast/observations.py
+index abe0a0ad..b00f915e 100644
+--- a/astroquery/mast/observations.py
++++ b/astroquery/mast/observations.py
+@@ -19,7 +19,7 @@ from requests import HTTPError
+ import astropy.units as u
+ import astropy.coordinates as coord
+ 
+-from astropy.table import Table, Row, vstack, MaskedColumn
++from astropy.table import Table, Row, unique, vstack, MaskedColumn
+ from astroquery import log
+ 
+ from astropy.utils import deprecated
+@@ -31,7 +31,7 @@ from ..query import QueryWithLogin
+ from ..utils import commons, async_to_sync
+ from ..utils.class_or_instance import class_or_instance
+ from ..exceptions import (TimeoutError, InvalidQueryError, RemoteServiceError,
+-                          ResolverError, MaxResultsWarning,
++                          ResolverError, MaxResultsWarning, DuplicateResultsWarning,
+                           NoResultsWarning, InputWarning, AuthenticationWarning)
+ 
+ from . import conf, utils
+@@ -716,6 +716,9 @@ class ObservationsClass(MastQueryWithLogin):
+ 
+             products = vstack(product_lists)
+ 
++        # Remove duplicate products
++        products = self._remove_duplicate_products(products)
++
+         # apply filters
+         products = self.filter_products(products, mrp_only=mrp_only, **filters)
+ 
+@@ -767,6 +770,9 @@ class ObservationsClass(MastQueryWithLogin):
+             raise RemoteServiceError('Please enable anonymous cloud access by calling `enable_cloud_dataset` method. '
+                                      'See MAST Labs documentation for an example: https://mast-labs.stsci.io/#example-data-access-with-astroquery-observations')
+ 
++        # Remove duplicate products
++        data_products = self._remove_duplicate_products(data_products)
++
+         return self._cloud_connection.get_cloud_uri_list(data_products, include_bucket, full_url)
+ 
+     def get_cloud_uri(self, data_product, *, include_bucket=True, full_url=False):
+@@ -802,6 +808,30 @@ class ObservationsClass(MastQueryWithLogin):
+         # Query for product URIs
+         return self._cloud_connection.get_cloud_uri(data_product, include_bucket, full_url)
+ 
++    def _remove_duplicate_products(self, data_products):
++        """
++        Removes duplicate data products that have the same dataURI.
++
++        Parameters
++        ----------
++        data_products : `~astropy.table.Table`
++            Table containing products to be checked for duplicates.
++
++        Returns
++        -------
++        unique_products : `~astropy.table.Table`
++            Table containing products with unique dataURIs.
++
++        """
++        number = len(data_products)
++        unique_products = unique(data_products, keys="dataURI")
++        number_unique = len(unique_products)
++        if number_unique < number:
++            warnings.warn(f"{number - number_unique} of {number} products were duplicates."
++                          f"Only downloading {number_unique} unique product(s).", DuplicateResultsWarning)
++
++        return unique_products
++
+ 
+ @async_to_sync
+ class MastClass(MastQueryWithLogin):
+diff --git a/astroquery/svo_fps/core.py b/astroquery/svo_fps/core.py
+index 31bf1d61..6a94b5d8 100644
+--- a/astroquery/svo_fps/core.py
++++ b/astroquery/svo_fps/core.py
+@@ -9,13 +9,11 @@ from astropy.io.votable import parse_single_table
+ from . import conf
+ 
+ from ..query import BaseQuery
+-from astroquery.exceptions import InvalidQueryError
++from astroquery.exceptions import InvalidQueryError, TimeoutError
+ 
+ 
+ __all__ = ['SvoFpsClass', 'SvoFps']
+ 
+-FLOAT_MAX = np.finfo(np.float64).max
+-
+ # Valid query parameters taken from
+ # http://svo2.cab.inta-csic.es/theory/fps/index.php?mode=voservice
+ _params_with_range = {"WavelengthRef", "WavelengthMean", "WavelengthEff",
+@@ -80,19 +78,17 @@ class SvoFpsClass(BaseQuery):
+             # If no table element found in VOTable
+             raise IndexError(error_msg)
+ 
+-    def get_filter_index(self, wavelength_eff_min=0*u.angstrom,
+-                         wavelength_eff_max=FLOAT_MAX*u.angstrom, **kwargs):
++    def get_filter_index(self, wavelength_eff_min, wavelength_eff_max, **kwargs):
+         """Get master list (index) of all filters at SVO
+         Optional parameters can be given to get filters data for specified
+         Wavelength Effective range from SVO
+ 
+         Parameters
+         ----------
+-        wavelength_eff_min : `~astropy.units.Quantity` with units of length, optional
+-            Minimum value of Wavelength Effective (default is 0 angstrom)
+-        wavelength_eff_max : `~astropy.units.Quantity` with units of length, optional
+-            Maximum value of Wavelength Effective (default is a very large
+-            quantity FLOAT_MAX angstroms i.e. maximum value of np.float64)
++        wavelength_eff_min : `~astropy.units.Quantity` with units of length
++            Minimum value of Wavelength Effective
++        wavelength_eff_max : `~astropy.units.Quantity` with units of length
++            Maximum value of Wavelength Effective
+         kwargs : dict
+             Passed to `data_from_svo`.  Relevant arguments include ``cache``
+ 
+@@ -104,7 +100,13 @@ class SvoFpsClass(BaseQuery):
+         query = {'WavelengthEff_min': wavelength_eff_min.to_value(u.angstrom),
+                  'WavelengthEff_max': wavelength_eff_max.to_value(u.angstrom)}
+         error_msg = 'No filter found for requested Wavelength Effective range'
+-        return self.data_from_svo(query=query, error_msg=error_msg, **kwargs)
++        try:
++            return self.data_from_svo(query=query, error_msg=error_msg, **kwargs)
++        except requests.ReadTimeout:
++            raise TimeoutError(
++                "Query did not finish fast enough. A smaller wavelength range might "
++                "succeed. Try increasing the timeout limit if a large range is needed."
++            )
+ 
+     def get_transmission_data(self, filter_id, **kwargs):
+         """Get transmission data for the requested Filter ID from SVO

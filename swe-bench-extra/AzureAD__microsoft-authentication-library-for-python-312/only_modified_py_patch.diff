@@ -1,0 +1,68 @@
+diff --git a/msal/application.py b/msal/application.py
+index a1f5003..9fcad59 100644
+--- a/msal/application.py
++++ b/msal/application.py
+@@ -822,6 +822,7 @@ class ClientApplication(object):
+             force_refresh=False,  # type: Optional[boolean]
+             claims_challenge=None,
+             **kwargs):
++        access_token_from_cache = None
+         if not (force_refresh or claims_challenge):  # Bypass AT when desired or using claims
+             query={
+                     "client_id": self.client_id,
+@@ -839,17 +840,27 @@ class ClientApplication(object):
+             now = time.time()
+             for entry in matches:
+                 expires_in = int(entry["expires_on"]) - now
+-                if expires_in < 5*60:
++                if expires_in < 5*60:  # Then consider it expired
+                     continue  # Removal is not necessary, it will be overwritten
+                 logger.debug("Cache hit an AT")
+-                return {  # Mimic a real response
++                access_token_from_cache = {  # Mimic a real response
+                     "access_token": entry["secret"],
+                     "token_type": entry.get("token_type", "Bearer"),
+                     "expires_in": int(expires_in),  # OAuth2 specs defines it as int
+                     }
+-        return self._acquire_token_silent_by_finding_rt_belongs_to_me_or_my_family(
++                if "refresh_on" in entry and int(entry["refresh_on"]) < now:  # aging
++                    break  # With a fallback in hand, we break here to go refresh
++                return access_token_from_cache  # It is still good as new
++        try:
++            result = self._acquire_token_silent_by_finding_rt_belongs_to_me_or_my_family(
+                 authority, decorate_scope(scopes, self.client_id), account,
+                 force_refresh=force_refresh, claims_challenge=claims_challenge, **kwargs)
++            if (result and "error" not in result) or (not access_token_from_cache):
++                return result
++        except:  # The exact HTTP exception is transportation-layer dependent
++            logger.exception("Refresh token failed")  # Potential AAD outage?
++        return access_token_from_cache
++
+ 
+     def _acquire_token_silent_by_finding_rt_belongs_to_me_or_my_family(
+             self, authority, scopes, account, **kwargs):
+@@ -1013,6 +1024,9 @@ class PublicClientApplication(ClientApplication):  # browser app or mobile app
+             **kwargs):
+         """Acquire token interactively i.e. via a local browser.
+ 
++        Prerequisite: In Azure Portal, configure the Redirect URI of your
++        "Mobile and Desktop application" as ``http://localhost``.
++
+         :param list scope:
+             It is a list of case-sensitive strings.
+         :param str prompt:
+diff --git a/msal/token_cache.py b/msal/token_cache.py
+index 34eff37..028635b 100644
+--- a/msal/token_cache.py
++++ b/msal/token_cache.py
+@@ -170,6 +170,9 @@ class TokenCache(object):
+                     }
+                 if data.get("key_id"):  # It happens in SSH-cert or POP scenario
+                     at["key_id"] = data.get("key_id")
++                if "refresh_in" in response:
++                    refresh_in = response["refresh_in"]  # It is an integer
++                    at["refresh_on"] = str(now + refresh_in)  # Schema wants a string
+                 self.modify(self.CredentialType.ACCESS_TOKEN, at, at)
+ 
+             if client_info and not event.get("skip_account_creation"):
+

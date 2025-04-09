@@ -1,0 +1,334 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1,10 +1,38 @@
++import inspect
+ import os
+ import secrets
++import subprocess
++import sys
++import textwrap
+ from importlib.machinery import SourceFileLoader
++from types import FunctionType
+ 
+ import pytest
+ 
+ 
++def _extract_source_code_from_function(function):
++    if function.__code__.co_argcount:
++        raise RuntimeError(f'function {function.__qualname__} cannot have any arguments')
++
++    code_lines = ''
++    body_started = False
++    for line in textwrap.dedent(inspect.getsource(function)).split('\n'):
++        if line.startswith('def '):
++            body_started = True
++            continue
++        elif body_started:
++            code_lines += f'{line}\n'
++
++    return textwrap.dedent(code_lines)
++
++
++def _create_module(code, tmp_path, name):
++    name = f'{name}_{secrets.token_hex(5)}'
++    path = tmp_path / f'{name}.py'
++    path.write_text(code)
++    return name, path
++
++
+ class SetEnv:
+     def __init__(self):
+         self.envars = set()
+@@ -28,11 +56,37 @@ def env():
+ 
+ 
+ @pytest.fixture
+-def create_module(tmp_path):
+-    def run(code):
+-        name = f'test_code_{secrets.token_hex(5)}'
+-        path = tmp_path / f'{name}.py'
+-        path.write_text(code)
++def create_module(tmp_path, request):
++    def run(module_source_code=None):
++        """
++        Creates module and loads it with SourceFileLoader().load_module()
++        """
++        if isinstance(module_source_code, FunctionType):
++            module_source_code = _extract_source_code_from_function(module_source_code)
++        name, path = _create_module(module_source_code, tmp_path, request.node.name)
+         return SourceFileLoader(name, str(path)).load_module()
+ 
+     return run
++
++
++@pytest.fixture
++def run_as_module(tmp_path, request):
++    def run(module_source_code=None):
++        """
++        Creates module source and runs it in subprocess
++
++        This way is much slower than SourceFileLoader().load_module(),
++        but executes module as __main__ with a clear stack (https://docs.python.org/3/library/__main__.html)
++        """
++        if isinstance(module_source_code, FunctionType):
++            module_source_code = _extract_source_code_from_function(module_source_code)
++        _, path = _create_module(module_source_code, tmp_path, request.node.name)
++        result = subprocess.run([sys.executable, str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
++        if result.returncode != 0:
++            pytest.fail(
++                f'Running {path} failed with non-zero return code: {result.returncode}\n'
++                f'Captured stdout:\n{result.stdout.decode()}\n'
++                f'Captured stderr:\n{result.stderr.decode()}'
++            )
++
++    return run
+diff --git a/tests/test_create_model.py b/tests/test_create_model.py
+--- a/tests/test_create_model.py
++++ b/tests/test_create_model.py
+@@ -11,6 +11,7 @@ def test_create_model():
+     assert model.__fields__.keys() == {'foo', 'bar'}
+     assert model.__validators__ == {}
+     assert model.__config__.__name__ == 'Config'
++    assert model.__module__ == 'pydantic.main'
+ 
+ 
+ def test_create_model_usage():
+@@ -24,6 +25,29 @@ def test_create_model_usage():
+         model(foo='hello', bar='xxx')
+ 
+ 
++def test_create_model_pickle(create_module):
++    """
++    Pickle will work for dynamically created model only if it was defined globally with its class name
++    and module where it's defined was specified
++    """
++
++    @create_module
++    def module():
++        import pickle
++
++        from pydantic import create_model
++
++        FooModel = create_model('FooModel', foo=(str, ...), bar=123, __module__=__name__)
++
++        m = FooModel(foo='hello')
++        d = pickle.dumps(m)
++        m2 = pickle.loads(d)
++        assert m2.foo == m.foo == 'hello'
++        assert m2.bar == m.bar == 123
++        assert m2 == m
++        assert m2 is not m
++
++
+ def test_invalid_name():
+     with pytest.warns(RuntimeWarning):
+         model = create_model('FooModel', _foo=(str, ...))
+diff --git a/tests/test_forward_ref.py b/tests/test_forward_ref.py
+--- a/tests/test_forward_ref.py
++++ b/tests/test_forward_ref.py
+@@ -472,3 +472,15 @@ class Filter(BaseModel):
+     )
+     Filter = module.Filter
+     assert isinstance(Filter(p={'sort': 'some_field:asc', 'fields': []}), Filter)
++
++
++def test_forward_ref_with_create_model(create_module):
++    @create_module
++    def module():
++        import pydantic
++
++        Sub = pydantic.create_model('Sub', foo='bar', __module__=__name__)
++        assert Sub  # get rid of "local variable 'Sub' is assigned to but never used"
++        Main = pydantic.create_model('Main', sub=('Sub', ...), __module__=__name__)
++        instance = Main(sub={})
++        assert instance.sub.dict() == {'foo': 'bar'}
+diff --git a/tests/test_generics.py b/tests/test_generics.py
+--- a/tests/test_generics.py
++++ b/tests/test_generics.py
+@@ -5,7 +5,7 @@
+ import pytest
+ 
+ from pydantic import BaseModel, Field, ValidationError, root_validator, validator
+-from pydantic.generics import GenericModel, _generic_types_cache
++from pydantic.generics import GenericModel, _generic_types_cache, get_caller_module_name
+ 
+ skip_36 = pytest.mark.skipif(sys.version_info < (3, 7), reason='generics only supported for python 3.7 and above')
+ 
+@@ -412,7 +412,6 @@ class MyModel(GenericModel, Generic[T]):
+ 
+ @skip_36
+ def test_child_schema():
+-
+     T = TypeVar('T')
+ 
+     class Model(GenericModel, Generic[T]):
+@@ -599,3 +598,168 @@ class Model(GenericModel, Generic[AT, BT]):
+         {'loc': ('a',), 'msg': 'none is not an allowed value', 'type': 'type_error.none.not_allowed'},
+         {'loc': ('b',), 'msg': 'none is not an allowed value', 'type': 'type_error.none.not_allowed'},
+     ]
++
++
++@skip_36
++def test_generic_model_pickle(create_module):
++    # Using create_module because pickle doesn't support
++    # objects with <locals> in their __qualname__  (e. g. defined in function)
++    @create_module
++    def module():
++        import pickle
++        from typing import Generic, TypeVar
++
++        from pydantic import BaseModel
++        from pydantic.generics import GenericModel
++
++        t = TypeVar('t')
++
++        class Model(BaseModel):
++            a: float
++            b: int = 10
++
++        class MyGeneric(GenericModel, Generic[t]):
++            value: t
++
++        original = MyGeneric[Model](value=Model(a='24'))
++        dumped = pickle.dumps(original)
++        loaded = pickle.loads(dumped)
++        assert loaded.value.a == original.value.a == 24
++        assert loaded.value.b == original.value.b == 10
++        assert loaded == original
++
++
++@skip_36
++def test_generic_model_from_function_pickle_fail(create_module):
++    @create_module
++    def module():
++        import pickle
++        from typing import Generic, TypeVar
++
++        import pytest
++
++        from pydantic import BaseModel
++        from pydantic.generics import GenericModel
++
++        t = TypeVar('t')
++
++        class Model(BaseModel):
++            a: float
++            b: int = 10
++
++        class MyGeneric(GenericModel, Generic[t]):
++            value: t
++
++        def get_generic(t):
++            return MyGeneric[t]
++
++        original = get_generic(Model)(value=Model(a='24'))
++        with pytest.raises(pickle.PicklingError):
++            pickle.dumps(original)
++
++
++@skip_36
++def test_generic_model_redefined_without_cache_fail(create_module):
++    @create_module
++    def module():
++        from typing import Generic, TypeVar
++
++        import pytest
++
++        from pydantic.generics import GenericModel, _generic_types_cache
++
++        t = TypeVar('t')
++
++        class MyGeneric(GenericModel, Generic[t]):
++            value: t
++
++        concrete = MyGeneric[t]
++        _generic_types_cache.clear()
++        with pytest.raises(
++            TypeError, match=r"'MyGeneric\[t\]' already defined above, please consider reusing it"
++        ) as exc_info:
++            MyGeneric[t]
++
++        cause = exc_info.value.__cause__
++        assert isinstance(cause, NameError), cause
++        expected_message = f"Name conflict: 'MyGeneric[t]' in {__name__!r} is already used by {concrete!r}"
++        assert cause.args[0] == expected_message, f'{cause.args[0]} != {expected_message}'
++
++
++def test_get_caller_module_name_from_function():
++    def get_current_module_name():
++        return get_caller_module_name()
++
++    assert get_current_module_name() == __name__
++
++
++def test_get_caller_module_name_from_module(create_module):
++    @create_module
++    def module():
++        from pydantic.generics import get_caller_module_name
++
++        def get_current_module_name():
++            return get_caller_module_name()
++
++        module_name = get_current_module_name()
++        assert module_name == __name__, f'{module_name} != {__name__}'
++
++        def get_current_module_name():
++            return get_caller_module_name()
++
++        assert get_current_module_name() == __name__
++
++
++def test_get_caller_module_name_not_found(mocker):
++    mocker.patch('inspect.getmodule', return_value=None)
++    assert get_caller_module_name() is None
++
++
++def test_is_call_from_module(create_module):
++    @create_module
++    def module():
++        from pydantic.generics import is_call_from_module
++
++        def function():
++            assert is_call_from_module()
++
++            another_function()
++
++        def another_function():
++            assert not is_call_from_module()
++            third_function()
++
++        def third_function():
++            assert not is_call_from_module()
++
++        function()
++
++
++def test_is_call_from_module_called_in_module(run_as_module):
++    @run_as_module
++    def module():
++        import pytest
++
++        from pydantic.generics import is_call_from_module
++
++        with pytest.raises(RuntimeError, match='This function must be used inside another function') as exc_info:
++            is_call_from_module()
++
++        e = exc_info.value
++        assert isinstance(e.__cause__, IndexError), e.__cause__
++        assert isinstance(e.__context__, IndexError), e.__context__
++
++
++def test_get_caller_module_called_from_module(run_as_module):
++    @run_as_module
++    def module():
++        import pytest
++
++        from pydantic.generics import get_caller_module_name
++
++        with pytest.raises(RuntimeError, match='This function must be used inside another function') as exc_info:
++            get_caller_module_name()
++
++        e = exc_info.value
++        assert isinstance(e.__cause__, IndexError), e.__cause__
++        assert isinstance(e.__context__, IndexError), e.__context__

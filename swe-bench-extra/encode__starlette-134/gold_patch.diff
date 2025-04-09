@@ -1,0 +1,139 @@
+diff --git a/docs/applications.md b/docs/applications.md
+index 2cce4ab..d4b44ca 100644
+--- a/docs/applications.md
++++ b/docs/applications.md
+@@ -56,7 +56,7 @@ There are two ways to add event handlers:
+ * `@app.on_event(event_type)` - Add an event, decorator style
+ * `app.add_event_handler(event_type, func)` - Add an event through a function call.
+ 
+-`event_type` must be specified as either `'startup'` or `'cleanup'`.
++`event_type` must be specified as either `'startup'` or `'shutdown'`.
+ 
+ ### Submounting other applications
+ 
+diff --git a/docs/events.md b/docs/events.md
+index b6696bb..3378a83 100644
+--- a/docs/events.md
++++ b/docs/events.md
+@@ -20,7 +20,7 @@ app = Starlette()
+ async def open_database_connection_pool():
+     ...
+ 
+-@app.on_event('cleanup')
++@app.on_event('shutdown')
+ async def close_database_connection_pool():
+     ...
+ ```
+@@ -39,14 +39,14 @@ async def close_database_connection_pool():
+     ...
+ 
+ app.add_event_handler('startup', open_database_connection_pool)
+-app.add_event_handler('cleanup', close_database_connection_pool)
++app.add_event_handler('shutdown', close_database_connection_pool)
+ 
+ ```
+ 
+ Starlette will not start serving any incoming requests until all of the
+ registered startup handlers have completed.
+ 
+-The cleanup handlers will run once all connections have been closed, and
++The shutdown handlers will run once all connections have been closed, and
+ any in-process background tasks have completed.
+ 
+ **Note**: The ASGI lifespan protocol has only recently been added to the spec,
+@@ -74,5 +74,5 @@ def test_homepage():
+         response = client.get("/")
+         assert response.status_code == 200
+ 
+-    # Application 'cleanup' handlers are called on exiting the block.
++    # Application 'shutdown' handlers are called on exiting the block.
+ ```
+diff --git a/starlette/lifespan.py b/starlette/lifespan.py
+index a862298..b25ec8c 100644
+--- a/starlette/lifespan.py
++++ b/starlette/lifespan.py
+@@ -22,7 +22,7 @@ class LifespanHandler:
+         return decorator
+ 
+     def add_event_handler(self, event_type: str, func: typing.Callable) -> None:
+-        assert event_type in ("startup", "cleanup")
++        assert event_type in ("startup", "shutdown", "cleanup")
+ 
+         if event_type == "startup":
+             self.startup_handlers.append(func)
+@@ -53,19 +53,26 @@ class LifespanHandler:
+         await self.run_startup()
+         await send({"type": "lifespan.startup.complete"})
+         message = await receive()
+-        assert message["type"] == "lifespan.cleanup"
++        assert (
++            message["type"] == "lifespan.shutdown"
++            or message["type"] == "lifespan.cleanup"
++        )
+         await self.run_cleanup()
+-        await send({"type": "lifespan.cleanup.complete"})
++        if message["type"] == "lifespan.shutdown":
++            await send({"type": "lifespan.shutdown.complete"})
++
++        if message["type"] == "lifespan.cleanup":
++            await send({"type": "lifespan.cleanup.complete"})  # pragma: no cover
+ 
+ 
+ class LifespanContext:
+     def __init__(
+-        self, app: ASGIApp, startup_timeout: int = 10, cleanup_timeout: int = 10
++        self, app: ASGIApp, startup_timeout: int = 10, shutdown_timeout: int = 10
+     ) -> None:
+         self.startup_timeout = startup_timeout
+-        self.cleanup_timeout = cleanup_timeout
++        self.shutdown_timeout = shutdown_timeout
+         self.startup_event = asyncio.Event()
+-        self.cleanup_event = asyncio.Event()
++        self.shutdown_event = asyncio.Event()
+         self.receive_queue = asyncio.Queue()  # type: asyncio.Queue
+         self.asgi = app({"type": "lifespan"})  # type: ASGIInstance
+ 
+@@ -81,25 +88,25 @@ class LifespanContext:
+         tb: TracebackType,
+     ) -> None:
+         loop = asyncio.get_event_loop()
+-        loop.run_until_complete(self.wait_cleanup())
++        loop.run_until_complete(self.wait_shutdown())
+ 
+     async def run_lifespan(self) -> None:
+         try:
+             await self.asgi(self.receive, self.send)
+         finally:
+             self.startup_event.set()
+-            self.cleanup_event.set()
++            self.shutdown_event.set()
+ 
+     async def send(self, message: Message) -> None:
+         if message["type"] == "lifespan.startup.complete":
+             assert not self.startup_event.is_set(), STATE_TRANSITION_ERROR
+-            assert not self.cleanup_event.is_set(), STATE_TRANSITION_ERROR
++            assert not self.shutdown_event.is_set(), STATE_TRANSITION_ERROR
+             self.startup_event.set()
+         else:
+-            assert message["type"] == "lifespan.cleanup.complete"
++            assert message["type"] == "lifespan.shutdown.complete"
+             assert self.startup_event.is_set(), STATE_TRANSITION_ERROR
+-            assert not self.cleanup_event.is_set(), STATE_TRANSITION_ERROR
+-            self.cleanup_event.set()
++            assert not self.shutdown_event.is_set(), STATE_TRANSITION_ERROR
++            self.shutdown_event.set()
+ 
+     async def receive(self) -> Message:
+         return await self.receive_queue.get()
+@@ -108,6 +115,8 @@ class LifespanContext:
+         await self.receive_queue.put({"type": "lifespan.startup"})
+         await asyncio.wait_for(self.startup_event.wait(), timeout=self.startup_timeout)
+ 
+-    async def wait_cleanup(self) -> None:
+-        await self.receive_queue.put({"type": "lifespan.cleanup"})
+-        await asyncio.wait_for(self.cleanup_event.wait(), timeout=self.cleanup_timeout)
++    async def wait_shutdown(self) -> None:
++        await self.receive_queue.put({"type": "lifespan.shutdown"})
++        await asyncio.wait_for(
++            self.shutdown_event.wait(), timeout=self.shutdown_timeout
++        )

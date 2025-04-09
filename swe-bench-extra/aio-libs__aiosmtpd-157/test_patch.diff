@@ -1,0 +1,230 @@
+diff --git a/.github/workflows/unit-testing-and-coverage.yml b/.github/workflows/unit-testing-and-coverage.yml
+index d3de80b..252af1e 100644
+--- a/.github/workflows/unit-testing-and-coverage.yml
++++ b/.github/workflows/unit-testing-and-coverage.yml
+@@ -4,9 +4,15 @@ on:
+   # This is for direct commit to master
+   push:
+     branches: [ "master" ]
++    paths:
++      - "aiosmtpd/*"
++      - "setup.cfg"  # To monitor changes in dependencies
+   # This is for PRs
+   pull_request:
+     branches: [ "master" ]
++    paths:
++      - "aiosmtpd/*"
++      - "setup.cfg"  # To monitor changes in dependencies
+   # Manual/on-demand
+   workflow_dispatch:
+   # When doing "releases"
+@@ -14,20 +20,37 @@ on:
+     types: [ "created", "edited", "published", "prereleased", "released" ]
+ 
+ jobs:
+-  test:
++  qa_docs:
++    runs-on: ubuntu-20.04
++    steps:
++      - name: "Checkout latest commit"
++        uses: actions/checkout@v2
++      - name: "Set up Python 3.8"
++        uses: actions/setup-python@v2
++        with:
++          python-version: 3.8
++      - name: "Install dependencies"
++        run: |
++          python -m pip install --upgrade pip
++          pip install tox
++      - name: "Execute tox -e qa,docs"
++        run: |
++          tox -e qa,docs
++  testing:
++    needs: qa_docs
+     strategy:
+       # If a matrix fail, do NOT stop other matrix, let them run to completion
+       fail-fast: false
+       matrix:
+-        os: [ "ubuntu-latest" ]
+-        platform: [ "linux" ]
++        os: [ "ubuntu-18.04", "ubuntu-20.04", "macos-10.15" ]
++        platform: [ "posix" ]
+         python-version: [ "3.6", "3.7", "3.8", "3.9", "pypy3" ]
+         include:
+           - os: "windows-latest"
+             platform: "mswin"
+-            # Only the latest stable branch as indicated on
++            # Only the latest frozen branch as indicated on
+             # https://devguide.python.org/#branchstatus
+-            # ('stable' means Status == "security")
++            # ('frozen' means Status == "security")
+             # Reason being that Windows users can change their Python anytime,
+             # so there is no benefit in testing all released Python versions.
+             # Plus pypy3 implementation in Windows is ... complicated. We
+@@ -53,7 +76,7 @@ jobs:
+       # "py" testenv means we'll use whatever Python provided by GA,
+       # as specified in 'matrix' above. No need to specify exact version.
+       run: |
+-        tox -e "qa,docs,py-cov"
++        tox -e py-cov
+     - name: "Report to codecov"
+       # Ubuntu 18.04 came out of the box with 3.6, and LOTS of system are still running
+       # 18.04 happily, so we choose this as the 'canonical' code coverage testing.
+diff --git a/aiosmtpd/tests/test_handlers.py b/aiosmtpd/tests/test_handlers.py
+index 3463d35..f20028d 100644
+--- a/aiosmtpd/tests/test_handlers.py
++++ b/aiosmtpd/tests/test_handlers.py
+@@ -14,7 +14,7 @@ from mailbox import Maildir
+ from operator import itemgetter
+ from smtplib import SMTP, SMTPDataError, SMTPRecipientsRefused
+ from tempfile import TemporaryDirectory
+-from unittest.mock import call, patch
++from unittest.mock import call, patch, Mock
+ 
+ 
+ CRLF = '\r\n'
+@@ -534,11 +534,40 @@ class HELOHandler:
+         return '250 geddy.example.com'
+ 
+ 
+-class EHLOHandler:
++class EHLOHandlerDeprecated:
++    hostname = None
++
+     async def handle_EHLO(self, server, session, envelope, hostname):
++        self.hostname = hostname
+         return '250 alex.example.com'
+ 
+ 
++class EHLOHandlerNew:
++    hostname = None
++    orig_responses = []
++
++    def __init__(self, *features):
++        self.features = features
++
++    async def handle_EHLO(self, server, session, envelope, hostname, responses):
++        self.hostname = hostname
++        self.orig_responses.extend(responses)
++        my_resp = [responses[0]]
++        my_resp.extend(f"250-{f}" for f in self.features)
++        my_resp.append("250 HELP")
++        return my_resp
++
++
++class EHLOHandlerIncompatibleShort:
++    async def handle_EHLO(self, server, session, envelope):
++        return
++
++
++class EHLOHandlerIncompatibleLong:
++    async def handle_EHLO(self, server, session, envelope, hostname, responses, xtra):
++        return
++
++
+ class MAILHandler:
+     async def handle_MAIL(self, server, session, envelope, address, options):
+         envelope.mail_options.extend(options)
+@@ -595,16 +624,56 @@ Subject: Test
+         self.assertEqual(code, 250)
+         self.assertEqual(response, b'geddy.example.com')
+ 
+-    def test_ehlo_hook(self):
+-        controller = Controller(EHLOHandler())
++    def test_ehlo_hook_oldsystem(self):
++        declare_myself = "me"
++        handler = EHLOHandlerDeprecated()
++        controller = Controller(handler)
+         controller.start()
+         self.addCleanup(controller.stop)
+         with SMTP(controller.hostname, controller.port) as client:
+-            code, response = client.ehlo('me')
++            code, response = client.ehlo(declare_myself)
+         self.assertEqual(code, 250)
++        self.assertEqual(declare_myself, handler.hostname)
+         lines = response.decode('utf-8').splitlines()
+         self.assertEqual(lines[-1], 'alex.example.com')
+ 
++    def test_ehlo_hook_newsystem(self):
++        declare_myself = "me"
++        handler = EHLOHandlerNew("FEATURE1", "FEATURE2 OPTION", "FEAT3 OPTA OPTB")
++        controller = Controller(handler)
++        controller.start()
++        self.addCleanup(controller.stop)
++        with SMTP(controller.hostname, controller.port) as client:
++            code, response = client.ehlo(declare_myself)
++        self.assertEqual(code, 250)
++        self.assertEqual(declare_myself, handler.hostname)
++
++        self.assertIn("250-8BITMIME", handler.orig_responses)
++        self.assertIn("250-SMTPUTF8", handler.orig_responses)
++        self.assertNotIn("8bitmime", client.esmtp_features)
++        self.assertNotIn("smtputf8", client.esmtp_features)
++
++        self.assertIn("feature1", client.esmtp_features)
++        self.assertIn("feature2", client.esmtp_features)
++        self.assertEqual("OPTION", client.esmtp_features["feature2"])
++        self.assertIn("feat3", client.esmtp_features)
++        self.assertEqual("OPTA OPTB", client.esmtp_features["feat3"])
++        self.assertIn("help", client.esmtp_features)
++
++    def test_ehlo_hook_incompat_short(self):
++        handler = EHLOHandlerIncompatibleShort()
++        controller = Controller(handler)
++        self.addCleanup(controller.stop)
++        with self.assertRaises(RuntimeError):
++            controller.start()
++
++    def test_ehlo_hook_incompat_long(self):
++        handler = EHLOHandlerIncompatibleLong()
++        controller = Controller(handler)
++        self.addCleanup(controller.stop)
++        with self.assertRaises(RuntimeError):
++            controller.start()
++
+     def test_mail_hook(self):
+         controller = Controller(MAILHandler())
+         controller.start()
+@@ -782,3 +851,15 @@ Testing
+             controller.smtpd.warnings[0],
+             call('Use handler.handle_RSET() instead of .rset_hook()',
+                  DeprecationWarning))
++
++    @patch("aiosmtpd.smtp.warn")
++    def test_handle_ehlo_4arg_deprecation(self, mock_warn: Mock):
++        handler = EHLOHandlerDeprecated()
++        _ = Server(handler)
++        mock_warn.assert_called_with(
++            "Use the 5-argument handle_EHLO() hook instead of "
++            "the 4-argument handle_EHLO() hook; "
++            "support for the 4-argument handle_EHLO() hook will be "
++            "removed in version 2.0",
++            DeprecationWarning
++        )
+diff --git a/aiosmtpd/tests/test_smtp.py b/aiosmtpd/tests/test_smtp.py
+index d682dc1..966c5fa 100644
+--- a/aiosmtpd/tests/test_smtp.py
++++ b/aiosmtpd/tests/test_smtp.py
+@@ -435,16 +435,17 @@ class TestSMTP(unittest.TestCase):
+         with SMTP(*self.address) as client:
+             code, response = client.ehlo('example.com')
+             self.assertEqual(code, 250)
+-            lines = response.splitlines()
+-            expecteds = (
++            actuals = response.splitlines()
++            expecteds = [
+                 bytes(socket.getfqdn(), 'utf-8'),
+                 b'SIZE 33554432',
+                 b'SMTPUTF8',
+                 b'AUTH LOGIN PLAIN',
+                 b'HELP',
+-            )
+-            for actual, expected in zip(lines, expecteds):
+-                self.assertEqual(actual, expected)
++            ]
++            # for actual, expected in zip(lines, expecteds):
++            #     self.assertEqual(actual, expected)
++            self.assertEqual(expecteds, actuals)
+ 
+     def test_ehlo_duplicate(self):
+         with SMTP(*self.address) as client:

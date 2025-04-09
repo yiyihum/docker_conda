@@ -1,0 +1,154 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 67c32ed7..8c0f0ded 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -66,6 +66,9 @@ Bug Fixes
+ Cubeviz
+ ^^^^^^^
+ 
++- Fixed get_model_parameters error when retrieving parameters for a cube fit. This
++  also removed the "_3d" previously appended to model labels in the returned dict. [#2171]
++
+ Imviz
+ ^^^^^
+ 
+diff --git a/jdaviz/app.py b/jdaviz/app.py
+index 81d04123..e04b932c 100644
+--- a/jdaviz/app.py
++++ b/jdaviz/app.py
+@@ -13,6 +13,7 @@ from astropy.nddata import CCDData, NDData
+ from astropy.io import fits
+ from astropy import units as u
+ from astropy.coordinates import Angle
++from astropy.time import Time
+ from regions import PixCoord, CirclePixelRegion, RectanglePixelRegion, EllipsePixelRegion
+ 
+ from echo import CallbackProperty, DictCallbackProperty, ListCallbackProperty
+@@ -686,8 +687,13 @@ class Application(VuetifyTemplate, HubListener):
+                         if cls is not None:
+                             handler, _ = data_translator.get_handler_for(cls)
+                             try:
+-                                layer_data = handler.to_object(layer_data,
+-                                                               statistic=statistic)
++                                if cls == Spectrum1D:
++                                    # if this is a spectrum, apply the `statistic`:
++                                    layer_data = handler.to_object(layer_data,
++                                                                   statistic=statistic)
++                                else:
++                                    # otherwise simply translate to an object:
++                                    layer_data = handler.to_object(layer_data)
+                             except IncompatibleAttribute:
+                                 continue
+ 
+@@ -878,8 +884,9 @@ class Application(VuetifyTemplate, HubListener):
+                 all_subsets[label] = None
+                 continue
+ 
+-            # Is the subset spectral or spatial?
++            # Is the subset spectral, spatial, temporal?
+             is_spectral = self._is_subset_spectral(subset_region)
++            is_temporal = self._is_subset_temporal(subset_region)
+ 
+             # Remove duplicate spectral regions
+             if is_spectral and isinstance(subset_region, SpectralRegion):
+@@ -903,6 +910,12 @@ class Application(VuetifyTemplate, HubListener):
+                 else:
+                     all_subsets[label] = subset_region
+ 
++            if not (spectral_only or spatial_only) and is_temporal:
++                if object_only:
++                    all_subsets[label] = [reg['region'] for reg in subset_region]
++                else:
++                    all_subsets[label] = subset_region
++
+         all_subset_names = [subset.label for subset in dc.subset_groups]
+         if subset_name and subset_name in all_subset_names:
+             return all_subsets[subset_name]
+@@ -935,6 +948,14 @@ class Application(VuetifyTemplate, HubListener):
+                 return True
+         return False
+ 
++    def _is_subset_temporal(self, subset_region):
++        if isinstance(subset_region, Time):
++            return True
++        elif isinstance(subset_region, list) and len(subset_region) > 0:
++            if isinstance(subset_region[0]['region'], Time):
++                return True
++        return False
++
+     def _remove_duplicate_bounds(self, spec_regions):
+         regions_no_dups = None
+ 
+diff --git a/jdaviz/core/helpers.py b/jdaviz/core/helpers.py
+index fad12728..d9a41576 100644
+--- a/jdaviz/core/helpers.py
++++ b/jdaviz/core/helpers.py
+@@ -231,6 +231,12 @@ class ConfigHelper(HubListener):
+         elif models is None:
+             models = self.fitted_models
+ 
++        data_shapes = {}
++        for label in models:
++            data_label = label.split(" (")[0]
++            if data_label not in data_shapes:
++                data_shapes[data_label] = self.app.data_collection[data_label].data.shape
++
+         param_dict = {}
+         parameters_cube = {}
+         param_x_y = {}
+@@ -241,7 +247,7 @@ class ConfigHelper(HubListener):
+             # looks for that style and separates out the pertinent information.
+             if " (" in label:
+                 label_split = label.split(" (")
+-                model_name = label_split[0] + "_3d"
++                model_name = label_split[0]
+                 x = int(label_split[1].split(", ")[0])
+                 y = int(label_split[1].split(", ")[1][:-1])
+ 
+@@ -268,10 +274,7 @@ class ConfigHelper(HubListener):
+         # on whether the model in question is 3d or 1d, respectively.
+         for model_name in param_dict:
+             if model_name in param_x_y:
+-                x_size = len(param_x_y[model_name]['x'])
+-                y_size = len(param_x_y[model_name]['y'])
+-
+-                parameters_cube[model_name] = {x: np.zeros(shape=(x_size, y_size))
++                parameters_cube[model_name] = {x: np.zeros(shape=data_shapes[model_name][:2])
+                                                for x in param_dict[model_name]}
+             else:
+                 parameters_cube[model_name] = {x: 0
+@@ -282,7 +285,7 @@ class ConfigHelper(HubListener):
+         for label in models:
+             if " (" in label:
+                 label_split = label.split(" (")
+-                model_name = label_split[0] + "_3d"
++                model_name = label_split[0]
+ 
+                 # If the get_models method is used to build a dictionary of
+                 # models and a value is set for the x or y parameters, that
+diff --git a/setup.cfg b/setup.cfg
+index 90d5dab1..08b3ae6f 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -27,6 +27,7 @@ install_requires =
+     glue-core>=1.6.0,!=v1.9.0
+     glue-jupyter>=0.15.0
+     echo>=0.5.0
++    ipython<8.13;python_version=='3.8'
+     ipykernel>=6.19.4
+     ipyvue>=1.6
+     ipyvuetify>=1.7.0
+diff --git a/tox.ini b/tox.ini
+index 80e46204..52b0bda9 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -50,7 +50,8 @@ deps =
+     devdeps: git+https://github.com/spacetelescope/gwcs.git
+     devdeps: git+https://github.com/asdf-format/asdf.git
+     devdeps: git+https://github.com/astropy/asdf-astropy.git
+-    devdeps: git+https://github.com/spacetelescope/stdatamodels.git
++    # FIXME: https://github.com/spacetelescope/stdatamodels/issues/159
++    #devdeps: git+https://github.com/spacetelescope/stdatamodels.git
+     devdeps: git+https://github.com/bqplot/bqplot.git@0.12.x
+     devdeps: git+https://github.com/glue-viz/glue.git
+     devdeps: git+https://github.com/voila-dashboards/voila.git

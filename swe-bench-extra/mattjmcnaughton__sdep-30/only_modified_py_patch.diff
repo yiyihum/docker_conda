@@ -1,0 +1,172 @@
+diff --git a/sdep/app.py b/sdep/app.py
+index ecf518f..ad923f8 100644
+--- a/sdep/app.py
++++ b/sdep/app.py
+@@ -28,12 +28,6 @@ class Sdep(object):
+     # Constant names of AWS objects.
+     BUCKET_NAME = "bucket_name"
+ 
+-    # Default index and error.
+-    # @TODO This specification is temporary, as eventually we will make these
+-    # configurable options with `Config`.
+-    DEFAULT_INDEX_SUFFIX = "index.html"
+-    DEFAULT_ERROR_KEY = "404.html"
+-
+     def __init__(self, config):
+         self._config = config
+         self._s3_client = self._establish_s3_client()
+@@ -199,10 +193,10 @@ class Sdep(object):
+         """
+         website_config = {
+             "IndexDocument": {
+-                "Suffix": self.DEFAULT_INDEX_SUFFIX
++                "Suffix": self._config.get(Config.INDEX_SUFFIX_FIELD)
+             },
+             "ErrorDocument": {
+-                "Key": self.DEFAULT_ERROR_KEY
++                "Key": self._config.get(Config.ERROR_KEY_FIELD)
+             }
+         }
+ 
+diff --git a/sdep/config.py b/sdep/config.py
+index 636f97a..22298f8 100644
+--- a/sdep/config.py
++++ b/sdep/config.py
+@@ -65,6 +65,8 @@ class Config(object):
+     AWS_SECRET_ACCESS_KEY_FIELD = "aws_secret_access_key"
+     SITE_DIR_FIELD = "site_dir"
+     DOMAIN_FIELD = "domain"
++    INDEX_SUFFIX_FIELD = "index_suffix"
++    ERROR_KEY_FIELD = "error_key"
+ 
+     def __init__(self, config_file=None, test_mode=False):
+         # @TODO I wonder if it would make more sense for the `Config` class to
+@@ -144,13 +146,11 @@ class Config(object):
+             ConfigImproperFormatError: If vital configuration data is either in
+                 the incorrect format or nonexistent.
+         """
+-        for field in self.required_config_fields(env=True):
+-            value = os.environ.get(field)
+-
+-            if value is None:
+-                raise ConfigImproperFormatError
+-            else:
+-                self._config_hash[field.lower()] = value
++        self._config_hash = self._parse_from_store(
++            self.required_config_fields(env=True),
++            self.optional_config_fields(env=True),
++            os.environ
++        )
+ 
+     def _parse_from_config_file(self, config_file):
+         """
+@@ -172,15 +172,46 @@ class Config(object):
+         except (IOError, json.JSONDecodeError):
+             raise ConfigImproperFormatError
+ 
+-        # @TODO Should a common helper method implement this functionality
+-        # for both `_parse_from_config_file` and `_parse_from_env`.
+-        for field in self.required_config_fields(env=False):
+-            value = config_data.get(field)
++        self._config_hash = self._parse_from_store(
++            self.required_config_fields(env=False),
++            self.optional_config_fields(env=False),
++            config_data
++        )
++
++    @classmethod
++    def _parse_from_store(cls, required_fields, optional_fields, data_store):
++        """
++        Parse the configuration from a data store object (i.e. the json hash or
++        `os.environ`). This method is useful because the process for parsing the
++        data from either the environment or a configuration file shares many of
++        the same components. Abstracting to a single method ensures less
++        duplicate code.
++
++        Args:
++            required_fields (list): A list of the required fields.
++            optional_fields (list): A list of the optional fields.
++            data_store (dict): A dictionary containing key/value pairs with the
++                fields as a key.
++
++        Returns:
++            dict: A configuration dictionary.
++        """
++        # Start with all of the defaults filled in. We will overwrite with any
++        # specified info.
++        config_hash = cls._optional_fields_and_defaults()
++
++        fields = [(f, True) for f in required_fields] + [(f, False) for f in optional_fields]
++
++        for field, required in fields:
++            value = data_store.get(field)
+ 
+             if value is None:
+-                raise ConfigImproperFormatError
++                if required:
++                    raise ConfigImproperFormatError
+             else:
+-                self._config_hash[field.lower()] = value
++                config_hash[field.lower()] = value
++
++        return config_hash
+ 
+     @classmethod
+     def required_config_fields(cls, env=False):
+@@ -207,8 +238,8 @@ class Config(object):
+         else:
+             return required_fields
+ 
+-    @staticmethod
+-    def optional_config_fields(env=False):
++    @classmethod
++    def optional_config_fields(cls, env=False):
+         """
+         Return the optinal configuration fields either in `snake_case` or in all
+         upper-case `snake_case`, depending on whether the `env` flag is set.
+@@ -220,23 +251,40 @@ class Config(object):
+         Returns:
+             [str]: A list of optional configuration fields.
+         """
+-        optional_fields = []
++        optional_fields = list(cls._optional_fields_and_defaults().keys())
+ 
+         if env:
+             return [field.upper() for field in optional_fields]
+         else:
+             return optional_fields
+ 
++    @classmethod
++    def _optional_fields_and_defaults(cls):
++        """
++        Return a dictionary of optional fields and their defaults.
++
++        Returns:
++            dict: Optional fields and their defaults.
++        """
++        return {
++            cls.INDEX_SUFFIX_FIELD: "index.html",
++            cls.ERROR_KEY_FIELD: "404.html"
++        }
++
+     def _prepopulate_config(self):
+         """
+         Prepopulate this instance of `Config` with sensible default values which
+         we can use when testing.
+         """
+-        # @TODO Determine a better method for automatically including all
+-        # `required` variables.
+-        self._config_hash = {
++        populate_hash = {
+             self.AWS_ACCESS_KEY_ID_FIELD: "MY_ACCESS_KEY",
+             self.AWS_SECRET_ACCESS_KEY_FIELD: "MY_SECRET_KEY",
+             self.SITE_DIR_FIELD: "./static",
+             self.DOMAIN_FIELD: "sdep-test.com"
+         }
++
++        self._config_hash = self._parse_from_store(
++            self.required_config_fields(env=False),
++            self.optional_config_fields(env=False),
++            populate_hash
++        )
+

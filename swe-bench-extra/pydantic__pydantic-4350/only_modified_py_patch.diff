@@ -1,0 +1,97 @@
+diff --git a/pydantic/config.py b/pydantic/config.py
+--- a/pydantic/config.py
++++ b/pydantic/config.py
+@@ -2,6 +2,8 @@
+ from enum import Enum
+ from typing import TYPE_CHECKING, Any, Callable, Dict, ForwardRef, Optional, Tuple, Type, Union
+ 
++from typing_extensions import Literal, Protocol
++
+ from .typing import AnyCallable
+ from .utils import GetterDict
+ from .version import compiled
+@@ -9,14 +11,12 @@
+ if TYPE_CHECKING:
+     from typing import overload
+ 
+-    import typing_extensions
+-
+     from .fields import ModelField
+     from .main import BaseModel
+ 
+     ConfigType = Type['BaseConfig']
+ 
+-    class SchemaExtraCallable(typing_extensions.Protocol):
++    class SchemaExtraCallable(Protocol):
+         @overload
+         def __call__(self, schema: Dict[str, Any]) -> None:
+             pass
+@@ -40,7 +40,7 @@ class Extra(str, Enum):
+ # https://github.com/cython/cython/issues/4003
+ # Will be fixed with Cython 3 but still in alpha right now
+ if not compiled:
+-    from typing_extensions import Literal, TypedDict
++    from typing_extensions import TypedDict
+ 
+     class ConfigDict(TypedDict, total=False):
+         title: Optional[str]
+@@ -103,8 +103,10 @@ class BaseConfig:
+     json_encoders: Dict[Union[Type[Any], str, ForwardRef], AnyCallable] = {}
+     underscore_attrs_are_private: bool = False
+ 
+-    # whether inherited models as fields should be reconstructed as base model
+-    copy_on_model_validation: bool = True
++    # whether inherited models as fields should be reconstructed as base model,
++    # and whether such a copy should be shallow or deep
++    copy_on_model_validation: Literal['none', 'deep', 'shallow'] = 'shallow'
++
+     # whether `Union` should check all allowed types before even trying to coerce
+     smart_union: bool = False
+     # whether dataclass `__post_init__` should be run before or after validation
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -679,10 +679,28 @@ def __get_validators__(cls) -> 'CallableGenerator':
+     @classmethod
+     def validate(cls: Type['Model'], value: Any) -> 'Model':
+         if isinstance(value, cls):
+-            if cls.__config__.copy_on_model_validation:
+-                return value._copy_and_set_values(value.__dict__, value.__fields_set__, deep=True)
+-            else:
++            copy_on_model_validation = cls.__config__.copy_on_model_validation
++            # whether to deep or shallow copy the model on validation, None means do not copy
++            deep_copy: Optional[bool] = None
++            if copy_on_model_validation not in {'deep', 'shallow', 'none'}:
++                # Warn about deprecated behavior
++                warnings.warn(
++                    "`copy_on_model_validation` should be a string: 'deep', 'shallow' or 'none'", DeprecationWarning
++                )
++                if copy_on_model_validation:
++                    deep_copy = False
++
++            if copy_on_model_validation == 'shallow':
++                # shallow copy
++                deep_copy = False
++            elif copy_on_model_validation == 'deep':
++                # deep copy
++                deep_copy = True
++
++            if deep_copy is None:
+                 return value
++            else:
++                return value._copy_and_set_values(value.__dict__, value.__fields_set__, deep=deep_copy)
+ 
+         value = cls._enforce_dict_if_root(value)
+ 
+diff --git a/pydantic/version.py b/pydantic/version.py
+--- a/pydantic/version.py
++++ b/pydantic/version.py
+@@ -1,6 +1,6 @@
+ __all__ = 'compiled', 'VERSION', 'version_info'
+ 
+-VERSION = '1.9.0'
++VERSION = '1.9.2'
+ 
+ try:
+     import cython  # type: ignore
+

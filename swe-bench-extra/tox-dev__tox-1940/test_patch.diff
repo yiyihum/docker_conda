@@ -1,0 +1,183 @@
+diff --git a/src/tox/_pytestplugin.py b/src/tox/_pytestplugin.py
+index c9176348..d0c87033 100644
+--- a/src/tox/_pytestplugin.py
++++ b/src/tox/_pytestplugin.py
+@@ -491,7 +491,14 @@ def create_files(base, filedefs):
+             create_files(base.ensure(key, dir=1), value)
+         elif isinstance(value, six.string_types):
+             s = textwrap.dedent(value)
+-            base.join(key).write(s)
++
++            if not isinstance(s, six.text_type):
++                if not isinstance(s, six.binary_type):
++                    s = str(s)
++                else:
++                    s = six.ensure_text(s)
++
++            base.join(key).write_text(s, encoding="UTF-8")
+ 
+ 
+ @pytest.fixture()
+diff --git a/tests/unit/config/test_config.py b/tests/unit/config/test_config.py
+index fe11224c..b4bd24fb 100644
+--- a/tests/unit/config/test_config.py
++++ b/tests/unit/config/test_config.py
+@@ -1,3 +1,4 @@
++# coding=utf-8
+ import os
+ import re
+ import sys
+@@ -3556,7 +3557,10 @@ def test_config_via_pyproject_legacy(initproj):
+     initproj(
+         "config_via_pyproject_legacy-0.5",
+         filedefs={
+-            "pyproject.toml": '''
++            "pyproject.toml": u'''
++                [project]
++                description = "Factory ⸻ A code generator 🏭"
++                authors = [{name = "Łukasz Langa"}]
+                 [tool.tox]
+                 legacy_tox_ini = """
+                 [tox]
+diff --git a/tests/unit/config/test_config_parallel.py b/tests/unit/config/test_config_parallel.py
+index 785b7710..0e42a2c5 100644
+--- a/tests/unit/config/test_config_parallel.py
++++ b/tests/unit/config/test_config_parallel.py
+@@ -38,7 +38,7 @@ def test_parallel_number_negative(newconfig, capsys):
+     assert "value must be positive" in err
+ 
+ 
+-def test_depends(newconfig, capsys):
++def test_depends(newconfig):
+     config = newconfig(
+         """\
+         [tox]
+@@ -49,7 +49,7 @@ def test_depends(newconfig, capsys):
+     assert config.envconfigs["py"].depends == ("py37", "py36")
+ 
+ 
+-def test_depends_multi_row_facotr(newconfig, capsys):
++def test_depends_multi_row_facotr(newconfig):
+     config = newconfig(
+         """\
+         [tox]
+@@ -61,7 +61,7 @@ def test_depends_multi_row_facotr(newconfig, capsys):
+     assert config.envconfigs["py"].depends == ("py37", "py36-a", "py36-b")
+ 
+ 
+-def test_depends_factor(newconfig, capsys):
++def test_depends_factor(newconfig):
+     config = newconfig(
+         """\
+         [tox]
+diff --git a/tests/unit/session/test_provision.py b/tests/unit/session/test_provision.py
+index cb7bd9b5..cf2ded10 100644
+--- a/tests/unit/session/test_provision.py
++++ b/tests/unit/session/test_provision.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import, unicode_literals
+ 
++import json
+ import os
+ import shutil
+ import subprocess
+@@ -185,6 +186,99 @@ def test_provision_cli_args_not_ignored_if_provision_false(cmd, initproj):
+     result.assert_fail(is_run_test_env=False)
+ 
+ 
++parametrize_json_path = pytest.mark.parametrize("json_path", [None, "missing.json"])
++
++
++@parametrize_json_path
++def test_provision_does_not_fail_with_no_provision_no_reason(cmd, initproj, json_path):
++    p = initproj("test-0.1", {"tox.ini": "[tox]"})
++    result = cmd("--no-provision", *([json_path] if json_path else []))
++    result.assert_success(is_run_test_env=True)
++    assert not (p / "missing.json").exists()
++
++
++@parametrize_json_path
++def test_provision_fails_with_no_provision_next_tox(cmd, initproj, next_tox_major, json_path):
++    p = initproj(
++        "test-0.1",
++        {
++            "tox.ini": """\
++                             [tox]
++                             minversion = {}
++                             """.format(
++                next_tox_major,
++            )
++        },
++    )
++    result = cmd("--no-provision", *([json_path] if json_path else []))
++    result.assert_fail(is_run_test_env=False)
++    if json_path:
++        missing = json.loads((p / json_path).read_text("utf-8"))
++        assert missing["minversion"] == next_tox_major
++
++
++@parametrize_json_path
++def test_provision_fails_with_no_provision_missing_requires(cmd, initproj, json_path):
++    p = initproj(
++        "test-0.1",
++        {
++            "tox.ini": """\
++                             [tox]
++                             requires =
++                                 virtualenv > 99999999
++                             """
++        },
++    )
++    result = cmd("--no-provision", *([json_path] if json_path else []))
++    result.assert_fail(is_run_test_env=False)
++    if json_path:
++        missing = json.loads((p / json_path).read_text("utf-8"))
++        assert missing["requires"] == ["virtualenv > 99999999"]
++
++
++@parametrize_json_path
++def test_provision_does_not_fail_with_satisfied_requires(cmd, initproj, next_tox_major, json_path):
++    p = initproj(
++        "test-0.1",
++        {
++            "tox.ini": """\
++                             [tox]
++                             minversion = 0
++                             requires =
++                                 setuptools > 2
++                                 pip > 3
++                             """
++        },
++    )
++    result = cmd("--no-provision", *([json_path] if json_path else []))
++    result.assert_success(is_run_test_env=True)
++    assert not (p / "missing.json").exists()
++
++
++@parametrize_json_path
++def test_provision_fails_with_no_provision_combined(cmd, initproj, next_tox_major, json_path):
++    p = initproj(
++        "test-0.1",
++        {
++            "tox.ini": """\
++                             [tox]
++                             minversion = {}
++                             requires =
++                                 setuptools > 2
++                                 pip > 3
++                             """.format(
++                next_tox_major,
++            )
++        },
++    )
++    result = cmd("--no-provision", *([json_path] if json_path else []))
++    result.assert_fail(is_run_test_env=False)
++    if json_path:
++        missing = json.loads((p / json_path).read_text("utf-8"))
++        assert missing["minversion"] == next_tox_major
++        assert missing["requires"] == ["setuptools > 2", "pip > 3"]
++
++
+ @pytest.fixture(scope="session")
+ def wheel(tmp_path_factory):
+     """create a wheel for a project"""

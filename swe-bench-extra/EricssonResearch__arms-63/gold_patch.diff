@@ -1,0 +1,170 @@
+diff --git a/arms/misc/socket.py b/arms/misc/socket.py
+index 0ca3fd3..a04eb19 100644
+--- a/arms/misc/socket.py
++++ b/arms/misc/socket.py
+@@ -25,9 +25,10 @@ class SocketClient:
+         server.
+ 
+         Return:
+-            - True, if a setting entry belonging to the client (client_name)
+-            could be found and no data type violation occurred.
+-            - False, if not.
++			- [#1, #2]
++				#1: True, if a setting entry belonging to the client (client_name)
++					could be found and no data type violation occurred. False, if not.
++				#2: True, if a connection could be made. False, if not.
+         """
+         try:
+             c = config.var.data['socket'][self.name]
+@@ -38,11 +39,11 @@ class SocketClient:
+                              'socket {} in the configuration file ('
+                              'arms/config/config.json). Hence, no '
+                              'connection could be made.'.format(self.name))
+-            return False
++            return [False, False]
+ 
+         if isinstance(host, str) and isinstance(port, int):
+             ok = self.connect(host, port)
+-            return ok
++            return [True, ok]
+         else:
+             log.socket.error('Data type violation. The host number has to be '
+                              'provided as a string and the port number as an '
+@@ -50,7 +51,7 @@ class SocketClient:
+                              'arms/config/config.json). In consequence, the '
+                              'socket {} could not connect to the server.'
+                              .format(self.name))
+-            return False
++            return [False, False]
+ 
+     def connect(self, host, port):
+         """Establishes a connection to a server.
+diff --git a/arms/units/abb.py b/arms/units/abb.py
+index 5d39fa1..76c3cb0 100644
+--- a/arms/units/abb.py
++++ b/arms/units/abb.py
+@@ -23,6 +23,11 @@ class ABB:
+     def __exit__(self, exc_type, exc_val, exc_tb):
+         self.close()
+ 
++    def connect(self):
++        """Connects to the socket server."""
++        ok, connected = self.client.get_config_and_connect()
++        return ok, connected
++
+     def close(self):
+         """Close connection."""
+         case = 0
+diff --git a/arms/units/alarms.py b/arms/units/alarms.py
+new file mode 100644
+index 0000000..8d3ff68
+--- /dev/null
++++ b/arms/units/alarms.py
+@@ -0,0 +1,46 @@
++"""Utilities related to receiving and evaluating of DU failure reports."""
++
++import requests
++import time
++from arms.config import config
++from arms.utils import log
++
++
++class Alarms:
++
++    """Receiving and evaluating of DU failure reports."""
++
++    def listen(self):
++        """Connects with the web server 'alarms' specified in the settings
++        (arms/config/config.json -> web -> alarms) and waits for an error
++        message.
++
++        Return:
++            -   True, if a hardware link failure was reported.
++            -   False, if an internal error occurred.
++        """
++
++        try:
++            host = config.var.data['web']['alarms']['host']
++            port = config.var.data['web']['alarms']['port']
++            url = config.var.data['web']['alarms']['url']
++            webpage = host + ":" + str(port) + url
++            response = requests.get(webpage).text
++        except (TypeError, KeyError):
++            log.alarms.critical("Could not find (appropriate) settings in the "
++                                "configuration file (arms/config/config.json) "
++                                "to reach the website responsible for sending "
++                                "failure reports. Hence, this service will be "
++                                "closed.")
++            return False
++        except requests.exceptions.RequestException:
++            time.sleep(60)
++            return self.listen()
++
++        if response == "A":
++            log.alarms.info("The error code ({}) was received. The healing "
++                            "process will be started.".format(response))
++            return True
++        else:
++            time.sleep(60)
++            return self.listen()
+diff --git a/arms/utils/log.py b/arms/utils/log.py
+index 5c1a8b6..72a7217 100644
+--- a/arms/utils/log.py
++++ b/arms/utils/log.py
+@@ -71,6 +71,7 @@ def get_logger(name):
+ 
+ # The different loggers used (alphabetical order).
+ abb = get_logger('abb')
++alarms = get_logger('alarms')
+ app = get_logger('app')
+ ard_log = get_logger('ard_log')
+ camera = get_logger('camera')
+diff --git a/other/alarms/alarmSample.txt b/other/alarms/alarmSample.txt
+new file mode 100644
+index 0000000..f45e1a4
+--- /dev/null
++++ b/other/alarms/alarmSample.txt
+@@ -0,0 +1,7 @@
++===================================================================================================================================================================================================================
++Date & Time (Local) S Specific Problem                      				MO (Cause/AdditionalInfo)
++===================================================================================================================================================================================================================
++2018-11-22 15:52:19 M Gigabit Ethernet Link Fault         				Subrack=1,Slot=1,PlugInUnit=1,ExchangeTerminalIp=1,GigaBitEthernet=1 (Autonegotiation Failed to Meet Minimum Requirements.)
++2018-11-22 16:03:19 M Network Synch Time from GPS Missing 				Subrack=1,Slot=1,PlugInUnit=1,TimingUnit=1,GpsSyncRef=1 (Cause: Loss of signal)
++2018-11-23 10:23:52 m Link Failure RiLink=1 (No signal detected (link start time-out)   ManagedElement=1,Equipment=1,Subrack=1,Slot=1,PlugInUnit=1,RiPort=A (transportType=NOT_SET)
++
+diff --git a/other/alarms/alservice_rest.py b/other/alarms/alservice_rest.py
+new file mode 100644
+index 0000000..e501c44
+--- /dev/null
++++ b/other/alarms/alservice_rest.py
+@@ -0,0 +1,21 @@
++from flask import Flask
++import os
++import sys
++
++app = Flask(__name__)
++
++@app.route('/alarms')
++def alarms():
++
++	with open(os.getcwd() + '/alarmSample.txt', 'r') as f:
++		lines = f.readlines()
++		f.close()
++	for line in lines:
++		if "Link Failure" in line:
++			return line[line.find("RiPort") + 7:line.find("RiPort") + 8]
++
++	return "no alarm"
++
++
++if __name__ == '__main__':
++	app.run(host='0.0.0.0', port=8000)
+diff --git a/requirements.txt b/requirements.txt
+index a6b2e32..cd20793 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,2 +1,3 @@
+ # List of files to be installed using pip install.
++requests
+ pytest
+\ No newline at end of file

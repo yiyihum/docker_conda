@@ -1,0 +1,136 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a6f56821..2fe4e734 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,10 +19,13 @@
+      scroll the actual error message off the screen.
+     * Exceptions occurring in tab completion functions are now printed to stderr before returning control back to
+     readline. This makes debugging a lot easier since readline suppresses these exceptions.
++    * Added support for custom Namespaces in the argparse decorators. See description of `ns_provider` argument
++    for more information.
+ * Potentially breaking changes
+     * Replaced `unquote_redirection_tokens()` with `unquote_specific_tokens()`. This was to support the fix
+       that allows terminators in alias and macro values.
+-    * Changed `Statement.pipe_to` to a string instead of a list 
++    * Changed `Statement.pipe_to` to a string instead of a list
++    * `preserve_quotes` is now a keyword-only argument in the argparse decorators
+ * **Python 3.4 EOL notice**
+     * Python 3.4 reached its [end of life](https://www.python.org/dev/peps/pep-0429/) on March 18, 2019
+     * This is the last release of `cmd2` which will support Python 3.4
+diff --git a/cmd2/cmd2.py b/cmd2/cmd2.py
+index c29a1812..f5a2a844 100644
+--- a/cmd2/cmd2.py
++++ b/cmd2/cmd2.py
+@@ -191,12 +191,17 @@ def with_argument_list(*args: List[Callable], preserve_quotes: bool = False) ->
+         return arg_decorator
+ 
+ 
+-def with_argparser_and_unknown_args(argparser: argparse.ArgumentParser, preserve_quotes: bool = False) -> \
++def with_argparser_and_unknown_args(argparser: argparse.ArgumentParser, *,
++                                    ns_provider: Optional[Callable[..., argparse.Namespace]] = None,
++                                    preserve_quotes: bool = False) -> \
+         Callable[[argparse.Namespace, List], Optional[bool]]:
+     """A decorator to alter a cmd2 method to populate its ``args`` argument by parsing arguments with the given
+     instance of argparse.ArgumentParser, but also returning unknown args as a list.
+ 
+     :param argparser: unique instance of ArgumentParser
++    :param ns_provider: An optional function that accepts a cmd2.Cmd object as an argument and returns an
++                        argparse.Namespace. This is useful if the Namespace needs to be prepopulated with
++                        state data that affects parsing.
+     :param preserve_quotes: if True, then arguments passed to argparse maintain their quotes
+     :return: function that gets passed argparse-parsed args in a Namespace and a list of unknown argument strings
+              A member called __statement__ is added to the Namespace to provide command functions access to the
+@@ -213,8 +218,13 @@ def with_argparser_and_unknown_args(argparser: argparse.ArgumentParser, preserve
+                                                                                             statement,
+                                                                                             preserve_quotes)
+ 
++            if ns_provider is None:
++                namespace = None
++            else:
++                namespace = ns_provider(cmd2_instance)
++
+             try:
+-                args, unknown = argparser.parse_known_args(parsed_arglist)
++                args, unknown = argparser.parse_known_args(parsed_arglist, namespace)
+             except SystemExit:
+                 return
+             else:
+@@ -241,12 +251,16 @@ def with_argparser_and_unknown_args(argparser: argparse.ArgumentParser, preserve
+     return arg_decorator
+ 
+ 
+-def with_argparser(argparser: argparse.ArgumentParser,
++def with_argparser(argparser: argparse.ArgumentParser, *,
++                   ns_provider: Optional[Callable[..., argparse.Namespace]] = None,
+                    preserve_quotes: bool = False) -> Callable[[argparse.Namespace], Optional[bool]]:
+     """A decorator to alter a cmd2 method to populate its ``args`` argument by parsing arguments
+     with the given instance of argparse.ArgumentParser.
+ 
+     :param argparser: unique instance of ArgumentParser
++    :param ns_provider: An optional function that accepts a cmd2.Cmd object as an argument and returns an
++                        argparse.Namespace. This is useful if the Namespace needs to be prepopulated with
++                        state data that affects parsing.
+     :param preserve_quotes: if True, then arguments passed to argparse maintain their quotes
+     :return: function that gets passed the argparse-parsed args in a Namespace
+              A member called __statement__ is added to the Namespace to provide command functions access to the
+@@ -261,8 +275,14 @@ def with_argparser(argparser: argparse.ArgumentParser,
+             statement, parsed_arglist = cmd2_instance.statement_parser.get_command_arg_list(command_name,
+                                                                                             statement,
+                                                                                             preserve_quotes)
++
++            if ns_provider is None:
++                namespace = None
++            else:
++                namespace = ns_provider(cmd2_instance)
++
+             try:
+-                args = argparser.parse_args(parsed_arglist)
++                args = argparser.parse_args(parsed_arglist, namespace)
+             except SystemExit:
+                 return
+             else:
+diff --git a/docs/argument_processing.rst b/docs/argument_processing.rst
+index fc1f2433..4bd917cf 100644
+--- a/docs/argument_processing.rst
++++ b/docs/argument_processing.rst
+@@ -247,7 +247,7 @@ argument list instead of a string::
+             pass
+ 
+ 
+-Using the argument parser decorator and also receiving a a list of unknown positional arguments
++Using the argument parser decorator and also receiving a list of unknown positional arguments
+ ===============================================================================================
+ If you want all unknown arguments to be passed to your command as a list of strings, then
+ decorate the command method with the ``@with_argparser_and_unknown_args`` decorator.
+@@ -275,6 +275,31 @@ Here's what it looks like::
+ 
+         ...
+ 
++Using custom argparse.Namespace with argument parser decorators
++===============================================================================================
++In some cases, it may be necessary to write custom ``argparse`` code that is dependent on state data of your
++application.  To support this ability while still allowing use of the decorators, both ``@with_argparser`` and
++``@with_argparser_and_unknown_args`` have an optional argument called ``ns_provider``.
++
++``ns_provider`` is a Callable that accepts a ``cmd2.Cmd`` object as an argument and returns an ``argparse.Namespace``::
++
++    Callable[[cmd2.Cmd], argparse.Namespace]
++
++For example::
++
++    def settings_ns_provider(self) -> argparse.Namespace:
++        """Populate an argparse Namespace with current settings"""
++        ns = argparse.Namespace()
++        ns.app_settings = self.settings
++        return ns
++
++To use this function with the argparse decorators, do the following::
++
++    @with_argparser(my_parser, ns_provider=settings_ns_provider)
++
++The Namespace is passed by the decorators to the ``argparse`` parsing functions which gives your custom code access
++to the state data it needs for its parsing logic.
++
+ Sub-commands
+ ============
+ Sub-commands are supported for commands using either the ``@with_argparser`` or

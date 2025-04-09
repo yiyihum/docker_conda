@@ -1,0 +1,152 @@
+diff --git a/doc/conf.py b/doc/conf.py
+index ec7c640cf..f2eac1f60 100644
+--- a/doc/conf.py
++++ b/doc/conf.py
+@@ -1,3 +1,4 @@
++import os
+ from datetime import date
+ from sphinx_gallery.sorting import ExplicitOrder, FileNameSortKey
+ from warnings import filterwarnings
+@@ -81,12 +82,15 @@ exclude_patterns = ["release/release_template.rst"]
+ project = "NetworkX"
+ copyright = f"2004-{date.today().year}, NetworkX Developers"
+ 
++# Used in networkx.utils.backends for cleaner rendering of functions.
++# We need to set this before we import networkx.
++os.environ["_NETWORKX_BUILDING_DOCS_"] = "True"
++import networkx
++
+ # The default replacements for |version| and |release|, also used in various
+ # other places throughout the built documents.
+ #
+ # The short X.Y version.
+-import networkx
+-
+ version = networkx.__version__
+ # The full version, including dev info
+ release = networkx.__version__.replace("_", "")
+diff --git a/networkx/algorithms/minors/contraction.py b/networkx/algorithms/minors/contraction.py
+index ff4df958d..1b4da3522 100644
+--- a/networkx/algorithms/minors/contraction.py
++++ b/networkx/algorithms/minors/contraction.py
+@@ -497,6 +497,18 @@ def contracted_nodes(G, u, v, self_loops=True, copy=True):
+     >>> list(H.edges())
+     [(1, 1)]
+ 
++    In a ``MultiDiGraph`` with a self loop, the in and out edges will
++    be treated separately as edges, so while contracting a node which
++    has a self loop the contraction will add multiple edges:
++
++    >>> G = nx.MultiDiGraph([(1, 2), (2, 2)])
++    >>> H = nx.contracted_nodes(G, 1, 2)
++    >>> list(H.edges())  # edge 1->2, 2->2, 2<-2 from the original Graph G
++    [(1, 1), (1, 1), (1, 1)]
++    >>> H = nx.contracted_nodes(G, 1, 2, self_loops=False)
++    >>> list(H.edges())  # edge 2->2, 2<-2 from the original Graph G
++    [(1, 1), (1, 1)]
++
+     See Also
+     --------
+     contracted_edge
+diff --git a/networkx/algorithms/polynomials.py b/networkx/algorithms/polynomials.py
+index 54d00fa57..57ecf0d09 100644
+--- a/networkx/algorithms/polynomials.py
++++ b/networkx/algorithms/polynomials.py
+@@ -250,10 +250,10 @@ def chromatic_polynomial(G):
+     cases are listed in [2]_.
+ 
+     The chromatic polynomial is a specialization of the Tutte polynomial; in
+-    particular, `X_G(x) = `T_G(x, 0)` [6]_.
++    particular, ``X_G(x) = T_G(x, 0)`` [6]_.
+ 
+     The chromatic polynomial may take negative arguments, though evaluations
+-    may not have chromatic interpretations. For instance, `X_G(-1)` enumerates
++    may not have chromatic interpretations. For instance, ``X_G(-1)`` enumerates
+     the acyclic orientations of `G` [7]_.
+ 
+     References
+diff --git a/networkx/algorithms/tree/operations.py b/networkx/algorithms/tree/operations.py
+index 169a2e2be..3682110ce 100644
+--- a/networkx/algorithms/tree/operations.py
++++ b/networkx/algorithms/tree/operations.py
+@@ -4,13 +4,42 @@ from itertools import accumulate, chain
+ 
+ import networkx as nx
+ 
+-__all__ = ["join"]
++__all__ = ["join", "join_trees"]
+ 
+ 
+ def join(rooted_trees, label_attribute=None):
+-    """Returns a new rooted tree with a root node joined with the roots
++    """A deprecated name for `join_trees`
++
++    Returns a new rooted tree with a root node joined with the roots
+     of each of the given rooted trees.
+ 
++    .. deprecated:: 3.2
++
++       `join` is deprecated in NetworkX v3.2 and will be removed in v3.4.
++       It has been renamed join_trees with the same syntax/interface.
++
++    """
++    import warnings
++
++    warnings.warn(
++        "The function `join` is deprecated and is renamed `join_trees`.\n"
++        "The ``join`` function itself will be removed in v3.4",
++        DeprecationWarning,
++        stacklevel=2,
++    )
++
++    return join_trees(rooted_trees, label_attribute=label_attribute)
++
++
++def join_trees(rooted_trees, label_attribute=None):
++    """Returns a new rooted tree made by joining `rooted_trees`
++
++    Constructs a new tree by joining each tree in `rooted_trees`.
++    A new root node is added and connected to each of the roots
++    of the input trees. While copying the nodes from the trees,
++    relabeling to integers occurs and the old name stored as an
++    attribute of the new node in the returned graph.
++
+     Parameters
+     ----------
+     rooted_trees : list
+@@ -35,6 +64,10 @@ def join(rooted_trees, label_attribute=None):
+ 
+     Notes
+     -----
++    Trees are stored in NetworkX as NetworkX Graphs. There is no specific
++    enforcement of the fact that these are trees. Testing for each tree
++    can be done using :func:`networkx.is_tree`.
++
+     Graph, edge, and node attributes are propagated from the given
+     rooted trees to the created tree. If there are any overlapping graph
+     attributes, those from later trees will overwrite those from earlier
+diff --git a/networkx/utils/backends.py b/networkx/utils/backends.py
+index c7871c77a..ae7b030a7 100644
+--- a/networkx/utils/backends.py
++++ b/networkx/utils/backends.py
+@@ -817,3 +817,19 @@ class _dispatch:
+ 
+ def _restore_dispatch(name):
+     return _registered_algorithms[name]
++
++
++if os.environ.get("_NETWORKX_BUILDING_DOCS_"):
++    # When building docs with Sphinx, use the original function with the
++    # dispatched __doc__, b/c Sphinx renders normal Python functions better.
++    # This doesn't show e.g. `*, backend=None, **backend_kwargs` in the
++    # signatures, which is probably okay. It does allow the docstring to be
++    # updated based on the installed backends.
++    _orig_dispatch = _dispatch
++
++    def _dispatch(func=None, **kwargs):  # type: ignore[no-redef]
++        if func is None:
++            return partial(_dispatch, **kwargs)
++        dispatched_func = _orig_dispatch(func, **kwargs)
++        func.__doc__ = dispatched_func.__doc__
++        return func
+

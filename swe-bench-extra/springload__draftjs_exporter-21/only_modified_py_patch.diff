@@ -1,0 +1,346 @@
+diff --git a/draftjs_exporter/constants.py b/draftjs_exporter/constants.py
+index 882f5ee..8e6e18a 100644
+--- a/draftjs_exporter/constants.py
++++ b/draftjs_exporter/constants.py
+@@ -3,10 +3,13 @@ from __future__ import absolute_import, unicode_literals
+ 
+ # http://stackoverflow.com/a/22723724/1798491
+ class Enum(object):
+-    def __init__(self, tupleList):
+-        self.tupleList = tupleList
++    def __init__(self, *elements):
++        self.elements = tuple(elements)
+ 
+     def __getattr__(self, name):
++        if name not in self.elements:
++            raise AttributeError("'Enum' has no attribute '{}'".format(name))
++
+         return name
+ 
+ 
+@@ -27,6 +30,6 @@ class BLOCK_TYPES:
+     ATOMIC = 'atomic'
+     HORIZONTAL_RULE = 'horizontal-rule'
+ 
+-ENTITY_TYPES = Enum(('LINK', 'IMAGE', 'TOKEN'))
++ENTITY_TYPES = Enum('LINK', 'IMAGE', 'TOKEN')
+ 
+-INLINE_STYLES = Enum(('BOLD', 'CODE', 'ITALIC', 'STRIKETHROUGH', 'UNDERLINE'))
++INLINE_STYLES = Enum('BOLD', 'CODE', 'ITALIC', 'STRIKETHROUGH', 'UNDERLINE')
+diff --git a/draftjs_exporter/dom.py b/draftjs_exporter/dom.py
+index 0b76d7b..89ab65d 100644
+--- a/draftjs_exporter/dom.py
++++ b/draftjs_exporter/dom.py
+@@ -13,11 +13,11 @@ except NameError:
+     unicode = lambda s: str(s)
+ 
+ 
+-def Soup(str):
++def Soup(raw_str):
+     """
+     Wrapper around BeautifulSoup to keep the code DRY.
+     """
+-    return BeautifulSoup(str, 'html5lib')
++    return BeautifulSoup(raw_str, 'html5lib')
+ 
+ 
+ class DOM(object):
+@@ -25,11 +25,14 @@ class DOM(object):
+     Wrapper around our HTML building library to facilitate changes.
+     """
+     @staticmethod
+-    def create_tag(type, attributes={}):
+-        return Soup('').new_tag(type, **attributes)
++    def create_tag(type_, attributes=None):
++        if attributes is None:
++            attributes = {}
++
++        return Soup('').new_tag(type_, **attributes)
+ 
+     @staticmethod
+-    def create_element(type=None, props={}, *children):
++    def create_element(type_=None, props=None, *children):
+         """
+         Signature inspired by React.createElement.
+         createElement(
+@@ -39,15 +42,17 @@ class DOM(object):
+         )
+         https://facebook.github.io/react/docs/top-level-api.html#react.createelement
+         """
+-        if not type:
++        if props is None:
++            props = {}
++
++        if not type_:
+             elt = DOM.create_document_fragment()
+         else:
+             attributes = {}
+ 
+             # Map props from React/Draft.js to HTML lingo.
+             if 'className' in props:
+-                props['class'] = props.get('className')
+-                props.pop('className', None)
++                props['class'] = props.pop('className')
+ 
+             for key in props:
+                 prop = props[key]
+@@ -56,10 +61,10 @@ class DOM(object):
+                     attributes[key] = prop
+ 
+             # "type" is either an entity with a render method, or a tag name.
+-            if inspect.isclass(type):
+-                elt = type().render(attributes)
++            if inspect.isclass(type_):
++                elt = type_().render(attributes)
+             else:
+-                elt = DOM.create_tag(type, attributes)
++                elt = DOM.create_tag(type_, attributes)
+ 
+         for child in children:
+             if child:
+diff --git a/draftjs_exporter/entities.py b/draftjs_exporter/entities.py
+index e0c15f8..2ee9d77 100644
+--- a/draftjs_exporter/entities.py
++++ b/draftjs_exporter/entities.py
+@@ -3,18 +3,18 @@ from __future__ import absolute_import, unicode_literals
+ from draftjs_exporter.dom import DOM
+ 
+ 
+-class Null():
++class Null:
+     def render(self, props):
+         return DOM.create_element()
+ 
+ 
+-class Icon():
++class Icon:
+     def render(self, props):
+         href = 'icon-%s' % props.get('name', '')
+         return DOM.create_element('svg', {'class': 'icon'}, DOM.create_element('use', {'xlink:href': href}))
+ 
+ 
+-class Image():
++class Image:
+     def render(self, props):
+         data = props.get('data', {})
+ 
+@@ -26,13 +26,13 @@ class Image():
+         })
+ 
+ 
+-class Link():
++class Link:
+     attributes = ['url', 'rel', 'target', 'title']
+ 
+     @staticmethod
+     def is_valid_attribute(key):
+         # TODO How much do we need to whitelist / blacklist attributes?
+-        valid_data_attr = (key.startswith('data-') and key.replace('data-', '') and key.replace('data-', '').islower())
++        valid_data_attr = key.startswith('data-') and len(key) > 5 and key.islower()
+         return key in Link.attributes or valid_data_attr
+ 
+     def render(self, props):
+@@ -48,11 +48,16 @@ class Link():
+         return DOM.create_element('a', attributes)
+ 
+ 
+-class Button():
++class Button:
+     def render(self, props):
+         data = props.get('data', {})
+         href = data.get('href', '#')
+         icon = data.get('icon', None)
+         text = data.get('text', '')
+ 
+-        return DOM.create_element('a', {'class': 'icon-text' if icon else None, 'href': href}, DOM.create_element(Icon, {'name': icon}) if icon else None, DOM.create_element('span', {'class': 'icon-text__text'}, text) if icon else text)
++        return DOM.create_element(
++            'a',
++            {'class': 'icon-text' if icon else None, 'href': href},
++            DOM.create_element(Icon, {'name': icon}) if icon else None,
++            DOM.create_element('span', {'class': 'icon-text__text'}, text) if icon else text
++        )
+diff --git a/draftjs_exporter/entity_state.py b/draftjs_exporter/entity_state.py
+index 2da83c6..b284a84 100644
+--- a/draftjs_exporter/entity_state.py
++++ b/draftjs_exporter/entity_state.py
+@@ -8,7 +8,7 @@ class EntityException(ExporterException):
+     pass
+ 
+ 
+-class EntityState():
++class EntityState:
+     def __init__(self, root_element, entity_decorators, entity_map):
+         self.entity_decorators = entity_decorators
+         self.entity_map = entity_map
+@@ -19,9 +19,9 @@ class EntityState():
+         self.entity_stack = [(stack_start, {})]
+ 
+     def apply(self, command):
+-        if (command.name == 'start_entity'):
++        if command.name == 'start_entity':
+             self.start_command(command)
+-        elif (command.name == 'stop_entity'):
++        elif command.name == 'stop_entity':
+             self.stop_command(command)
+ 
+     def current_parent(self):
+@@ -37,11 +37,11 @@ class EntityState():
+         return details
+ 
+     def get_entity_decorator(self, entity_details):
+-        type = entity_details.get('type')
+-        decorator = self.entity_decorators.get(type)
++        type_ = entity_details.get('type')
++        decorator = self.entity_decorators.get(type_)
+ 
+         if decorator is None:
+-            raise EntityException('Decorator "%s" does not exist in entity_decorators' % type)
++            raise EntityException('Decorator "%s" does not exist in entity_decorators' % type_)
+ 
+         return decorator
+ 
+@@ -52,7 +52,7 @@ class EntityState():
+         new_element = decorator.render(entity_details)
+         DOM.append_child(self.current_parent(), new_element)
+ 
+-        self.entity_stack.append([new_element, entity_details])
++        self.entity_stack.append((new_element, entity_details))
+ 
+     def stop_command(self, command):
+         entity_details = self.get_entity_details(command)
+diff --git a/draftjs_exporter/html.py b/draftjs_exporter/html.py
+index c7be12d..b0cc16b 100644
+--- a/draftjs_exporter/html.py
++++ b/draftjs_exporter/html.py
+@@ -7,12 +7,15 @@ from draftjs_exporter.style_state import StyleState
+ from draftjs_exporter.wrapper_state import WrapperState
+ 
+ 
+-class HTML():
++class HTML:
+     """
+     Entry point of the exporter. Combines entity, wrapper and style state
+     to generate the right HTML nodes.
+     """
+-    def __init__(self, config={}):
++    def __init__(self, config=None):
++        if config is None:
++            config = {}
++
+         self.entity_decorators = config.get('entity_decorators', {})
+         self.wrapper_state = WrapperState(config.get('block_map', BLOCK_MAP))
+         self.style_state = StyleState(config.get('style_map', STYLE_MAP))
+diff --git a/draftjs_exporter/style_state.py b/draftjs_exporter/style_state.py
+index bb9ccdf..eed38d6 100644
+--- a/draftjs_exporter/style_state.py
++++ b/draftjs_exporter/style_state.py
+@@ -10,13 +10,13 @@ _first_cap_re = re.compile(r'(.)([A-Z][a-z]+)')
+ _all_cap_re = re.compile('([a-z0-9])([A-Z])')
+ 
+ 
+-def camelToDash(camelCasedStr):
+-    sub2 = _first_cap_re.sub(r'\1-\2', camelCasedStr)
++def camel_to_dash(camel_cased_str):
++    sub2 = _first_cap_re.sub(r'\1-\2', camel_cased_str)
+     dashed_case_str = _all_cap_re.sub(r'\1-\2', sub2).lower()
+     return dashed_case_str.replace('--', '-')
+ 
+ 
+-class StyleState():
++class StyleState:
+     """
+     Handles the creation of inline styles on elements.
+     Receives inline_style commands, and generates the element's `style`
+@@ -52,7 +52,7 @@ class StyleState():
+             css_style = self.style_map.get(style, {})
+             for prop in css_style.keys():
+                 if prop != 'element':
+-                    rules.append('{0}: {1};'.format(camelToDash(prop), css_style[prop]))
++                    rules.append('{0}: {1};'.format(camel_to_dash(prop), css_style[prop]))
+ 
+         return ''.join(sorted(rules))
+ 
+diff --git a/draftjs_exporter/wrapper_state.py b/draftjs_exporter/wrapper_state.py
+index 8bec7e1..2879d99 100644
+--- a/draftjs_exporter/wrapper_state.py
++++ b/draftjs_exporter/wrapper_state.py
+@@ -8,7 +8,7 @@ class BlockException(ExporterException):
+     pass
+ 
+ 
+-class WrapperState():
++class WrapperState:
+     """
+     This class does the initial node building for the tree.
+     It sets elements with the right tag, text content, and attributes.
+@@ -25,19 +25,19 @@ class WrapperState():
+         ]
+ 
+     def element_for(self, block):
+-        type = block.get('type', 'unstyled')
++        type_ = block.get('type', 'unstyled')
+         depth = block.get('depth', 0)
+-        block_options = self.get_block_options(type)
++        block_options = self.get_block_options(type_)
+ 
+         # Make an element from the options specified in the block map.
+         elt_options = self.map_element_options(block_options.get('element'))
+         elt = DOM.create_element(elt_options[0], elt_options[1])
+ 
+-        parent = self.parent_for(type, depth)
++        parent = self.parent_for(type_, depth)
+         DOM.append_child(parent, elt)
+ 
+         # At level 0, the element is added to the document.
+-        if (depth == 0):
++        if depth == 0:
+             DOM.append_child(self.document, parent)
+ 
+         return elt
+@@ -48,8 +48,8 @@ class WrapperState():
+     def __str__(self):
+         return '<WrapperState: %s>' % self.to_string()
+ 
+-    def set_wrapper(self, options=[], depth=0):
+-        if len(options) == 0:
++    def set_wrapper(self, options=None, depth=0):
++        if not options:
+             element = DOM.create_document_fragment()
+         else:
+             element = DOM.create_element(options[0], options[1])
+@@ -73,8 +73,8 @@ class WrapperState():
+     def get_wrapper_options(self, depth=-1):
+         return self.wrapper_stack[depth][2]
+ 
+-    def parent_for(self, type, depth):
+-        block_options = self.get_block_options(type)
++    def parent_for(self, type_, depth):
++        block_options = self.get_block_options(type_)
+         wrapper_options = block_options.get('wrapper', None)
+ 
+         if wrapper_options:
+@@ -95,7 +95,7 @@ class WrapperState():
+         ['ul']
+         ['ul', {'className': 'bullet-list'}]
+         """
+-        if (isinstance(opts, list)):
++        if isinstance(opts, list):
+             tag = opts[0]
+             attributes = opts[1] if len(opts) > 1 else {}
+         else:
+@@ -104,11 +104,11 @@ class WrapperState():
+ 
+         return [tag, attributes]
+ 
+-    def get_block_options(self, type):
+-        block_options = self.block_map.get(type)
++    def get_block_options(self, type_):
++        block_options = self.block_map.get(type_)
+ 
+         if block_options is None:
+-            raise BlockException('Block "%s" does not exist in block_map' % type)
++            raise BlockException('Block "%s" does not exist in block_map' % type_)
+ 
+         return block_options
+ 
+

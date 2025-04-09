@@ -1,0 +1,92 @@
+diff --git a/README.md b/README.md
+index e224048..3dc602a 100644
+--- a/README.md
++++ b/README.md
+@@ -2020,7 +2020,7 @@ It has the following parameters that affects class selection rules:
+   by which all the variants can be distinguished
+ * `include_subtypes` — allow to deserialize subclasses
+ * `include_supertypes` — allow to deserialize superclasses
+-* `variant_tagger_fn` — a custom function used to generate a tag value
++* `variant_tagger_fn` — a custom function used to generate tag values
+   associated with a variant
+ 
+ By default, each variant that you want to discriminate by tags should have a
+@@ -2039,10 +2039,11 @@ following forms:
+ > processed during serialization.
+ 
+ However, it is possible to use discriminator without the class-level
+-attribute. You can provide a custom function that generates a variant tag
+-value. This function should take a class as the only argument and return a
+-value of the basic type like `str` or `int`. The common practice is to use
+-a class name as a tag value:
++attribute. You can provide a custom function that generates one or many variant
++tag values. This function should take a class as the only argument and return
++either a single value of the basic type like `str` or `int` or a list of them
++to associate multiple tags with a variant. The common practice is to use
++a class name as a single tag value:
+ 
+ ```python
+ variant_tagger_fn = lambda cls: cls.__name__
+@@ -2466,6 +2467,15 @@ disconnected_event = ClientEvent.from_dict(
+ assert disconnected_event == ClientDisconnectedEvent(IPv4Address("10.0.0.42"))
+ ```
+ 
++If we need to associate multiple tags with a single variant, we can return
++a list of tags:
++
++```python
++def client_event_tagger(cls):
++    name = cls.__name__[6:-5]
++    return [name.lower(), name.upper()]
++```
++
+ ### Code generation options
+ 
+ #### Add `omit_none` keyword argument
+diff --git a/mashumaro/core/meta/types/unpack.py b/mashumaro/core/meta/types/unpack.py
+index b979d2a..b6b1853 100644
+--- a/mashumaro/core/meta/types/unpack.py
++++ b/mashumaro/core/meta/types/unpack.py
+@@ -347,12 +347,17 @@ class DiscriminatedUnionUnpackerBuilder(AbstractUnpackerBuilder):
+             with lines.indent("except (KeyError, AttributeError):"):
+                 lines.append(f"variants_map = {variants_map}")
+                 with lines.indent(f"for variant in {variants}:"):
+-                    with lines.indent("try:"):
+-                        lines.append(
+-                            f"variants_map[{variant_tagger_expr}] = variant"
++                    if discriminator.variant_tagger_fn is not None:
++                        self._add_register_variant_tags(
++                            lines, variant_tagger_expr
+                         )
+-                    with lines.indent("except KeyError:"):
+-                        lines.append("continue")
++                    else:
++                        with lines.indent("try:"):
++                            self._add_register_variant_tags(
++                                lines, variant_tagger_expr
++                            )
++                        with lines.indent("except KeyError:"):
++                            lines.append("continue")
+                     self._add_build_variant_unpacker(
+                         spec, lines, variant_method_name, variant_method_call
+                     )
+@@ -457,6 +462,19 @@ class DiscriminatedUnionUnpackerBuilder(AbstractUnpackerBuilder):
+                     lines.append(f"return {attrs}.{variant_method_call}")
+                 lines.append("except Exception: pass")
+ 
++    def _add_register_variant_tags(
++        self, lines: CodeLines, variant_tagger_expr: str
++    ) -> None:
++        if self.discriminator.variant_tagger_fn:
++            lines.append(f"variant_tags = {variant_tagger_expr}")
++            with lines.indent("if type(variant_tags) is list:"):
++                with lines.indent("for varint_tag in variant_tags:"):
++                    lines.append("variants_map[varint_tag] = variant")
++            with lines.indent("else:"):
++                lines.append("variants_map[variant_tags] = variant")
++        else:
++            lines.append(f"variants_map[{variant_tagger_expr}] = variant")
++
+ 
+ class SubtypeUnpackerBuilder(DiscriminatedUnionUnpackerBuilder):
+     def _get_variants_attr(self, spec: ValueSpec) -> str:

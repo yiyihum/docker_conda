@@ -1,0 +1,187 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 73f7a38..db9cf3f 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -21,6 +21,9 @@ Fixed
+   <https://github.com/omni-us/jsonargparse/issues/317>`__).
+ - Dataclass nested in list not setting defaults (`#357
+   <https://github.com/omni-us/jsonargparse/issues/357>`__)
++- AST resolver ``kwargs.pop()`` with conflicting defaults not setting the
++  conditional default (`#362
++  <https://github.com/omni-us/jsonargparse/issues/362>`__).
+ 
+ 
+ v4.24.0 (2023-08-23)
+diff --git a/DOCUMENTATION.rst b/DOCUMENTATION.rst
+index 9d12594..f68a386 100644
+--- a/DOCUMENTATION.rst
++++ b/DOCUMENTATION.rst
+@@ -1693,11 +1693,11 @@ A special case which is supported but with caveats, is multiple calls that use
+ 
+ The resolved parameters that have the same type hint and default across all
+ calls are supported normally. When there is a discrepancy between the calls, the
+-parameters behave differently and are shown in the help in special "Conditional
+-arguments" sections. The main difference is that these arguments are not
+-included in :py:meth:`.ArgumentParser.get_defaults` or the output of
+-``--print_config``. This is necessary because the parser does not know which of
+-the calls will be used at runtime, and adding them would cause
++parameters behave differently and are shown in the help with the default like
++``Conditional<ast-resolver> {DEFAULT_1, ...}``. The main difference is that
++these parameters are not included in :py:meth:`.ArgumentParser.get_defaults` or
++the output of ``--print_config``. This is necessary because the parser does not
++know which of the calls will be used at runtime, and adding them would cause
+ :py:meth:`.ArgumentParser.instantiate_classes` to fail due to unexpected keyword
+ arguments.
+ 
+@@ -1747,6 +1747,10 @@ Without the stubs resolver, the
+ given to the ``a`` and ``b`` arguments, instead of ``float``. And this means
+ that the parser would not fail if given an invalid value, for instance a string.
+ 
++It is not possible to know the defaults of parameters discovered only because of
++the stubs. In these cases in the parser help the default is shown as
++``Unknown<stubs-resolver>`` and not included in
++:py:meth:`.ArgumentParser.get_defaults` or the output of ``--print_config``.
+ 
+ .. _sub-classes:
+ 
+diff --git a/jsonargparse/_parameter_resolvers.py b/jsonargparse/_parameter_resolvers.py
+index c59ebe2..85a7c4c 100644
+--- a/jsonargparse/_parameter_resolvers.py
++++ b/jsonargparse/_parameter_resolvers.py
+@@ -40,8 +40,7 @@ ParamList = List[ParamData]
+ parameter_attributes = [s[1:] for s in inspect.Parameter.__slots__]  # type: ignore
+ kinds = inspect._ParameterKind
+ ast_assign_type: Tuple[Type[ast.AST], ...] = (ast.AnnAssign, ast.Assign)
+-param_kwargs_get = "**.get()"
+-param_kwargs_pop = "**.pop()"
++param_kwargs_pop_or_get = "**.pop|get():"
+ 
+ 
+ class SourceNotAvailable(Exception):
+@@ -304,29 +303,6 @@ def add_stub_types(stubs: Optional[Dict[str, Any]], params: ParamList, component
+ ast_literals = {ast.dump(ast.parse(v, mode="eval").body): partial(ast.literal_eval, v) for v in ["{}", "[]"]}
+ 
+ 
+-def get_kwargs_pop_or_get_parameter(node, component, parent, doc_params, log_debug):
+-    name = ast_get_constant_value(node.args[0])
+-    if ast_is_constant(node.args[1]):
+-        default = ast_get_constant_value(node.args[1])
+-    else:
+-        default = ast.dump(node.args[1])
+-        if default in ast_literals:
+-            default = ast_literals[default]()
+-        else:
+-            default = None
+-            log_debug(f"unsupported kwargs pop/get default: {ast_str(node)}")
+-    return ParamData(
+-        name=name,
+-        annotation=inspect._empty,
+-        default=default,
+-        kind=kinds.KEYWORD_ONLY,
+-        doc=doc_params.get(name),
+-        parent=parent,
+-        component=component,
+-        origin=param_kwargs_get if node.func.attr == "get" else param_kwargs_pop,
+-    )
+-
+-
+ def is_param_subclass_instance_default(param: ParamData) -> bool:
+     if is_dataclass_like(type(param.default)):
+         return False
+@@ -368,31 +344,27 @@ def group_parameters(params_list: List[ParamList]) -> ParamList:
+                 param.origin = None
+         return params_list[0]
+     grouped = []
+-    params_count = 0
+-    params_skip = set()
++    non_get_pop_count = 0
+     params_dict = defaultdict(lambda: [])
+     for params in params_list:
+-        if params[0].origin not in {param_kwargs_get, param_kwargs_pop}:
+-            params_count += 1
++        if not (params[0].origin or "").startswith(param_kwargs_pop_or_get):  # type: ignore
++            non_get_pop_count += 1
+         for param in params:
+-            if param.name not in params_skip and param.kind != kinds.POSITIONAL_ONLY:
++            if param.kind != kinds.POSITIONAL_ONLY:
+                 params_dict[param.name].append(param)
+-                if param.origin == param_kwargs_pop:
+-                    params_skip.add(param.name)
+     for params in params_dict.values():
+         gparam = params[0]
+         types = unique(p.annotation for p in params if p.annotation is not inspect._empty)
+         defaults = unique(p.default for p in params if p.default is not inspect._empty)
+-        if len(params) >= params_count and len(types) <= 1 and len(defaults) <= 1:
++        if len(params) >= non_get_pop_count and len(types) <= 1 and len(defaults) <= 1:
+             gparam.origin = None
+         else:
+             gparam.parent = tuple(p.parent for p in params)
+             gparam.component = tuple(p.component for p in params)
+             gparam.origin = tuple(p.origin for p in params)
+-            gparam.default = ConditionalDefault(
+-                "ast-resolver",
+-                (p.default for p in params) if len(defaults) > 1 else defaults,
+-            )
++            if len(params) < non_get_pop_count:
++                defaults += ["NOT_ACCEPTED"]
++            gparam.default = ConditionalDefault("ast-resolver", defaults)
+             if len(types) > 1:
+                 gparam.annotation = Union[tuple(types)] if types else inspect._empty
+         docs = [p.doc for p in params if p.doc]
+@@ -644,6 +616,28 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+         default_nodes = [d for n, d in enumerate(default_nodes) if arg_nodes[n].arg in param_names]
+         return default_nodes
+ 
++    def get_kwargs_pop_or_get_parameter(self, node, component, parent, doc_params):
++        name = ast_get_constant_value(node.args[0])
++        if ast_is_constant(node.args[1]):
++            default = ast_get_constant_value(node.args[1])
++        else:
++            default = ast.dump(node.args[1])
++            if default in ast_literals:
++                default = ast_literals[default]()
++            else:
++                default = None
++                self.log_debug(f"unsupported kwargs pop/get default: {ast_str(node)}")
++        return ParamData(
++            name=name,
++            annotation=inspect._empty,
++            default=default,
++            kind=kinds.KEYWORD_ONLY,
++            doc=doc_params.get(name),
++            parent=parent,
++            component=component,
++            origin=param_kwargs_pop_or_get + self.get_node_origin(node),
++        )
++
+     def get_parameters_args_and_kwargs(self) -> Tuple[ParamList, ParamList]:
+         self.parse_source_tree()
+         args_name = getattr(self.component_node.args.vararg, "arg", None)
+@@ -664,9 +658,7 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+         for node in [v for k, v in values_found if k == kwargs_name]:
+             if isinstance(node, ast.Call):
+                 if ast_is_kwargs_pop_or_get(node, kwargs_value_dump):
+-                    param = get_kwargs_pop_or_get_parameter(
+-                        node, self.component, self.parent, self.doc_params, self.log_debug
+-                    )
++                    param = self.get_kwargs_pop_or_get_parameter(node, self.component, self.parent, self.doc_params)
+                     params_list.append([param])
+                     continue
+                 kwarg = ast_get_call_kwarg_with_value(node, kwargs_value)
+@@ -717,12 +709,15 @@ class ParametersVisitor(LoggerProperty, ast.NodeVisitor):
+         self.log_debug(f"did not find use of {self.self_name}.{attr_name} in members of {self.parent}")
+         return []
+ 
++    def get_node_origin(self, node) -> str:
++        return f"{get_parameter_origins(self.component, self.parent)}:{node.lineno}"
++
+     def add_node_origins(self, params: ParamList, node) -> None:
+         origin = None
+         for param in params:
+             if param.origin is None:
+                 if not origin:
+-                    origin = f"{get_parameter_origins(self.component, self.parent)}:{node.lineno}"
++                    origin = self.get_node_origin(node)
+                 param.origin = origin
+ 
+     def get_parameters_call_attr(self, attr_name: str, attr_value: ast.AST) -> Optional[ParamList]:

@@ -1,0 +1,197 @@
+diff --git a/labelbot/auth.py b/labelbot/auth.py
+index c23a0a1..a0bfa67 100644
+--- a/labelbot/auth.py
++++ b/labelbot/auth.py
+@@ -1,9 +1,8 @@
+-"""Handles authentication tokens with the GitHub API.
++"""Functions for handling authentication procedures.
+ 
+ .. module:: auth
+-    :synopsis: Functions for generating tokens used for authentication with GitHub.
++    :synopsis: Functions for handling authentication procedures.
+ .. moduleauthor:: Lars Hummelgren <larshum@kth.se> & Joakim Croona <jcroona@kth.se>
+-
+ """
+ 
+ import datetime
+@@ -12,6 +11,10 @@ import json
+ import jwcrypto
+ import python_jwt
+ import requests
++import boto3
++import botocore
++import hmac
++import hashlib
+ 
+ USER_AGENT = "label-bot"
+ 
+@@ -31,7 +34,7 @@ def generate_jwt_token(private_pem: bytes, app_id: int) -> str:
+     return python_jwt.generate_jwt(payload, private_key, "RS256", duration)
+ 
+ 
+-def generate_installation_access_token(jwt_token: str, installation_id):
++def generate_installation_access_token(jwt_token: str, installation_id) -> str:
+     """Generates an installation access token using a JWT token and an installation id.
+ 
+     An installation access token is valid for 1 hour.
+@@ -50,3 +53,40 @@ def generate_installation_access_token(jwt_token: str, installation_id):
+     url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+     r = requests.post(url, headers=headers)
+     return r.json()["token"]
++
++
++def get_pem(bucket_name: str, bucket_key: str) -> bytes:
++    """Reads a private PEM file from an S3 bucket.
++
++    Args:
++        bucket_name: Name of the S3 bucket.
++        bucket_key: Bucket key for the PEM file.
++    Returns:
++        Contents of the PEM file.
++    """
++    s3 = boto3.resource("s3")
++    s3.Bucket(bucket_name).download_file(bucket_key, "/tmp/key.pem")
++    with open("/tmp/key.pem", "rb") as f:
++        return f.read()
++
++
++def authenticate_request(shared_secret: str, body: str, signature: str) -> bool:
++    """Checks if the MAC (message authentication code) sent in the request is really
++    from GitHub.
++
++    Args:
++        shared_secret: A secret shared between GitHub and the bot.
++        body: Body of the HTTP request.
++        signature: The header containing the MAC.
++    Returns:
++        True iff the signature is a MAC computed with the body of the request and the
++        shared secret.
++    """
++    if signature is None:
++        return False
++
++    sha_body = hmac.new(
++        shared_secret.encode("utf8"), body.encode("utf8"), hashlib.sha1
++    ).hexdigest()
++    _, sha_github = signature.split("=")
++    return hmac.compare_digest(sha_body, sha_github)
+diff --git a/labelbot/bot.py b/labelbot/bot.py
+index 163071f..7d6090f 100644
+--- a/labelbot/bot.py
++++ b/labelbot/bot.py
+@@ -1,14 +1,17 @@
++"""Event handler for AWS lambda.
++
++This is the main module of labelbot, and contains the event handler for AWS lambda.  If
++for any reason one would like to use a different service than AWS lambda, this is the
++functionality that needs to be changed.
++
++.. module:: bot
++    :synopsis: Event handler for AWS lambda.
++.. moduleauthor:: Simon Larsén <slarse@kth.se> & Joakim Croona <jcroona@kth.se>
++"""
+ import json
+-from jwcrypto import jwk
+-import python_jwt
+ import os
+-import boto3
+-import botocore
+-import hmac
+-import hashlib
+ from labelbot import auth
+ from labelbot import github_api
+-from labelbot import parse
+ 
+ 
+ def lambda_handler(event, context):
+@@ -22,12 +25,15 @@ def lambda_handler(event, context):
+ 
+     app_id = int(os.getenv("APP_ID"))
+     secret_key = os.getenv("SECRET_KEY")
+-    authenticated = authenticate_request(secret_key, event["body"], event["headers"]["X-Hub-Signature"])
++    authenticated = auth.authenticate_request(
++        secret_key, event["body"], event["headers"]["X-Hub-Signature"]
++    )
+     if not authenticated:
+         return {"statuscode": 403}
++
+     bucket_name = os.getenv("BUCKET_NAME")
+     bucket_key = os.getenv("BUCKET_KEY")
+-    pem = get_pem(bucket_name, bucket_key)
++    pem = auth.get_pem(bucket_name, bucket_key)
+ 
+     jwt_token = auth.generate_jwt_token(pem, app_id)
+     access_token = auth.generate_installation_access_token(jwt_token, installation_id)
+@@ -37,25 +43,3 @@ def lambda_handler(event, context):
+     )
+ 
+     return {"statusCode": 200 if success else 403, "body": json.dumps("temp")}
+-
+-
+-def get_pem(bucket_name, key):
+-    """Reads key from s3"""
+-    s3 = boto3.resource("s3")
+-    s3.Bucket(bucket_name).download_file(key, "/tmp/key.pem")
+-    with open("/tmp/key.pem", "rb") as f:
+-        pem = f.read()
+-    return pem
+-
+-
+-def authenticate_request(key: str, body: str, signature: str) -> bool:
+-    """ Chacks if the X-Hub-Signature header exists, and if it does, verifies that the body 
+-    matches the hash sent from github."""
+-    if signature is None:
+-        return False
+-
+-    sha_body = hmac.new(
+-        key.encode("utf8"), body.encode("utf8"), hashlib.sha1
+-    ).hexdigest()
+-    alg, sha_github = signature.split("=")
+-    return hmac.compare_digest(sha_body, sha_github)
+diff --git a/labelbot/github_api.py b/labelbot/github_api.py
+index d1a052b..66be23d 100644
+--- a/labelbot/github_api.py
++++ b/labelbot/github_api.py
+@@ -6,7 +6,7 @@
+ import json
+ import sys
+ import base64
+-from typing import Sequence, List
++from typing import Iterable, List
+ import requests
+ 
+ from labelbot import parse
+@@ -60,7 +60,7 @@ def set_allowed_labels(
+ 
+ 
+ def set_labels(
+-    labels: Sequence[str], owner: str, repo: str, issue_nr: int, access_token: str
++    labels: Iterable[str], owner: str, repo: str, issue_nr: int, access_token: str
+ ) -> bool:
+     """Unconditionally set the provided labels on a repository issue.
+ 
+diff --git a/setup.py b/setup.py
+index 0ac9d8b..da892e9 100644
+--- a/setup.py
++++ b/setup.py
+@@ -3,12 +3,18 @@ from setuptools import setup, find_packages
+ with open("README.md", mode="r", encoding="utf-8") as f:
+     readme = f.read()
+ 
+-test_requirements = ["pytest>=4.0.0", "codecov", "pytest-cov", "responses","pytest-mock"]
++test_requirements = [
++    "pytest>=4.0.0",
++    "codecov",
++    "pytest-cov",
++    "responses",
++    "pytest-mock",
++]
+ required = ["python_jwt", "jwcrypto", "requests", "boto3"]
+ 
+ setup(
+     name="labelbot",
+-    version="0.0.4",
++    version="0.0.6",
+     description=(
+         "A GitHub label bot for allowing unprivileged users to label issues "
+         "with allowed labels."

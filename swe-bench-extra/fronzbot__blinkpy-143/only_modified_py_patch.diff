@@ -1,0 +1,305 @@
+diff --git a/blinkpy/api.py b/blinkpy/api.py
+index f9db8df..723c069 100644
+--- a/blinkpy/api.py
++++ b/blinkpy/api.py
+@@ -3,7 +3,7 @@
+ import logging
+ from json import dumps
+ import blinkpy.helpers.errors as ERROR
+-from blinkpy.helpers.util import http_req, BlinkException
++from blinkpy.helpers.util import http_req, get_time, BlinkException
+ from blinkpy.helpers.constants import DEFAULT_URL
+ 
+ _LOGGER = logging.getLogger(__name__)
+@@ -96,9 +96,11 @@ def request_video_count(blink, headers):
+     return http_get(blink, url)
+ 
+ 
+-def request_videos(blink, page=0):
++def request_videos(blink, time=None, page=0):
+     """Perform a request for videos."""
+-    url = "{}/api/v2/videos/page/{}".format(blink.urls.base_url, page)
++    timestamp = get_time(time)
++    url = "{}/api/v2/videos/changed?since={}&page/{}".format(
++        blink.urls.base_url, timestamp, page)
+     return http_get(blink, url)
+ 
+ 
+diff --git a/blinkpy/blinkpy.py b/blinkpy/blinkpy.py
+index 7285465..c6de470 100644
+--- a/blinkpy/blinkpy.py
++++ b/blinkpy/blinkpy.py
+@@ -166,6 +166,9 @@ class Blink():
+             for sync_name, sync_module in self.sync.items():
+                 _LOGGER.debug("Attempting refresh of sync %s", sync_name)
+                 sync_module.refresh(force_cache=force_cache)
++            if not force_cache:
++                # Prevents rapid clearing of motion detect property
++                self.last_refresh = int(time.time())
+ 
+     def check_if_ok_to_update(self):
+         """Check if it is ok to perform an http request."""
+@@ -174,7 +177,6 @@ class Blink():
+         if last_refresh is None:
+             last_refresh = 0
+         if current_time >= (last_refresh + self.refresh_rate):
+-            self.last_refresh = current_time
+             return True
+         return False
+ 
+diff --git a/blinkpy/camera.py b/blinkpy/camera.py
+index 8c0eb5b..7991a91 100644
+--- a/blinkpy/camera.py
++++ b/blinkpy/camera.py
+@@ -6,8 +6,6 @@ from blinkpy import api
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
+-MAX_CLIPS = 5
+-
+ 
+ class BlinkCamera():
+     """Class to initialize individual camera."""
+@@ -28,7 +26,7 @@ class BlinkCamera():
+         self.battery_state = None
+         self.motion_detected = None
+         self.wifi_strength = None
+-        self.last_record = []
++        self.last_record = None
+         self._cached_image = None
+         self._cached_video = None
+ 
+@@ -128,12 +126,15 @@ class BlinkCamera():
+             new_thumbnail = "{}{}.jpg".format(self.sync.urls.base_url,
+                                               thumb_addr)
+ 
+-        # Check if a new motion clip has been recorded
+-        # check_for_motion_method sets motion_detected variable
+-        self.check_for_motion()
++        try:
++            self.motion_detected = self.sync.motion[self.name]
++        except KeyError:
++            self.motion_detected = False
++
+         clip_addr = None
+-        if self.last_record:
+-            clip_addr = self.sync.all_clips[self.name][self.last_record[0]]
++        if self.name in self.sync.last_record:
++            clip_addr = self.sync.last_record[self.name]['clip']
++            self.last_record = self.sync.last_record[self.name]['time']
+             self.clip = "{}{}".format(self.sync.urls.base_url,
+                                       clip_addr)
+ 
+@@ -158,25 +159,6 @@ class BlinkCamera():
+                                               stream=True,
+                                               json=False)
+ 
+-    def check_for_motion(self):
+-        """Check if motion detected.."""
+-        try:
+-            records = sorted(self.sync.record_dates[self.name])
+-            new_clip = records.pop()
+-            if new_clip not in self.last_record and self.last_record:
+-                self.motion_detected = True
+-                self.last_record.insert(0, new_clip)
+-                if len(self.last_record) > MAX_CLIPS:
+-                    self.last_record.pop()
+-            elif not self.last_record:
+-                self.last_record.insert(0, new_clip)
+-                self.motion_detected = False
+-            else:
+-                self.motion_detected = False
+-        except KeyError:
+-            _LOGGER.info("Could not extract clip info from camera %s",
+-                         self.name)
+-
+     def image_to_file(self, path):
+         """
+         Write image to file.
+diff --git a/blinkpy/helpers/constants.py b/blinkpy/helpers/constants.py
+index 3eb1d82..9ebcf7d 100644
+--- a/blinkpy/helpers/constants.py
++++ b/blinkpy/helpers/constants.py
+@@ -54,3 +54,8 @@ LOGIN_BACKUP_URL = "https://{}.{}/login".format('rest.piri', BLINK_URL)
+ Dictionaries
+ '''
+ ONLINE = {'online': True, 'offline': False}
++
++'''
++OTHER
++'''
++TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S%Z'
+diff --git a/blinkpy/helpers/util.py b/blinkpy/helpers/util.py
+index 4bcc497..6e14cc5 100644
+--- a/blinkpy/helpers/util.py
++++ b/blinkpy/helpers/util.py
+@@ -1,14 +1,22 @@
+ """Useful functions for blinkpy."""
+ 
+ import logging
++import time
+ from requests import Request, Session, exceptions
+-from blinkpy.helpers.constants import BLINK_URL
++from blinkpy.helpers.constants import BLINK_URL, TIMESTAMP_FORMAT
+ import blinkpy.helpers.errors as ERROR
+ 
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
+ 
++def get_time(time_to_convert=None):
++    """Create blink-compatible timestamp."""
++    if time_to_convert is None:
++        time_to_convert = time.time()
++    return time.strftime(TIMESTAMP_FORMAT, time.localtime(time_to_convert))
++
++
+ def merge_dicts(dict_a, dict_b):
+     """Merge two dictionaries into one."""
+     duplicates = [val for val in dict_a if val in dict_b]
+diff --git a/blinkpy/sync_module.py b/blinkpy/sync_module.py
+index 75c02c1..9e5bc42 100644
+--- a/blinkpy/sync_module.py
++++ b/blinkpy/sync_module.py
+@@ -32,11 +32,10 @@ class BlinkSyncModule():
+         self.summary = None
+         self.homescreen = None
+         self.network_info = None
+-        self.record_dates = {}
+-        self.videos = {}
+         self.events = []
+         self.cameras = CaseInsensitiveDict({})
+-        self.all_clips = {}
++        self.motion = {}
++        self.last_record = {}
+ 
+     @property
+     def attributes(self):
+@@ -85,22 +84,17 @@ class BlinkSyncModule():
+         self.status = self.summary['status']
+ 
+         self.events = self.get_events()
+-
+         self.homescreen = api.request_homescreen(self.blink)
+-
+         self.network_info = api.request_network_status(self.blink,
+                                                        self.network_id)
+ 
++        self.check_new_videos()
+         camera_info = self.get_camera_info()
+         for camera_config in camera_info:
+             name = camera_config['name']
+             self.cameras[name] = BlinkCamera(self)
+-
+-        self.videos = self.get_videos()
+-        for camera_config in camera_info:
+-            name = camera_config['name']
+-            if name in self.cameras:
+-                self.cameras[name].update(camera_config, force_cache=True)
++            self.motion[name] = False
++            self.cameras[name].update(camera_config, force_cache=True)
+ 
+     def get_events(self):
+         """Retrieve events from server."""
+@@ -115,73 +109,38 @@ class BlinkSyncModule():
+     def refresh(self, force_cache=False):
+         """Get all blink cameras and pulls their most recent status."""
+         self.events = self.get_events()
+-        self.videos = self.get_videos()
+         self.homescreen = api.request_homescreen(self.blink)
+         self.network_info = api.request_network_status(self.blink,
+                                                        self.network_id)
+         camera_info = self.get_camera_info()
++        self.check_new_videos()
+         for camera_config in camera_info:
+             name = camera_config['name']
+             self.cameras[name].update(camera_config, force_cache=force_cache)
+ 
+-    def get_videos(self, start_page=0, end_page=1):
+-        """
+-        Retrieve last recorded videos per camera.
+-
+-        :param start_page: Page to start reading from on blink servers
+-                           (defaults to 0)
+-        :param end_page: Page to stop reading from (defaults to 1)
+-        """
+-        videos = list()
+-        all_dates = dict()
+-
+-        for page_num in range(start_page, end_page + 1):
+-            this_page = api.request_videos(self.blink, page=page_num)
+-            if not this_page:
+-                break
+-            elif 'message' in this_page:
+-                _LOGGER.warning("Could not retrieve videos. Message: %s",
+-                                this_page['message'])
+-                break
+-
+-            videos.append(this_page)
+-        _LOGGER.debug("Getting videos from page %s through %s",
+-                      start_page,
+-                      end_page)
+-        for page in videos:
+-            for entry in page:
+-                try:
+-                    camera_name = entry['camera_name']
+-                    clip_addr = entry['address']
+-                    thumb_addr = entry['thumbnail']
+-                except TypeError:
+-                    _LOGGER.warning("Could not extract video information.")
+-                    break
+-                clip_date = clip_addr.split('_')[-6:]
+-                clip_date = '_'.join(clip_date)
+-                clip_date = clip_date.split('.')[0]
+-                try:
+-                    self.all_clips[camera_name][clip_date] = clip_addr
+-                except KeyError:
+-                    self.all_clips[camera_name] = {clip_date: clip_addr}
+-
+-                if camera_name not in all_dates:
+-                    all_dates[camera_name] = list()
+-                all_dates[camera_name].append(clip_date)
+-                try:
+-                    self.videos[camera_name].append(
+-                        {
+-                            'clip': clip_addr,
+-                            'thumb': thumb_addr,
+-                        }
+-                    )
+-                except KeyError:
+-                    self.videos[camera_name] = [
+-                        {
+-                            'clip': clip_addr,
+-                            'thumb': thumb_addr,
+-                        }
+-                    ]
+-        self.record_dates = all_dates
+-        _LOGGER.debug("Retrieved a total of %s records", len(all_dates))
+-        return self.videos
++    def check_new_videos(self):
++        """Check if new videos since last refresh."""
++        resp = api.request_videos(self.blink,
++                                  time=self.blink.last_refresh,
++                                  page=0)
++
++        for camera in self.cameras.keys():
++            self.motion[camera] = False
++
++        try:
++            info = resp['videos']
++        except (KeyError, TypeError):
++            _LOGGER.warning("Could not check for motion. Response: %s", resp)
++            return False
++
++        for entry in info:
++            try:
++                name = entry['camera_name']
++                clip = entry['address']
++                timestamp = entry['created_at']
++                self.motion[name] = True
++                self.last_record[name] = {'clip': clip, 'time': timestamp}
++            except KeyError:
++                _LOGGER.debug("No new videos since last refresh.")
++
++        return True
+

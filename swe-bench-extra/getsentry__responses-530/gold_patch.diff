@@ -1,0 +1,91 @@
+diff --git a/CHANGES b/CHANGES
+index fc3be1c..a7d667b 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -1,6 +1,7 @@
+ 0.21.0
+ ------
+ 
++* Add `threading.Lock()` to allow `responses` working with `threading` module.
+ * Removed internal `_cookies_from_headers` function
+ 
+ 0.20.0
+diff --git a/README.rst b/README.rst
+index 445ab4a..51c029e 100644
+--- a/README.rst
++++ b/README.rst
+@@ -517,6 +517,11 @@ you can see, that status code will depend on the invocation order.
+ 
+ .. code-block:: python
+ 
++    import requests
++
++    import responses
++    from responses.registries import OrderedRegistry
++
+     @responses.activate(registry=OrderedRegistry)
+     def test_invocation_index():
+         responses.add(
+@@ -1010,6 +1015,32 @@ matched responses from the registered list.
+ 
+ Finally, ``reset`` will reset all registered responses.
+ 
++Coroutines and Multithreading
++-----------------------------
++
++``responses`` supports both Coroutines and Multithreading out of the box.
++Note, ``responses`` locks threading on ``RequestMock`` object allowing only
++single thread to access it.
++
++.. code-block:: python
++
++    async def test_async_calls():
++        @responses.activate
++        async def run():
++            responses.add(
++                responses.GET,
++                "http://twitter.com/api/1/foobar",
++                json={"error": "not found"},
++                status=404,
++            )
++
++            resp = requests.get("http://twitter.com/api/1/foobar")
++            assert resp.json() == {"error": "not found"}
++            assert responses.calls[0].request.url == "http://twitter.com/api/1/foobar"
++
++        await run()
++
++
+ Contributing
+ ------------
+ 
+diff --git a/responses/__init__.py b/responses/__init__.py
+index e72703c..f7aef8f 100644
+--- a/responses/__init__.py
++++ b/responses/__init__.py
+@@ -8,6 +8,7 @@ from functools import wraps
+ from http import client
+ from itertools import groupby
+ from re import Pattern
++from threading import Lock as _ThreadingLock
+ from warnings import warn
+ 
+ from requests.adapters import HTTPAdapter
+@@ -569,6 +570,7 @@ class RequestsMock(object):
+         self.passthru_prefixes = tuple(passthru_prefixes)
+         self.target = target
+         self._patcher = None
++        self._thread_lock = _ThreadingLock()
+ 
+     def get_registry(self):
+         return self._registry
+@@ -786,7 +788,8 @@ class RequestsMock(object):
+             (Response) found match. If multiple found, then remove & return the first match.
+             (list) list with reasons why other matches don't match
+         """
+-        return self._registry.find(request)
++        with self._thread_lock:
++            return self._registry.find(request)
+ 
+     def _parse_request_params(self, url):
+         params = {}

@@ -1,0 +1,149 @@
+diff --git a/tests/agent/test_ecs_agent.py b/tests/agent/test_ecs_agent.py
+index f6de39f5d0..79925e4d43 100644
+--- a/tests/agent/test_ecs_agent.py
++++ b/tests/agent/test_ecs_agent.py
+@@ -506,7 +506,7 @@ class TestGetRunTaskKwargs:
+ 
+ 
+ @pytest.mark.parametrize("kind", ["exists", "missing", "error"])
+-def test_lookup_task_definition_arn(aws, kind):
++def test_get_task_definition_arn(aws, kind):
+     if kind == "exists":
+         aws.resourcegroupstaggingapi.get_resources.return_value = {
+             "ResourceTagMappingList": [{"ResourceARN": "my-taskdef-arn"}]
+@@ -525,10 +525,11 @@ def test_lookup_task_definition_arn(aws, kind):
+         )
+         expected = None
+ 
++    run_config = ECSRun()
+     flow_run = GraphQLResult({"flow": GraphQLResult({"id": "flow-id", "version": 1})})
+     agent = ECSAgent()
+ 
+-    res = agent.lookup_task_definition_arn(flow_run)
++    res = agent.get_task_definition_arn(flow_run, run_config)
+     assert res == expected
+     kwargs = aws.resourcegroupstaggingapi.get_resources.call_args[1]
+     assert sorted(kwargs["TagFilters"], key=lambda x: x["Key"]) == [
+@@ -538,6 +539,15 @@ def test_lookup_task_definition_arn(aws, kind):
+     assert kwargs["ResourceTypeFilters"] == ["ecs:task-definition"]
+ 
+ 
++def test_get_task_definition_arn_provided_task_definition_arn():
++    run_config = ECSRun(task_definition_arn="my-taskdef-arn")
++    flow_run = GraphQLResult({"flow": GraphQLResult({"id": "flow-id", "version": 1})})
++    agent = ECSAgent()
++
++    res = agent.get_task_definition_arn(flow_run, run_config)
++    assert res == "my-taskdef-arn"
++
++
+ class TestDeployFlow:
+     def deploy_flow(self, run_config, **kwargs):
+         agent = ECSAgent(**kwargs)
+@@ -599,6 +609,15 @@ class TestDeployFlow:
+         assert aws.ecs.run_task.call_args[1]["enableECSManagedTags"] is True
+         assert "my-task-arn" in res
+ 
++    def test_deploy_flow_uses_provided_task_definition_arn(self, aws):
++        aws.ecs.run_task.return_value = {"tasks": [{"taskArn": "my-task-arn"}]}
++
++        res = self.deploy_flow(ECSRun(task_definition_arn="my-taskdef-arn"))
++        assert not aws.ecs.register_task_definition.called
++        assert aws.ecs.run_task.called
++        assert aws.ecs.run_task.call_args[1]["taskDefinition"] == "my-taskdef-arn"
++        assert "my-task-arn" in res
++
+     def test_deploy_flow_run_task_fails(self, aws):
+         aws.resourcegroupstaggingapi.get_resources.return_value = {
+             "ResourceTagMappingList": [{"ResourceARN": "my-taskdef-arn"}]
+diff --git a/tests/run_configs/test_ecs.py b/tests/run_configs/test_ecs.py
+index 64c04c303b..ffa2251573 100644
+--- a/tests/run_configs/test_ecs.py
++++ b/tests/run_configs/test_ecs.py
+@@ -10,6 +10,7 @@ def test_no_args():
+     config = ECSRun()
+     assert config.task_definition is None
+     assert config.task_definition_path is None
++    assert config.task_definition_arn is None
+     assert config.image is None
+     assert config.env is None
+     assert config.cpu is None
+@@ -45,15 +46,29 @@ def test_labels():
+     assert config.labels == {"a", "b"}
+ 
+ 
+-def test_cant_specify_both_task_definition_and_task_definition_path():
+-    with pytest.raises(ValueError, match="Cannot provide both"):
+-        ECSRun(task_definition={}, task_definition_path="/some/path")
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        dict(task_definition={}, task_definition_path="/some/path"),
++        dict(task_definition={}, task_definition_arn="some_arn"),
++        dict(task_definition_path="/some/path", task_definition_arn="some_arn"),
++        dict(
++            task_definition={},
++            task_definition_path="/some/path",
++            task_definition_arn="some_arn",
++        ),
++    ],
++)
++def test_can_only_specify_task_definition_one_way(kwargs):
++    with pytest.raises(ValueError, match="Can only provide one of"):
++        ECSRun(**kwargs)
+ 
+ 
+ def test_remote_task_definition_path():
+     config = ECSRun(task_definition_path="s3://bucket/example.yaml")
+     assert config.task_definition_path == "s3://bucket/example.yaml"
+     assert config.task_definition is None
++    assert config.task_definition_arn is None
+ 
+ 
+ @pytest.mark.parametrize("scheme", ["local", "file", None])
+@@ -78,9 +93,17 @@ def test_local_task_definition_path(tmpdir, scheme):
+     config = ECSRun(task_definition_path=task_definition_path)
+ 
+     assert config.task_definition_path is None
++    assert config.task_definition_arn is None
+     assert config.task_definition == task_definition
+ 
+ 
++def test_task_definition_arn():
++    config = ECSRun(task_definition_arn="my-task-definition")
++    assert config.task_definition_arn == "my-task-definition"
++    assert config.task_definition is None
++    assert config.task_definition_path is None
++
++
+ def test_task_definition():
+     task_definition = {
+         "containerDefinitions": [
+@@ -90,6 +113,7 @@ def test_task_definition():
+     config = ECSRun(task_definition=task_definition)
+ 
+     assert config.task_definition_path is None
++    assert config.task_definition_arn is None
+     assert config.task_definition == task_definition
+ 
+ 
+diff --git a/tests/serialization/test_run_configs.py b/tests/serialization/test_run_configs.py
+index f4cb6c00ad..38d9c23c28 100644
+--- a/tests/serialization/test_run_configs.py
++++ b/tests/serialization/test_run_configs.py
+@@ -109,6 +109,7 @@ def test_serialize_docker_run(config):
+                 ]
+             }
+         ),
++        ECSRun(task_definition_arn="my-task-definition"),
+     ],
+ )
+ def test_serialize_ecs_run(config):
+@@ -118,6 +119,7 @@ def test_serialize_ecs_run(config):
+     fields = [
+         "task_definition",
+         "task_definition_path",
++        "task_definition_arn",
+         "image",
+         "env",
+         "cpu",

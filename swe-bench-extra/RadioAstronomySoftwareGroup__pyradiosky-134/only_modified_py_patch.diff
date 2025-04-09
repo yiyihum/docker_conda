@@ -1,0 +1,125 @@
+diff --git a/pyradiosky/skymodel.py b/pyradiosky/skymodel.py
+index 7c5ce17..4a00dd9 100644
+--- a/pyradiosky/skymodel.py
++++ b/pyradiosky/skymodel.py
+@@ -153,6 +153,9 @@ class SkyModel(UVBase):
+         nside parameter for HEALPix maps.
+     hpx_inds : array_like of int
+         Indices for HEALPix maps, only used if nside is set.
++    hpx_order : str
++        For HEALPix maps, pixel ordering parameter. Can be "ring" or "nested".
++        Defaults to "ring" if unset in init keywords.
+     extended_model_group : array_like of str
+         Identifier that groups components of an extended source model.
+         Empty string for point sources, shape (Ncomponents,).
+@@ -192,6 +195,7 @@ class SkyModel(UVBase):
+         nside=None,
+         hpx_inds=None,
+         stokes_error=None,
++        hpx_order=None,
+         extended_model_group=None,
+         beam_amp=None,
+         history="",
+@@ -262,8 +266,19 @@ class SkyModel(UVBase):
+             expected_type=int,
+             required=False,
+         )
++        desc = (
++            "Healpix pixel ordering (ring or nested). Only required for HEALPix maps."
++        )
++        self._hpx_order = UVParameter(
++            "hpx_order",
++            description=desc,
++            value=None,
++            expected_type=str,
++            required=False,
++            acceptable_vals=["ring", "nested"],
++        )
+ 
+-        desc = "Healpix index, only reqired for HEALPix maps. shape (Ncomponents,)"
++        desc = "Healpix indices, only required for HEALPix maps."
+         self._hpx_inds = UVParameter(
+             "hpx_inds",
+             description=desc,
+@@ -464,7 +479,7 @@ class SkyModel(UVBase):
+             self._set_component_type_params("point")
+ 
+         if self.component_type == "healpix":
+-            req_args = ["nside", "hpx_inds", "stokes", "spectral_type"]
++            req_args = ["nside", "hpx_inds", "stokes", "spectral_type", "hpx_order"]
+             args_set_req = [
+                 nside is not None,
+                 hpx_inds is not None,
+@@ -508,16 +523,27 @@ class SkyModel(UVBase):
+                 self.nside = nside
+             if hpx_inds is not None:
+                 self.hpx_inds = np.atleast_1d(hpx_inds)
++            if hpx_order is not None:
++                self.hpx_order = str(hpx_order).lower()
++
++                # Ensure that the value can be used in healpix_to_lonlat below.
++                self._hpx_order.check_acceptability()
+ 
+             if self.component_type == "healpix":
+-                self.Ncomponents = self.hpx_inds.size
+                 try:
+                     import astropy_healpix
+                 except ImportError as e:
+                     raise ImportError(
+                         "The astropy-healpix module must be installed to use HEALPix methods"
+                     ) from e
+-                ra, dec = astropy_healpix.healpix_to_lonlat(hpx_inds, nside)
++
++                if self.hpx_order is None:
++                    self.hpx_order = "ring"
++
++                self.Ncomponents = self.hpx_inds.size
++                ra, dec = astropy_healpix.healpix_to_lonlat(
++                    hpx_inds, nside, order=self.hpx_order
++                )
+                 self.ra = ra
+                 self.dec = dec
+ 
+@@ -3770,7 +3796,7 @@ def write_healpix_hdf5(filename, hpmap, indices, freqs, nside=None, history=None
+                 fileobj.attrs[k] = d
+ 
+ 
+-def healpix_to_sky(hpmap, indices, freqs):
++def healpix_to_sky(hpmap, indices, freqs, hpx_order="ring"):
+     """
+     Convert a healpix map in K to a set of point source components in Jy.
+ 
+@@ -3785,6 +3811,9 @@ def healpix_to_sky(hpmap, indices, freqs):
+         Corresponding HEALPix indices for hpmap.
+     freqs : array_like, float
+         Frequencies in Hz. Shape (Nfreqs)
++    hpx_order : str
++        HEALPix map ordering parameter: ring or nested.
++        Defaults to ring.
+ 
+     Returns
+     -------
+@@ -3808,10 +3837,13 @@ def healpix_to_sky(hpmap, indices, freqs):
+         "This function will be removed in version 0.2.0.",
+         category=DeprecationWarning,
+     )
++    hpx_order = str(hpx_order).lower()
++    if hpx_order not in ["ring", "nested"]:
++        raise ValueError("order must be 'nested' or 'ring'")
+ 
+     nside = int(astropy_healpix.npix_to_nside(hpmap.shape[-1]))
+ 
+-    ra, dec = astropy_healpix.healpix_to_lonlat(indices, nside)
++    ra, dec = astropy_healpix.healpix_to_lonlat(indices, nside, order=hpx_order)
+     freq = Quantity(freqs, "hertz")
+ 
+     stokes = Quantity(np.zeros((4, len(freq), len(indices))), "K")
+@@ -3825,6 +3857,7 @@ def healpix_to_sky(hpmap, indices, freqs):
+         freq_array=freq,
+         nside=nside,
+         hpx_inds=indices,
++        hpx_order=hpx_order,
+     )
+     return sky
+ 
+

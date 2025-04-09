@@ -1,0 +1,129 @@
+diff --git a/sceptre/config/reader.py b/sceptre/config/reader.py
+index f618d87..4b371a6 100644
+--- a/sceptre/config/reader.py
++++ b/sceptre/config/reader.py
+@@ -102,14 +102,6 @@ STACK_CONFIG_ATTRIBUTES = ConfigAttributes(
+     },
+ )
+ 
+-INTERNAL_CONFIG_ATTRIBUTES = ConfigAttributes(
+-    {
+-        "project_path",
+-        "stack_group_path",
+-    },
+-    {},
+-)
+-
+ REQUIRED_KEYS = STACK_GROUP_CONFIG_ATTRIBUTES.required.union(
+     STACK_CONFIG_ATTRIBUTES.required
+ )
+@@ -251,7 +243,7 @@ class ConfigReader(object):
+             if directory in stack_group_configs:
+                 stack_group_config = stack_group_configs[directory]
+             else:
+-                stack_group_config = stack_group_configs[directory] = self.read(
++                stack_group_config = stack_group_configs[directory] = self._read(
+                     path.join(directory, self.context.config_file)
+                 )
+ 
+@@ -323,7 +315,7 @@ class ConfigReader(object):
+             stacks.add(stack)
+         return stacks
+ 
+-    def read(self, rel_path, base_config=None):
++    def _read(self, rel_path, base_config=None):
+         """
+         Reads in configuration from one or more YAML files
+         within the Sceptre project folder.
+@@ -559,7 +551,7 @@ class ConfigReader(object):
+ 
+         self.templating_vars["stack_group_config"] = stack_group_config
+         parsed_stack_group_config = self._parsed_stack_group_config(stack_group_config)
+-        config = self.read(rel_path, stack_group_config)
++        config = self._read(rel_path, stack_group_config)
+         stack_name = path.splitext(rel_path)[0]
+ 
+         # Check for missing mandatory attributes
+@@ -609,6 +601,7 @@ class ConfigReader(object):
+             ignore=config.get("ignore", False),
+             obsolete=config.get("obsolete", False),
+             stack_group_config=parsed_stack_group_config,
++            config=config,
+         )
+ 
+         del self.templating_vars["stack_group_config"]
+diff --git a/sceptre/plan/actions.py b/sceptre/plan/actions.py
+index bbcacdf..b453b6d 100644
+--- a/sceptre/plan/actions.py
++++ b/sceptre/plan/actions.py
+@@ -19,7 +19,6 @@ from typing import Dict, Optional, Tuple, Union
+ import botocore
+ from dateutil.tz import tzutc
+ 
+-from sceptre.config.reader import ConfigReader
+ from sceptre.connection_manager import ConnectionManager
+ from sceptre.exceptions import (
+     CannotUpdateFailedStackError,
+@@ -28,7 +27,7 @@ from sceptre.exceptions import (
+     UnknownStackChangeSetStatusError,
+     UnknownStackStatusError,
+ )
+-from sceptre.helpers import extract_datetime_from_aws_response_headers, normalise_path
++from sceptre.helpers import extract_datetime_from_aws_response_headers
+ from sceptre.hooks import add_stack_hooks
+ from sceptre.stack import Stack
+ from sceptre.stack_status import StackChangeSetStatus, StackStatus
+@@ -1146,9 +1145,8 @@ class StackActions:
+         return result
+ 
+     @add_stack_hooks
+-    def dump_config(self, config_reader: ConfigReader):
++    def dump_config(self):
+         """
+         Dump the config for a stack.
+         """
+-        stack_path = normalise_path(self.stack.name + ".yaml")
+-        return config_reader.read(stack_path)
++        return self.stack.config
+diff --git a/sceptre/plan/plan.py b/sceptre/plan/plan.py
+index 7b40dff..6164488 100644
+--- a/sceptre/plan/plan.py
++++ b/sceptre/plan/plan.py
+@@ -439,4 +439,4 @@ class SceptrePlan(object):
+         Dump the config for a stack.
+         """
+         self.resolve(command=self.dump_config.__name__)
+-        return self._execute(self.config_reader, *args)
++        return self._execute(*args)
+diff --git a/sceptre/stack.py b/sceptre/stack.py
+index b953dcb..b1d7a29 100644
+--- a/sceptre/stack.py
++++ b/sceptre/stack.py
+@@ -123,6 +123,8 @@ class Stack:
+            If not supplied, Sceptre uses default value (3600 seconds)
+ 
+     :param stack_group_config: The StackGroup config for the Stack
++
++    :param config: The complete config for the stack. Used by dump config.
+     """
+ 
+     parameters = ResolvableContainerProperty("parameters")
+@@ -193,7 +195,8 @@ class Stack:
+         iam_role_session_duration: Optional[int] = None,
+         ignore=False,
+         obsolete=False,
+-        stack_group_config: dict = {},
++        stack_group_config: dict = None,
++        config: dict = None,
+     ):
+         self.logger = logging.getLogger(__name__)
+ 
+@@ -211,6 +214,7 @@ class Stack:
+             "disable_rollback", disable_rollback
+         )
+         self.stack_group_config = stack_group_config or {}
++        self.config = config or {}
+         self.stack_timeout = stack_timeout
+         self.profile = profile
+         self.template_key_prefix = template_key_prefix
+

@@ -1,0 +1,71 @@
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -106,7 +106,8 @@ class FieldInfo(Representation):
+         'extra',
+     )
+ 
+-    __field_constraints__ = {  # field constraints with the default value
++    # field constraints with the default value, it's also used in update_from_config below
++    __field_constraints__ = {
+         'min_length': None,
+         'max_length': None,
+         'regex': None,
+@@ -153,6 +154,20 @@ def get_constraints(self) -> Set[str]:
+         """
+         return {attr for attr, default in self.__field_constraints__.items() if getattr(self, attr) != default}
+ 
++    def update_from_config(self, from_config: Dict[str, Any]) -> None:
++        """
++        Update this FieldInfo based on a dict from get_field_info, only fields which have not been set are dated.
++        """
++        for attr_name, value in from_config.items():
++            try:
++                current_value = getattr(self, attr_name)
++            except AttributeError:
++                # attr_name is not an attribute of FieldInfo, it should therefore be added to extra
++                self.extra[attr_name] = value
++            else:
++                if current_value is self.__field_constraints__.get(attr_name, None):
++                    setattr(self, attr_name, value)
++
+     def _validate(self) -> None:
+         if self.default not in (Undefined, Ellipsis) and self.default_factory is not None:
+             raise ValueError('cannot specify both default and default_factory')
+@@ -354,17 +369,20 @@ def _get_field_info(
+                 raise ValueError(f'cannot specify multiple `Annotated` `Field`s for {field_name!r}')
+             field_info = next(iter(field_infos), None)
+             if field_info is not None:
++                field_info.update_from_config(field_info_from_config)
+                 if field_info.default not in (Undefined, Ellipsis):
+                     raise ValueError(f'`Field` default cannot be set in `Annotated` for {field_name!r}')
+                 if value not in (Undefined, Ellipsis):
+                     field_info.default = value
++
+         if isinstance(value, FieldInfo):
+             if field_info is not None:
+                 raise ValueError(f'cannot specify `Annotated` and value `Field`s together for {field_name!r}')
+             field_info = value
+-        if field_info is None:
++            field_info.update_from_config(field_info_from_config)
++        elif field_info is None:
+             field_info = FieldInfo(value, **field_info_from_config)
+-        field_info.alias = field_info.alias or field_info_from_config.get('alias')
++
+         value = None if field_info.default_factory is not None else field_info.default
+         field_info._validate()
+         return field_info, value
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -142,6 +142,10 @@ class BaseConfig:
+ 
+     @classmethod
+     def get_field_info(cls, name: str) -> Dict[str, Any]:
++        """
++        Get properties of FieldInfo from the `fields` property of the config class.
++        """
++
+         fields_value = cls.fields.get(name)
+ 
+         if isinstance(fields_value, str):

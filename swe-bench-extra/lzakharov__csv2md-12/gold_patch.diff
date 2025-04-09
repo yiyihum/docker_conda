@@ -1,0 +1,155 @@
+diff --git a/LICENSE b/LICENSE
+index e18fb38..34d0931 100644
+--- a/LICENSE
++++ b/LICENSE
+@@ -1,6 +1,6 @@
+ MIT License
+ 
+-Copyright (c) 2018 Lev Zakharov
++Copyright (c) 2023 Lev Zakharov
+ 
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+diff --git a/README.md b/README.md
+index 69f12a4..95b3836 100644
+--- a/README.md
++++ b/README.md
+@@ -87,26 +87,24 @@ You can also specify delimiter, quotation characters and alignment (see [Help](h
+ To view help run `csv2md -h`:
+ 
+ ```commandline
+-usage: csv2md [-h] [-d DELIMITER] [-q QUOTECHAR]
+-              [-c [CENTER_ALIGNED_COLUMNS [CENTER_ALIGNED_COLUMNS ...]]]
+-              [-r [RIGHT_ALIGNED_COLUMNS [RIGHT_ALIGNED_COLUMNS ...]]]
+-              [CSV_FILE [CSV_FILE ...]]
++usage: csv2md [-h] [-d DELIMITER] [-q QUOTECHAR] [-c [CENTER_ALIGNED_COLUMNS ...]] [-r [RIGHT_ALIGNED_COLUMNS ...]] [-H] [CSV_FILE ...]
+ 
+ Parse CSV files into Markdown tables.
+ 
+ positional arguments:
+   CSV_FILE              One or more CSV files to parse
+ 
+-optional arguments:
++options:
+   -h, --help            show this help message and exit
+   -d DELIMITER, --delimiter DELIMITER
+                         delimiter character. Default is ','
+   -q QUOTECHAR, --quotechar QUOTECHAR
+                         quotation character. Default is '"'
+-  -c [CENTER_ALIGNED_COLUMNS [CENTER_ALIGNED_COLUMNS ...]], --center-aligned-columns [CENTER_ALIGNED_COLUMNS [CENTER_ALIGNED_COLUMNS ...]]
++  -c [CENTER_ALIGNED_COLUMNS ...], --center-aligned-columns [CENTER_ALIGNED_COLUMNS ...]
+                         column numbers with center alignment (from zero)
+-  -r [RIGHT_ALIGNED_COLUMNS [RIGHT_ALIGNED_COLUMNS ...]], --right-aligned-columns [RIGHT_ALIGNED_COLUMNS [RIGHT_ALIGNED_COLUMNS ...]]
++  -r [RIGHT_ALIGNED_COLUMNS ...], --right-aligned-columns [RIGHT_ALIGNED_COLUMNS ...]
+                         column numbers with right alignment (from zero)
++  -H, --no-header-row   specify that the input CSV file has no header row. Will create default headers in Excel format (a,b,c,...)
+ ```
+ 
+ ## Running Tests
+@@ -126,4 +124,4 @@ Feel free to also ask questions on the tracker.
+ 
+ ## License
+ 
+-Copyright (c) 2018 Lev Zakharov. Licensed under [the MIT License](https://raw.githubusercontent.com/lzakharov/csv2md/master/LICENSE).
++Copyright (c) 2023 Lev Zakharov. Licensed under [the MIT License](https://raw.githubusercontent.com/lzakharov/csv2md/master/LICENSE).
+diff --git a/csv2md/__main__.py b/csv2md/__main__.py
+index 76a7d45..2f23966 100644
+--- a/csv2md/__main__.py
++++ b/csv2md/__main__.py
+@@ -16,16 +16,18 @@ def main():
+                         type=int, default=[], help='column numbers with center alignment (from zero)')
+     parser.add_argument('-r', '--right-aligned-columns', metavar='RIGHT_ALIGNED_COLUMNS', nargs='*',
+                         type=int, default=[], help='column numbers with right alignment (from zero)')
++    parser.add_argument('-H', '--no-header-row', dest='no_header_row', action='store_true',
++                        help='specify that the input CSV file has no header row. Will create default headers in Excel format (a,b,c,...)')
+     args = parser.parse_args()
+ 
+     if not args.files:
+         table = Table.parse_csv(sys.stdin, args.delimiter, args.quotechar)
+-        print(table.markdown(args.center_aligned_columns, args.right_aligned_columns))
++        print(table.markdown(args.center_aligned_columns, args.right_aligned_columns, args.no_header_row))
+         return
+ 
+     for file in args.files:
+         table = Table.parse_csv(file, args.delimiter, args.quotechar)
+-        print(table.markdown(args.center_aligned_columns, args.right_aligned_columns))
++        print(table.markdown(args.center_aligned_columns, args.right_aligned_columns, args.no_header_row))
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/csv2md/table.py b/csv2md/table.py
+index 971bf60..4452cfc 100644
+--- a/csv2md/table.py
++++ b/csv2md/table.py
+@@ -1,16 +1,24 @@
+ import csv
+ 
++from .utils import column_letter
++
+ 
+ class Table:
+     def __init__(self, cells):
+         self.cells = cells
+         self.widths = list(map(max, zip(*[list(map(len, row)) for row in cells])))
+ 
+-    def markdown(self, center_aligned_columns=None, right_aligned_columns=None):
++    def markdown(self, center_aligned_columns=None, right_aligned_columns=None, no_header_row=False):
++        if len(self.cells) == 0:
++            return ''
++
++        def ljust_row(row):
++            return [cell.ljust(width) for cell, width in zip(row, self.widths)]
++
+         def format_row(row):
+             return '| ' + ' | '.join(row) + ' |'
+ 
+-        rows = [format_row([cell.ljust(width) for cell, width in zip(row, self.widths)]) for row in self.cells]
++        rows = [format_row(ljust_row(row)) for row in self.cells]
+         separators = ['-' * width for width in self.widths]
+ 
+         if right_aligned_columns is not None:
+@@ -20,6 +28,10 @@ class Table:
+             for column in center_aligned_columns:
+                 separators[column] = ':' + ('-' * (self.widths[column] - 2)) + ':'
+ 
++        if no_header_row:
++            width = len(self.cells[0])
++            rows.insert(0, format_row(ljust_row(self.make_default_headers(width))))
++
+         rows.insert(1, format_row(separators))
+ 
+         return '\n'.join(rows)
+@@ -27,3 +39,7 @@ class Table:
+     @staticmethod
+     def parse_csv(file, delimiter=',', quotechar='"'):
+         return Table(list(csv.reader(file, delimiter=delimiter, quotechar=quotechar)))
++
++    @staticmethod
++    def make_default_headers(n):
++        return tuple(map(column_letter, range(n)))
+diff --git a/csv2md/utils.py b/csv2md/utils.py
+new file mode 100644
+index 0000000..a50b0a3
+--- /dev/null
++++ b/csv2md/utils.py
+@@ -0,0 +1,7 @@
++import string
++
++def column_letter(index):
++    """Returns the column letter in Excel format."""
++    letters = string.ascii_lowercase
++    count = len(letters)
++    return letters[index % count] * ((index // count) + 1)
+diff --git a/setup.py b/setup.py
+index 1587e8c..2da19e6 100644
+--- a/setup.py
++++ b/setup.py
+@@ -9,7 +9,7 @@ with open('LICENSE') as f:
+ 
+ setup(
+     name='csv2md',
+-    version='1.1.2',
++    version='1.2.0',
+     description='Command line tool for converting CSV files into Markdown tables.',
+     long_description=readme,
+     author='Lev Zakharov',

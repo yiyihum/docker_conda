@@ -1,0 +1,269 @@
+diff --git a/tests/test_graph.py b/tests/test_graph.py
+index b85e73b..ecf7948 100644
+--- a/tests/test_graph.py
++++ b/tests/test_graph.py
+@@ -1,4 +1,4 @@
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from typing import cast
+ from unittest import TestCase
+ 
+@@ -6,6 +6,7 @@ from fffw.encoding import inputs, outputs, codecs
+ from fffw.encoding.complex import FilterComplex
+ from fffw.encoding.filters import *
+ from fffw.graph import *
++from fffw.wrapper import param
+ 
+ 
+ @dataclass
+@@ -24,6 +25,15 @@ class ScaleCuda(Scale):
+     hardware = 'cuda'
+ 
+ 
++@dataclass
++class FdkAAC(codecs.AudioCodec):
++    codec = 'libfdk_aac'
++    bitrate: int = param(name='b', stream_suffix=True)
++
++    def transform(self, metadata: Meta) -> Meta:
++        return replace(metadata, bitrate=self.bitrate)
++
++
+ class FilterGraphTestCase(TestCase):
+ 
+     def setUp(self) -> None:
+@@ -37,10 +47,18 @@ class FilterGraphTestCase(TestCase):
+             frame_rate=10.0,
+             frame_count=3000
+         )
++        self.source_audio_duration = 200.0
++        self.source_sampling_rate = 48000
++        self.source_samples_count = (self.source_audio_duration *
++                                     self.source_sampling_rate)
++        self.source_audio_bitrate = 128000
+         self.audio_metadata = audio_meta_data(
+-            duration=200.0,
+-            sampling_rate=48000,
+-            samples_count=200 * 48000)
++            duration=self.source_audio_duration,
++            sampling_rate=self.source_sampling_rate,
++            samples_count=self.source_samples_count,
++            bit_rate=self.source_audio_bitrate,
++        )
++        self.target_audio_bitrate = 64000
+ 
+         self.source = inputs.Input(
+             input_file='input.mp4',
+@@ -49,7 +67,7 @@ class FilterGraphTestCase(TestCase):
+         self.output = outputs.output_file(
+             'output.mp4',
+             codecs.VideoCodec('libx264'),
+-            codecs.AudioCodec('libfdk_aac'))
++            FdkAAC(bitrate=self.target_audio_bitrate))
+         self.input_list = inputs.InputList((self.source,))
+         self.output_list = outputs.OutputList((self.output,))
+         self.fc = FilterComplex(self.input_list, self.output_list)
+@@ -361,3 +379,26 @@ class FilterGraphTestCase(TestCase):
+             s | Upload(device=cuda) | UniversalFilter()
+         except ValueError:  # pragma: no cover
+             self.fail("hardware validation unexpectedly failed")
++
++    def test_codec_metadata_transform(self):
++        """
++        Codecs parameters applied to stream metadata when using transform.
++        """
++        with self.subTest('codec with transform'):
++            self.source.audio > self.output
++            am = cast(AudioMeta, self.output.codecs[1].meta)
++            self.assertEqual(am.bitrate, self.target_audio_bitrate)
++
++        with self.subTest('no input metadata'):
++            no_meta_input = inputs.input_file('input.mp4')
++            output = outputs.output_file('output.mp4',
++                                         codecs.AudioCodec('aac'))
++            no_meta_input.audio > output.audio
++            self.assertIsNone(output.codecs[0].meta)
++
++        with self.subTest('no transform'):
++            output = outputs.output_file('output.mp4',
++                                         codecs.AudioCodec('aac'))
++            self.source.audio > output.audio
++            am = cast(AudioMeta, output.codecs[0].meta)
++            self.assertEqual(am.bitrate, self.audio_metadata.bitrate)
+diff --git a/tests/test_vector.py b/tests/test_vector.py
+index bc4e8c8..3f74cf0 100644
+--- a/tests/test_vector.py
++++ b/tests/test_vector.py
+@@ -9,6 +9,15 @@ from tests.base import BaseTestCase
+ from tests.test_ffmpeg import Volume
+ 
+ 
++@dataclass
++class AAC(AudioCodec):
++    codec = 'aac'
++    bitrate: int = param(name='b', stream_suffix=True)
++
++    def transform(self, metadata: Meta) -> Meta:
++        return replace(metadata, bitrate=self.bitrate)
++
++
+ @dataclass
+ class StubFilter(AudioFilter):
+     filter = 'stub'
+@@ -30,13 +39,14 @@ class VectorTestCase(BaseTestCase):
+     def setUp(self) -> None:
+         super().setUp()
+         self.video_meta = video_meta_data(width=1920, height=1080)
+-        self.audio_meta = audio_meta_data()
++        self.audio_meta = audio_meta_data(bit_rate=128000)
++        self.audio_bitrate = 64000
+         self.source = input_file('input.mp4',
+                                  Stream(VIDEO, self.video_meta),
+                                  Stream(AUDIO, self.audio_meta))
+         self.output1 = output_file('output1.mp4',
+                                    VideoCodec('libx264'),
+-                                   AudioCodec('aac'))
++                                   AAC(bitrate=self.audio_bitrate))
+         self.output2 = output_file('output2.mp5',
+                                    VideoCodec('libx265'),
+                                    AudioCodec('libfdk_aac'))
+@@ -63,7 +73,9 @@ class VectorTestCase(BaseTestCase):
+         """
+         with self.subTest("input meta"):
+             v = self.simd.video
++            a = self.simd.audio
+             self.assertEqual(v.meta, self.video_meta)
++            self.assertEqual(a.meta, self.audio_meta)
+ 
+         with self.subTest("filter meta"):
+             v = v | Scale(1280, 720)
+@@ -71,9 +83,10 @@ class VectorTestCase(BaseTestCase):
+             self.assertEqual(v.meta, expected)
+ 
+         with self.subTest("codec meta"):
++            expected = replace(self.audio_meta, bitrate=self.audio_bitrate)
+             simd = SIMD(self.source, self.output1)
+-            x = v > simd
+-            self.assertEqual(x.meta, expected)
++            a = a > simd
++            self.assertEqual(a.meta, expected)
+ 
+     def test_vector_metadata_for_multiple_streams(self):
+         """
+@@ -88,7 +101,7 @@ class VectorTestCase(BaseTestCase):
+         self.assert_simd_args(
+             '-i', 'input.mp4',
+             '-map', '0:v', '-c:v', 'libx264',
+-            '-map', '0:a', '-c:a', 'aac',
++            '-map', '0:a', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '0:v', '-c:v', 'libx265',
+             '-map', '0:a', '-c:a', 'libfdk_aac',
+@@ -105,7 +118,7 @@ class VectorTestCase(BaseTestCase):
+             '[0:a]volume=30.00[a:volume0];'
+             '[a:volume0]asplit[aout0][aout1]',
+             '-map', '0:v', '-c:v', 'libx264',
+-            '-map', '[aout0]', '-c:a', 'aac',
++            '-map', '[aout0]', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '0:v', '-c:v', 'libx265',
+             '-map', '[aout1]', '-c:a', 'libfdk_aac',
+@@ -122,7 +135,7 @@ class VectorTestCase(BaseTestCase):
+             '[0:a]asplit[a:asplit0][aout0];'
+             '[a:asplit0]volume=30.00[aout1]',
+             '-map', '0:v', '-c:v', 'libx264',
+-            '-map', '[aout0]', '-c:a', 'aac',
++            '-map', '[aout0]', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '0:v', '-c:v', 'libx265',
+             '-map', '[aout1]', '-c:a', 'libfdk_aac',
+@@ -137,7 +150,7 @@ class VectorTestCase(BaseTestCase):
+             '-filter_complex',
+             '[0:a]asplit[aout0][aout1]',
+             '-map', '0:v', '-c:v', 'libx264',
+-            '-map', '[aout0]', '-c:a', 'aac',
++            '-map', '[aout0]', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '0:v', '-c:v', 'libx265',
+             '-map', '[aout1]', '-c:a', 'libfdk_aac',
+@@ -154,7 +167,7 @@ class VectorTestCase(BaseTestCase):
+             '[a:asplit0]volume=20.00[aout0];'
+             '[a:asplit1]volume=30.00[aout1]',
+             '-map', '0:v', '-c:v', 'libx264',
+-            '-map', '[aout0]', '-c:a', 'aac',
++            '-map', '[aout0]', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '0:v', '-c:v', 'libx265',
+             '-map', '[aout1]', '-c:a', 'libfdk_aac',
+@@ -170,7 +183,7 @@ class VectorTestCase(BaseTestCase):
+             '[0:a]volume=30.00[a:volume0];'
+             '[a:volume0]asplit[aout0][aout1]',
+             '-map', '0:v', '-c:v', 'libx264',
+-            '-map', '[aout0]', '-c:a', 'aac',
++            '-map', '[aout0]', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '0:v', '-c:v', 'libx265',
+             '-map', '[aout1]', '-c:a', 'libfdk_aac',
+@@ -193,7 +206,7 @@ class VectorTestCase(BaseTestCase):
+             '[a:asplit1]volume=30.00[a:volume1];'
+             '[a:volume1]stub[aout1]',
+             '-map', '0:v', '-c:v', 'libx264',
+-            '-map', '[aout0]', '-c:a', 'aac',
++            '-map', '[aout0]', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '0:v', '-c:v', 'libx265',
+             '-map', '[aout1]', '-c:a', 'libfdk_aac',
+@@ -227,7 +240,7 @@ class VectorTestCase(BaseTestCase):
+             '[v:split4][v:scale0]overlay[vout0];'
+             '[v:split5][v:scale1]overlay[vout1]',
+             '-map', '[vout0]', '-c:v', 'libx264',
+-            '-map', '0:a', '-c:a', 'aac',
++            '-map', '0:a', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '[vout1]', '-c:v', 'libx265',
+             '-map', '0:a', '-c:a', 'libfdk_aac',
+@@ -255,7 +268,7 @@ class VectorTestCase(BaseTestCase):
+             '[v:split2][v:scale0]overlay[vout0];'
+             '[v:split3][v:scale1]overlay[vout1]',
+             '-map', '[vout0]', '-c:v', 'libx264',
+-            '-map', '0:a', '-c:a', 'aac',
++            '-map', '0:a', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '[vout1]', '-c:v', 'libx265',
+             '-map', '0:a', '-c:a', 'libfdk_aac',
+@@ -279,7 +292,7 @@ class VectorTestCase(BaseTestCase):
+             '[0:v]split[v:split0][vout0];'
+             '[1:v][v:split0]overlay[vout1]',
+             '-map', '[vout1]', '-c:v', 'libx264',
+-            '-map', '0:a', '-c:a', 'aac',
++            '-map', '0:a', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '[vout0]', '-c:v', 'libx265',
+             '-map', '0:a', '-c:a', 'libfdk_aac',
+@@ -310,7 +323,7 @@ class VectorTestCase(BaseTestCase):
+             '[1:v][v:split0]concat[vout1];'
+             '[1:a][a:asplit0]concat=v=0:a=1:n=2[aout1]',
+             '-map', '[vout1]', '-c:v', 'libx264',
+-            '-map', '[aout1]', '-c:a', 'aac',
++            '-map', '[aout1]', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '[vout0]', '-c:v', 'libx265',
+             '-map', '[aout0]', '-c:a', 'libfdk_aac',
+@@ -333,7 +346,7 @@ class VectorTestCase(BaseTestCase):
+             '[1:v]scale=w=120:h=120[v:scale0];'
+             '[0:v][v:scale0]overlay[v:overlay0]',
+             '-map', '[vout0]', '-c:v', 'libx264',
+-            '-map', '0:a', '-c:a', 'aac',
++            '-map', '0:a', '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '[vout1]', '-c:v', 'libx265',
+             '-map', '0:a', '-c:a', 'libfdk_aac',
+@@ -365,7 +378,7 @@ class VectorTestCase(BaseTestCase):
+             '-map', '[vout0]',
+             '-c:v', 'libx264',
+             '-map', '[aout0]',
+-            '-c:a', 'aac',
++            '-c:a', 'aac', '-b:a', '64000',
+             'output1.mp4',
+             '-map', '[vout1]',
+             '-c:v', 'libx265',

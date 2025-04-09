@@ -1,0 +1,112 @@
+diff --git a/tests/integration/test_hooks.py b/tests/integration/test_hooks.py
+index 8378e5d..4cfa7f8 100644
+--- a/tests/integration/test_hooks.py
++++ b/tests/integration/test_hooks.py
+@@ -17,12 +17,60 @@ def preplayback_hook(interaction, cassette):
+     interaction.data['response']['headers']['Betamax-Fake-Header'] = 'temp'
+ 
+ 
++class Counter(object):
++    def __init__(self):
++        self.value = 0
++
++    def increment(self, cassette):
++        self.value += 1
++
++
+ class TestHooks(helper.IntegrationHelper):
+     def tearDown(self):
+         super(TestHooks, self).tearDown()
+         # Clear out the hooks
++        betamax.configure.Configuration.recording_hooks.pop('after_start', None)
+         betamax.cassette.Cassette.hooks.pop('before_record', None)
+         betamax.cassette.Cassette.hooks.pop('before_playback', None)
++        betamax.configure.Configuration.recording_hooks.pop('before_stop', None)
++
++    def test_post_start_hook(self):
++        start_count = Counter()
++        with betamax.Betamax.configure() as config:
++            config.after_start(callback=start_count.increment)
++
++        recorder = betamax.Betamax(self.session)
++
++        assert start_count.value == 0
++        with recorder.use_cassette('after_start_hook'):
++            assert start_count.value == 1
++            self.cassette_path = recorder.current_cassette.cassette_path
++            self.session.get('https://httpbin.org/get')
++
++        assert start_count.value == 1
++        with recorder.use_cassette('after_start_hook', record='none'):
++            assert start_count.value == 2
++            self.session.get('https://httpbin.org/get')
++        assert start_count.value == 2
++
++    def test_pre_stop_hook(self):
++        stop_count = Counter()
++        with betamax.Betamax.configure() as config:
++            config.before_stop(callback=stop_count.increment)
++
++        recorder = betamax.Betamax(self.session)
++
++        assert stop_count.value == 0
++        with recorder.use_cassette('before_stop_hook'):
++            self.cassette_path = recorder.current_cassette.cassette_path
++            self.session.get('https://httpbin.org/get')
++            assert stop_count.value == 0
++        assert stop_count.value == 1
++
++        with recorder.use_cassette('before_stop_hook', record='none'):
++            self.session.get('https://httpbin.org/get')
++            assert stop_count.value == 1
++        assert stop_count.value == 2
+ 
+     def test_prerecord_hook(self):
+         with betamax.Betamax.configure() as config:
+diff --git a/tests/unit/test_configure.py b/tests/unit/test_configure.py
+index c39de63..4f00b93 100644
+--- a/tests/unit/test_configure.py
++++ b/tests/unit/test_configure.py
+@@ -4,6 +4,7 @@ import unittest
+ 
+ from betamax.configure import Configuration
+ from betamax.cassette import Cassette
++from betamax.recorder import Betamax
+ 
+ 
+ class TestConfiguration(unittest.TestCase):
+@@ -14,6 +15,7 @@ class TestConfiguration(unittest.TestCase):
+         self.cassette_dir = Configuration.CASSETTE_LIBRARY_DIR
+ 
+     def tearDown(self):
++        Configuration.recording_hooks = collections.defaultdict(list)
+         Cassette.default_cassette_options = self.cassette_options
+         Cassette.hooks = collections.defaultdict(list)
+         Configuration.CASSETTE_LIBRARY_DIR = self.cassette_dir
+@@ -43,6 +45,14 @@ class TestConfiguration(unittest.TestCase):
+         assert placeholders[0]['placeholder'] == '<TEST>'
+         assert placeholders[0]['replace'] == 'test'
+ 
++    def test_registers_post_start_hooks(self):
++        c = Configuration()
++        assert Configuration.recording_hooks['after_start'] == []
++        c.after_start(callback=lambda: None)
++        assert Configuration.recording_hooks['after_start'] != []
++        assert len(Configuration.recording_hooks['after_start']) == 1
++        assert callable(Configuration.recording_hooks['after_start'][0])
++
+     def test_registers_pre_record_hooks(self):
+         c = Configuration()
+         assert Cassette.hooks['before_record'] == []
+@@ -58,3 +68,11 @@ class TestConfiguration(unittest.TestCase):
+         assert Cassette.hooks['before_playback'] != []
+         assert len(Cassette.hooks['before_playback']) == 1
+         assert callable(Cassette.hooks['before_playback'][0])
++
++    def test_registers_pre_stop_hooks(self):
++        c = Configuration()
++        assert Configuration.recording_hooks['before_stop'] == []
++        c.before_stop(callback=lambda: None)
++        assert Configuration.recording_hooks['before_stop'] != []
++        assert len(Configuration.recording_hooks['before_stop']) == 1
++        assert callable(Configuration.recording_hooks['before_stop'][0])

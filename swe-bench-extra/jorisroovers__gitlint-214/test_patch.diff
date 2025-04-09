@@ -1,0 +1,110 @@
+diff --git a/gitlint-core/gitlint/tests/cli/test_cli_hooks.py b/gitlint-core/gitlint/tests/cli/test_cli_hooks.py
+index 825345f..94c35dc 100644
+--- a/gitlint-core/gitlint/tests/cli/test_cli_hooks.py
++++ b/gitlint-core/gitlint/tests/cli/test_cli_hooks.py
+@@ -132,6 +132,9 @@ class CLIHookTests(BaseTestCase):
+         for i in range(0, len(set_editors)):
+             if set_editors[i]:
+                 os.environ['EDITOR'] = set_editors[i]
++            else:
++                # When set_editors[i] == None, ensure we don't fallback to EDITOR set in shell invocating the tests
++                os.environ.pop('EDITOR', None)
+ 
+             with self.patch_input(['e', 'e', 'n']):
+                 with self.tempdir() as tmpdir:
+diff --git a/gitlint-core/gitlint/tests/git/test_git.py b/gitlint-core/gitlint/tests/git/test_git.py
+index 7b9b7c6..e9e5645 100644
+--- a/gitlint-core/gitlint/tests/git/test_git.py
++++ b/gitlint-core/gitlint/tests/git/test_git.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ import os
+ 
+-from unittest.mock import patch
++from unittest.mock import patch, call
+ 
+ from gitlint.shell import ErrorReturnCode, CommandNotFound
+ 
+@@ -64,8 +64,12 @@ class GitTests(BaseTestCase):
+ 
+         # assert that commit message was read using git command
+         sh.git.assert_called_once_with("log", "-1", "--pretty=%H", **self.expected_sh_special_args)
+-        sh.git.reset_mock()
+ 
++    @patch('gitlint.git.sh')
++    def test_git_no_commits_get_branch(self, sh):
++        """ Check that we can still read the current branch name when there's no commits. This is useful when
++            when trying to lint the first commit using the --staged flag.
++        """
+         # Unknown reference 'HEAD' commits: returned by 'git rev-parse'
+         err = (b"HEAD"
+                b"fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."
+@@ -74,15 +78,22 @@ class GitTests(BaseTestCase):
+ 
+         sh.git.side_effect = [
+             "#\n",  # git config --get core.commentchar
+-            ErrorReturnCode("rev-parse --abbrev-ref HEAD", b"", err)
++            ErrorReturnCode("rev-parse --abbrev-ref HEAD", b"", err),
++            'test-branch',  # git branch --show-current
+         ]
+ 
+-        with self.assertRaisesMessage(GitContextError, expected_msg):
+-            context = GitContext.from_commit_msg("test")
+-            context.current_branch
++        context = GitContext.from_commit_msg("test")
++        self.assertEqual(context.current_branch, 'test-branch')
+ 
+-        # assert that commit message was read using git command
+-        sh.git.assert_called_with("rev-parse", "--abbrev-ref", "HEAD", _tty_out=False, _cwd=None)
++        # assert that we try using `git rev-parse` first, and if that fails (as will be the case with the first commit),
++        #  we fallback to `git branch --show-current` to determine the current branch name.
++        expected_calls = [
++            call("config", "--get", "core.commentchar", _tty_out=False, _cwd=None, _ok_code=[0, 1]),
++            call("rev-parse", "--abbrev-ref", "HEAD", _tty_out=False, _cwd=None),
++            call("branch", "--show-current", _tty_out=False, _cwd=None)
++        ]
++
++        self.assertEqual(sh.git.mock_calls, expected_calls)
+ 
+     @patch("gitlint.git._git")
+     def test_git_commentchar(self, git):
+diff --git a/qa/test_gitlint.py b/qa/test_gitlint.py
+index 0200d76..36fba69 100644
+--- a/qa/test_gitlint.py
++++ b/qa/test_gitlint.py
+@@ -178,7 +178,7 @@ class IntegrationTests(BaseTestCase):
+         expected = "Missing git configuration: please set user.email\n"
+         self.assertEqualStdout(output, expected)
+ 
+-    def test_git_errors(self):
++    def test_git_empty_repo(self):
+         # Repo has no commits: caused by `git log`
+         empty_git_repo = self.create_tmp_git_repo()
+         output = gitlint(_cwd=empty_git_repo, _tty_in=True, _ok_code=[self.GIT_CONTEXT_ERROR_CODE])
+@@ -186,7 +186,13 @@ class IntegrationTests(BaseTestCase):
+         expected = "Current branch has no commits. Gitlint requires at least one commit to function.\n"
+         self.assertEqualStdout(output, expected)
+ 
+-        # Repo has no commits: caused by `git rev-parse`
++    def test_git_empty_repo_staged(self):
++        """ When repo is empty, we can still use gitlint when using --staged flag and piping a message into it """
++        empty_git_repo = self.create_tmp_git_repo()
++        expected = ("1: T3 Title has trailing punctuation (.): \"WIP: Pïpe test.\"\n"
++                    "1: T5 Title contains the word \'WIP\' (case-insensitive): \"WIP: Pïpe test.\"\n"
++                    "3: B6 Body message is missing\n")
++
+         output = gitlint(echo("WIP: Pïpe test."), "--staged", _cwd=empty_git_repo, _tty_in=False,
+-                         _err_to_out=True, _ok_code=[self.GIT_CONTEXT_ERROR_CODE])
++                         _err_to_out=True, _ok_code=[3])
+         self.assertEqualStdout(output, expected)
+diff --git a/test-requirements.txt b/test-requirements.txt
+index 78a383d..df3c4ab 100644
+--- a/test-requirements.txt
++++ b/test-requirements.txt
+@@ -4,5 +4,5 @@ python-coveralls==2.9.3
+ radon==5.1.0
+ flake8-polyfill==1.0.2 # Required when installing both flake8 and radon>=4.3.1 
+ pytest==7.0.1;
+-pylint==2.12.2;
++pylint==2.13.5;
+ -r requirements.txt

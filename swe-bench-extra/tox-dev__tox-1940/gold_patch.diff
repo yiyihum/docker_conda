@@ -1,0 +1,149 @@
+diff --git a/CONTRIBUTORS b/CONTRIBUTORS
+index 1e085ba7..55dd6d1b 100644
+--- a/CONTRIBUTORS
++++ b/CONTRIBUTORS
+@@ -4,6 +4,7 @@ Alexander Loechel
+ Alexander Schepanovski
+ Alexandre Conrad
+ Allan Feldman
++Andrey Bienkowski
+ Andrii Soldatenko
+ Andrzej Klajnert
+ Anthon van der Neuth
+diff --git a/docs/changelog/1921.feature.rst b/docs/changelog/1921.feature.rst
+new file mode 100644
+index 00000000..64ea8c15
+--- /dev/null
++++ b/docs/changelog/1921.feature.rst
+@@ -0,0 +1,6 @@
++tox can now be invoked with a new ``--no-provision`` flag that prevents provision,
++if :conf:`requires` or :conf:`minversion` are not satisfied,
++tox will fail;
++if a path is specified as an argument to the flag
++(e.g. as ``tox --no-provision missing.json``) and provision is prevented,
++provision metadata are written as JSON to that path - by :user:`hroncok`
+diff --git a/docs/config.rst b/docs/config.rst
+index 01bc9b7d..31e96331 100644
+--- a/docs/config.rst
++++ b/docs/config.rst
+@@ -38,6 +38,11 @@ Global settings are defined under the ``tox`` section as:
+    than this the tool will create an environment and provision it with a version of
+    tox that satisfies this under :conf:`provision_tox_env`.
+ 
++   .. versionchanged:: 3.23.0
++
++   When tox is invoked with the ``--no-provision`` flag,
++   the provision won't be attempted, tox will fail instead.
++
+ .. conf:: requires ^ LIST of PEP-508
+ 
+     .. versionadded:: 3.2.0
+@@ -54,6 +59,11 @@ Global settings are defined under the ``tox`` section as:
+         requires = tox-pipenv
+                    setuptools >= 30.0.0
+ 
++    .. versionchanged:: 3.23.0
++
++    When tox is invoked with the ``--no-provision`` flag,
++    the provision won't be attempted, tox will fail instead.
++
+ .. conf:: provision_tox_env ^ string ^ .tox
+ 
+     .. versionadded:: 3.8.0
+@@ -61,6 +71,11 @@ Global settings are defined under the ``tox`` section as:
+     Name of the virtual environment used to provision a tox having all dependencies specified
+     inside :conf:`requires` and :conf:`minversion`.
+ 
++    .. versionchanged:: 3.23.0
++
++    When tox is invoked with the ``--no-provision`` flag,
++    the provision won't be attempted, tox will fail instead.
++
+ .. conf:: toxworkdir ^ PATH ^ {toxinidir}/.tox
+ 
+    Directory for tox to generate its environments into, will be created if it does not exist.
+diff --git a/src/tox/config/__init__.py b/src/tox/config/__init__.py
+index 10bc9bef..278d4b2b 100644
+--- a/src/tox/config/__init__.py
++++ b/src/tox/config/__init__.py
+@@ -1,7 +1,9 @@
+ from __future__ import print_function
+ 
+ import argparse
++import io
+ import itertools
++import json
+ import os
+ import random
+ import re
+@@ -302,7 +304,7 @@ def parseconfig(args, plugins=()):
+ 
+ 
+ def get_py_project_toml(path):
+-    with open(str(path)) as file_handler:
++    with io.open(str(path), encoding="UTF-8") as file_handler:
+         config_data = toml.load(file_handler)
+         return config_data
+ 
+@@ -572,6 +574,16 @@ def tox_addoption(parser):
+         action="store_true",
+         help="override alwayscopy setting to True in all envs",
+     )
++    parser.add_argument(
++        "--no-provision",
++        action="store",
++        nargs="?",
++        default=False,
++        const=True,
++        metavar="REQUIRES_JSON",
++        help="do not perform provision, but fail and if a path was provided "
++        "write provision metadata as JSON to it",
++    )
+ 
+     cli_skip_missing_interpreter(parser)
+     parser.add_argument("--workdir", metavar="PATH", help="tox working directory")
+@@ -1318,8 +1330,8 @@ class ParseIni(object):
+         # raise on unknown args
+         self.config._parser.parse_cli(args=self.config.args, strict=True)
+ 
+-    @staticmethod
+-    def ensure_requires_satisfied(config, requires, min_version):
++    @classmethod
++    def ensure_requires_satisfied(cls, config, requires, min_version):
+         missing_requirements = []
+         failed_to_parse = False
+         deps = []
+@@ -1346,12 +1358,33 @@ class ParseIni(object):
+                 missing_requirements.append(str(requirements.Requirement(require)))
+         if failed_to_parse:
+             raise tox.exception.BadRequirement()
++        if config.option.no_provision and missing_requirements:
++            msg = "provisioning explicitly disabled within {}, but missing {}"
++            if config.option.no_provision is not True:  # it's a path
++                msg += " and wrote to {}"
++                cls.write_requires_to_json_file(config)
++            raise tox.exception.Error(
++                msg.format(sys.executable, missing_requirements, config.option.no_provision)
++            )
+         if WITHIN_PROVISION and missing_requirements:
+             msg = "break infinite loop provisioning within {} missing {}"
+             raise tox.exception.Error(msg.format(sys.executable, missing_requirements))
+         config.run_provision = bool(len(missing_requirements))
+         return deps
+ 
++    @staticmethod
++    def write_requires_to_json_file(config):
++        requires_dict = {
++            "minversion": config.minversion,
++            "requires": config.requires,
++        }
++        try:
++            with open(config.option.no_provision, "w", encoding="utf-8") as outfile:
++                json.dump(requires_dict, outfile, indent=4)
++        except TypeError:  # Python 2
++            with open(config.option.no_provision, "w") as outfile:
++                json.dump(requires_dict, outfile, indent=4, encoding="utf-8")
++
+     def parse_build_isolation(self, config, reader):
+         config.isolated_build = reader.getbool("isolated_build", False)
+         config.isolated_build_env = reader.getstring("isolated_build_env", ".package")

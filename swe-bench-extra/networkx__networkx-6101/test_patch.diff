@@ -1,0 +1,153 @@
+diff --git a/networkx/algorithms/flow/tests/test_maxflow.py b/networkx/algorithms/flow/tests/test_maxflow.py
+index 36bc5ec7c..d4f9052ce 100644
+--- a/networkx/algorithms/flow/tests/test_maxflow.py
++++ b/networkx/algorithms/flow/tests/test_maxflow.py
+@@ -20,6 +20,7 @@ flow_funcs = {
+     preflow_push,
+     shortest_augmenting_path,
+ }
++
+ max_min_funcs = {nx.maximum_flow, nx.minimum_cut}
+ flow_value_funcs = {nx.maximum_flow_value, nx.minimum_cut_value}
+ interface_funcs = max_min_funcs & flow_value_funcs
+@@ -427,25 +428,24 @@ class TestMaxFlowMinCutInterface:
+ 
+     def test_minimum_cut_no_cutoff(self):
+         G = self.G
+-        for flow_func in flow_funcs:
+-            pytest.raises(
+-                nx.NetworkXError,
+-                nx.minimum_cut,
+-                G,
+-                "x",
+-                "y",
+-                flow_func=flow_func,
+-                cutoff=1.0,
+-            )
+-            pytest.raises(
+-                nx.NetworkXError,
+-                nx.minimum_cut_value,
+-                G,
+-                "x",
+-                "y",
+-                flow_func=flow_func,
+-                cutoff=1.0,
+-            )
++        pytest.raises(
++            nx.NetworkXError,
++            nx.minimum_cut,
++            G,
++            "x",
++            "y",
++            flow_func=preflow_push,
++            cutoff=1.0,
++        )
++        pytest.raises(
++            nx.NetworkXError,
++            nx.minimum_cut_value,
++            G,
++            "x",
++            "y",
++            flow_func=preflow_push,
++            cutoff=1.0,
++        )
+ 
+     def test_kwargs(self):
+         G = self.H
+@@ -539,11 +539,20 @@ class TestCutoff:
+         assert k <= R.graph["flow_value"] <= (2 * k)
+         R = edmonds_karp(G, "s", "t", cutoff=k)
+         assert k <= R.graph["flow_value"] <= (2 * k)
++        R = dinitz(G, "s", "t", cutoff=k)
++        assert k <= R.graph["flow_value"] <= (2 * k)
++        R = boykov_kolmogorov(G, "s", "t", cutoff=k)
++        assert k <= R.graph["flow_value"] <= (2 * k)
+ 
+     def test_complete_graph_cutoff(self):
+         G = nx.complete_graph(5)
+         nx.set_edge_attributes(G, {(u, v): 1 for u, v in G.edges()}, "capacity")
+-        for flow_func in [shortest_augmenting_path, edmonds_karp]:
++        for flow_func in [
++            shortest_augmenting_path,
++            edmonds_karp,
++            dinitz,
++            boykov_kolmogorov,
++        ]:
+             for cutoff in [3, 2, 1]:
+                 result = nx.maximum_flow_value(
+                     G, 0, 4, flow_func=flow_func, cutoff=cutoff
+diff --git a/networkx/algorithms/tests/test_richclub.py b/networkx/algorithms/tests/test_richclub.py
+index 1ed42d459..5638ddbf0 100644
+--- a/networkx/algorithms/tests/test_richclub.py
++++ b/networkx/algorithms/tests/test_richclub.py
+@@ -80,6 +80,17 @@ def test_rich_club_exception2():
+         nx.rich_club_coefficient(G)
+ 
+ 
++def test_rich_club_selfloop():
++    G = nx.Graph()  # or DiGraph, MultiGraph, MultiDiGraph, etc
++    G.add_edge(1, 1)  # self loop
++    G.add_edge(1, 2)
++    with pytest.raises(
++        Exception,
++        match="rich_club_coefficient is not implemented for " "graphs with self loops.",
++    ):
++        nx.rich_club_coefficient(G)
++
++
+ # def test_richclub2_normalized():
+ #    T = nx.balanced_tree(2,10)
+ #    rcNorm = nx.richclub.rich_club_coefficient(T,Q=2)
+diff --git a/networkx/classes/tests/test_multigraph.py b/networkx/classes/tests/test_multigraph.py
+index 0584f5620..07f7f5db6 100644
+--- a/networkx/classes/tests/test_multigraph.py
++++ b/networkx/classes/tests/test_multigraph.py
+@@ -303,6 +303,9 @@ class TestMultiGraph(BaseMultiGraphTester, _TestGraph):
+         G = self.Graph()
+         G.add_edge(*(0, 1))
+         assert G.adj == {0: {1: {0: {}}}, 1: {0: {0: {}}}}
++        G = self.Graph()
++        with pytest.raises(ValueError):
++            G.add_edge(None, "anything")
+ 
+     def test_add_edge_conflicting_key(self):
+         G = self.Graph()
+diff --git a/networkx/readwrite/tests/test_gml.py b/networkx/readwrite/tests/test_gml.py
+index 6e6ce0f3a..68b0da6f8 100644
+--- a/networkx/readwrite/tests/test_gml.py
++++ b/networkx/readwrite/tests/test_gml.py
+@@ -571,10 +571,6 @@ graph
+         G = nx.Graph()
+         G.graph["data"] = frozenset([1, 2, 3])
+         assert_generate_error(G, stringizer=literal_stringizer)
+-        G = nx.Graph()
+-        G.graph["data"] = []
+-        assert_generate_error(G)
+-        assert_generate_error(G, stringizer=len)
+ 
+     def test_label_kwarg(self):
+         G = nx.parse_gml(self.simple_data, label="id")
+@@ -712,3 +708,23 @@ class TestPropertyLists:
+             f.seek(0)
+             graph = nx.read_gml(f)
+         assert graph.nodes(data=True)["n1"] == {"properties": ["element"]}
++
++
++@pytest.mark.parametrize("coll", (list(), tuple()))
++def test_stringize_empty_list_tuple(coll):
++    G = nx.path_graph(2)
++    G.nodes[0]["test"] = coll  # test serializing an empty collection
++    f = io.BytesIO()
++    nx.write_gml(G, f)  # Smoke test - should not raise
++    f.seek(0)
++    H = nx.read_gml(f)
++    assert H.nodes["0"]["test"] == coll  # Check empty list round-trips properly
++    # Check full round-tripping. Note that nodes are loaded as strings by
++    # default, so there needs to be some remapping prior to comparison
++    H = nx.relabel_nodes(H, {"0": 0, "1": 1})
++    assert nx.utils.graphs_equal(G, H)
++    # Same as above, but use destringizer for node remapping. Should have no
++    # effect on node attr
++    f.seek(0)
++    H = nx.read_gml(f, destringizer=int)
++    assert nx.utils.graphs_equal(G, H)

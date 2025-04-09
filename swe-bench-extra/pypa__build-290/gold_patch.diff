@@ -1,0 +1,87 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 585e8d4..2f9858e 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -10,15 +10,18 @@ Unreleased
+ - Set and test minimum versions of build's runtime dependencies (`PR #267`_, Fixes `#263`_)
+ - Use symlinks on creating venv's when available (`PR #274`_, Fixes `#271`_)
+ - Error sooner if pip upgrade is required and fails (`PR #288`_, Fixes `#256`_)
++- Add a ``runner`` argument to ``ProjectBuilder`` (`PR #290`_, Fixes `#289`_)
+ 
+ .. _PR #260: https://github.com/pypa/build/pull/260
+ .. _PR #267: https://github.com/pypa/build/pull/267
+ .. _PR #274: https://github.com/pypa/build/pull/274
+ .. _PR #288: https://github.com/pypa/build/pull/288
++.. _PR #290: https://github.com/pypa/build/pull/290
+ .. _#256: https://github.com/pypa/build/issues/256
+ .. _#259: https://github.com/pypa/build/issues/259
+ .. _#263: https://github.com/pypa/build/issues/263
+ .. _#271: https://github.com/pypa/build/issues/271
++.. _#289: https://github.com/pypa/build/issues/289
+ 
+ Breaking Changes
+ ----------------
+diff --git a/src/build/__init__.py b/src/build/__init__.py
+index 10e5c9d..4345623 100644
+--- a/src/build/__init__.py
++++ b/src/build/__init__.py
+@@ -20,6 +20,8 @@ import toml
+ import toml.decoder
+ 
+ 
++RUNNER_TYPE = Callable[[Sequence[str], Optional[Union[bytes, Text]], Optional[Dict[str, str]]], None]
++
+ if sys.version_info < (3,):
+     FileNotFoundError = IOError
+     PermissionError = OSError
+@@ -139,12 +141,31 @@ class ProjectBuilder(object):
+     The PEP 517 consumer API.
+     """
+ 
+-    def __init__(self, srcdir, python_executable=sys.executable, scripts_dir=None):
+-        # type: (str, Union[bytes, Text], Optional[Union[bytes, Text]]) -> None
++    def __init__(
++        self,
++        srcdir,  # type: str
++        python_executable=sys.executable,  # type: Union[bytes, Text]
++        scripts_dir=None,  # type: Optional[Union[bytes, Text]]
++        runner=pep517.wrappers.default_subprocess_runner,  # type: RUNNER_TYPE
++    ):
++        # type: (...) -> None
+         """
+         :param srcdir: The source directory
+         :param scripts_dir: The location of the scripts dir (defaults to the folder where the python executable lives)
+         :param python_executable: The python executable where the backend lives
++        :param runner: An alternative runner for backend subprocesses
++
++        The 'runner', if provided, must accept the following arguments:
++
++        - cmd: a list of strings representing the command and arguments to
++          execute, as would be passed to e.g. 'subprocess.check_call'.
++        - cwd: a string representing the working directory that must be
++          used for the subprocess. Corresponds to the provided srcdir.
++        - extra_environ: a dict mapping environment variable names to values
++          which must be set for the subprocess execution.
++
++        The default runner simply calls the backend hooks in a subprocess, writing backend output
++        to stdout/stderr.
+         """
+         self.srcdir = os.path.abspath(srcdir)  # type: str
+         _validate_source_directory(srcdir)
+@@ -180,6 +201,7 @@ class ProjectBuilder(object):
+         self._build_system = build_system
+         self._backend = self._build_system['build-backend']
+         self._scripts_dir = scripts_dir
++        self._hook_runner = runner
+         self._hook = pep517.wrappers.Pep517HookCaller(
+             self.srcdir,
+             self._backend,
+@@ -198,7 +220,7 @@ class ProjectBuilder(object):
+                 paths.update((i, None) for i in os.environ['PATH'].split(os.pathsep))
+             extra_environ = {} if extra_environ is None else extra_environ
+             extra_environ['PATH'] = os.pathsep.join(paths)
+-        pep517.default_subprocess_runner(cmd, cwd, extra_environ)
++        self._hook_runner(cmd, cwd, extra_environ)
+ 
+     @property
+     def python_executable(self):  # type: () -> Union[bytes, Text]

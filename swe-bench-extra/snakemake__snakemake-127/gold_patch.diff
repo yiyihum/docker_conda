@@ -1,0 +1,105 @@
+diff --git a/docs/project_info/faq.rst b/docs/project_info/faq.rst
+index 91321e44..e1ef4d2a 100644
+--- a/docs/project_info/faq.rst
++++ b/docs/project_info/faq.rst
+@@ -100,6 +100,25 @@ In order to infer the IDs from present files, Snakemake provides the ``glob_wild
+ 
+ The function matches the given pattern against the files present in the filesystem and thereby infers the values for all wildcards in the pattern. A named tuple that contains a list of values for each wildcard is returned. Here, this named tuple has only one item, that is the list of values for the wildcard ``{id}``.
+ 
++I don't want expand to use the product of every wildcard, what can I do?
++------------------------------------------------------------------------
++
++By default the expand function uses ``itertools.product`` to create every combination of the supplied wildcards.
++Expand takes an optional, second positional argument which can customize how wildcards are combined.
++To create the list ``["a_1.txt", "b_2.txt", "c_3.txt"]``, invoke expand as:
++``expand("{sample}_{id}.txt", zip, sample=["a", "b", "c"], id=["1", "2", "3"])``
++
++I don't want expand to use every wildcard, what can I do?
++---------------------------------------------------------
++
++Sometimes partially expanding wildcards is useful to define inputs which still depend on some wildcards.
++Expand takes an optional keyword argument, allow_missing=True, that will format only wildcards which are supplied, leaving others as is.
++To create the list ``["{sample}_1.txt", "{sample}_2.txt"]``, invoke expand as:
++``expand("{sample}_{id}.txt", id=["1", "2"], allow_missing=True)``
++If the filename contains the wildcard ``allow_missing``, it will be formatted normally:
++``expand("{allow_missing}.txt", allow_missing=True)`` returns ``["True.txt"]``.
++
++
+ Snakemake complains about a cyclic dependency or a PeriodicWildcardError. What can I do?
+ ----------------------------------------------------------------------------------------
+ 
+diff --git a/snakemake/io.py b/snakemake/io.py
+index fd7d5dda..a976a9e9 100755
+--- a/snakemake/io.py
++++ b/snakemake/io.py
+@@ -17,6 +17,7 @@ import functools
+ import subprocess as sp
+ from itertools import product, chain
+ from contextlib import contextmanager
++import string
+ import collections
+ 
+ import yaml
+@@ -892,7 +893,8 @@ def expand(*args, **wildcards):
+         second arg (optional): a function to combine wildcard values
+         (itertools.product per default)
+     **wildcards -- the wildcards as keyword arguments
+-        with their values as lists
++        with their values as lists. If allow_missing=True is included
++        wildcards in filepattern without values will stay unformatted.
+     """
+     filepatterns = args[0]
+     if len(args) == 1:
+@@ -916,12 +918,27 @@ def expand(*args, **wildcards):
+             "of expand (e.g. 'temp(expand(\"plots/{sample}.pdf\", sample=SAMPLES))')."
+         )
+ 
++    # check if remove missing is provided
++    format_dict = dict
++    if "allow_missing" in wildcards and wildcards["allow_missing"] is True:
++
++        class FormatDict(dict):
++            def __missing__(self, key):
++                return "{" + key + "}"
++
++        format_dict = FormatDict
++        # check that remove missing is not a wildcard in the filepatterns
++        for filepattern in filepatterns:
++            if "allow_missing" in re.findall(r"{([^}\.[!:]+)", filepattern):
++                format_dict = dict
++                break
++
+     # remove unused wildcards to avoid duplicate filepatterns
+     wildcards = {
+         filepattern: {
+             k: v
+             for k, v in wildcards.items()
+-            if k in re.findall("{([^}\.[!:]+)", filepattern)
++            if k in re.findall(r"{([^}\.[!:]+)", filepattern)
+         }
+         for filepattern in filepatterns
+     }
+@@ -934,11 +951,12 @@ def expand(*args, **wildcards):
+                 values = [values]
+             yield [(wildcard, value) for value in values]
+ 
++    formatter = string.Formatter()
+     try:
+         return [
+-            filepattern.format(**comb)
++            formatter.vformat(filepattern, (), comb)
+             for filepattern in filepatterns
+-            for comb in map(dict, combinator(*flatten(wildcards[filepattern])))
++            for comb in map(format_dict, combinator(*flatten(wildcards[filepattern])))
+         ]
+     except KeyError as e:
+         raise WildcardError("No values given for wildcard {}.".format(e))
+@@ -1050,7 +1068,7 @@ def update_wildcard_constraints(
+ 
+ 
+ def split_git_path(path):
+-    file_sub = re.sub("^git\+file:/+", "/", path)
++    file_sub = re.sub(r"^git\+file:/+", "/", path)
+     (file_path, version) = file_sub.split("@")
+     file_path = os.path.realpath(file_path)
+     root_path = get_git_root(file_path)

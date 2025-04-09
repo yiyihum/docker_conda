@@ -1,0 +1,167 @@
+diff --git a/tests/handlers/test_home_handler.py b/tests/handlers/test_home_handler.py
+index 95807b8..596b8db 100644
+--- a/tests/handlers/test_home_handler.py
++++ b/tests/handlers/test_home_handler.py
+@@ -7,10 +7,10 @@ from remoteappmanager.docker.container import Container
+ from remoteappmanager.docker.container_manager import ContainerManager
+ from remoteappmanager.docker.image import Image
+ from remoteappmanager.services.hub import Hub
+-from remoteappmanager.services.reverse_proxy import ReverseProxy
+ 
+ from remoteappmanager.application import Application
+ from tests import utils
++from tests.mock.mock_reverse_proxy import MockReverseProxy
+ from tests.temp_mixin import TempMixin
+ 
+ 
+@@ -38,9 +38,7 @@ class TestHomeHandler(TempMixin, utils.AsyncHTTPTestCase):
+         file_config.accounting_kwargs = {'url': "sqlite:///"+sqlite_file_path}
+ 
+         app = Application(command_line_config, file_config)
+-        app.reverse_proxy = mock.Mock(spec=ReverseProxy)
+-        app.reverse_proxy.add_container = utils.mock_coro_factory("/")
+-        app.reverse_proxy.remove_container = utils.mock_coro_factory()
++        app.reverse_proxy = MockReverseProxy()
+         app.hub = mock.Mock(spec=Hub)
+         app.hub.verify_token = utils.mock_coro_factory({
+             'pending': None,
+@@ -107,7 +105,7 @@ class TestHomeHandler(TempMixin, utils.AsyncHTTPTestCase):
+                        ".HomeHandler"
+                        ".redirect") as redirect:
+ 
+-            self.assertFalse(self._app.reverse_proxy.add_container.called)
++            self.assertFalse(self._app.reverse_proxy.register.called)
+             self.fetch("/user/username/",
+                        method="POST",
+                        headers={
+@@ -115,7 +113,7 @@ class TestHomeHandler(TempMixin, utils.AsyncHTTPTestCase):
+                        },
+                        body=body)
+ 
+-            self.assertTrue(self._app.reverse_proxy.add_container.called)
++            self.assertTrue(self._app.reverse_proxy.register.called)
+             self.assertTrue(redirect.called)
+ 
+     def test_post_failed_auth(self):
+@@ -156,7 +154,7 @@ class TestHomeHandler(TempMixin, utils.AsyncHTTPTestCase):
+                        },
+                        body=body)
+ 
+-            self.assertTrue(self._app.reverse_proxy.remove_container.called)
++            self.assertTrue(self._app.reverse_proxy.unregister.called)
+             self.assertTrue(redirect.called)
+ 
+     def test_post_view(self):
+@@ -184,5 +182,5 @@ class TestHomeHandler(TempMixin, utils.AsyncHTTPTestCase):
+                        },
+                        body=body)
+ 
+-            self.assertTrue(self._app.reverse_proxy.add_container.called)
++            self.assertTrue(self._app.reverse_proxy.register.called)
+             self.assertTrue(redirect.called)
+diff --git a/tests/logging/__init__.py b/tests/logging/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/logging/test_logging_mixin.py b/tests/logging/test_logging_mixin.py
+new file mode 100644
+index 0000000..833562e
+--- /dev/null
++++ b/tests/logging/test_logging_mixin.py
+@@ -0,0 +1,19 @@
++import unittest
++from unittest import mock
++
++from remoteappmanager.logging.logging_mixin import LoggingMixin
++
++
++class Logged(LoggingMixin):
++    pass
++
++
++class TestLoggingMixin(unittest.TestCase):
++    def test_issue(self):
++        l = Logged()
++        with mock.patch("tornado.log.app_log.error") as mock_error:
++            ref = l.log.issue("hello")
++            self.assertIn("hello. Ref: "+str(ref), mock_error.call_args[0][0])
++            ref = l.log.issue("hello", Exception("Boom!"))
++            self.assertIn("hello : Boom!. Ref: "+str(ref),
++                          mock_error.call_args[0][0])
+diff --git a/tests/mock/__init__.py b/tests/mock/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/mock/mock_reverse_proxy.py b/tests/mock/mock_reverse_proxy.py
+new file mode 100644
+index 0000000..ee624a6
+--- /dev/null
++++ b/tests/mock/mock_reverse_proxy.py
+@@ -0,0 +1,15 @@
++from unittest import mock
++
++from remoteappmanager.services.reverse_proxy import ReverseProxy
++from tests import utils
++
++
++def MockReverseProxy():
++    """Constructor. Returns a mock reverse proxy implementation.
++    Named as a class for potential future expansion in mock implementation."""
++
++    mock_revproxy = mock.Mock(spec=ReverseProxy)
++    mock_revproxy.register = utils.mock_coro_factory("/")
++    mock_revproxy.unregister = utils.mock_coro_factory()
++
++    return mock_revproxy
+diff --git a/tests/restmodel/test_container.py b/tests/restmodel/test_container.py
+index ba87141..7ae9a96 100644
+--- a/tests/restmodel/test_container.py
++++ b/tests/restmodel/test_container.py
+@@ -2,6 +2,7 @@ from unittest.mock import Mock, patch
+ 
+ from remoteappmanager.restresources import Container
+ from tests import utils
++from tests.mock.mock_reverse_proxy import MockReverseProxy
+ from tornado import web, escape
+ 
+ from remoteappmanager import rest
+@@ -28,11 +29,10 @@ class TestContainer(AsyncHTTPTestCase):
+         app = web.Application(handlers=handlers)
+         app.file_config = Mock()
+         app.file_config.network_timeout = 5
++        app.urlpath_for_object = Mock(return_value="/urlpath_for_object/")
+         app.command_line_config = Mock()
+         app.command_line_config.base_urlpath = "/"
+-        app.reverse_proxy = Mock()
+-        app.reverse_proxy.add_container = mock_coro_factory()
+-        app.reverse_proxy.remove_container = mock_coro_factory()
++        app.reverse_proxy = MockReverseProxy()
+         container = Mock()
+         container.urlpath = "containers/12345"
+         container.url_id = "12345"
+diff --git a/tests/services/test_reverse_proxy.py b/tests/services/test_reverse_proxy.py
+index 39ff093..71b0298 100644
+--- a/tests/services/test_reverse_proxy.py
++++ b/tests/services/test_reverse_proxy.py
+@@ -4,8 +4,6 @@ from jupyterhub import orm
+ from remoteappmanager.services.reverse_proxy import ReverseProxy
+ from tornado import gen, testing
+ 
+-from remoteappmanager.docker.container import Container
+-
+ 
+ class TestReverseProxy(testing.AsyncTestCase):
+     @testing.gen_test
+@@ -22,11 +20,11 @@ class TestReverseProxy(testing.AsyncTestCase):
+         reverse_proxy._reverse_proxy = Mock(spec=orm.Proxy)
+         reverse_proxy._reverse_proxy.api_request = mock_api_request
+ 
+-        container = Container(docker_id="12345", base_urlpath="/foo/")
+-        yield reverse_proxy.add_container(container)
++        yield reverse_proxy.register("/hello/from/me/",
++                                     "http://localhost:12312/")
+ 
+         self.assertEqual(coroutine_out["kwargs"]["method"], "POST")
+ 
+-        yield reverse_proxy.remove_container(container)
++        yield reverse_proxy.unregister("/hello/from/me/")
+ 
+         self.assertEqual(coroutine_out["kwargs"]["method"], "DELETE")

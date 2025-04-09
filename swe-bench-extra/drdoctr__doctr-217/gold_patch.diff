@@ -1,0 +1,87 @@
+diff --git a/doctr/__init__.py b/doctr/__init__.py
+index 9ef98056..d85651c8 100644
+--- a/doctr/__init__.py
++++ b/doctr/__init__.py
+@@ -1,6 +1,6 @@
+ from .local import (encrypt_variable, encrypt_file, GitHub_post,
+     generate_GitHub_token, upload_GitHub_deploy_key, generate_ssh_key,
+-    check_repo_exists)
++    check_repo_exists, guess_github_repo)
+ from .travis import (decrypt_file, setup_deploy_key, get_token, run,
+     setup_GitHub_push, checkout_deploy_branch, deploy_branch_exists,
+     set_git_user_email, create_deploy_branch, copy_to_tmp, sync_from_log,
+@@ -9,7 +9,7 @@ from .travis import (decrypt_file, setup_deploy_key, get_token, run,
+ __all__ = [
+     'encrypt_variable', 'encrypt_file', 'GitHub_post',
+     'generate_GitHub_token', 'upload_GitHub_deploy_key', 'generate_ssh_key',
+-    'check_repo_exists',
++    'check_repo_exists', 'guess_github_repo',
+ 
+     'decrypt_file', 'setup_deploy_key', 'get_token', 'run',
+     'setup_GitHub_push', 'set_git_user_email', 'checkout_deploy_branch', 'deploy_branch_exists',
+diff --git a/doctr/__main__.py b/doctr/__main__.py
+index 41f5f9e9..89f07443 100644
+--- a/doctr/__main__.py
++++ b/doctr/__main__.py
+@@ -35,7 +35,8 @@ from pathlib import Path
+ from textwrap import dedent
+ 
+ from .local import (generate_GitHub_token, encrypt_variable, encrypt_file,
+-    upload_GitHub_deploy_key, generate_ssh_key, check_repo_exists, GitHub_login)
++    upload_GitHub_deploy_key, generate_ssh_key, check_repo_exists,
++    GitHub_login, guess_github_repo)
+ from .travis import (setup_GitHub_push, commit_docs, push_docs,
+     get_current_repo, sync_from_log, find_sphinx_build_dir, run,
+     get_travis_branch, copy_to_tmp, checkout_deploy_branch)
+@@ -326,9 +327,15 @@ def configure(args, parser):
+         login_kwargs = {'auth': None, 'headers': None}
+ 
+     get_build_repo = False
++    default_repo = guess_github_repo()
+     while not get_build_repo:
+         try:
+-            build_repo = input("What repo do you want to build the docs for (org/reponame, like 'drdoctr/doctr')? ")
++            if default_repo:
++                build_repo = input("What repo do you want to build the docs for [{default_repo}]? ".format(default_repo=default_repo))
++                if not build_repo:
++                    build_repo = default_repo
++            else:
++                build_repo = input("What repo do you want to build the docs for (org/reponame, like 'drdoctr/doctr')? ")
+             is_private = check_repo_exists(build_repo, service='github', **login_kwargs)
+             check_repo_exists(build_repo, service='travis')
+             get_build_repo = True
+diff --git a/doctr/local.py b/doctr/local.py
+index 0fb5c85b..a2f702d3 100644
+--- a/doctr/local.py
++++ b/doctr/local.py
+@@ -7,6 +7,7 @@ import json
+ import uuid
+ import base64
+ import subprocess
++import re
+ from getpass import getpass
+ 
+ import requests
+@@ -254,3 +255,22 @@ def check_repo_exists(deploy_repo, service='github', *, auth=None, headers=None)
+     r.raise_for_status()
+ 
+     return r.json().get('private', False)
++
++GIT_URL = re.compile(r'(?:git@|https://|git://)github\.com[:/](.*?)(?:\.git)?')
++
++def guess_github_repo():
++    """
++    Guesses the github repo for the current directory
++
++    Returns False if no guess can be made.
++    """
++    p = subprocess.run(['git', 'ls-remote', '--get-url', 'origin'],
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++    if p.stderr or p.returncode:
++        return False
++
++    url = p.stdout.decode('utf-8').strip()
++    m = GIT_URL.fullmatch(url)
++    if not m:
++        return False
++    return m.group(1)

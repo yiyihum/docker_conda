@@ -1,0 +1,197 @@
+diff --git a/tflens/__main__.py b/tflens/__main__.py
+index 4417c32..de432d6 100644
+--- a/tflens/__main__.py
++++ b/tflens/__main__.py
+@@ -2,11 +2,7 @@ from pathlib import Path
+ import argparse
+ 
+ from tflens.helper.config import VERSION
+-from tflens.controller.tfstate import (
+-  RemoteS3TfStateController,
+-  RemoteHttpTfStateController,
+-  LocalTfStateController
+-)
++from tflens.helper.remote import RemoteHelper
+ 
+ parser = argparse.ArgumentParser(
+   description='Terraform lens is a CLI tool that enables developers have a summarized view of tfstate resources.'
+@@ -28,15 +24,6 @@ parser.add_argument('-o', '--output',
+   help="Defines output type (markdown|html). If empty outputs in terminal",
+   default="")
+ 
+-parser.add_argument('-r', '--remote',
+-  type=str,
+-  action="store",
+-  dest="remote",
+-  help="Defines if remote (s3|http) or local tfstate file. If empty local is used. \
+-    When remote is defined, you also need to specify --file-location with the tfstate location \
+-      according to the following pattern: bucket-name/tfstate-key",
+-  default="")
+-
+ parser.add_argument('-m', '--filter-module',
+   type=str,
+   action="store",
+@@ -98,7 +85,6 @@ parser.add_argument('-v', '--version',
+ 
+ args = parser.parse_args()
+ 
+-ARGS_REMOTE = args.remote
+ ARGS_FILE_LOCATION = args.file_location
+ ARGS_OUTPUT = args.output
+ ARGS_FILTER_MODULE = args.filter_module
+@@ -113,13 +99,9 @@ if not ARGS_FILE_LOCATION:
+   ARGS_FILE_LOCATION = "{}/terraform.tfstate".format(Path().absolute())
+ 
+ def main():
+-  remote_router = {
+-    's3': RemoteS3TfStateController,
+-    'http': RemoteHttpTfStateController,
+-    '': LocalTfStateController
+-  }
++  remote_helper = RemoteHelper(ARGS_FILE_LOCATION)
+ 
+-  tfstate_controller = remote_router[ARGS_REMOTE](
++  tfstate_controller = remote_helper.invoke_remote_controller(
+     file_location=ARGS_FILE_LOCATION,
+     user=ARGS_HTTP_USER,
+     password=ARGS_HTTP_PASSWORD,
+diff --git a/tflens/exception/exception.py b/tflens/exception/exception.py
+index bff9917..95e47b5 100644
+--- a/tflens/exception/exception.py
++++ b/tflens/exception/exception.py
+@@ -36,3 +36,13 @@ class ServerUnavailable(CustomException):
+ 
+   def __init__(self):
+     super().__init__("The server is unavailable")
++
++class NotValidS3Location(CustomException):
++
++  def __init__(self):
++    super().__init__("Invalid S3 location. Must be something like 's3://bucket_name/key'")
++
++class NotValidHttpLocation(CustomException):
++
++  def __init__(self):
++    super().__init__("Invalid Http location. Must be something like 'http(s)://http_server/'")
+diff --git a/tflens/helper/location.py b/tflens/helper/location.py
+new file mode 100644
+index 0000000..3d13d5c
+--- /dev/null
++++ b/tflens/helper/location.py
+@@ -0,0 +1,21 @@
++import re
++
++class LocationHelper():
++
++  def __init__(self, file_location: str, validation_pattern: str):
++    self.__file_location = file_location
++    self.__validation_pattern = validation_pattern
++    self.__compiled_pattern = re.compile(self.__validation_pattern)
++
++  def validate(self):
++    return self.__compiled_pattern.search(self.__file_location)
++
++class S3LocationHelper(LocationHelper):
++
++  def __init__(self, file_location: str):
++    super().__init__(file_location=file_location, validation_pattern="s3\:\/\/.+\/.+")
++
++class HttpLocationHelper(LocationHelper):
++
++  def __init__(self, file_location: str):
++    super().__init__(file_location=file_location, validation_pattern="http(s)?\:\/\/.+")
+diff --git a/tflens/helper/remote.py b/tflens/helper/remote.py
+new file mode 100644
+index 0000000..a6bfbd3
+--- /dev/null
++++ b/tflens/helper/remote.py
+@@ -0,0 +1,26 @@
++from tflens.controller.tfstate import (
++  RemoteS3TfStateController,
++  RemoteHttpTfStateController,
++  LocalTfStateController
++)
++
++class RemoteHelper():
++
++  def __init__(self, file_location: str):
++    self.__file_location = file_location
++    self.__remote_router = {
++      's3': RemoteS3TfStateController,
++      'http': RemoteHttpTfStateController,
++      'https': RemoteHttpTfStateController,
++      'local': LocalTfStateController
++    }
++    self.__remote_type = "local"
++
++    if ":" in self.__file_location:
++      self.__remote_type = self.__file_location.split(":")[0]
++
++  def get_remote_type(self):
++    return self.__remote_type
++
++  def invoke_remote_controller(self, **kwargs):
++    return self.__remote_router[self.__remote_type](**kwargs)
+diff --git a/tflens/service/tfstate.py b/tflens/service/tfstate.py
+index e778a05..8972a4f 100644
+--- a/tflens/service/tfstate.py
++++ b/tflens/service/tfstate.py
+@@ -6,21 +6,35 @@ import requests
+ 
+ from botocore.exceptions import ClientError
+ 
++from tflens.helper.location import (
++  S3LocationHelper,
++  HttpLocationHelper
++)
+ from tflens.exception.exception import (
+   CannotLoadLocalFile,
+   CannotReadLocalFile,
+   CannotLoadRemoteFile,
+   UnauthorizedAccess,
+   Forbidden,
+-  ServerUnavailable
++  ServerUnavailable,
++  NotValidS3Location,
++  NotValidHttpLocation
+ )
+ 
+ class RemoteS3TfStateService():
+ 
+   def __init__(self, file_location: str):
+-    self.__s3_client = boto3.client('s3')
+-    self.__bucket_name = file_location.split('/')[0]
+-    self.__file_s3_key = "/".join(file_location.split('/')[1:])
++    location_helper = S3LocationHelper(file_location=file_location)
++
++    if location_helper.validate():
++      location_without_schema = file_location.split(":")[1].replace("//", "")
++
++      self.__s3_client = boto3.client('s3')
++      self.__bucket_name = location_without_schema.split('/')[0]
++      self.__file_s3_key = "/".join(location_without_schema.split('/')[1:])
++
++    else:
++      raise NotValidS3Location
+ 
+   def read_content(self):
+     try:
+@@ -37,9 +51,15 @@ class RemoteS3TfStateService():
+ class RemoteHttpTfStateService():
+ 
+   def __init__(self, file_location: str, user: str=None, password: str=None):
+-    self.__file_location = file_location
+-    self.__user = user
+-    self.__password = password
++    location_helper = HttpLocationHelper(file_location=file_location)
++
++    if location_helper.validate():
++      self.__file_location = file_location
++      self.__user = user
++      self.__password = password
++
++    else:
++      raise NotValidHttpLocation
+ 
+   def read_content(self):
+     try:

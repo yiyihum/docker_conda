@@ -1,0 +1,226 @@
+diff --git a/.travis.yml b/.travis.yml
+index 46a1b13..a88237d 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -11,6 +11,9 @@ python:
+   - "3.5"
+   - "3.5-dev" # 3.5 development branch
+   - "nightly" # currently points to 3.6-dev
++matrix:
++  allow_failures:
++    - python: nightly
+ install:
+  - pip install unittest2 pylint
+ script:
+diff --git a/dns/name.py b/dns/name.py
+index ef812cf..5288e1e 100644
+--- a/dns/name.py
++++ b/dns/name.py
+@@ -488,9 +488,6 @@ class Name(object):
+     def __getitem__(self, index):
+         return self.labels[index]
+ 
+-    def __getslice__(self, start, stop):
+-        return self.labels[start:stop]
+-
+     def __add__(self, other):
+         return self.concatenate(other)
+ 
+diff --git a/dns/resolver.py b/dns/resolver.py
+index 5bd1e8d..c9a7c78 100644
+--- a/dns/resolver.py
++++ b/dns/resolver.py
+@@ -282,9 +282,6 @@ class Answer(object):
+     def __delitem__(self, i):
+         del self.rrset[i]
+ 
+-    def __getslice__(self, i, j):
+-        return self.rrset[i:j]
+-
+ 
+ class Cache(object):
+ 
+diff --git a/dns/set.py b/dns/set.py
+index 0efc7d9..ef7fd29 100644
+--- a/dns/set.py
++++ b/dns/set.py
+@@ -232,9 +232,6 @@ class Set(object):
+     def __delitem__(self, i):
+         del self.items[i]
+ 
+-    def __getslice__(self, i, j):
+-        return self.items[i:j]
+-
+     def issubset(self, other):
+         """Is I{self} a subset of I{other}?
+ 
+diff --git a/dns/wiredata.py b/dns/wiredata.py
+index b381f7b..ccef595 100644
+--- a/dns/wiredata.py
++++ b/dns/wiredata.py
+@@ -15,6 +15,7 @@
+ 
+ """DNS Wire Data Helper"""
+ 
++import sys
+ 
+ import dns.exception
+ from ._compat import binary_type, string_types
+@@ -26,12 +27,16 @@ from ._compat import binary_type, string_types
+ # out what constant Python will use.
+ 
+ 
+-class _SliceUnspecifiedBound(str):
++class _SliceUnspecifiedBound(binary_type):
+ 
+-    def __getslice__(self, i, j):
+-        return j
++    def __getitem__(self, key):
++        return key.stop
++
++    if sys.version_info < (3,):
++        def __getslice__(self, i, j):  # pylint: disable=getslice-method
++            return self.__getitem__(slice(i, j))
+ 
+-_unspecified_bound = _SliceUnspecifiedBound('')[1:]
++_unspecified_bound = _SliceUnspecifiedBound()[1:]
+ 
+ 
+ class WireData(binary_type):
+@@ -40,26 +45,40 @@ class WireData(binary_type):
+     def __getitem__(self, key):
+         try:
+             if isinstance(key, slice):
+-                return WireData(super(WireData, self).__getitem__(key))
++                # make sure we are not going outside of valid ranges,
++                # do stricter control of boundaries than python does
++                # by default
++                start = key.start
++                stop = key.stop
++
++                if sys.version_info < (3,):
++                    if stop == _unspecified_bound:
++                        # handle the case where the right bound is unspecified
++                        stop = len(self)
++
++                    if start < 0 or stop < 0:
++                        raise dns.exception.FormError
++                    # If it's not an empty slice, access left and right bounds
++                    # to make sure they're valid
++                    if start != stop:
++                        super(WireData, self).__getitem__(start)
++                        super(WireData, self).__getitem__(stop - 1)
++                else:
++                    for index in (start, stop):
++                        if index is None:
++                            continue
++                        elif abs(index) > len(self):
++                            raise dns.exception.FormError
++
++                return WireData(super(WireData, self).__getitem__(
++                    slice(start, stop)))
+             return bytearray(self.unwrap())[key]
+         except IndexError:
+             raise dns.exception.FormError
+ 
+-    def __getslice__(self, i, j):
+-        try:
+-            if j == _unspecified_bound:
+-                # handle the case where the right bound is unspecified
+-                j = len(self)
+-            if i < 0 or j < 0:
+-                raise dns.exception.FormError
+-            # If it's not an empty slice, access left and right bounds
+-            # to make sure they're valid
+-            if i != j:
+-                super(WireData, self).__getitem__(i)
+-                super(WireData, self).__getitem__(j - 1)
+-            return WireData(super(WireData, self).__getslice__(i, j))
+-        except IndexError:
+-            raise dns.exception.FormError
++    if sys.version_info < (3,):
++        def __getslice__(self, i, j):  # pylint: disable=getslice-method
++            return self.__getitem__(slice(i, j))
+ 
+     def __iter__(self):
+         i = 0
+diff --git a/dns/zone.py b/dns/zone.py
+index 4a73e1e..1b5dca2 100644
+--- a/dns/zone.py
++++ b/dns/zone.py
+@@ -19,6 +19,7 @@ from __future__ import generators
+ 
+ import sys
+ import re
++import os
+ from io import BytesIO
+ 
+ import dns.exception
+@@ -498,18 +499,27 @@ class Zone(object):
+         @type nl: string or None
+         """
+ 
+-        str_type = string_types
++        if isinstance(f, string_types):
++            f = open(f, 'wb')
++            want_close = True
++        else:
++            want_close = False
++
++        # must be in this way, f.encoding may contain None, or even attribute
++        # may not be there
++        file_enc = getattr(f, 'encoding', None)
++        if file_enc is None:
++            file_enc = 'utf-8'
+ 
+         if nl is None:
+-            opts = 'wb'
++            nl_b = os.linesep.encode(file_enc)  # binary mode, '\n' is not enough
++            nl = u'\n'
++        elif isinstance(nl, string_types):
++            nl_b = nl.encode(file_enc)
+         else:
+-            opts = 'wb'
++            nl_b = nl
++            nl = nl.decode()
+ 
+-        if isinstance(f, str_type):
+-            f = open(f, opts)
+-            want_close = True
+-        else:
+-            want_close = False
+         try:
+             if sorted:
+                 names = list(self.keys())
+@@ -520,11 +530,15 @@ class Zone(object):
+                 l = self[n].to_text(n, origin=self.origin,
+                                     relativize=relativize)
+                 if isinstance(l, text_type):
+-                    l = l.encode()
+-                if nl is None:
+-                    f.write(l)
+-                    f.write('\n')
++                    l_b = l.encode(file_enc)
+                 else:
++                    l_b = l
++                    l = l.decode()
++
++                try:
++                    f.write(l_b)
++                    f.write(nl_b)
++                except TypeError:  # textual mode
+                     f.write(l)
+                     f.write(nl)
+         finally:
+diff --git a/pylintrc b/pylintrc
+index c37ac1e..3f16509 100644
+--- a/pylintrc
++++ b/pylintrc
+@@ -23,7 +23,6 @@ disable=
+     bare-except,
+     deprecated-method,
+     fixme,
+-    getslice-method,
+     global-statement,
+     invalid-name,
+     missing-docstring,

@@ -1,0 +1,430 @@
+diff --git a/doc/format.rst b/doc/format.rst
+index 87f5ff7..cdeec0b 100644
+--- a/doc/format.rst
++++ b/doc/format.rst
+@@ -252,13 +252,21 @@ The sections of a function's docstring are:
+    Support for the **Yields** section was added in `numpydoc
+    <https://github.com/numpy/numpydoc>`_ version 0.6.
+ 
+-7. **Other Parameters**
++7. **Receives**
++
++   Explanation of parameters passed to a generator's ``.send()`` method,
++   formatted as for Parameters, above.  Since, like for Yields and Returns, a
++   single object is always passed to the method, this may describe either the
++   single parameter, or positional arguments passed as a tuple.  If a docstring
++   includes Receives it must also include Yields.
++
++8. **Other Parameters**
+ 
+    An optional section used to describe infrequently used parameters.
+    It should only be used if a function has a large number of keyword
+    parameters, to prevent cluttering the **Parameters** section.
+ 
+-8. **Raises**
++9. **Raises**
+ 
+    An optional section detailing which errors get raised and under
+    what conditions::
+@@ -271,16 +279,16 @@ The sections of a function's docstring are:
+    This section should be used judiciously, i.e., only for errors
+    that are non-obvious or have a large chance of getting raised.
+ 
+-9. **Warns**
++10. **Warns**
+ 
+    An optional section detailing which warnings get raised and
+    under what conditions, formatted similarly to Raises.
+ 
+-10. **Warnings**
++11. **Warnings**
+ 
+     An optional section with cautions to the user in free text/reST.
+ 
+-11. **See Also**
++12. **See Also**
+ 
+     An optional section used to refer to related code.  This section
+     can be very useful, but should be used judiciously.  The goal is to
+@@ -319,7 +327,7 @@ The sections of a function's docstring are:
+       func_b, func_c_, func_d
+       func_e
+ 
+-12. **Notes**
++13. **Notes**
+ 
+     An optional section that provides additional information about the
+     code, possibly including a discussion of the algorithm. This
+@@ -364,7 +372,7 @@ The sections of a function's docstring are:
+     where filename is a path relative to the reference guide source
+     directory.
+ 
+-13. **References**
++14. **References**
+ 
+     References cited in the **notes** section may be listed here,
+     e.g. if you cited the article below using the text ``[1]_``,
+@@ -397,7 +405,7 @@ The sections of a function's docstring are:
+ 
+ .. highlight:: pycon
+ 
+-14. **Examples**
++15. **Examples**
+ 
+     An optional section for examples, using the `doctest
+     <http://docs.python.org/library/doctest.html>`_ format.
+diff --git a/numpydoc/docscrape.py b/numpydoc/docscrape.py
+index f3453c6..02afd88 100644
+--- a/numpydoc/docscrape.py
++++ b/numpydoc/docscrape.py
+@@ -16,6 +16,7 @@ except ImportError:
+ import copy
+ import sys
+ 
++from sphinx.ext.autodoc import ALL
+ 
+ def strip_blank_lines(l):
+     "Remove leading and trailing blank lines from a list of lines"
+@@ -127,6 +128,7 @@ class NumpyDocString(Mapping):
+         'Parameters': [],
+         'Returns': [],
+         'Yields': [],
++        'Receives': [],
+         'Raises': [],
+         'Warns': [],
+         'Other Parameters': [],
+@@ -236,9 +238,41 @@ class NumpyDocString(Mapping):
+ 
+         return params
+ 
+-    _name_rgx = re.compile(r"^\s*(:(?P<role>\w+):"
+-                           r"`(?P<name>(?:~\w+\.)?[a-zA-Z0-9_.-]+)`|"
+-                           r" (?P<name2>[a-zA-Z0-9_.-]+))\s*", re.X)
++    # See also supports the following formats.
++    #
++    # <FUNCNAME>
++    # <FUNCNAME> SPACE* COLON SPACE+ <DESC> SPACE*
++    # <FUNCNAME> ( COMMA SPACE+ <FUNCNAME>)* SPACE*
++    # <FUNCNAME> ( COMMA SPACE+ <FUNCNAME>)* SPACE* COLON SPACE+ <DESC> SPACE*
++
++    # <FUNCNAME> is one of
++    #   <PLAIN_FUNCNAME>
++    #   COLON <ROLE> COLON BACKTICK <PLAIN_FUNCNAME> BACKTICK
++    # where
++    #   <PLAIN_FUNCNAME> is a legal function name, and
++    #   <ROLE> is any nonempty sequence of word characters.
++    # Examples: func_f1  :meth:`func_h1` :obj:`~baz.obj_r` :class:`class_j`
++    # <DESC> is a string describing the function.
++
++    _role = r":(?P<role>\w+):"
++    _funcbacktick = r"`(?P<name>(?:~\w+\.)?[a-zA-Z0-9_.-]+)`"
++    _funcplain = r"(?P<name2>[a-zA-Z0-9_.-]+)"
++    _funcname = r"(" + _role + _funcbacktick + r"|" + _funcplain + r")"
++    _funcnamenext = _funcname.replace('role', 'rolenext')
++    _funcnamenext = _funcnamenext.replace('name', 'namenext')
++    _description = r"(?P<description>\s*:(\s+(?P<desc>\S+.*))?)?\s*$"
++    _func_rgx = re.compile(r"^\s*" + _funcname + r"\s*")
++    _line_rgx = re.compile(
++        r"^\s*" +
++        r"(?P<allfuncs>" +        # group for all function names
++        _funcname +
++        r"(?P<morefuncs>([,]\s+" + _funcnamenext + r")*)" +
++        r")" +                     # end of "allfuncs"
++        r"(?P<trailing>\s*,)?" +   # Some function lists have a trailing comma
++        _description)
++
++    # Empty <DESC> elements are replaced with '..'
++    empty_description = '..'
+ 
+     def _parse_see_also(self, content):
+         """
+@@ -248,52 +282,49 @@ class NumpyDocString(Mapping):
+         func_name1, func_name2, :meth:`func_name`, func_name3
+ 
+         """
++
+         items = []
+ 
+         def parse_item_name(text):
+-            """Match ':role:`name`' or 'name'"""
+-            m = self._name_rgx.match(text)
+-            if m:
+-                g = m.groups()
+-                if g[1] is None:
+-                    return g[3], None
+-                else:
+-                    return g[2], g[1]
+-            raise ParseError("%s is not a item name" % text)
++            """Match ':role:`name`' or 'name'."""
++            m = self._func_rgx.match(text)
++            if not m:
++                raise ParseError("%s is not a item name" % text)
++            role = m.group('role')
++            name = m.group('name') if role else m.group('name2')
++            return name, role, m.end()
+ 
+-        def push_item(name, rest):
+-            if not name:
+-                return
+-            name, role = parse_item_name(name)
+-            items.append((name, list(rest), role))
+-            del rest[:]
+-
+-        current_func = None
+         rest = []
+-
+         for line in content:
+             if not line.strip():
+                 continue
+ 
+-            m = self._name_rgx.match(line)
+-            if m and line[m.end():].strip().startswith(':'):
+-                push_item(current_func, rest)
+-                current_func, line = line[:m.end()], line[m.end():]
+-                rest = [line.split(':', 1)[1].strip()]
+-                if not rest[0]:
+-                    rest = []
+-            elif not line.startswith(' '):
+-                push_item(current_func, rest)
+-                current_func = None
+-                if ',' in line:
+-                    for func in line.split(','):
+-                        if func.strip():
+-                            push_item(func, [])
+-                elif line.strip():
+-                    current_func = line
+-            elif current_func is not None:
++            line_match = self._line_rgx.match(line)
++            description = None
++            if line_match:
++                description = line_match.group('desc')
++                if line_match.group('trailing'):
++                    self._error_location(
++                        'Unexpected comma after function list at index %d of '
++                        'line "%s"' % (line_match.end('trailing'), line),
++                        error=False)
++            if not description and line.startswith(' '):
+                 rest.append(line.strip())
+-        push_item(current_func, rest)
++            elif line_match:
++                funcs = []
++                text = line_match.group('allfuncs')
++                while True:
++                    if not text.strip():
++                        break
++                    name, role, match_end = parse_item_name(text)
++                    funcs.append((name, role))
++                    text = text[match_end:].strip()
++                    if text and text[0] == ',':
++                        text = text[1:].strip()
++                rest = list(filter(None, [description]))
++                items.append((funcs, rest))
++            else:
++                raise ParseError("%s is not a item name" % line)
+         return items
+ 
+     def _parse_index(self, section, content):
+@@ -350,6 +381,9 @@ class NumpyDocString(Mapping):
+         if has_returns and has_yields:
+             msg = 'Docstring contains both a Returns and Yields section.'
+             raise ValueError(msg)
++        if not has_yields and 'Receives' in section_names:
++            msg = 'Docstring contains a Receives section but not Yields.'
++            raise ValueError(msg)
+ 
+         for (section, content) in sections:
+             if not section.startswith('..'):
+@@ -359,8 +393,8 @@ class NumpyDocString(Mapping):
+                     self._error_location("The section %s appears twice"
+                                          % section)
+ 
+-            if section in ('Parameters', 'Returns', 'Yields', 'Raises',
+-                           'Warns', 'Other Parameters', 'Attributes',
++            if section in ('Parameters', 'Returns', 'Yields', 'Receives',
++                           'Raises', 'Warns', 'Other Parameters', 'Attributes',
+                            'Methods'):
+                 self[section] = self._parse_param_list(content)
+             elif section.startswith('.. index::'):
+@@ -440,24 +474,30 @@ class NumpyDocString(Mapping):
+             return []
+         out = []
+         out += self._str_header("See Also")
++        out += ['']
+         last_had_desc = True
+-        for func, desc, role in self['See Also']:
+-            if role:
+-                link = ':%s:`%s`' % (role, func)
+-            elif func_role:
+-                link = ':%s:`%s`' % (func_role, func)
+-            else:
+-                link = "`%s`_" % func
+-            if desc or last_had_desc:
+-                out += ['']
+-                out += [link]
+-            else:
+-                out[-1] += ", %s" % link
++        for funcs, desc in self['See Also']:
++            assert isinstance(funcs, list)
++            links = []
++            for func, role in funcs:
++                if role:
++                    link = ':%s:`%s`' % (role, func)
++                elif func_role:
++                    link = ':%s:`%s`' % (func_role, func)
++                else:
++                    link = "`%s`_" % func
++                links.append(link)
++            link = ', '.join(links)
++            out += [link]
+             if desc:
+                 out += self._str_indent([' '.join(desc)])
+                 last_had_desc = True
+             else:
+                 last_had_desc = False
++                out += self._str_indent([self.empty_description])
++
++        if last_had_desc:
++            out += ['']
+         out += ['']
+         return out
+ 
+@@ -484,7 +524,7 @@ class NumpyDocString(Mapping):
+         out += self._str_signature()
+         out += self._str_summary()
+         out += self._str_extended_summary()
+-        for param_list in ('Parameters', 'Returns', 'Yields',
++        for param_list in ('Parameters', 'Returns', 'Yields', 'Receives',
+                            'Other Parameters', 'Raises', 'Warns'):
+             out += self._str_param_list(param_list)
+         out += self._str_section('Warnings')
+@@ -593,18 +633,25 @@ class ClassDoc(NumpyDocString):
+ 
+         NumpyDocString.__init__(self, doc)
+ 
+-        if config.get('show_class_members', True):
++        _members = config.get('members', [])
++        if _members is ALL:
++            _members = None
++        _exclude = config.get('exclude-members', [])
++        
++        if config.get('show_class_members', True) and _exclude is not ALL:
+             def splitlines_x(s):
+                 if not s:
+                     return []
+                 else:
+                     return s.splitlines()
+-
+             for field, items in [('Methods', self.methods),
+                                  ('Attributes', self.properties)]:
+                 if not self[field]:
+                     doc_list = []
+                     for name in sorted(items):
++                        if (name in _exclude or 
++                                (_members and name not in _members)):
++                            continue
+                         try:
+                             doc_item = pydoc.getdoc(getattr(self._cls, name))
+                             doc_list.append(
+diff --git a/numpydoc/docscrape_sphinx.py b/numpydoc/docscrape_sphinx.py
+index 4cc95d8..9b23235 100644
+--- a/numpydoc/docscrape_sphinx.py
++++ b/numpydoc/docscrape_sphinx.py
+@@ -374,6 +374,7 @@ class SphinxDocString(NumpyDocString):
+             'parameters': self._str_param_list('Parameters'),
+             'returns': self._str_returns('Returns'),
+             'yields': self._str_returns('Yields'),
++            'receives': self._str_returns('Receives'),
+             'other_parameters': self._str_param_list('Other Parameters'),
+             'raises': self._str_param_list('Raises'),
+             'warns': self._str_param_list('Warns'),
+diff --git a/numpydoc/numpydoc.py b/numpydoc/numpydoc.py
+index c8e676f..e25241d 100644
+--- a/numpydoc/numpydoc.py
++++ b/numpydoc/numpydoc.py
+@@ -27,8 +27,9 @@ try:
+ except ImportError:
+     from collections import Callable
+ import hashlib
++import itertools
+ 
+-from docutils.nodes import citation, Text, reference
++from docutils.nodes import citation, Text, section, comment, reference
+ import sphinx
+ from sphinx.addnodes import pending_xref, desc_content, only
+ 
+@@ -73,18 +74,39 @@ def rename_references(app, what, name, obj, options, lines):
+                                             sixu('.. [%s]') % new_r)
+ 
+ 
+-def _ascend(node, cls):
+-    while node and not isinstance(node, cls):
+-        node = node.parent
+-    return node
++def _is_cite_in_numpydoc_docstring(citation_node):
++    # Find DEDUPLICATION_TAG in comment as last node of sibling section
++
++    # XXX: I failed to use citation_node.traverse to do this:
++    section_node = citation_node.parent
++
++    def is_docstring_section(node):
++        return isinstance(node, (section, desc_content))
++
++    while not is_docstring_section(section_node):
++        section_node = section_node.parent
++        if section_node is None:
++            return False
++
++    sibling_sections = itertools.chain(section_node.traverse(is_docstring_section,
++                                                             include_self=True,
++                                                             descend=False,
++                                                             siblings=True))
++    for sibling_section in sibling_sections:
++        if not sibling_section.children:
++            continue
++        last_child = sibling_section.children[-1]
++        if not isinstance(last_child, comment):
++            continue
++        if last_child.rawsource.strip() == DEDUPLICATION_TAG.strip():
++            return True
++    return False
+ 
+ 
+ def relabel_references(app, doc):
+     # Change 'hash-ref' to 'ref' in label text
+     for citation_node in doc.traverse(citation):
+-        if _ascend(citation_node, desc_content) is None:
+-            # no desc node in ancestry -> not in a docstring
+-            # XXX: should we also somehow check it's in a References section?
++        if not _is_cite_in_numpydoc_docstring(citation_node):
+             continue
+         label_node = citation_node[0]
+         prefix, _, new_label = label_node[0].astext().partition('-')
+@@ -132,6 +154,7 @@ def mangle_docstrings(app, what, name, obj, options, lines):
+            app.config.numpydoc_show_inherited_class_members,
+            'class_members_toctree': app.config.numpydoc_class_members_toctree}
+ 
++    cfg.update(options or {})
+     u_NL = sixu('\n')
+     if what == 'module':
+         # Strip top title
+@@ -177,7 +200,7 @@ def mangle_signature(app, what, name, obj, options, sig, retann):
+ 
+     if not hasattr(obj, '__doc__'):
+         return
+-    doc = get_doc_object(obj)
++    doc = get_doc_object(obj, config={'show_class_members': False})
+     sig = doc['Signature'] or getattr(obj, '__text_signature__', None)
+     if sig:
+         sig = re.sub(sixu("^[^(]*"), sixu(""), sig)
+diff --git a/numpydoc/templates/numpydoc_docstring.rst b/numpydoc/templates/numpydoc_docstring.rst
+index 1900db5..79ab1f8 100644
+--- a/numpydoc/templates/numpydoc_docstring.rst
++++ b/numpydoc/templates/numpydoc_docstring.rst
+@@ -4,6 +4,7 @@
+ {{parameters}}
+ {{returns}}
+ {{yields}}
++{{receives}}
+ {{other_parameters}}
+ {{raises}}
+ {{warns}}

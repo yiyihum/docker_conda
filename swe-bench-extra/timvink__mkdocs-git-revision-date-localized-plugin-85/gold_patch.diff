@@ -1,0 +1,132 @@
+diff --git a/docs/available-variables.md b/docs/available-variables.md
+index 168bbb0..6843a92 100644
+--- a/docs/available-variables.md
++++ b/docs/available-variables.md
+@@ -32,11 +32,13 @@ To allow for more flexibility when overriding a theme there are also variables f
+ - `page.meta.git_revision_date_localized_raw_iso_date`
+ - `page.meta.git_revision_date_localized_raw_iso_datetime`
+ - `page.meta.git_revision_date_localized_raw_timeago`
++- `page.meta.git_revision_date_localized_raw_custom`
+ - `page.meta.git_site_revision_date_localized_raw_datetime`
+ - `page.meta.git_site_revision_date_localized_raw_iso_date`
+ - `page.meta.git_site_revision_date_localized_raw_date`
+ - `page.meta.git_site_revision_date_localized_raw_iso_datetime`
+ - `page.meta.git_site_revision_date_localized_raw_timeago`
++- `page.meta.git_site_revision_date_localized_raw_custom`
+ 
+ And if you've enabled creation date in the config:
+ 
+@@ -45,6 +47,7 @@ And if you've enabled creation date in the config:
+ - `page.meta.git_creation_date_localized_raw_iso_date`
+ - `page.meta.git_creation_date_localized_raw_iso_datetime`
+ - `page.meta.git_creation_date_localized_raw_timeago`
++- `page.meta.git_creation_date_localized_raw_custom`
+ 
+ !!! warning "timeago.js dependency"
+ 
+diff --git a/docs/options.md b/docs/options.md
+index 2f87302..666ae87 100644
+--- a/docs/options.md
++++ b/docs/options.md
+@@ -8,6 +8,7 @@ You can customize the plugin by setting options in `mkdocs.yml`. For example:
+   plugins:
+     - git-revision-date-localized:
+         type: timeago
++        custom_format: "%d. %B %Y"
+         timezone: Europe/Amsterdam
+         locale: en
+         fallback_to_build_date: false
+@@ -19,7 +20,7 @@ You can customize the plugin by setting options in `mkdocs.yml`. For example:
+ 
+ ## `type`
+ 
+-Default is `date`. The format of the date to be displayed. Valid values are `date`, `datetime`, `iso_date`, `iso_datetime` and `timeago`. Example outputs:
++Default is `date`. The format of the date to be displayed. Valid values are `date`, `datetime`, `iso_date`, `iso_datetime`, `timeago` and `custom`. Example outputs:
+ 
+ ```yaml
+ November 28, 2019           # type: date (default)
+@@ -27,8 +28,13 @@ November 28, 2019 13:57:28  # type: datetime
+ 2019-11-28                  # type: iso_date
+ 2019-11-28 13:57:26         # type: iso_datetime
+ 20 hours ago                # type: timeago
++28. November 2019           # type: custom
+ ```
+ 
++## `custom_format`
++
++Default is `%d. %B %Y`. The date format used when `type: custom`. Passed to python's `strftime`, see the [cheatsheat](https://strftime.org/) for details.
++
+ ## `timezone`
+ 
+ Default is `UTC`. Specify a time zone database name ([reference](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)). This option is especially relevant when using `type: datetime` and `type: iso_datetime`. Note that when using [timeago](http://timeago.yarp.com/) (with `type: timeago`) any difference in time zones between server and client will be handled automatically.
+diff --git a/mkdocs_git_revision_date_localized_plugin/plugin.py b/mkdocs_git_revision_date_localized_plugin/plugin.py
+index 9a3bdb3..9d609fc 100644
+--- a/mkdocs_git_revision_date_localized_plugin/plugin.py
++++ b/mkdocs_git_revision_date_localized_plugin/plugin.py
+@@ -37,6 +37,7 @@ class GitRevisionDateLocalizedPlugin(BasePlugin):
+         ("fallback_to_build_date", config_options.Type(bool, default=False)),
+         ("locale", config_options.Type(str, default=None)),
+         ("type", config_options.Type(str, default="date")),
++        ("custom_format", config_options.Type(str, default="%d. %B %Y")),
+         ("timezone", config_options.Type(str, default="UTC")),
+         ("exclude", config_options.Type(list, default=[])),
+         ("enable_creation_date", config_options.Type(bool, default=False)),
+@@ -61,7 +62,7 @@ class GitRevisionDateLocalizedPlugin(BasePlugin):
+         if not self.config.get('enabled'):
+             return config
+         
+-        assert self.config['type'] in ["date","datetime","iso_date","iso_datetime","timeago"]
++        assert self.config['type'] in ["date","datetime","iso_date","iso_datetime","timeago","custom"]
+ 
+         self.util = Util(config=self.config)
+ 
+@@ -195,7 +196,6 @@ class GitRevisionDateLocalizedPlugin(BasePlugin):
+         assert len(locale) == 2, "locale must be a 2 letter code, see https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes"
+         
+ 
+-
+         # Retrieve git commit timestamp
+         last_revision_timestamp = self.util.get_git_commit_timestamp(
+                 path=page.file.abs_src_path,
+diff --git a/mkdocs_git_revision_date_localized_plugin/util.py b/mkdocs_git_revision_date_localized_plugin/util.py
+index 8fbf847..c93a5bd 100644
+--- a/mkdocs_git_revision_date_localized_plugin/util.py
++++ b/mkdocs_git_revision_date_localized_plugin/util.py
+@@ -46,7 +46,7 @@ class Util:
+ 
+     @staticmethod
+     def _date_formats(
+-        unix_timestamp: float, locale: str = "en", time_zone: str = "UTC"
++        unix_timestamp: float, locale: str = "en", time_zone: str = "UTC", custom_format: str = "%d. %B %Y"
+     ) -> Dict[str, Any]:
+         """
+         Calculate different date formats / types.
+@@ -55,6 +55,7 @@ class Util:
+             unix_timestamp (float): A timestamp in seconds since 1970.
+             locale (str): Locale code of language to use. Defaults to 'en'.
+             time_zone (str): Timezone database name (https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
++            custom_format (str): strftime format specifier for the 'custom' type
+ 
+         Returns:
+             dict: Different date formats.
+@@ -77,8 +78,8 @@ class Util:
+             ),
+             "iso_date": loc_revision_date.strftime("%Y-%m-%d"),
+             "iso_datetime": loc_revision_date.strftime("%Y-%m-%d %H:%M:%S"),
+-            "timeago": '<span class="timeago" datetime="%s" locale="%s"></span>'
+-            % (loc_revision_date.isoformat(), locale),
++            "timeago": '<span class="timeago" datetime="%s" locale="%s"></span>' % (loc_revision_date.isoformat(), locale),
++            "custom": loc_revision_date.strftime(custom_format),
+         }
+ 
+     def get_git_commit_timestamp(
+@@ -195,7 +196,8 @@ class Util:
+         date_formats = self._date_formats(
+             unix_timestamp=commit_timestamp, 
+             time_zone=self.config.get("timezone"),
+-            locale=locale
++            locale=locale,
++            custom_format=self.config.get('custom_format')
+         )
+         if add_spans:
+             date_formats = self.add_spans(date_formats)

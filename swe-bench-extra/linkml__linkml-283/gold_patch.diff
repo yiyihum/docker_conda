@@ -1,0 +1,213 @@
+diff --git a/linkml/generators/jsonldcontextgen.py b/linkml/generators/jsonldcontextgen.py
+index 343874ff..d7067140 100644
+--- a/linkml/generators/jsonldcontextgen.py
++++ b/linkml/generators/jsonldcontextgen.py
+@@ -165,42 +165,6 @@ class ContextGenerator(Generator):
+         if slot_def:
+             self.context_body[underscore(aliased_slot_name)] = slot_def
+ 
+-    def add_prefix(self, ncname: str) -> None:
+-        """ Add a prefix to the list of prefixes to emit
+-
+-        @param ncname: name to add
+-        """
+-        if ncname not in self.namespaces:
+-            self.logger.warning(f"Unrecognized prefix: {ncname}")
+-            self.namespaces[ncname] = f"http://example.org/UNKNOWN/{ncname}/"
+-        self.emit_prefixes.add(self.namespaces._cased_key(ncname))
+-
+-    def add_mappings(self, defn: Definition) -> None:
+-        """
+-        Process any mappings in defn, adding all of the mappings prefixes to the namespace map
+-        :param defn: Class or Slot Definition
+-        """
+-        self.add_id_prefixes(defn)
+-        mappings = defn.mappings + defn.related_mappings + defn.close_mappings + \
+-                   defn.narrow_mappings + defn.broad_mappings + defn.exact_mappings
+-        for mapping in mappings:
+-            if '://' in mapping:
+-                mcurie = self.namespaces.curie_for(mapping)
+-                if mcurie is None:
+-                    self.logger.warning(f"No namespace defined for URI: {mapping}")
+-                    return        # Absolute path - no prefix/name
+-                else:
+-                    mapping = mcurie
+-            if ':' not in mapping or len(mapping.split(':')) != 2:
+-                raise ValueError(f"Definition {defn.name} - unrecognized mapping: {mapping}")
+-            ns = mapping.split(':')[0]
+-            self.add_prefix(ns)
+-
+-    def add_id_prefixes(self, element: Element) -> None:
+-        for id_prefix in element.id_prefixes:
+-            self.add_prefix(id_prefix)
+-
+-
+ @shared_arguments(ContextGenerator)
+ @click.command()
+ @click.option("--base", help="Base URI for model")
+diff --git a/linkml/generators/owlgen.py b/linkml/generators/owlgen.py
+index 868b7f1a..74ff2a4e 100644
+--- a/linkml/generators/owlgen.py
++++ b/linkml/generators/owlgen.py
+@@ -39,6 +39,7 @@ class OwlSchemaGenerator(Generator):
+             SchemaLoader(METAMODEL_YAML_URI, base_dir=META_BASE_URI, importmap=kwargs.get('importmap', None),
+                          mergeimports=self.merge_imports)
+         self.metamodel.resolve()
++        self.emit_prefixes: Set[str] = set()
+         self.top_value_uri: Optional[URIRef] = None
+         self.ontology_uri_suffix = ontology_uri_suffix
+ 
+@@ -119,6 +120,7 @@ class OwlSchemaGenerator(Generator):
+                     logging.warning(f'No URI for {m}')
+ 
+     def visit_class(self, cls: ClassDefinition) -> bool:
++        self.add_mappings(cls)
+         cls_uri = self._class_uri(cls.name)
+         self.add_metadata(cls, cls_uri)
+         self.graph.add((cls_uri, RDF.type, OWL.Class))
+@@ -235,6 +237,7 @@ class OwlSchemaGenerator(Generator):
+         @param slot:
+         @return:
+         """
++        self.add_mappings(slot)
+         # Note: We use the raw name in OWL and add a subProperty arc
+         slot_uri = self._prop_uri(slot.name)
+         self._add_element_properties(slot_uri, slot)
+diff --git a/linkml/generators/prefixmapgen.py b/linkml/generators/prefixmapgen.py
+index 7a4c04a9..0df2dd83 100644
+--- a/linkml/generators/prefixmapgen.py
++++ b/linkml/generators/prefixmapgen.py
+@@ -85,38 +85,8 @@ class PrefixGenerator(Generator):
+         # We don't bother to visit class slots - just all slots
+         return False
+ 
+-    def add_prefix(self, ncname: str) -> None:
+-        """ Add a prefix to the list of prefixes to emit
+-
+-        @param ncname: name to add
+-        """
+-        if ncname not in self.namespaces:
+-            self.logger.warning(f"Unrecognized prefix: {ncname}")
+-            self.namespaces[ncname] = f"http://example.org/UNKNOWN/{ncname}/"
+-        self.emit_prefixes.add(ncname)
+-
+-    def add_mappings(self, defn: Definition) -> None:
+-        """
+-        Process any mappings in defn, adding all of the mappings prefixes to the namespace map
+-        :param defn: Class or Slot Definition
+-        """
+-        self.add_id_prefixes(defn)
+-        for mapping in defn.mappings:
+-            if '://' in mapping:
+-                mcurie = self.namespaces.curie_for(mapping)
+-                self.logger.warning(f"No namespace defined for URI: {mapping}")
+-                if mcurie is None:
+-                    return        # Absolute path - no prefix/name
+-                else:
+-                    mapping = mcurie
+-            if ':' not in mapping or len(mapping.split(':')) != 2:
+-                raise ValueError(f"Definition {defn.name} - unrecognized mapping: {mapping}")
+-            ns = mapping.split(':')[0]
+-            self.add_prefix(ns)
+-
+-    def add_id_prefixes(self, element: Element) -> None:
+-        for id_prefix in element.id_prefixes:
+-            self.add_prefix(id_prefix)
++    def visit_slot(self,  aliased_slot_name: str, slot: SlotDefinition) -> None:
++        self.add_mappings(slot)
+ 
+ 
+ @shared_arguments(PrefixGenerator)
+diff --git a/linkml/generators/pythongen.py b/linkml/generators/pythongen.py
+index 7e250e76..a748e558 100644
+--- a/linkml/generators/pythongen.py
++++ b/linkml/generators/pythongen.py
+@@ -69,28 +69,6 @@ class PythonGenerator(Generator):
+             if type_prefix:
+                 self.emit_prefixes.add(type_prefix)
+ 
+-    def add_mappings(self, defn: Definition) -> None:
+-        """
+-        Process any mappings in defn, adding all of the mappings prefixes to the namespace map
+-        :param defn: Class or Slot Definition
+-        """
+-        self.add_id_prefixes(defn)
+-        for mapping in defn.mappings:
+-            if '://' in mapping:
+-                mcurie = self.namespaces.curie_for(mapping)
+-                self.logger.warning(f"No namespace defined for URI: {mapping}")
+-                if mcurie is None:
+-                    return        # Absolute path - no prefix/name
+-                else:
+-                    mapping = mcurie
+-            if ':' not in mapping or len(mapping.split(':')) != 2:
+-                raise ValueError(f"Definition {defn.name} - unrecognized mapping: {mapping}")
+-            ns = mapping.split(':')[0]
+-            self.emit_prefixes.add(ns)
+-
+-    def add_id_prefixes(self, element: Element) -> None:
+-        self.emit_prefixes.update(element.id_prefixes)
+-
+     def gen_schema(self) -> str:
+         # The metamodel uses Enumerations to define itself, so don't import if we are generating the metamodel
+         enumimports = '' if self.genmeta else \
+diff --git a/linkml/utils/generator.py b/linkml/utils/generator.py
+index 52e58d76..cfd44f7e 100644
+--- a/linkml/utils/generator.py
++++ b/linkml/utils/generator.py
+@@ -9,7 +9,7 @@ from click import Command, Argument, Option
+ 
+ from linkml_runtime.linkml_model.meta import SchemaDefinition, ClassDefinition, SlotDefinition, ClassDefinitionName, \
+     TypeDefinition, Element, SlotDefinitionName, TypeDefinitionName, PrefixPrefixPrefix, ElementName, \
+-    SubsetDefinition, SubsetDefinitionName, EnumDefinition, EnumDefinitionName
++    SubsetDefinition, SubsetDefinitionName, EnumDefinition, EnumDefinitionName, Definition
+ from linkml_runtime.utils.formatutils import camelcase, underscore
+ from linkml.utils.mergeutils import alias_root
+ from linkml.utils.schemaloader import SchemaLoader
+@@ -561,6 +561,46 @@ class Generator(metaclass=abc.ABCMeta):
+         return [slot for slot in [self.schema.slots[sn] for sn in cls.slots] if cls.name in slot.domain_of or
+                 (set(cls.mixins).intersection(slot.domain_of))]
+ 
++    def add_mappings(self, defn: Definition) -> None:
++        """
++        Process any mappings in defn, adding all of the mappings prefixes to the namespace map
++        :param defn: Class or Slot Definition
++        """
++        self.add_id_prefixes(defn)
++        mappings = defn.mappings + defn.related_mappings + defn.close_mappings + \
++                   defn.narrow_mappings + defn.broad_mappings + defn.exact_mappings
++        # see https://github.com/linkml/linkml/pull/283
++        #if isinstance(defn, ClassDefinition):
++        #    mappings.append(defn.class_uri)
++        #if isinstance(defn, SlotDefinition):
++        #    mappings.append(defn.slot_uri)
++        for mapping in mappings:
++            if '://' in mapping:
++                mcurie = self.namespaces.curie_for(mapping)
++                if mcurie is None:
++                    self.logger.warning(f"No namespace defined for URI: {mapping}")
++                    return        # Absolute path - no prefix/name
++                else:
++                    mapping = mcurie
++            if ':' not in mapping or len(mapping.split(':')) != 2:
++                raise ValueError(f"Definition {defn.name} - unrecognized mapping: {mapping}")
++            ns = mapping.split(':')[0]
++            self.add_prefix(ns)
++
++    def add_id_prefixes(self, element: Element) -> None:
++        for id_prefix in element.id_prefixes:
++            self.add_prefix(id_prefix)
++
++    def add_prefix(self, ncname: str) -> None:
++        """ Add a prefix to the list of prefixes to emit
++
++        @param ncname: name to add
++        """
++        if ncname not in self.namespaces:
++            self.logger.warning(f"Unrecognized prefix: {ncname}")
++            self.namespaces[ncname] = f"http://example.org/UNKNOWN/{ncname}/"
++        self.emit_prefixes.add(ncname)
++
+ 
+ def shared_arguments(g: Type[Generator]) -> Callable[[Command], Command]:
+     _LOG_LEVEL_STRINGS = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']

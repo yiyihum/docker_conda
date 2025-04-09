@@ -1,0 +1,162 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b364ebf..475799a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## [7.1.0] - 2023-04-19
++### Added
++- You can now configure `retry_spec` and `timeout_spec` at the endpoint level. Calls to endpoints may override the endpoint-level configuration when necessary.
++
+ ## [7.0.0] - 2022-12-07
+ ### Fixed
+ - Ensure `py.typed` files end up in binary wheel distribution, which may break type checking for consumers
+diff --git a/setup.cfg b/setup.cfg
+index 42cfc74..2d7482a 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,6 +1,6 @@
+ [metadata]
+ name = apiron
+-version = 7.0.0
++version = 7.1.0
+ description = apiron helps you cook a tasty client for RESTful APIs. Just don't wash it with SOAP.
+ author = Ithaka Harbors, Inc.
+ author_email = opensource@ithaka.org
+@@ -75,7 +75,7 @@ skip_covered = True
+ [coverage:paths]
+ source =
+     src
+-    .tox/*/site-packages
++    .tox/**/site-packages
+ 
+ [tool:pytest]
+ testpaths = tests
+diff --git a/src/apiron/client.py b/src/apiron/client.py
+index 4667942..68a91c7 100644
+--- a/src/apiron/client.py
++++ b/src/apiron/client.py
+@@ -137,6 +137,14 @@ def _get_guaranteed_session(session: Optional[requests.Session]) -> requests.Ses
+     return requests.Session()
+ 
+ 
++def _get_retry_spec(endpoint: apiron.Endpoint, retry_spec: Optional[retry.Retry] = None) -> retry.Retry:
++    return retry_spec or endpoint.retry_spec or DEFAULT_RETRY
++
++
++def _get_timeout_spec(endpoint: apiron.Endpoint, timeout_spec: Optional[Timeout] = None) -> Timeout:
++    return timeout_spec or endpoint.timeout_spec or DEFAULT_TIMEOUT
++
++
+ def call(
+     service: apiron.Service,
+     endpoint: apiron.Endpoint,
+@@ -150,8 +158,8 @@ def call(
+     cookies: Optional[Dict[str, Any]] = None,
+     auth: Optional[Any] = None,
+     encoding: Optional[str] = None,
+-    retry_spec: retry.Retry = DEFAULT_RETRY,
+-    timeout_spec: Timeout = DEFAULT_TIMEOUT,
++    retry_spec: Optional[retry.Retry] = None,
++    timeout_spec: Optional[Timeout] = None,
+     logger: Optional[logging.Logger] = None,
+     allow_redirects: bool = True,
+     return_raw_response_object: Optional[bool] = None,
+@@ -200,11 +208,11 @@ def call(
+     :param urllib3.util.retry.Retry retry_spec:
+         (optional)
+         An override of the retry behavior for this call.
+-        (default ``Retry(total=1, connect=1, read=1, status_forcelist=[500-level status codes])``)
++        (default ``None``)
+     :param Timeout timeout_spec:
+         (optional)
+         An override of the timeout behavior for this call.
+-        (default ``Timeout(connection_timeout=1, read_timeout=3)``)
++        (default ``None``)
+     :param logging.Logger logger:
+         (optional)
+         An existing logger for logging from the proper caller for better correlation
+@@ -229,7 +237,10 @@ def call(
+ 
+     managing_session = not session
+     guaranteed_session = _get_guaranteed_session(session)
+-    adapted_session = _adapt_session(guaranteed_session, adapters.HTTPAdapter(max_retries=retry_spec))
++
++    retry_spec_to_use = _get_retry_spec(endpoint, retry_spec)
++
++    adapted_session = _adapt_session(guaranteed_session, adapters.HTTPAdapter(max_retries=retry_spec_to_use))
+ 
+     method = method or endpoint.default_method
+ 
+@@ -252,9 +263,11 @@ def call(
+ 
+     logger.info("%s %s", method, request.url)
+ 
++    timeout_spec_to_use = _get_timeout_spec(endpoint, timeout_spec)
++
+     response = adapted_session.send(
+         request,
+-        timeout=(timeout_spec.connection_timeout, timeout_spec.read_timeout),
++        timeout=(timeout_spec_to_use.connection_timeout, timeout_spec_to_use.read_timeout),
+         stream=getattr(endpoint, "streaming", False),
+         allow_redirects=allow_redirects,
+         proxies=adapted_session.proxies or service.proxies,
+diff --git a/src/apiron/endpoint/endpoint.py b/src/apiron/endpoint/endpoint.py
+index 22afba7..5d04f4f 100644
+--- a/src/apiron/endpoint/endpoint.py
++++ b/src/apiron/endpoint/endpoint.py
+@@ -7,7 +7,7 @@ import warnings
+ from functools import partial, update_wrapper
+ from typing import Optional, Any, Callable, Dict, Iterable, List, TypeVar, Union, TYPE_CHECKING
+ 
+-if TYPE_CHECKING:
++if TYPE_CHECKING:  # pragma: no cover
+     if sys.version_info >= (3, 10):
+         from typing import Concatenate, ParamSpec
+     else:
+@@ -19,8 +19,9 @@ if TYPE_CHECKING:
+     R = TypeVar("R")
+ 
+ import requests
++from urllib3.util import retry
+ 
+-from apiron import client
++from apiron import client, Timeout
+ from apiron.exceptions import UnfulfilledParameterException
+ 
+ 
+@@ -55,6 +56,8 @@ class Endpoint:
+         default_params: Optional[Dict[str, Any]] = None,
+         required_params: Optional[Iterable[str]] = None,
+         return_raw_response_object: bool = False,
++        timeout_spec: Optional[Timeout] = None,
++        retry_spec: Optional[retry.Retry] = None,
+     ):
+         """
+         :param str path:
+@@ -72,6 +75,14 @@ class Endpoint:
+             Whether to return a :class:`requests.Response` object or call :func:`format_response` on it first.
+             This can be overridden when calling the endpoint.
+             (Default ``False``)
++        :param Timeout timeout_spec:
++            (optional)
++            An override of the timeout behavior for calls to this endpoint.
++            (default ``None``)
++        :param urllib3.util.retry.Retry retry_spec:
++            (optional)
++            An override of the retry behavior for calls to this endpoint.
++            (default ``None``)
+         """
+         self.default_method = default_method
+ 
+@@ -87,6 +98,8 @@ class Endpoint:
+         self.default_params = default_params or {}
+         self.required_params = required_params or set()
+         self.return_raw_response_object = return_raw_response_object
++        self.timeout_spec = timeout_spec
++        self.retry_spec = retry_spec
+ 
+     def format_response(self, response: requests.Response) -> Union[str, Dict[str, Any], Iterable[bytes]]:
+         """

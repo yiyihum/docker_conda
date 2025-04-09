@@ -1,0 +1,178 @@
+diff --git a/dvc/command/get.py b/dvc/command/get.py
+--- a/dvc/command/get.py
++++ b/dvc/command/get.py
+@@ -31,7 +31,9 @@ def run(self):
+ 
+ 
+ def add_parser(subparsers, parent_parser):
+-    GET_HELP = "Download/copy files or directories from DVC repository."
++    GET_HELP = (
++        "Download a file or directory from any DVC project or Git repository."
++    )
+     get_parser = subparsers.add_parser(
+         "get",
+         parents=[parent_parser],
+@@ -40,18 +42,17 @@ def add_parser(subparsers, parent_parser):
+         formatter_class=argparse.RawDescriptionHelpFormatter,
+     )
+     get_parser.add_argument(
+-        "url", help="URL of Git repository with DVC project to download from."
++        "url",
++        help="Location of DVC project or Git repository to download from",
+     )
+     get_parser.add_argument(
+-        "path", help="Path to a file or directory within a DVC repository."
++        "path",
++        help="Path to a file or directory within the project or repository",
+     )
+     get_parser.add_argument(
+-        "-o",
+-        "--out",
+-        nargs="?",
+-        help="Destination path to copy/download files to.",
++        "-o", "--out", nargs="?", help="Destination path to download files to"
+     )
+     get_parser.add_argument(
+-        "--rev", nargs="?", help="DVC repository git revision."
++        "--rev", nargs="?", help="Git revision (e.g. branch, tag, SHA)"
+     )
+     get_parser.set_defaults(func=CmdGet)
+diff --git a/dvc/command/imp.py b/dvc/command/imp.py
+--- a/dvc/command/imp.py
++++ b/dvc/command/imp.py
+@@ -30,7 +30,8 @@ def run(self):
+ 
+ def add_parser(subparsers, parent_parser):
+     IMPORT_HELP = (
+-        "Download data from DVC repository and take it under DVC control."
++        "Download a file or directory from any DVC project or Git repository"
++        "and take it under DVC control."
+     )
+ 
+     import_parser = subparsers.add_parser(
+@@ -41,15 +42,17 @@ def add_parser(subparsers, parent_parser):
+         formatter_class=argparse.RawTextHelpFormatter,
+     )
+     import_parser.add_argument(
+-        "url", help="URL of Git repository with DVC project to download from."
++        "url",
++        help="Location of DVC project or Git repository to download from",
+     )
+     import_parser.add_argument(
+-        "path", help="Path to data within DVC repository."
++        "path",
++        help="Path to a file or directory within the project or repository",
+     )
+     import_parser.add_argument(
+-        "-o", "--out", nargs="?", help="Destination path to put data to."
++        "-o", "--out", nargs="?", help="Destination path to download files to"
+     )
+     import_parser.add_argument(
+-        "--rev", nargs="?", help="DVC repository git revision."
++        "--rev", nargs="?", help="Git revision (e.g. branch, tag, SHA)"
+     )
+     import_parser.set_defaults(func=CmdImport)
+diff --git a/dvc/exceptions.py b/dvc/exceptions.py
+--- a/dvc/exceptions.py
++++ b/dvc/exceptions.py
+@@ -240,11 +240,6 @@ def __init__(self, ignore_dirname):
+         )
+ 
+ 
+-class UrlNotDvcRepoError(DvcException):
+-    def __init__(self, url):
+-        super().__init__("URL '{}' is not a dvc repository.".format(url))
+-
+-
+ class GitHookAlreadyExistsError(DvcException):
+     def __init__(self, hook_name):
+         super().__init__(
+diff --git a/dvc/repo/get.py b/dvc/repo/get.py
+--- a/dvc/repo/get.py
++++ b/dvc/repo/get.py
+@@ -7,10 +7,9 @@
+     DvcException,
+     NotDvcRepoError,
+     OutputNotFoundError,
+-    UrlNotDvcRepoError,
+     PathMissingError,
+ )
+-from dvc.external_repo import external_repo
++from dvc.external_repo import external_repo, cached_clone
+ from dvc.path_info import PathInfo
+ from dvc.stage import Stage
+ from dvc.utils import resolve_output
+@@ -42,37 +41,47 @@ def get(url, path, out=None, rev=None):
+     # and won't work with reflink/hardlink.
+     dpath = os.path.dirname(os.path.abspath(out))
+     tmp_dir = os.path.join(dpath, "." + str(shortuuid.uuid()))
++    repo_dir = None
+     try:
+-        with external_repo(cache_dir=tmp_dir, url=url, rev=rev) as repo:
+-            # Try any links possible to avoid data duplication.
+-            #
+-            # Not using symlink, because we need to remove cache after we are
+-            # done, and to make that work we would have to copy data over
+-            # anyway before removing the cache, so we might just copy it
+-            # right away.
+-            #
+-            # Also, we can't use theoretical "move" link type here, because
+-            # the same cache file might be used a few times in a directory.
+-            repo.cache.local.cache_types = ["reflink", "hardlink", "copy"]
+-
+-            try:
+-                output = repo.find_out_by_relpath(path)
+-            except OutputNotFoundError:
+-                output = None
+-
+-            if output and output.use_cache:
+-                _get_cached(repo, output, out)
+-            else:
++        try:
++            with external_repo(cache_dir=tmp_dir, url=url, rev=rev) as repo:
++                # Try any links possible to avoid data duplication.
++                #
++                # Not using symlink, because we need to remove cache after we
++                # are done, and to make that work we would have to copy data
++                # over anyway before removing the cache, so we might just copy
++                # it right away.
++                #
++                # Also, we can't use theoretical "move" link type here, because
++                # the same cache file might be used a few times in a directory.
++                repo.cache.local.cache_types = ["reflink", "hardlink", "copy"]
++
++                try:
++                    output = repo.find_out_by_relpath(path)
++                except OutputNotFoundError:
++                    output = None
++
++                if output and output.use_cache:
++                    _get_cached(repo, output, out)
++                    return
++
+                 # Either an uncached out with absolute path or a user error
+-                if os.path.isabs(path):
+-                    raise FileNotFoundError
+ 
+-                fs_copy(os.path.join(repo.root_dir, path), out)
++                repo_dir = repo.root_dir
++
++        except NotDvcRepoError:
++            # Not a DVC repository, continue below and copy from git
++            pass
++
++        if os.path.isabs(path):
++            raise FileNotFoundError
++
++        if not repo_dir:
++            repo_dir = cached_clone(url, rev=rev)
+ 
++        fs_copy(os.path.join(repo_dir, path), out)
+     except (OutputNotFoundError, FileNotFoundError):
+         raise PathMissingError(path, url)
+-    except NotDvcRepoError:
+-        raise UrlNotDvcRepoError(url)
+     finally:
+         remove(tmp_dir)
+ 
+

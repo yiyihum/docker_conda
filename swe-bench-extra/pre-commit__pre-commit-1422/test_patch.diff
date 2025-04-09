@@ -1,0 +1,75 @@
+diff --git a/testing/util.py b/testing/util.py
+index 439bee7..19500f6 100644
+--- a/testing/util.py
++++ b/testing/util.py
+@@ -103,10 +103,12 @@ def cwd(path):
+         os.chdir(original_cwd)
+ 
+ 
+-def git_commit(*args, fn=cmd_output, msg='commit!', **kwargs):
++def git_commit(*args, fn=cmd_output, msg='commit!', all_files=True, **kwargs):
+     kwargs.setdefault('stderr', subprocess.STDOUT)
+ 
+-    cmd = ('git', 'commit', '--allow-empty', '--no-gpg-sign', '-a') + args
++    cmd = ('git', 'commit', '--allow-empty', '--no-gpg-sign', *args)
++    if all_files:  # allow skipping `-a` with `all_files=False`
++        cmd += ('-a',)
+     if msg is not None:  # allow skipping `-m` with `msg=None`
+         cmd += ('-m', msg)
+     ret, out, _ = fn(*cmd, **kwargs)
+diff --git a/tests/commands/install_uninstall_test.py b/tests/commands/install_uninstall_test.py
+index 6d75e68..5809a3f 100644
+--- a/tests/commands/install_uninstall_test.py
++++ b/tests/commands/install_uninstall_test.py
+@@ -789,6 +789,37 @@ def test_post_checkout_integration(tempdir_factory, store):
+         assert 'some_file' not in stderr
+ 
+ 
++def test_skips_post_checkout_unstaged_changes(tempdir_factory, store):
++    path = git_dir(tempdir_factory)
++    config = {
++        'repo': 'local',
++        'hooks': [{
++            'id': 'fail',
++            'name': 'fail',
++            'entry': 'fail',
++            'language': 'fail',
++            'always_run': True,
++            'stages': ['post-checkout'],
++        }],
++    }
++    write_config(path, config)
++    with cwd(path):
++        cmd_output('git', 'add', '.')
++        _get_commit_output(tempdir_factory)
++
++        install(C.CONFIG_FILE, store, hook_types=['pre-commit'])
++        install(C.CONFIG_FILE, store, hook_types=['post-checkout'])
++
++        # make an unstaged change so staged_files_only fires
++        open('file', 'a').close()
++        cmd_output('git', 'add', 'file')
++        with open('file', 'w') as f:
++            f.write('unstaged changes')
++
++        retc, out = _get_commit_output(tempdir_factory, all_files=False)
++        assert retc == 0
++
++
+ def test_prepare_commit_msg_integration_failing(
+         failing_prepare_commit_msg_repo, tempdir_factory, store,
+ ):
+diff --git a/tests/commands/run_test.py b/tests/commands/run_test.py
+index c51bcff..2fffdb9 100644
+--- a/tests/commands/run_test.py
++++ b/tests/commands/run_test.py
+@@ -1022,3 +1022,9 @@ def test_args_hook_only(cap_out, store, repo_with_passing_hook):
+         run_opts(hook='do_not_commit'),
+     )
+     assert b'identity-copy' not in printed
++
++
++def test_skipped_without_any_setup_for_post_checkout(in_git_dir, store):
++    environ = {'_PRE_COMMIT_SKIP_POST_CHECKOUT': '1'}
++    opts = run_opts(hook_stage='post-checkout')
++    assert run(C.CONFIG_FILE, store, opts, environ=environ) == 0

@@ -1,0 +1,88 @@
+diff --git a/src/elcaminoreal/_gather.py b/src/elcaminoreal/_gather.py
+index 63f85a9..cbe7637 100644
+--- a/src/elcaminoreal/_gather.py
++++ b/src/elcaminoreal/_gather.py
+@@ -24,12 +24,13 @@ class Commands(object):
+     def command(self,
+                 name=None,
+                 parser=caparg.command(''),
+-                dependencies=pyrsistent.v()):
++                dependencies=pyrsistent.v(),
++                regular=False):
+         """
+         Register as a command.
+ 
+         """
+-        transform = gather.Wrapper.glue((dependencies, parser))
++        transform = gather.Wrapper.glue((dependencies, parser, regular))
+         ret = self._command_collector.register(name, transform=transform)
+         return ret
+ 
+@@ -47,20 +48,27 @@ class Commands(object):
+         parsed = command.parse(args)
+         subcommand = ' '.join(parsed['__caparg_subcommand__'])
+         func = collection[subcommand].original
+-        dependencies, _ignored = collection[subcommand].extra
++        dependencies, _ignored, regular = collection[subcommand].extra
+         graph = self.mkgraph(dependencies)
+         graph.update(override_dependencies)
+-        return func(parsed, graph)
++        if not regular:
++            return func(parsed, graph)
++        args = {dependency: graph[dependency]
++                for dependency in dependencies}
++        args.update(parsed)
++        del args['__caparg_subcommand__']
++        return func(**args)
+ 
+     def dependency(self,
+                    name=None,
+                    dependencies=pyrsistent.v(),
+-                   possible_dependencies=pyrsistent.v()):
++                   possible_dependencies=pyrsistent.v(),
++                   regular=False):
+         """
+         Register as a dependency.
+ 
+         """
+-        glue = (dependencies, possible_dependencies)
++        glue = (dependencies, possible_dependencies, regular)
+         transform = gather.Wrapper.glue(glue)
+         ret = self._collector.register(name, transform=transform)
+         return ret
+@@ -83,14 +91,20 @@ class Commands(object):
+             on_route = on_route.add(thing)
+             plugin = collection[thing]
+             func = plugin.original
+-            dependencies, possible_dependencies = plugin.extra
++            dependencies, possible_dependencies, regular = plugin.extra
+             my_dependencies, my_possible_dependencies = {}, {}
+             for other_thing in dependencies:
+                 my_dependencies[other_thing] = _build(other_thing, on_route)
+             for other_thing in possible_dependencies:
+                 builder = functools.partial(_build, other_thing, on_route)
+                 my_possible_dependencies[other_thing] = builder
+-            ret[thing] = func(my_dependencies, my_possible_dependencies)
++            if regular:
++                args = {'build_' + key: value
++                        for key, value in my_possible_dependencies.items()}
++                args.update(my_dependencies)
++                ret[thing] = func(**args)
++            else:
++                ret[thing] = func(my_dependencies, my_possible_dependencies)
+             return ret[thing]
+         for thing in things:
+             _build(thing)
+diff --git a/tox.ini b/tox.ini
+index 0ef3c06..297cc23 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -30,7 +30,7 @@ commands =
+     # E0704 -- bare raise outside except (rare, when it's done I mean it)
+     # R0201 -- unused self in methods (methods can be used for polymorphism)
+     # R0903 -- too few public methods (attrs-based classes have implicit ones)
+-    py27-lint: pylint --disable=unsupported-assignment-operation --disable=no-member --disable=not-callable --disable=unsubscriptable-object --disable=E0704 --disable=R0903 --disable=R0201 src/elcaminoreal
++    py27-lint: pylint --disable=blacklisted-name --disable=unsupported-assignment-operation --disable=no-member --disable=not-callable --disable=unsubscriptable-object --disable=E0704 --disable=R0903 --disable=R0201 src/elcaminoreal
+     py27-lint: flake8 src/elcaminoreal
+     #{py27,pypy,py36,py35}-func: python -m elcaminoreal.example selftest
+     #{py27,pypy,py35}-func: python -m elcaminoreal.example selftest

@@ -1,0 +1,105 @@
+diff --git a/requirements/test.txt b/requirements/test.txt
+index f2fa609..c6cc811 100644
+--- a/requirements/test.txt
++++ b/requirements/test.txt
+@@ -1,5 +1,4 @@
+ pytest
+ pytest-cov
+ pytest-sugar
+-pytest-watch
+ mock; python_version < '3'
+diff --git a/tests/core/test_logging_hook.py b/tests/core/test_logging_hook.py
+new file mode 100644
+index 0000000..02ea23f
+--- /dev/null
++++ b/tests/core/test_logging_hook.py
+@@ -0,0 +1,32 @@
++# coding=utf-8
++from __future__ import absolute_import, division, print_function, unicode_literals
++
++import logging
++import sys
++
++import pytest
++
++from alive_progress.core.logging_hook import install_logging_hook, uninstall_logging_hook
++
++
++@pytest.fixture
++def all_handlers():
++    handler = logging.StreamHandler(sys.stderr)
++    nope = logging.FileHandler('/dev/null', delay=True)
++    [logging.root.addHandler(h) for h in (handler, nope)]
++    yield handler, nope
++    [logging.root.removeHandler(h) for h in (handler, nope)]
++
++
++def test_install(all_handlers):
++    handler, nope = all_handlers
++    changed = install_logging_hook()
++    assert handler.stream == sys.stdout
++    assert nope.stream is None
++    assert changed == {handler: sys.stderr}
++
++
++def test_uninstall(all_handlers):
++    handler, _ = all_handlers
++    uninstall_logging_hook({handler: sys.stderr})
++    assert handler.stream == sys.stderr
+diff --git a/tests/core/test_utils.py b/tests/core/test_utils.py
+index 07be92f..1620500 100644
+--- a/tests/core/test_utils.py
++++ b/tests/core/test_utils.py
+@@ -1,22 +1,48 @@
+ # coding=utf-8
+ from __future__ import absolute_import, division, print_function, unicode_literals
+ 
++import sys
++
+ import pytest
+ 
+-from alive_progress.core.utils import render_title, sanitize_text
++from alive_progress.core.utils import render_title, sanitize_text_marking_wide_chars, ZWJ
+ 
+ 
+ @pytest.mark.parametrize('text, expected', [
+     ('', ''),
+-    (None, 'None'),
++    (None, ''),
+     ('\n', ''),
++    (' \n ', ''),
++    ('\n \n', ''),
+     ('asd\n', 'asd'),
+     ('\nasd', 'asd'),
+     ('asd1\nasd2', 'asd1 asd2'),
+     ('\nasd1\n\n\nasd2\n', 'asd1 asd2'),
+ ])
+-def test_sanitize_text(text, expected):
+-    assert sanitize_text(text) == expected
++def test_sanitize_text_normal_chars(text, expected):
++    result = sanitize_text_marking_wide_chars(text)
++    assert result.replace(ZWJ, 'X') == expected
++
++
++if sys.version_info >= (3, 6):
++    # 2.7 doesn't mark those chars as Wide (ucd 5.2), so this test fails.
++    #   -> but curiously it does work in terminal, since they are encoded with 2 bytes.
++    # 3.5 doesn't mark those chars as Wide either (ucd 8.0), so this test also fails.
++    #   -> and here it doesn't work in terminal, since they are encoded with 1 byte.
++    # more details in https://github.com/rsalmei/alive-progress/issues/19#issuecomment-657120695
++    @pytest.mark.parametrize('text, expected', [
++        ('😺', 'X😺'),
++        ('\n😺', 'X😺'),
++        ('😺 \n 😺', 'X😺 X😺'),
++        ('\n 😺\n😺', 'X😺 X😺'),
++        ('asd😺\n', 'asdX😺'),
++        ('😺\nasd', 'X😺 asd'),
++        ('asd1\nasd2😺', 'asd1 asd2X😺'),
++        ('\nasd1😺\n😺\n\nasd2\n', 'asd1X😺 X😺 asd2'),
++    ])
++    def test_sanitize_text_wide_chars(text, expected):
++        result = sanitize_text_marking_wide_chars(text)
++        assert result.replace(ZWJ, 'X') == expected
+ 
+ 
+ @pytest.mark.parametrize('text, length, expected', [

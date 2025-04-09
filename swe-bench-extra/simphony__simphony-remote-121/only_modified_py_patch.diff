@@ -1,0 +1,333 @@
+diff --git a/remoteappmanager/application.py b/remoteappmanager/application.py
+index 7666a2a..abfcecf 100644
+--- a/remoteappmanager/application.py
++++ b/remoteappmanager/application.py
+@@ -19,6 +19,7 @@ from remoteappmanager.services.reverse_proxy import ReverseProxy
+ from remoteappmanager import rest
+ from remoteappmanager.rest import registry
+ from remoteappmanager import restresources
++from remoteappmanager.utils import url_path_join
+ 
+ 
+ class Application(web.Application, LoggingMixin):
+@@ -103,7 +104,6 @@ class Application(web.Application, LoggingMixin):
+         return ReverseProxy(
+             endpoint_url=self.command_line_config.proxy_api_url,
+             auth_token=auth_token,
+-            base_urlpath=self.command_line_config.base_urlpath
+         )
+ 
+     @default("hub")
+@@ -149,6 +149,16 @@ class Application(web.Application, LoggingMixin):
+ 
+         tornado.ioloop.IOLoop.current().start()
+ 
++    def urlpath_for_object(self, object):
++        """
++        Resolves the absolute url path of a given object.
++        The object must have a urlpath property.
++        """
++
++        return url_path_join(
++            self.command_line_config.base_urlpath,
++            object.urlpath)
++
+     # Private
+     def _get_handlers(self):
+         """Returns the registered handlers"""
+diff --git a/remoteappmanager/handlers/home_handler.py b/remoteappmanager/handlers/home_handler.py
+index c1648de..c21824b 100644
+--- a/remoteappmanager/handlers/home_handler.py
++++ b/remoteappmanager/handlers/home_handler.py
+@@ -1,6 +1,5 @@
+ import socket
+ import os
+-import uuid
+ from datetime import timedelta
+ 
+ import errno
+@@ -45,12 +44,11 @@ class HomeHandler(BaseHandler):
+ 
+         try:
+             yield handler(options)
+-        except Exception as e:
++        except Exception as exc:
+             # Create a random reference number for support
+-            ref = str(uuid.uuid1())
+-            self.log.exception("Failed with POST action: {0}. {1} "
+-                               "Ref: {2}".format(
+-                                   action, str(e), ref))
++            ref = self.log.issue(
++                "Failed with POST action {}".format(action),
++                exc)
+ 
+             images_info = yield self._get_images_info()
+ 
+@@ -63,7 +61,7 @@ class HomeHandler(BaseHandler):
+                         images_info=images_info,
+                         error_message=message.format(
+                             action=action,
+-                            error_type=type(e).__name__,
++                            error_type=type(exc).__name__,
+                             ref=ref))
+ 
+     # Subhandling after post
+@@ -112,7 +110,11 @@ class HomeHandler(BaseHandler):
+ 
+         # The server is up and running. Now contact the proxy and add
+         # the container url to it.
+-        urlpath = yield self.application.reverse_proxy.add_container(container)
++        urlpath = url_path_join(
++            self.application.command_line_config.base_urlpath,
++            container.urlpath)
++        yield self.application.reverse_proxy.register(
++            urlpath, container.host_url)
+ 
+         # Redirect the user
+         self.log.info('Redirecting to {}'.format(urlpath))
+@@ -136,7 +138,11 @@ class HomeHandler(BaseHandler):
+         yield self._wait_for_container_ready(container)
+ 
+         # in case the reverse proxy is not already set up
+-        urlpath = yield self.application.reverse_proxy.add_container(container)
++        urlpath = url_path_join(
++            self.application.command_line_config.base_urlpath,
++            container.urlpath)
++        yield self.application.reverse_proxy.register(
++            urlpath, container.host_url)
+ 
+         self.log.info('Redirecting to {}'.format(urlpath))
+         self.redirect(urlpath)
+@@ -155,13 +161,10 @@ class HomeHandler(BaseHandler):
+             self.finish("Unable to view the application")
+             return
+ 
+-        try:
+-            yield app.reverse_proxy.remove_container(container)
+-        except HTTPError as http_error:
+-            # The reverse proxy may be absent to start with
+-            if http_error.code != 404:
+-                raise http_error
+-
++        urlpath = url_path_join(
++            self.application.command_line_config.base_urlpath,
++            container.urlpath)
++        yield app.reverse_proxy.unregister(urlpath)
+         yield container_manager.stop_and_remove_container(container.docker_id)
+ 
+         # We don't have fancy stuff at the moment to change the button, so
+diff --git a/remoteappmanager/logging/logging_mixin.py b/remoteappmanager/logging/logging_mixin.py
+index 6339a43..fddc6f6 100644
+--- a/remoteappmanager/logging/logging_mixin.py
++++ b/remoteappmanager/logging/logging_mixin.py
+@@ -1,3 +1,6 @@
++import uuid
++import types
++
+ from traitlets import (
+     HasTraits,
+     Instance,
+@@ -5,6 +8,25 @@ from traitlets import (
+ )
+ 
+ 
++def issue(self, message, exc=None):
++    """Accepts a message that will be logged with an additional reference
++    code for easy log lookup.
++
++    The identifier will be returned for inclusion in user-visible
++    error messages.
++    """
++    ref = str(uuid.uuid1())
++
++    if exc is None:
++        err_message = "{}. Ref: {}".format(message, ref)
++    else:
++        err_message = "{} : {}. Ref: {}".format(
++            message, str(exc), ref)
++
++    self.error(err_message)
++    return ref
++
++
+ class LoggingMixin(HasTraits):
+     """A HasTrait class that provides logging. Used as a mixin.
+     """
+@@ -13,5 +35,9 @@ class LoggingMixin(HasTraits):
+ 
+     @default('log')
+     def _log_default(self):
+-        from traitlets import log
+-        return log.get_logger()
++        from tornado.log import app_log
++
++        # monkey patch the logger to provide an additional method that handles
++        # issues
++        app_log.issue = types.MethodType(issue, app_log)
++        return app_log
+diff --git a/remoteappmanager/restresources/container.py b/remoteappmanager/restresources/container.py
+index 3191c6b..cbf224a 100644
+--- a/remoteappmanager/restresources/container.py
++++ b/remoteappmanager/restresources/container.py
+@@ -36,7 +36,11 @@ class Container(Resource):
+                                                 policy,
+                                                 mapping_id)
+         yield self._wait_for_container_ready(container)
+-        yield self.application.reverse_proxy.add_container(container)
++        urlpath = url_path_join(
++            self.application.command_line_config.base_urlpath,
++            container.urlpath)
++        yield self.application.reverse_proxy.register(urlpath,
++                                                      container.host_url)
+ 
+         return container.url_id
+ 
+@@ -56,13 +60,15 @@ class Container(Resource):
+     @gen.coroutine
+     def delete(self, identifier):
+         """Stop the container."""
+-        app = self.application
+         container = yield self._container_from_url_id(identifier)
+         if not container:
+             raise exceptions.NotFound()
+ 
+-        yield app.reverse_proxy.remove_container(container)
+-        yield app.container_manager.stop_and_remove_container(
++        urlpath = url_path_join(
++            self.application.command_line_config.base_urlpath,
++            container.urlpath)
++        yield self.application.reverse_proxy.unregister(urlpath)
++        yield self.application.container_manager.stop_and_remove_container(
+             container.docker_id)
+ 
+     @gen.coroutine
+diff --git a/remoteappmanager/services/reverse_proxy.py b/remoteappmanager/services/reverse_proxy.py
+index 64807c3..4bff151 100644
+--- a/remoteappmanager/services/reverse_proxy.py
++++ b/remoteappmanager/services/reverse_proxy.py
+@@ -5,7 +5,6 @@ from jupyterhub import orm as jupyterhub_orm
+ from traitlets import HasTraits, Unicode
+ 
+ from remoteappmanager.logging.logging_mixin import LoggingMixin
+-from remoteappmanager.utils import url_path_join
+ 
+ 
+ class ReverseProxy(LoggingMixin, HasTraits):
+@@ -17,9 +16,6 @@ class ReverseProxy(LoggingMixin, HasTraits):
+     #: The authorization token to authenticate the request
+     auth_token = Unicode()
+ 
+-    #: The prefix for the url added to the passed object relative .url()
+-    base_urlpath = Unicode('/')
+-
+     def __init__(self, *args, **kwargs):
+         """Initializes the reverse proxy connection object."""
+         super().__init__(*args, **kwargs)
+@@ -31,73 +27,59 @@ class ReverseProxy(LoggingMixin, HasTraits):
+             api_server=_server_from_url(self.endpoint_url)
+         )
+ 
+-        self.log.info("Reverse proxy setup on {} with base url {}".format(
++        self.log.info("Reverse proxy setup on {}".format(
+             self.endpoint_url,
+-            self.base_urlpath
+         ))
+ 
+     @gen.coroutine
+-    def remove_container(self, container):
+-        """Removes a container from the reverse proxy at the associated url.
++    def register(self, urlpath, target_host_url):
++        """Register a given urlpath to redirect to a different target host.
++        The operation is idempotent.
+ 
+         Parameters
+         ----------
+-        container : remoteappmanager.docker.container.Container
+-            A container object.
++        urlpath: str
++            The absolute path of the url (e.g. /my/internal/service/)"
++
++        target_host_url:
++            The host to redirect to, e.g. http://127.0.0.1:31233/service/
+         """
+-        proxy = self._reverse_proxy
++        self.log.info("Registering {} redirection to {}".format(
++            urlpath,
++            target_host_url))
+ 
+-        urlpath = url_path_join(self.base_urlpath, container.urlpath)
+-        self.log.info("Unregistering url {} to {} on reverse proxy.".format(
++        yield self._reverse_proxy.api_request(
+             urlpath,
+-            container.host_url
+-        ))
++            method='POST',
++            body=dict(
++                target=target_host_url,
++            )
++        )
++
++    @gen.coroutine
++    def unregister(self, urlpath):
++        """Unregisters a previously registered urlpath.
++        If the urlpath is not found in the reverse proxy, it will not raise
++        an error, but it will log the unexpected circumstance.
++
++        Parameters
++        ----------
++        urlpath: str
++            The absolute path of the url (e.g. /my/internal/service/"
++        """
++        self.log.info("Deregistering {} redirection".format(urlpath))
+ 
+         try:
+-            yield proxy.api_request(urlpath, method='DELETE')
++            yield self._reverse_proxy.api_request(urlpath, method='DELETE')
+         except httpclient.HTTPError as e:
+             if e.code == 404:
+                 self.log.warning("Could not find urlpath {} when removing"
+                                  " container. In any case, the reverse proxy"
+                                  " does not map the url. Continuing".format(
+-                                    urlpath))
++                                     urlpath))
+             else:
+                 raise e
+ 
+-    @gen.coroutine
+-    def add_container(self, container):
+-        """Adds the url associated to a given container on the reverse proxy.
+-
+-        Parameters
+-        ----------
+-        container : remoteappmanager.docker.container.Container
+-            A container object.
+-
+-        Returns
+-        -------
+-        urlpath : str
+-            The absolute url path of the container as registered on the reverse
+-            proxy.
+-        """
+-
+-        proxy = self._reverse_proxy
+-        urlpath = url_path_join(self.base_urlpath, container.urlpath)
+-
+-        self.log.info("Registering url {} to {} on reverse proxy.".format(
+-            urlpath,
+-            container.host_url
+-        ))
+-
+-        yield proxy.api_request(
+-            urlpath,
+-            method='POST',
+-            body=dict(
+-                target=container.host_url,
+-            )
+-        )
+-
+-        return urlpath
+-
+ 
+ def _server_from_url(url):
+     """Creates a orm.Server from a given url"""
+

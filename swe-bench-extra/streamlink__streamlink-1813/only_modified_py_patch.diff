@@ -1,0 +1,386 @@
+diff --git a/src/streamlink/plugins/nos.py b/src/streamlink/plugins/nos.py
+index 7c03d388..66ee1b68 100644
+--- a/src/streamlink/plugins/nos.py
++++ b/src/streamlink/plugins/nos.py
+@@ -5,72 +5,49 @@ Supports:
+    Live: http://www.nos.nl/livestream/*
+    Tour: http://nos.nl/tour/live
+ """
+-
++import logging
+ import re
+-import json
+ 
++from streamlink.compat import urljoin
+ from streamlink.plugin import Plugin
+ from streamlink.plugin.api import http
+-from streamlink.plugin.api.utils import parse_json
+-from streamlink.stream import HTTPStream, HLSStream
++from streamlink.plugin.api.utils import itertags
++from streamlink.stream import HLSStream
+ 
+-_url_re = re.compile(r"http(s)?://(\w+\.)?nos.nl/")
+-_js_re = re.compile(r'\((.*)\)')
+-_data_stream_re = re.compile(r'data-stream="(.*?)"', re.DOTALL | re.IGNORECASE)
+-_source_re = re.compile(r"<source(?P<source>[^>]+)>", re.IGNORECASE)
+-_source_src_re = re.compile(r"src=\"(?P<src>[^\"]+)\"", re.IGNORECASE)
+-_source_type_re = re.compile(r"type=\"(?P<type>[^\"]+)\"", re.IGNORECASE)
++log = logging.getLogger(__name__)
+ 
+ 
+ class NOS(Plugin):
++    _url_re = re.compile(r"https?://(?:\w+\.)?nos.nl/")
++
+     @classmethod
+     def can_handle_url(cls, url):
+-        return _url_re.match(url)
++        return cls._url_re.match(url)
+ 
+     def _resolve_stream(self):
+         res = http.get(self.url)
+-        match = _data_stream_re.search(res.text)
+-        if not match:
+-            return
+-        data_stream = match.group(1)
+-
+-        resolve_data = {
+-            'stream': data_stream
+-        }
+-        res = http.post(
+-            'http://www-ipv4.nos.nl/livestream/resolve/',
+-            data=json.dumps(resolve_data)
+-        )
+-        data = http.json(res)
+-
+-        res = http.get(data['url'])
+-        match = _js_re.search(res.text)
+-        if not match:
+-            return
+-
+-        stream_url = parse_json(match.group(1))
+-
+-        return HLSStream.parse_variant_playlist(self.session, stream_url)
++        for video in itertags(res.text, 'video'):
++            stream_url = video.attributes.get("data-stream")
++            log.debug("Stream data: {0}".format(stream_url))
++            return HLSStream.parse_variant_playlist(self.session, stream_url)
+ 
+     def _get_source_streams(self):
+         res = http.get(self.url)
+ 
+-        streams = {}
+-        sources = _source_re.findall(res.text)
+-        for source in sources:
+-            src = _source_src_re.search(source).group("src")
+-            pixels = _source_type_re.search(source).group("type")
+-
+-            streams[pixels] = HTTPStream(self.session, src)
+-
+-        return streams
++        for atag in itertags(res.text, 'a'):
++            if "video-play__link" in atag.attributes.get("class", ""):
++                href = urljoin(self.url, atag.attributes.get("href"))
++                log.debug("Loading embedded video page")
++                vpage = http.get(href, params=dict(ajax="true", npo_cc_skip_wall="true"))
++                for source in itertags(vpage.text, 'source'):
++                    return HLSStream.parse_variant_playlist(self.session, source.attributes.get("src"))
+ 
+     def _get_streams(self):
+-        urlparts = self.url.split('/')
+-
+-        if urlparts[-2] == 'livestream' or urlparts[-3] == 'tour':
++        if "/livestream/" in self.url or "/tour/" in self.url:
++            log.debug("Finding live streams")
+             return self._resolve_stream()
+         else:
++            log.debug("Finding VOD streams")
+             return self._get_source_streams()
+ 
+ 
+diff --git a/src/streamlink/plugins/pandatv.py b/src/streamlink/plugins/pandatv.py
+index 028ba111..56d7ab2a 100644
+--- a/src/streamlink/plugins/pandatv.py
++++ b/src/streamlink/plugins/pandatv.py
+@@ -6,7 +6,7 @@ import json
+ from streamlink.compat import quote
+ from streamlink.plugin import Plugin
+ from streamlink.plugin.api import http, validate
+-from streamlink.stream import HTTPStream
++from streamlink.stream import HTTPStream, HLSStream
+ 
+ ROOM_API = "https://www.panda.tv/api_room_v3?token=&hostid={0}&roomid={1}&roomkey={2}&_={3}&param={4}&time={5}&sign={6}"
+ ROOM_API_V2 = "https://www.panda.tv/api_room_v2?roomid={0}&_={1}"
+@@ -14,7 +14,7 @@ SD_URL_PATTERN = "https://pl{0}.live.panda.tv/live_panda/{1}.flv?sign={2}&ts={3}
+ HD_URL_PATTERN = "https://pl{0}.live.panda.tv/live_panda/{1}_mid.flv?sign={2}&ts={3}&rid={4}"
+ OD_URL_PATTERN = "https://pl{0}.live.panda.tv/live_panda/{1}_small.flv?sign={2}&ts={3}&rid={4}"
+ 
+-_url_re = re.compile(r"http(s)?://(\w+.)?panda.tv/(?P<channel>[^/&?]+)")
++_url_re = re.compile(r"http(s)?://(?P<prefix>\w+.)?panda.tv/(?P<channel>[^/&?]+)")
+ _room_id_re = re.compile(r'data-room-id="(\d+)"')
+ _status_re = re.compile(r'"status"\s*:\s*"(\d+)"\s*,\s*"display_type"')
+ _room_key_re = re.compile(r'"room_key"\s*:\s*"(.+?)"')
+@@ -25,6 +25,13 @@ _sign_re = re.compile(r'"sign"\s*:\s*"(.+?)"')
+ _sd_re = re.compile(r'"SD"\s*:\s*"(\d+)"')
+ _hd_re = re.compile(r'"HD"\s*:\s*"(\d+)"')
+ _od_re = re.compile(r'"OD"\s*:\s*"(\d+)"')
++_roominfo_re = re.compile(r'window\.HOSTINFO=({.*});')
++
++STREAM_WEIGHTS = {
++    "source": 1080,
++    "medium": 720,
++    "low":    480
++}
+ 
+ _room_schema = validate.Schema(
+     {
+@@ -44,25 +51,49 @@ _room_schema = validate.Schema(
+     },
+     validate.get("data"))
+ 
+-
+ class Pandatv(Plugin):
+     @classmethod
+     def can_handle_url(cls, url):
+         return _url_re.match(url)
+ 
++    @classmethod
++    def stream_weight(cls, stream):
++        if stream in STREAM_WEIGHTS:
++            return STREAM_WEIGHTS[stream], "pandatv"
++        return Plugin.stream_weight(stream)
++
+     def _get_streams(self):
+         match = _url_re.match(self.url)
++        prefix = match.group("prefix")
+         channel = match.group("channel")
+ 
+         res = http.get(self.url)
+ 
++        if prefix == 'xingyan.':
++            roominfo = _roominfo_re.search(res.text).group(1)
++            roominfo = json.loads(roominfo)
++            videoinfo = roominfo['videoinfo']
++            if videoinfo['hlsurl']:
++                yield 'source', HLSStream(self.session, videoinfo['hlsurl'])
++
++            #wangsu cdn prior to others, wangsu = 0, alicloud = 1, qcloud = videoinfo['streamurl']
++            _cdn = 0
++            if videoinfo['zl'][_cdn]['streamurl']:
++                yield 'source', HTTPStream(self.session, videoinfo['zl'][_cdn]['streamurl'])
++            if videoinfo['zl'][_cdn]['streamtrans']['mid']:
++                yield 'medium', HTTPStream(self.session, videoinfo['zl'][_cdn]['streamtrans']['mid'])
++            if videoinfo['zl'][_cdn]['streamtrans']['small']:
++                yield 'low', HTTPStream(self.session, videoinfo['zl'][_cdn]['streamtrans']['small'])
++            return
++
+         try:
+             channel = int(channel)
+         except ValueError:
+             channel = _room_id_re.search(res.text).group(1)
+-            ts = int(time.time())
+-            url = ROOM_API_V2.format(channel, ts)
+-            res = http.get(url)
++
++        ts = int(time.time())
++        url = ROOM_API_V2.format(channel, ts)
++        res = http.get(url)
+ 
+         try:
+             status = _status_re.search(res.text).group(1)
+@@ -98,7 +129,6 @@ class Pandatv(Plugin):
+             self.logger.info("Please Check PandaTV Room API")
+             return
+ 
+-        streams = {}
+         plflag = videoinfo.get('plflag')
+         if not plflag or '_' not in plflag:
+             self.logger.info("Please Check PandaTV Room API")
+@@ -123,15 +153,15 @@ class Pandatv(Plugin):
+             plflag1 = plflag0[0]
+ 
+         if sd == '1':
+-            streams['ehq'] = HTTPStream(self.session, SD_URL_PATTERN.format(plflag1, room_key, sign, ts, rid))
++            yield 'source', HTTPStream(self.session, SD_URL_PATTERN.format(plflag1, room_key, sign, ts, rid))
+ 
+         if hd == '1':
+-            streams['hq'] = HTTPStream(self.session, HD_URL_PATTERN.format(plflag1, room_key, sign, ts, rid))
++            yield 'medium', HTTPStream(self.session, HD_URL_PATTERN.format(plflag1, room_key, sign, ts, rid))
+ 
+         if od == '1':
+-            streams['sq'] = HTTPStream(self.session, OD_URL_PATTERN.format(plflag1, room_key, sign, ts, rid))
++            yield 'low', HTTPStream(self.session, OD_URL_PATTERN.format(plflag1, room_key, sign, ts, rid))
+ 
+-        return streams
++        return
+ 
+ 
+ __plugin__ = Pandatv
+diff --git a/src/streamlink/plugins/vrtbe.py b/src/streamlink/plugins/vrtbe.py
+index 4e298d55..f6a9f4b6 100644
+--- a/src/streamlink/plugins/vrtbe.py
++++ b/src/streamlink/plugins/vrtbe.py
+@@ -1,85 +1,92 @@
++import logging
+ import re
+ 
++from streamlink.compat import urljoin
+ from streamlink.plugin import Plugin
+-from streamlink.plugin.api import http
+ from streamlink.plugin.api import validate
+-from streamlink.stream import HDSStream
+-from streamlink.stream import HLSStream
+-from streamlink.utils import parse_json
++from streamlink.plugin.api.utils import itertags
++from streamlink.stream import HLSStream, DASHStream
+ 
+-_url_re = re.compile(r'''https?://www\.vrt\.be/vrtnu/(?:kanalen/(?P<channel>[^/]+)|\S+)''')
+-_json_re = re.compile(r'''(\173[^\173\175]+\175)''')
++log = logging.getLogger(__name__)
+ 
+-API_LIVE = 'https://services.vrt.be/videoplayer/r/live.json'
+-API_VOD = 'https://mediazone.vrt.be/api/v1/{0}/assets/{1}'
+ 
+-_stream_schema = validate.Schema({
+-    'targetUrls': [
+-        {
+-            'type': validate.text,
+-            'url': validate.text
++class VRTbe(Plugin):
++    _url_re = re.compile(r'''https?://www\.vrt\.be/vrtnu/(?:kanalen/(?P<channel>[^/]+)|\S+)''')
++
++    _stream_schema = validate.Schema(
++        validate.any({
++            "code": validate.text,
++            "message": validate.text
+         },
+-    ],
+-})
++        {
++            "drm": validate.any(None, validate.text),
++            'targetUrls': [{
++                'type': validate.text,
++                'url': validate.text
++            }],
++        })
++    )
+ 
++    _token_schema = validate.Schema({
++        "vrtPlayerToken": validate.text
++    }, validate.get("vrtPlayerToken"))
++
++    api_url = "https://api.vuplay.co.uk/"
+ 
+-class VRTbe(Plugin):
+     @classmethod
+     def can_handle_url(cls, url):
+-        return _url_re.match(url)
++        return cls._url_re.match(url)
+ 
+-    def _get_live_stream(self, channel):
+-        channel = 'vualto_{0}'.format(channel)
+-        _live_json_re = re.compile(r'''"{0}":\s(\173[^\173\175]+\175)'''.format(channel))
++    def _get_api_info(self, page):
++        for div in itertags(page.text, 'div'):
++            if div.attributes.get("class") == "vrtvideo":
++                api_base = div.attributes.get("data-mediaapiurl") + "/"
+ 
+-        res = http.get(API_LIVE)
+-        match = _live_json_re.search(res.text)
+-        if not match:
+-            return
+-        data = parse_json(match.group(1))
++                data = {"token_url": urljoin(api_base, "tokens")}
++                if div.attributes.get("data-videotype") == "live":
++                    data["stream_url"] = urljoin(urljoin(api_base, "videos/"), div.attributes.get("data-livestream"))
++                else:
++                    resource = "{0}%24{1}".format(div.attributes.get("data-publicationid"), div.attributes.get("data-videoid"))
++                    data["stream_url"] = urljoin(urljoin(api_base, "videos/"), resource)
++                return data
+ 
+-        hls_url = data['hls']
++    def _get_streams(self):
++        page = self.session.http.get(self.url)
++        api_info = self._get_api_info(page)
+ 
+-        if hls_url:
+-            for s in HLSStream.parse_variant_playlist(self.session, hls_url).items():
+-                yield s
++        if not api_info:
++            log.error("Could not find API info in page")
++            return
+ 
+-    def _get_vod_stream(self):
+-        vod_url = self.url
+-        if vod_url.endswith('/'):
+-            vod_url = vod_url[:-1]
++        token_res = self.session.http.post(api_info["token_url"])
++        token = self.session.http.json(token_res, schema=self._token_schema)
+ 
+-        json_url = '{0}.securevideo.json'.format(vod_url)
++        log.debug("Got token: {0}".format(token))
++        log.debug("Getting stream data: {0}".format(api_info["stream_url"]))
++        res = self.session.http.get(api_info["stream_url"],
++                                    params={
++                                        "vrtPlayerToken": token,
++                                        "client": "vrtvideo"
++                                    }, raise_for_status=False)
++        data = self.session.http.json(res, schema=self._stream_schema)
+ 
+-        res = http.get(json_url)
+-        match = _json_re.search(res.text)
+-        if not match:
++        if "code" in data:
++            log.error("{0} ({1})".format(data['message'], data['code']))
+             return
+-        data = parse_json(match.group(1))
+ 
+-        res = http.get(API_VOD.format(data['clientid'], data['mzid']))
+-        data = http.json(res, schema=_stream_schema)
++        log.debug("Streams have {0}DRM".format("no " if not data["drm"] else ""))
+ 
+-        for d in data['targetUrls']:
+-            if d['type'] == 'HDS':
+-                hds_url = d['url']
+-                for s in HDSStream.parse_manifest(self.session, hds_url).items():
++        for target in data["targetUrls"]:
++            if data["drm"]:
++                if target["type"] == "hls_aes":
++                    for s in HLSStream.parse_variant_playlist(self.session, target["url"]).items():
++                        yield s
++            elif target["type"] == "hls":
++                for s in HLSStream.parse_variant_playlist(self.session, target["url"]).items():
+                     yield s
+-
+-            if d['type'] == 'HLS':
+-                hls_url = d['url']
+-                for s in HLSStream.parse_variant_playlist(self.session, hls_url).items():
++            elif target["type"] == "mpeg_dash":
++                for s in DASHStream.parse_manifest(self.session, target["url"]).items():
+                     yield s
+ 
+-    def _get_streams(self):
+-        match = _url_re.match(self.url)
+-
+-        channel = match.group('channel')
+-
+-        if channel:
+-            return self._get_live_stream(channel)
+-        else:
+-            return self._get_vod_stream()
+-
+ 
+ __plugin__ = VRTbe
+diff --git a/src/streamlink/stream/dash_manifest.py b/src/streamlink/stream/dash_manifest.py
+index 496e1b69..5477347e 100644
+--- a/src/streamlink/stream/dash_manifest.py
++++ b/src/streamlink/stream/dash_manifest.py
+@@ -488,7 +488,7 @@ class SegmentTemplate(MPDNode):
+             else:
+                 for segment, n in zip(self.segmentTimeline.segments, count(self.startNumber)):
+                     yield (self.make_url(self.media(Time=segment.t, Number=n, **kwargs)),
+-                           datetime.timedelta(seconds=segment.d / self.timescale))
++                           datetime.datetime.now(tz=utc))
+ 
+         else:
+             for number, available_at in self.segment_numbers():
+

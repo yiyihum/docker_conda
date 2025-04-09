@@ -1,0 +1,222 @@
+diff --git a/pyteal/__init__.py b/pyteal/__init__.py
+index 95dd111..879ecea 100644
+--- a/pyteal/__init__.py
++++ b/pyteal/__init__.py
+@@ -5,7 +5,7 @@ from .ir import __all__ as ir_all
+ from .compiler import MAX_TEAL_VERSION, MIN_TEAL_VERSION, DEFAULT_TEAL_VERSION, CompileOptions, compileTeal
+ from .types import TealType
+ from .errors import TealInternalError, TealTypeError, TealInputError, TealCompileError
+-from .config import MAX_GROUP_SIZE
++from .config import MAX_GROUP_SIZE, NUM_SLOTS
+ 
+ __all__ = ast_all + ir_all + [
+     "MAX_TEAL_VERSION",
+@@ -19,4 +19,5 @@ __all__ = ast_all + ir_all + [
+     "TealInputError",
+     "TealCompileError",
+     "MAX_GROUP_SIZE",
++    "NUM_SLOTS",
+ ]
+diff --git a/pyteal/ast/__init__.py b/pyteal/ast/__init__.py
+index 08a29e8..ed7e0b5 100644
+--- a/pyteal/ast/__init__.py
++++ b/pyteal/ast/__init__.py
+@@ -13,6 +13,7 @@ from .arg import Arg
+ from .txn import TxnType, TxnField, TxnExpr, TxnaExpr, TxnArray, TxnObject, Txn
+ from .gtxn import GtxnExpr, GtxnaExpr, TxnGroup, Gtxn
+ from .gaid import GeneratedID
++from .gload import ImportScratchValue
+ from .global_ import Global, GlobalField
+ from .app import App, AppField, OnComplete
+ from .asset import AssetHolding, AssetParam
+@@ -66,6 +67,7 @@ __all__ = [
+     "TxnGroup",
+     "Gtxn",
+     "GeneratedID",
++    "ImportScratchValue",
+     "Global",
+     "GlobalField",
+     "App",
+diff --git a/pyteal/ast/gload.py b/pyteal/ast/gload.py
+new file mode 100644
+index 0000000..f8774ab
+--- /dev/null
++++ b/pyteal/ast/gload.py
+@@ -0,0 +1,58 @@
++from typing import cast, Union, TYPE_CHECKING
++
++from ..types import TealType, require_type
++from ..ir import TealOp, Op, TealBlock
++from ..errors import TealInputError, verifyTealVersion
++from ..config import MAX_GROUP_SIZE, NUM_SLOTS
++from .expr import Expr
++from .int import Int
++from .leafexpr import LeafExpr
++
++if TYPE_CHECKING:
++    from ..compiler import CompileOptions
++
++class ImportScratchValue(LeafExpr):
++    """An expression to load a scratch value created by another transaction in the current group"""
++
++    def __init__(self, txnIndex: Union[int, Expr], slotId: int) -> None:
++        """ Create an expression to load a scratch space slot from a transaction in the current group.
++
++        Requires TEAL version 4 or higher. This operation is only permitted in application mode.
++
++        Args:
++            txnIndex: The index of the transaction from which the created ID should be obtained.
++                This index may be a Python int, or it may be a PyTeal expression that evaluates at
++                runtime. If it's an expression, it must evaluate to a uint64. In all cases, the index
++                must be less than the index of the current transaction.
++            slotId: The index of the scratch slot that should be loaded. The index must be a Python int
++                in the range [0-256). 
++        """
++        super().__init__()
++        if type(txnIndex) == int:
++            if txnIndex < 0 or txnIndex >= MAX_GROUP_SIZE:
++                raise TealInputError("Invalid transaction index {}, shoud be in [0, {})".format(txnIndex, MAX_GROUP_SIZE))
++        else:
++            require_type(cast(Expr, txnIndex).type_of(), TealType.uint64)
++        if slotId < 0 or slotId >= NUM_SLOTS:
++                raise TealInputError("Invalid slot ID {}, shoud be in [0, {})".format(slotId, NUM_SLOTS))
++        
++        self.txnIndex = txnIndex
++        self.slotId = slotId
++
++    def __str__(self) -> str:
++        return "(Gload {} {})".format(self.txnIndex, self.slotId)
++
++    def __teal__(self, options: 'CompileOptions'):
++        verifyTealVersion(Op.gload.min_version, options.version, "TEAL version too low to use Gload expression")
++
++        if type(self.txnIndex) == int:
++            op = TealOp(self, Op.gload, cast(int, self.txnIndex), cast(int, self.slotId))
++            return TealBlock.FromOp(options, op)
++        
++        op = TealOp(self, Op.gloads, self.slotId)
++        return TealBlock.FromOp(options, op, cast(Expr, self.txnIndex))
++
++    def type_of(self):
++        return TealType.anytype
++
++ImportScratchValue.__module__ = "pyteal"
+diff --git a/pyteal/ast/scratch.py b/pyteal/ast/scratch.py
+index 38de0f5..cd342fc 100644
+--- a/pyteal/ast/scratch.py
++++ b/pyteal/ast/scratch.py
+@@ -1,6 +1,8 @@
+ from typing import TYPE_CHECKING
+ 
+ from ..types import TealType
++from ..config import NUM_SLOTS
++from ..errors import TealInputError
+ from .expr import Expr
+ 
+ if TYPE_CHECKING:
+@@ -9,12 +11,28 @@ if TYPE_CHECKING:
+ class ScratchSlot:
+     """Represents the allocation of a scratch space slot."""
+ 
+-    slotId = 0
++    # Unique identifier for the compiler to automatically assign slots
++    # The id field is used by the compiler to map to an actual slot in the source code
++    # Slot ids under 256 are manually reserved slots
++    nextSlotId = NUM_SLOTS 
+ 
+-    def __init__(self):
+-        self.id = ScratchSlot.slotId
+-        ScratchSlot.slotId += 1
++    def __init__(self, requestedSlotId: int = None):
++        """Initializes a scratch slot with a particular id
+ 
++        Args:
++            requestedSlotId (optional): A scratch slot id that the compiler must store the value. 
++            This id may be a Python int in the range [0-256).       
++        """
++        if requestedSlotId is None:
++            self.id = ScratchSlot.nextSlotId
++            ScratchSlot.nextSlotId += 1
++            self.isReservedSlot = False
++        else:
++            if requestedSlotId < 0 or requestedSlotId >= NUM_SLOTS:
++                raise TealInputError("Invalid slot ID {}, shoud be in [0, {})".format(requestedSlotId, NUM_SLOTS))
++            self.id = requestedSlotId
++            self.isReservedSlot = True
++        
+     def store(self, value: Expr = None) -> Expr:
+         """Get an expression to store a value in this slot.
+         
+diff --git a/pyteal/ast/scratchvar.py b/pyteal/ast/scratchvar.py
+index 888bded..53398e1 100644
+--- a/pyteal/ast/scratchvar.py
++++ b/pyteal/ast/scratchvar.py
+@@ -16,15 +16,17 @@ class ScratchVar:
+             ])
+     """
+ 
+-    def __init__(self, type: TealType = TealType.anytype):
++    def __init__(self, type: TealType = TealType.anytype, slotId: int = None):
+         """Create a new ScratchVar with an optional type.
+ 
+         Args:
+             type (optional): The type that this variable can hold. An error will be thrown if an
+                 expression with an incompatiable type is stored in this variable. Defaults to
+                 TealType.anytype.
++            slotId (optional): A scratch slot id that the compiler must store the value. 
++                This id may be a Python int in the range [0-256).  
+         """
+-        self.slot = ScratchSlot()
++        self.slot = ScratchSlot(requestedSlotId=slotId)
+         self.type = type
+     
+     def storage_type(self) -> TealType:
+diff --git a/pyteal/compiler/compiler.py b/pyteal/compiler/compiler.py
+index 37635ee..d57f169 100644
+--- a/pyteal/compiler/compiler.py
++++ b/pyteal/compiler/compiler.py
+@@ -1,6 +1,6 @@
+-from typing import List
++from typing import List, Set
+ 
+-from ..ast import Expr
++from ..ast import Expr, ScratchSlot
+ from ..ir import Mode, TealComponent, TealOp, TealBlock
+ from ..errors import TealInputError, TealInternalError
+ from ..config import NUM_SLOTS
+@@ -96,18 +96,32 @@ def compileTeal(ast: Expr, mode: Mode, *, version: int = DEFAULT_TEAL_VERSION, a
+     verifyOpsForVersion(teal, version)
+     verifyOpsForMode(teal, mode)
+ 
+-    slots = set()
++    slots: Set[ScratchSlot] = set()
++    slotIds: Set[int] = set()
++    nextSlotIndex = 0
+     for stmt in teal:
+         for slot in stmt.getSlots():
++            # If there are two unique slots with same IDs, raise an error
++            if slot.id in slotIds and id(slot) not in [id(s) for s in slots]:
++                raise TealInternalError("Slot ID {} has been assigned multiple times".format(slot.id))
++            slotIds.add(slot.id)
+             slots.add(slot)
+     
+     if len(slots) > NUM_SLOTS:
+         # TODO: identify which slots can be reused
+         raise TealInternalError("Too many slots in use: {}, maximum is {}".format(len(slots), NUM_SLOTS))
+     
+-    for index, slot in enumerate(sorted(slots, key=lambda slot: slot.id)):
++    for slot in sorted(slots, key=lambda slot: slot.id):
++        # Find next vacant slot that compiler can assign to
++        while nextSlotIndex in slotIds:
++            nextSlotIndex += 1
+         for stmt in teal:
+-            stmt.assignSlot(slot, index)
++            if slot.isReservedSlot:
++                # Slot ids under 256 are manually reserved slots
++                stmt.assignSlot(slot, slot.id)
++            else:
++                stmt.assignSlot(slot, nextSlotIndex)
++                slotIds.add(nextSlotIndex)
+     
+     if assembleConstants:
+         if version < 3:

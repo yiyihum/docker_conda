@@ -1,0 +1,145 @@
+diff --git a/webviz_config/generic_plugins/_example_wlf_plugin/_shared_settings/_shared_settings.py b/webviz_config/generic_plugins/_example_wlf_plugin/_shared_settings/_shared_settings.py
+index c0bb990..b497bde 100644
+--- a/webviz_config/generic_plugins/_example_wlf_plugin/_shared_settings/_shared_settings.py
++++ b/webviz_config/generic_plugins/_example_wlf_plugin/_shared_settings/_shared_settings.py
+@@ -52,7 +52,7 @@ class SharedSettingsGroup(SettingsGroupABC):
+                                 "value": 3,
+                             },
+                         ],
+-                        value="2",
++                        value=2,
+                     ),
+                 ]
+             )
+diff --git a/webviz_config/generic_plugins/_example_wlf_plugin/_views/_plot/_view.py b/webviz_config/generic_plugins/_example_wlf_plugin/_views/_plot/_view.py
+index d286f0d..aea5033 100644
+--- a/webviz_config/generic_plugins/_example_wlf_plugin/_views/_plot/_view.py
++++ b/webviz_config/generic_plugins/_example_wlf_plugin/_views/_plot/_view.py
+@@ -16,10 +16,8 @@ from webviz_config.webviz_plugin_subclasses import (
+     ViewABC,
+     ViewElementABC,
+     SettingsGroupABC,
+-    callback_typecheck,
+ )
+-
+-from webviz_config.utils import StrEnum
++from webviz_config.utils import callback_typecheck, StrEnum
+ 
+ from webviz_config.generic_plugins._example_wlf_plugin._shared_view_elements import (
+     TextViewElement,
+diff --git a/webviz_config/generic_plugins/_example_wlf_plugin/_views/_table/_view.py b/webviz_config/generic_plugins/_example_wlf_plugin/_views/_table/_view.py
+index 3e6ad1e..6231ee1 100644
+--- a/webviz_config/generic_plugins/_example_wlf_plugin/_views/_table/_view.py
++++ b/webviz_config/generic_plugins/_example_wlf_plugin/_views/_table/_view.py
+@@ -10,14 +10,13 @@ import pandas as pd
+ 
+ import webviz_core_components as wcc
+ 
+-from webviz_config.utils import StrEnum
++from webviz_config.utils import callback_typecheck, StrEnum
+ from webviz_config import WebvizPluginABC, EncodedFile
+ 
+ from webviz_config.webviz_plugin_subclasses import (
+     ViewABC,
+     ViewElementABC,
+     SettingsGroupABC,
+-    callback_typecheck,
+ )
+ 
+ from webviz_config.generic_plugins._example_wlf_plugin._shared_view_elements import (
+diff --git a/webviz_config/utils/__init__.py b/webviz_config/utils/__init__.py
+index 980c8b8..7c3aa5e 100644
+--- a/webviz_config/utils/__init__.py
++++ b/webviz_config/utils/__init__.py
+@@ -6,3 +6,4 @@ from ._deprecate_webviz_settings_attribute_in_dash_app import (
+     deprecate_webviz_settings_attribute_in_dash_app,
+ )
+ from ._str_enum import StrEnum
++from ._callback_typecheck import callback_typecheck, ConversionError
+diff --git a/webviz_config/webviz_plugin_subclasses/_callback_typecheck.py b/webviz_config/utils/_callback_typecheck.py
+similarity index 53%
+rename from webviz_config/webviz_plugin_subclasses/_callback_typecheck.py
+rename to webviz_config/utils/_callback_typecheck.py
+index 99f45e1..f9b011a 100644
+--- a/webviz_config/webviz_plugin_subclasses/_callback_typecheck.py
++++ b/webviz_config/utils/_callback_typecheck.py
+@@ -1,7 +1,6 @@
+ # pylint: disable=line-too-long
+-from typing import Any, Callable, get_origin, TypeVar
++from typing import Any, Callable, get_origin, _TypedDictMeta, TypeVar, Union  # type: ignore[attr-defined]
+ import inspect
+-from enum import Enum
+ 
+ T = TypeVar("T")
+ 
+@@ -11,17 +10,35 @@ class ConversionError(Exception):
+ 
+ 
+ def convert(arg: Any, convert_to: T) -> T:
+-    # pylint: disable=too-many-return-statements
++    # pylint: disable=too-many-return-statements, too-many-branches
+     additional_error_message: str = ""
+     try:
+-        if inspect.isclass(convert_to) and issubclass(convert_to, Enum):
+-            return convert_to(arg)  # type: ignore[return-value]
+-        if convert_to is int:
+-            return int(arg)  # type: ignore[return-value]
+-        if convert_to is float:
+-            return float(arg)  # type: ignore[return-value]
+-        if convert_to is str:
+-            return str(arg)  # type: ignore[return-value]
++        if convert_to is None and arg is None:
++            return None
++        if inspect.isclass(convert_to) and not isinstance(convert_to, _TypedDictMeta):
++            return convert_to(arg)
++        if (
++            isinstance(convert_to, _TypedDictMeta)
++            and "__annotations__" in dir(convert_to)
++            and isinstance(arg, dict)
++        ):
++            new_dict = convert_to()
++            for key, value in arg.items():
++                if key in list(convert_to.__annotations__.keys()):
++                    new_dict[key] = convert(value, convert_to.__annotations__[key])
++                else:
++                    raise Exception(
++                        f"""
++                        Key '{key}' not allowed in '{convert_to}'.\n
++                        Allowed keys are: {', '.join(list(convert_to.__annotations__.keys()))}
++                        """
++                    )
++
++            if not convert_to.__total__ or len(new_dict.keys()) == len(
++                convert_to.__annotations__.keys()
++            ):
++                return new_dict
++
+         if convert_to is list and isinstance(arg, list):
+             return arg  # type: ignore[return-value]
+         if get_origin(convert_to) is list and isinstance(arg, list):
+@@ -37,6 +54,16 @@ def convert(arg: Any, convert_to: T) -> T:
+                     )
+                     for key, value in arg.items()
+                 }
++        if get_origin(convert_to) is Union:
++            if "__args__" in dir(convert_to):
++                for convert_type in convert_to.__args__:  # type: ignore[attr-defined]
++                    if isinstance(arg, convert_type):
++                        return arg
++                for convert_type in convert_to.__args__:  # type: ignore[attr-defined]
++                    try:
++                        return convert(arg, convert_type)
++                    except ConversionError:
++                        pass
+ 
+     # pylint: disable=broad-except
+     except Exception as exception:
+diff --git a/webviz_config/webviz_plugin_subclasses/__init__.py b/webviz_config/webviz_plugin_subclasses/__init__.py
+index f27b57a..5819415 100644
+--- a/webviz_config/webviz_plugin_subclasses/__init__.py
++++ b/webviz_config/webviz_plugin_subclasses/__init__.py
+@@ -2,4 +2,3 @@ from ._settings_group_abc import SettingsGroupABC
+ from ._views import ViewABC, ViewElementABC, ViewLayoutElement, LayoutElementType
+ from ._layout_base_abc import LayoutBaseABC
+ from ._layout_unique_id import LayoutUniqueId
+-from ._callback_typecheck import callback_typecheck

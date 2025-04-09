@@ -1,0 +1,116 @@
+diff --git a/hydra/core/hydra_config.py b/hydra/core/hydra_config.py
+index 35bc12e56c..4e49173f9b 100644
+--- a/hydra/core/hydra_config.py
++++ b/hydra/core/hydra_config.py
+@@ -15,7 +15,7 @@ class HydraConfig(metaclass=Singleton):
+         assert cfg is not None
+         OmegaConf.set_readonly(cfg.hydra, True)
+         assert OmegaConf.get_type(cfg, "hydra") == HydraConf
+-        self.cfg = cfg  # type: ignore
++        self.cfg = OmegaConf.masked_copy(cfg, "hydra")  # type: ignore
+ 
+     @staticmethod
+     def get() -> HydraConf:
+diff --git a/hydra/core/utils.py b/hydra/core/utils.py
+index efbe884ee1..673b421343 100644
+--- a/hydra/core/utils.py
++++ b/hydra/core/utils.py
+@@ -10,7 +10,7 @@ from dataclasses import dataclass
+ from os.path import basename, dirname, splitext
+ from pathlib import Path
+ from time import localtime, strftime
+-from typing import Any, Dict, Optional, Sequence, Tuple, Union
++from typing import Any, Dict, Optional, Sequence, Tuple, Union, cast
+ 
+ from omegaconf import DictConfig, OmegaConf, open_dict
+ 
+@@ -126,13 +126,18 @@ def get_valid_filename(s: str) -> str:
+ 
+ 
+ def setup_globals() -> None:
+-    try:
+-        OmegaConf.register_resolver(
+-            "now", lambda pattern: strftime(pattern, localtime())
+-        )
+-    except AssertionError:
+-        # calling it again in no_workers mode will throw. safe to ignore.
+-        pass
++    def register(name: str, f: Any) -> None:
++        try:
++            OmegaConf.register_resolver(name, f)
++        except AssertionError:
++            # calling it again in no_workers mode will throw. safe to ignore.
++            pass
++
++    register("now", lambda pattern: strftime(pattern, localtime()))
++    register(
++        "hydra",
++        lambda path: OmegaConf.select(cast(DictConfig, HydraConfig.get()), path),
++    )
+ 
+ 
+ @dataclass
+diff --git a/news/325.feature b/news/325.feature
+new file mode 100644
+index 0000000000..e9a0e06c53
+--- /dev/null
++++ b/news/325.feature
+@@ -0,0 +1,1 @@
++Hydra config can now be accessed through interpolation using ${hydra:key}, for example ${hydra:job.name}
+\ No newline at end of file
+diff --git a/website/docs/configure_hydra/Intro.md b/website/docs/configure_hydra/Intro.md
+index 5f60a292c0..1246619476 100644
+--- a/website/docs/configure_hydra/Intro.md
++++ b/website/docs/configure_hydra/Intro.md
+@@ -4,7 +4,9 @@ title: Overview
+ sidebar_label: Introduction
+ ---
+ 
+-Many things in Hydra can be customized, this includes:
++Many things in Hydra can be customized. This includes:
++* Launcher configurations
++* Sweeper configuration
+ * Logging configuration
+ * Run and Multirun output directory patterns
+ * Application help (--help and --hydra-help)
+@@ -43,14 +45,24 @@ hydra:
+ ```
+ 
+ ## Runtime variables
+-The following variables are populated at runtime.
+-You can access them as config variables.
++The `hydra` package is deleted from your config when the function runs to reduce the amount of noise
++in the config passed to the function.  
++You can still access all config nodes in Hydra through the custom resolver `hydra`. 
++
++For example:
++```yaml
++config_name: ${hydra:job.config_name}
++```
++Pay close attention to the syntax: The resolver name is `hydra`, and the `key` is passed after the colon.
++
++The following variables are some of the variables populated at runtime.  
++You can see the full Hydra config using `--cfg hydra`:
+ 
+ `hydra.job`:
+ - *hydra.job.name* : Job name, defaults to python file name without suffix. can be overridden.
+ - *hydra.job.override_dirname* : Pathname derived from the overrides for this job
+ - *hydra.job.num* : job serial number in sweep
+-- *hydra.job.id* : Job ID in the underlying jobs system (Slurm etc) 
++- *hydra.job.id* : Job ID in the underlying jobs system (SLURM etc) 
+ 
+ `hydra.runtime`:
+ - *hydra.runtime.version*: Hydra's version
+diff --git a/website/docs/tutorials/basic/your_first_app/config_groups.md b/website/docs/tutorials/basic/your_first_app/config_groups.md
+index b7293d945a..44bee51bea 100644
+--- a/website/docs/tutorials/basic/your_first_app/config_groups.md
++++ b/website/docs/tutorials/basic/your_first_app/config_groups.md
+@@ -41,7 +41,7 @@ Learn more about packages directive [here](/advanced/package_directive.md).
+ 
+ ### Using config groups
+ Since we moved all the configs into the `conf` directory, we need to tell Hydra where to find them using the `config_path` parameter.
+-`config_path` is a directory relative to `my_app.py`.
++**`config_path` is a directory relative to `my_app.py`**.
+ ```python title="my_app.py" {1}
+ @hydra.main(config_path="conf")
+ def my_app(cfg: DictConfig) -> None:

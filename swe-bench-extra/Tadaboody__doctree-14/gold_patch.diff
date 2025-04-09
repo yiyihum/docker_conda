@@ -1,0 +1,91 @@
+diff --git a/src/doctree.py b/src/doctree.py
+index 531c7c4..2923f89 100644
+--- a/src/doctree.py
++++ b/src/doctree.py
+@@ -4,11 +4,10 @@ from pathlib import Path
+ from typing import Tuple, Generator
+ 
+ from src.git_ignored_files import git_ignored_files
+-from src.py_comment_extractor import module_docstring, package_docstring
++from src.py_comment_extractor import docstring
+ from src.dfs import dfs, safe_iterdir
+ 
+ BACKSLASH = '\\'
+-SLASH = '/'
+ 
+ 
+ def ignored(filename: Path, starting_dir: Path, ignored_globs: Tuple[Path, ...]):
+@@ -40,8 +39,8 @@ def tree_dir(starting_dir: Path, ignored_globs=DEFAULT_IGNORE, max_depth=None) -
+     for item, depth in dfs_walk:
+         # item is all the things in the directory that does not ignored
+         full_path = Path.resolve(item)
+-        docstring = module_docstring(full_path) + package_docstring(full_path)
+-        doc = f'  # {module_docstring(full_path)}' if docstring else ''
++        doc = docstring(full_path)
++        doc = f'  # {doc}' if doc else ''
+         yield item, doc, depth
+ 
+ 
+diff --git a/src/py_comment_extractor.py b/src/py_comment_extractor.py
+index 17be1fc..9d31209 100644
+--- a/src/py_comment_extractor.py
++++ b/src/py_comment_extractor.py
+@@ -1,35 +1,36 @@
+ """Extracts comments from python files"""
+-from pathlib import Path
+-import importlib.util
+-from types import ModuleType
+-from typing import Any
+-import os
+ import logging
+-INIT_FILE = '__init__.py'
+-
+-
+-def import_module(module_path: os.PathLike) -> ModuleType:
+-    module_pathlib_path = Path(module_path)
+-    spec:Any = importlib.util.spec_from_file_location(
+-        module_pathlib_path.name, str(module_pathlib_path))
+-    module:Any = importlib.util.module_from_spec(spec)
+-    spec.loader.exec_module(module)
+-    logging.debug(module)
+-    return module
++import os
++from pathlib import Path
+ 
++INIT_FILE = '__init__.py'
+ 
+ def module_docstring(module_path: os.PathLike) -> str:
+-    logging.debug(module_path)
++    import ast
++    import inspect
++    module_path = Path(module_path)
+     try:
+-        return import_module(module_path).__doc__ or ''
+-    except Exception:  # pylint: disable=broad-except
++        module_ast = ast.parse(module_path.read_text(),filename=module_path.name)
++    except SyntaxError:
+         return ''
++    module_doc = ast.get_docstring(module_ast)
++    non_import_body = module_ast.body
++    non_import_body = [ node for node in module_ast.body if not isinstance(node, (ast.Import, ast.ImportFrom)) ]
++    if not module_doc and len( non_import_body ) == 1 and isinstance(non_import_body[0], (ast.ClassDef,ast.FunctionDef,ast.AsyncFunctionDef)):
++        module_doc = ast.get_docstring(non_import_body[0])
++    if not module_doc:
++        return ''
++    return inspect.cleandoc(module_doc).splitlines()[0]
+ 
+-
+-def package_docstring(package_path: Path)->str:
++def package_docstring(package_path: Path) -> str:
+     """Returns the packages docstring, extracted by its `__init__.py` file"""
+     logging.debug(package_path)
+-    init_file =package_path/ INIT_FILE
++    init_file = package_path / INIT_FILE
+     if package_path.is_dir() and init_file.exists():
+         return module_docstring(init_file)
+     return ''
++def docstring(path:Path):
++    try:
++        return package_docstring(path) if path.is_dir() else module_docstring(path)
++    except UnicodeDecodeError: # just in case. probably better to check that path is a python file with `inspect`
++        return ''

@@ -1,0 +1,151 @@
+diff --git a/tests/functional/cocoapods/test_resolvers_cocoapods.py b/tests/functional/cocoapods/test_resolvers_cocoapods.py
+index 19d5b9f..25ac872 100644
+--- a/tests/functional/cocoapods/test_resolvers_cocoapods.py
++++ b/tests/functional/cocoapods/test_resolvers_cocoapods.py
+@@ -106,14 +106,14 @@ class CocoaPodsInputProvider(AbstractProvider):
+     def get_preference(self, resolution, candidates, information):
+         return len(candidates)
+ 
+-    def _iter_matches(self, requirement):
++    def _iter_matches(self, name, requirements):
+         try:
+-            data = self.index[requirement.name]
++            data = self.index[name]
+         except KeyError:
+             return
+         for entry in data:
+             version = packaging.version.parse(entry["version"])
+-            if version not in requirement.spec:
++            if any(version not in r.spec for r in requirements):
+                 continue
+             # Some fixtures incorrectly set dependencies to an empty list.
+             dependencies = entry["dependencies"] or {}
+@@ -123,13 +123,18 @@ class CocoaPodsInputProvider(AbstractProvider):
+             ]
+             yield Candidate(entry["name"], version, dependencies)
+ 
+-    def find_matches(self, requirement):
+-        mapping = {c.ver: c for c in self._iter_matches(requirement)}
+-        try:
+-            version = self.pinned_versions[requirement.name]
+-        except KeyError:
+-            return sorted(mapping.values(), key=operator.attrgetter("ver"))
+-        return [mapping.pop(version)]
++    def find_matches(self, requirements):
++        name = requirements[0].name
++        candidates = sorted(
++            self._iter_matches(name, requirements),
++            key=operator.attrgetter("ver"),
++            reverse=True,
++        )
++        pinned = self.pinned_versions.get(name)
++        for c in candidates:
++            if pinned is not None and c.ver != pinned:
++                continue
++            yield c
+ 
+     def is_satisfied_by(self, requirement, candidate):
+         return candidate.ver in requirement.spec
+diff --git a/tests/functional/python/test_resolvers_python.py b/tests/functional/python/test_resolvers_python.py
+index 1acf0ac..4c702f8 100644
+--- a/tests/functional/python/test_resolvers_python.py
++++ b/tests/functional/python/test_resolvers_python.py
+@@ -67,26 +67,28 @@ class PythonInputProvider(AbstractProvider):
+     def get_preference(self, resolution, candidates, information):
+         return len(candidates)
+ 
+-    def _iter_matches(self, requirement):
+-        name = packaging.utils.canonicalize_name(requirement.name)
+-
++    def _iter_matches(self, name, requirements):
++        extras = {e for r in requirements for e in r.extras}
+         for key, value in self.index[name].items():
+             version = packaging.version.parse(key)
+-            if version not in requirement.specifier:
++            if any(version not in r.specifier for r in requirements):
+                 continue
+             yield Candidate(
+-                name=requirement.name,
+-                version=version,
+-                extras=requirement.extras,
++                name=name, version=version, extras=extras,
+             )
+ 
+-    def find_matches(self, requirement):
+-        mapping = {c.version: c for c in self._iter_matches(requirement)}
+-        try:
+-            version = self.pinned_versions[requirement.name]
+-        except KeyError:
+-            return sorted(mapping.values(), key=operator.attrgetter("version"))
+-        return [mapping.pop(version)]
++    def find_matches(self, requirements):
++        name = packaging.utils.canonicalize_name(requirements[0].name)
++        candidates = sorted(
++            (c for c in self._iter_matches(name, requirements)),
++            key=operator.attrgetter("version"),
++            reverse=True,
++        )
++        pinned = self.pinned_versions.get(name)
++        for candidate in candidates:
++            if pinned is not None and pinned != candidate.version:
++                continue
++            yield candidate
+ 
+     def is_satisfied_by(self, requirement, candidate):
+         return candidate.version in requirement.specifier
+diff --git a/tests/functional/swift-package-manager/test_resolvers_swift.py b/tests/functional/swift-package-manager/test_resolvers_swift.py
+index ce0a340..51b5f46 100644
+--- a/tests/functional/swift-package-manager/test_resolvers_swift.py
++++ b/tests/functional/swift-package-manager/test_resolvers_swift.py
+@@ -84,21 +84,27 @@ class SwiftInputProvider(AbstractProvider):
+     def get_preference(self, resolution, candidates, information):
+         return len(candidates)
+ 
+-    def _iter_matches(self, requirement):
+-        container = requirement.container
+-        constraint_requirement = requirement.constraint["requirement"]
++    def _iter_matches(self, requirements):
++        container = requirements[0].container
+         for version in container["versions"]:
+-            parsed_version = _parse_version(version)
+-            if not _is_version_allowed(parsed_version, constraint_requirement):
++            ver = _parse_version(version)
++            satisfied = all(
++                _is_version_allowed(ver, r.constraint["requirement"])
++                for r in requirements
++            )
++            if not satisfied:
+                 continue
+-            preference = _calculate_preference(parsed_version)
++            preference = _calculate_preference(ver)
+             yield (preference, Candidate(container, version))
+ 
+-    def find_matches(self, requirement):
++    def find_matches(self, requirements):
+         matches = sorted(
+-            self._iter_matches(requirement), key=operator.itemgetter(0),
++            self._iter_matches(requirements),
++            key=operator.itemgetter(0),
++            reverse=True,
+         )
+-        return [candidate for _, candidate in matches]
++        for _, candidate in matches:
++            yield candidate
+ 
+     def is_satisfied_by(self, requirement, candidate):
+         return _is_version_allowed(
+diff --git a/tests/test_resolvers.py b/tests/test_resolvers.py
+index a6cbde8..b0c2d38 100644
+--- a/tests/test_resolvers.py
++++ b/tests/test_resolvers.py
+@@ -23,8 +23,8 @@ def test_candidate_inconsistent_error():
+         def get_dependencies(self, _):
+             return []
+ 
+-        def find_matches(self, r):
+-            assert r is requirement
++        def find_matches(self, rs):
++            assert len(rs) == 1 and rs[0] is requirement
+             return [candidate]
+ 
+         def is_satisfied_by(self, r, c):

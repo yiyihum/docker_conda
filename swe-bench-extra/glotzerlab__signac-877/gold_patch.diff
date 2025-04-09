@@ -1,0 +1,148 @@
+diff --git a/changelog.txt b/changelog.txt
+index 9baa08f3..24e74b2b 100644
+--- a/changelog.txt
++++ b/changelog.txt
+@@ -54,7 +54,7 @@ Removed
+  - The ability to pass indexes to various ``Project`` methods (#599).
+  - The following ``JobsCursor`` methods: ``groupbydoc``, ``next`` (#601, #604).
+  - The ``Project.config`` property is no longer mutable. Use the command line ``$ signac config`` to modify configuration (#608, #246, #244).
+- - The following config related functions: ``get_config``, ``load_config``, ``read_config_file``, ``search_standard_dirs`` (#674, #753, #789, #847).
++ - The config module and all its functions, all of which have been made private (#674, #753, #789, #847, #877).
+  - ``Project`` subclasses can no longer define a ``Job`` subclass to use (#588, #693).
+  - The ``Collection`` class (#664, #667, #683).
+  - The ``project`` CLI subcommand (#752).
+diff --git a/signac/__main__.py b/signac/__main__.py
+index b18f54c8..7211be8e 100644
+--- a/signac/__main__.py
++++ b/signac/__main__.py
+@@ -29,7 +29,15 @@ except ImportError:
+ else:
+     READLINE = True
+ 
+-from . import config, get_project, init_project
++from . import get_project, init_project
++from ._config import (
++    PROJECT_CONFIG_FN,
++    USER_CONFIG_FN,
++    _Config,
++    _load_config,
++    _locate_config_dir,
++    _read_config_file,
++)
+ from ._utility import _add_verbosity_argument, _print_err, _query_yes_no, _safe_relpath
+ from ._vendor.configobj import Section, flatten_errors
+ from .diff import diff_jobs
+@@ -663,12 +671,12 @@ def main_config_show(args):
+     if args.local and args.globalcfg:
+         raise ValueError("You can specify either -l/--local or -g/--global, not both.")
+     elif args.local:
+-        if os.path.isfile(config.PROJECT_CONFIG_FN):
+-            cfg = config._read_config_file(config.PROJECT_CONFIG_FN)
++        if os.path.isfile(PROJECT_CONFIG_FN):
++            cfg = _read_config_file(PROJECT_CONFIG_FN)
+     elif args.globalcfg:
+-        cfg = config._read_config_file(config.USER_CONFIG_FN)
++        cfg = _read_config_file(USER_CONFIG_FN)
+     else:
+-        cfg = config._load_config(config._locate_config_dir(os.getcwd()))
++        cfg = _load_config(_locate_config_dir(os.getcwd()))
+     if not cfg:
+         if args.local:
+             mode = "local"
+@@ -686,7 +694,7 @@ def main_config_show(args):
+     if not isinstance(cfg, Section):
+         print(cfg)
+     else:
+-        for line in config._Config(cfg).write():
++        for line in _Config(cfg).write():
+             print(line)
+ 
+ 
+@@ -717,12 +725,12 @@ def main_config_verify(args):
+     if args.local and args.globalcfg:
+         raise ValueError("You can specify either -l/--local or -g/--global, not both.")
+     elif args.local:
+-        if os.path.isfile(config.PROJECT_CONFIG_FN):
+-            cfg = config._read_config_file(config.PROJECT_CONFIG_FN)
++        if os.path.isfile(PROJECT_CONFIG_FN):
++            cfg = _read_config_file(PROJECT_CONFIG_FN)
+     elif args.globalcfg:
+-        cfg = config._read_config_file(config.USER_CONFIG_FN)
++        cfg = _read_config_file(USER_CONFIG_FN)
+     else:
+-        cfg = config._load_config(config._locate_config_dir(os.getcwd()))
++        cfg = _load_config(_locate_config_dir(os.getcwd()))
+     if not cfg:
+         if args.local:
+             mode = "local"
+@@ -746,16 +754,16 @@ def main_config_set(args):
+     if args.local and args.globalcfg:
+         raise ValueError("You can specify either -l/--local or -g/--global, not both.")
+     elif args.local:
+-        if os.path.isfile(config.PROJECT_CONFIG_FN):
+-            fn_config = config.PROJECT_CONFIG_FN
++        if os.path.isfile(PROJECT_CONFIG_FN):
++            fn_config = PROJECT_CONFIG_FN
+     elif args.globalcfg:
+-        fn_config = config.USER_CONFIG_FN
++        fn_config = USER_CONFIG_FN
+     else:
+         raise ValueError(
+             "You need to specify either -l/--local or -g/--global "
+             "to specify which configuration to modify."
+         )
+-    cfg = config._read_config_file(fn_config)
++    cfg = _read_config_file(fn_config)
+     keys = args.key.split(".")
+     if len(args.value) == 0:
+         raise ValueError("No value argument provided!")
+diff --git a/signac/config.py b/signac/_config.py
+similarity index 100%
+rename from signac/config.py
+rename to signac/_config.py
+diff --git a/signac/migration/v1_to_v2.py b/signac/migration/v1_to_v2.py
+index e2da1e52..224c1d58 100644
+--- a/signac/migration/v1_to_v2.py
++++ b/signac/migration/v1_to_v2.py
+@@ -15,11 +15,10 @@ This migration involves the following changes:
+ 
+ import os
+ 
+-from signac._synced_collections.backends.collection_json import BufferedJSONAttrDict
+-from signac._vendor import configobj
+-from signac.config import _get_project_config_fn
+-from signac.project import Project
+-
++from .._config import _get_project_config_fn
++from .._synced_collections.backends.collection_json import BufferedJSONAttrDict
++from .._vendor import configobj
++from ..project import Project
+ from .v0_to_v1 import _load_config_v1
+ 
+ # A minimal v2 config.
+diff --git a/signac/project.py b/signac/project.py
+index fe43f5cb..54c76bf9 100644
+--- a/signac/project.py
++++ b/signac/project.py
+@@ -20,10 +20,7 @@ from multiprocessing.pool import ThreadPool
+ from tempfile import TemporaryDirectory
+ from threading import RLock
+ 
+-from ._search_indexer import _SearchIndexer
+-from ._synced_collections.backends.collection_json import BufferedJSONAttrDict
+-from ._utility import _mkdir_p, _nested_dicts_to_dotted_keys, _split_and_print_progress
+-from .config import (
++from ._config import (
+     _Config,
+     _get_project_config_fn,
+     _load_config,
+@@ -31,6 +28,9 @@ from .config import (
+     _raise_if_older_schema,
+     _read_config_file,
+ )
++from ._search_indexer import _SearchIndexer
++from ._synced_collections.backends.collection_json import BufferedJSONAttrDict
++from ._utility import _mkdir_p, _nested_dicts_to_dotted_keys, _split_and_print_progress
+ from .errors import (
+     DestinationExistsError,
+     IncompatibleSchemaVersion,

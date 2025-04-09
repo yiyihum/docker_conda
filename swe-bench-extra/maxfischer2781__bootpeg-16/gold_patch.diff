@@ -1,0 +1,311 @@
+diff --git a/bootpeg/grammars/__init__.py b/bootpeg/grammars/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/bootpeg/peg.peg b/bootpeg/grammars/bpeg.bpeg
+similarity index 95%
+rename from bootpeg/peg.peg
+rename to bootpeg/grammars/bpeg.bpeg
+index 8ae3681..c6bb48a 100644
+--- a/bootpeg/peg.peg
++++ b/bootpeg/grammars/bpeg.bpeg
+@@ -36,7 +36,7 @@ reference:
+ reject:
+     | "!" spaces expr=expr { Not(.expr) }
+ expr:
+-    | expr=(choice | sequence | repeat | delimited | capture | reference | group | optional | range | literal | reject | anything | nothing) { .expr }
++    | expr=(choice | sequence | repeat | delimited | capture | reference | group | optional | range | nothing | literal | reject | anything) { .expr }
+ 
+ rule:
+     | "|" spaces expr=expr spaces "{" body=(((!"}") .)+) "}" { Rule(.expr, Action(.body)) }
+diff --git a/bootpeg/grammars/bpeg.py b/bootpeg/grammars/bpeg.py
+new file mode 100644
+index 0000000..477c619
+--- /dev/null
++++ b/bootpeg/grammars/bpeg.py
+@@ -0,0 +1,132 @@
++"""
++The default bootpeg grammar
++"""
++from typing import Union, NamedTuple, Mapping, Callable, Optional, Any
++from functools import singledispatch
++from pathlib import Path
++
++from ..pika.peg import (
++    Clause,
++    Nothing,
++    Anything,
++    Literal,
++    Sequence,
++    Choice,
++    Repeat,
++    Not,
++    Reference,
++    Parser,
++)
++from ..pika.act import Capture, Rule, transform
++from ..pika.front import Range, Delimited
++from ..pika.boot import namespace, bootpeg, boot
++
++
++@singledispatch
++def unparse(clause: Union[Clause, Parser], top=True) -> str:
++    """Format a ``clause`` according to bootpeg standard grammar"""
++    raise NotImplementedError(f"Cannot unparse {clause!r} as bpeg")
++
++
++@unparse.register(Nothing)
++def unparse_nothing(clause: Nothing, top=True) -> str:
++    return '""'
++
++
++@unparse.register(Anything)
++def unparse_anything(clause: Anything, top=True) -> str:
++    return "." * clause.length
++
++
++@unparse.register(Literal)
++def unparse_literal(clause: Literal, top=True) -> str:
++    return repr(clause.value)
++
++
++@unparse.register(Sequence)
++def unparse_sequence(clause: Sequence, top=True) -> str:
++    children = " ".join(
++        unparse(sub_clause, top=False) for sub_clause in clause.sub_clauses
++    )
++    return f"({children})" if not top else children
++
++
++@unparse.register(Choice)
++def unparse_choice(clause: Choice, top=True) -> str:
++    children = " | ".join(
++        unparse(sub_clause, top=False) for sub_clause in clause.sub_clauses
++    )
++    return f"({children})" if not top else children
++
++
++@unparse.register(Repeat)
++def unparse_repeat(clause: Repeat, top=True) -> str:
++    return unparse(clause.sub_clauses[0], top=False) + "+"
++
++
++@unparse.register(Not)
++def unparse_not(clause: Not, top=True) -> str:
++    return "!" + unparse(clause.sub_clauses[0], top=False)
++
++
++@unparse.register(Reference)
++def unparse_reference(clause: Reference, top=True) -> str:
++    return clause.target
++
++
++@unparse.register(Capture)
++def unparse_capture(clause: Capture, top=True) -> str:
++    return f"{clause.name}={unparse(clause.sub_clauses[0], top=False)}"
++
++
++@unparse.register(Rule)
++def unparse_rule(clause: Rule, top=True) -> str:
++    return f"| {unparse(clause.sub_clauses[0])} {{{clause.action.literal}}}"
++
++
++@unparse.register(Range)
++def unparse_range(clause: Range, top=True) -> str:
++    return f"{clause.first!r} - {clause.last!r}"
++
++
++@unparse.register(Delimited)
++def unparse_delimited(clause: Delimited, top=True) -> str:
++    first, last = clause.sub_clauses
++    return f"{unparse(first, top=False)} :: {unparse(last, top=False)}"
++
++
++class Actions(NamedTuple):
++    #: names available for translation actions
++    names: Mapping[str, Callable]
++    #: postprocessing callable
++    post: Callable[..., Any]
++
++
++#: :py:class:`~.Actions` needed to construct a Pika parser
++PikaActions = Actions(
++    names=namespace,
++    post=lambda *args, **kwargs: Parser(
++        "top",
++        **{name: clause for name, clause in args[0]},
++    ),
++)
++
++_parser_cache: Optional[Parser] = None
++grammar_path = Path(__file__).parent / "bpeg.bpeg"
++
++
++def _get_parser() -> Parser:
++    global _parser_cache
++    if _parser_cache is None:
++        parser = bootpeg()
++        # TODO: does translating twice offer any benefit?
++        parser = boot(parser, grammar_path.read_text())
++        _parser_cache = parser
++    return _parser_cache
++
++
++def parse(source, actions: Actions = PikaActions):
++    head, memo = _get_parser().parse(source)
++    assert head.length == len(source)
++    args, kwargs = transform(head, memo, actions.names)
++    return actions.post(*args, **kwargs)
+diff --git a/bootpeg/pika/act.py b/bootpeg/pika/act.py
+index 7f8aafd..54c94c8 100644
+--- a/bootpeg/pika/act.py
++++ b/bootpeg/pika/act.py
+@@ -1,7 +1,7 @@
+ """
+ Pika bottom-up Peg parser extension to transform parsed source
+ """
+-from typing import TypeVar, Any, Dict, Tuple
++from typing import TypeVar, Any, Dict, Tuple, Mapping
+ import re
+ 
+ from .peg import Clause, D, Match, MemoTable, MemoKey, Literal, nested_str, Reference
+@@ -201,13 +201,13 @@ class TransformFailure(Exception):
+         self.exc = exc
+ 
+ 
+-def transform(head: Match, memo: MemoTable, namespace: Dict[str, Any]):
++def transform(head: Match, memo: MemoTable, namespace: Mapping[str, Any]):
+     return postorder_transform(head, memo.source, namespace)
+ 
+ 
+ # TODO: Use trampoline/coroutines for infinite depth
+ def postorder_transform(
+-    match: Match, source: D, namespace: Dict[str, Any]
++    match: Match, source: D, namespace: Mapping[str, Any]
+ ) -> Tuple[Any, Dict[str, Any]]:
+     matches, captures = (), {}
+     for sub_match in match.sub_matches:
+diff --git a/bootpeg/pika/boot.peg b/bootpeg/pika/boot.bpeg
+similarity index 100%
+rename from bootpeg/pika/boot.peg
+rename to bootpeg/pika/boot.bpeg
+diff --git a/bootpeg/pika/boot.py b/bootpeg/pika/boot.py
+index c06827d..ddc9521 100644
+--- a/bootpeg/pika/boot.py
++++ b/bootpeg/pika/boot.py
+@@ -1,3 +1,5 @@
++from typing import Optional
++
+ import string
+ import time
+ import pathlib
+@@ -129,7 +131,8 @@ namespace = {
+ 
+ end_line = Reference("end_line")  # Literal("\n")
+ 
+-parser = Parser(
++#: Minimal parser required to bootstrap the actual parser
++min_parser = Parser(
+     "top",
+     literal=Rule(
+         Choice(
+@@ -292,8 +295,8 @@ parser = Parser(
+         Action(".*"),
+     ),
+ )
+-boot_path = pathlib.Path(__file__).parent / "boot.peg"
+-full_path = pathlib.Path(__file__).parent.parent / "peg.peg"
++boot_path = pathlib.Path(__file__).parent / "boot.bpeg"
++full_path = pathlib.Path(__file__).parent.parent / "grammars" / "bpeg.bpeg"
+ 
+ 
+ def boot(base_parser: Parser, source: str) -> Parser:
+@@ -306,7 +309,20 @@ def boot(base_parser: Parser, source: str) -> Parser:
+     )
+ 
+ 
++_parser_cache: Optional[Parser] = None
++
++
++def bootpeg() -> Parser:
++    """Provide the basic bootpeg Pika parser"""
++    global _parser_cache
++    if _parser_cache is None:
++        with open(boot_path) as boot_peg_stream:
++            _parser_cache = boot(min_parser, boot_peg_stream.read())
++    return _parser_cache
++
++
+ if __name__ == "__main__":
++    parser = bootpeg()
+     for iteration in range(2):
+         with open(boot_path) as boot_peg:
+             print("Generation:", iteration)
+@@ -318,7 +334,7 @@ if __name__ == "__main__":
+     for iteration in range(2, 4):
+         with open(full_path) as base_peg:
+             print("Generation:", iteration)
+-            display(parser)
++            display(min_parser)
+             parser = range_parse(
+                 base_peg.read(),
+                 parser,
+diff --git a/bootpeg/pika/front.py b/bootpeg/pika/front.py
+index aac0c50..f81cb3d 100644
+--- a/bootpeg/pika/front.py
++++ b/bootpeg/pika/front.py
+@@ -19,6 +19,7 @@ from .peg import (
+     D,
+ )
+ from .act import Debug, Capture, Rule, transform, Action, Discard
++from ..utility import cache_hash
+ 
+ __all__ = [
+     # peg
+@@ -42,6 +43,7 @@ __all__ = [
+     "chain",
+     "either",
+     "Range",
++    "Delimited",
+ ]
+ 
+ 
+@@ -76,7 +78,7 @@ class Range(Terminal[D]):
+     maybe_zero = False
+ 
+     def __init__(self, first: D, last: D):
+-        assert len(first) == len(last) > 0
++        assert len(first) == len(last) > 0, "Range bounds must be of same length"
+         self.first = first
+         self.last = last
+         self._length = len(first)
+@@ -109,7 +111,7 @@ class Delimited(Clause[D]):
+     A pair of clauses with arbitrary intermediate filler
+     """
+ 
+-    __slots__ = ("sub_clauses",)
++    __slots__ = ("sub_clauses", "_hash")
+ 
+     @property
+     def maybe_zero(self):
+@@ -118,6 +120,7 @@ class Delimited(Clause[D]):
+ 
+     def __init__(self, start: Clause[D], stop: Clause[D]):
+         self.sub_clauses = start, stop
++        self._hash = None
+ 
+     @property
+     def triggers(self) -> "Tuple[Clause[D]]":
+@@ -135,6 +138,13 @@ class Delimited(Clause[D]):
+                 return Match(offset + tail.length, (head, tail), at, self)
+         return None
+ 
++    def __eq__(self, other):
++        return isinstance(other, Delimited) and self.sub_clauses == other.sub_clauses
++
++    @cache_hash
++    def __hash__(self):
++        return hash(self.sub_clauses)
++
+     def __repr__(self):
+         start, stop = self.sub_clauses
+         return f"{self.__class__.__name__}(start={start!r}, stop={stop!r})"

@@ -1,0 +1,235 @@
+diff --git a/fsspec/implementations/tests/conftest.py b/fsspec/implementations/tests/conftest.py
+index 70d79ef..7dce3ee 100644
+--- a/fsspec/implementations/tests/conftest.py
++++ b/fsspec/implementations/tests/conftest.py
+@@ -2,21 +2,33 @@ import tempfile
+ 
+ import pytest
+ 
++from fsspec.implementations.arrow import ArrowFSWrapper
+ from fsspec.implementations.local import LocalFileSystem
+-
++from fsspec.implementations.memory import MemoryFileSystem
+ 
+ # A dummy filesystem that has a list of protocols
++
++
+ class MultiProtocolFileSystem(LocalFileSystem):
+     protocol = ["file", "other"]
+ 
+ 
+-FILESYSTEMS = {"local": LocalFileSystem, "multi": MultiProtocolFileSystem}
++FILESYSTEMS = {
++    "local": LocalFileSystem,
++    "multi": MultiProtocolFileSystem,
++    "memory": MemoryFileSystem,
++}
+ 
+ READ_ONLY_FILESYSTEMS = []
+ 
+ 
+ @pytest.fixture(scope="function")
+ def fs(request):
++    pyarrow_fs = pytest.importorskip("pyarrow.fs")
++    FileSystem = pyarrow_fs.FileSystem
++    if request.param == "arrow":
++        fs = ArrowFSWrapper(FileSystem.from_uri("file:///")[0])
++        return fs
+     cls = FILESYSTEMS[request.param]
+     return cls()
+ 
+diff --git a/fsspec/implementations/tests/test_arrow.py b/fsspec/implementations/tests/test_arrow.py
+index 1386df8..99d8a49 100644
+--- a/fsspec/implementations/tests/test_arrow.py
++++ b/fsspec/implementations/tests/test_arrow.py
+@@ -14,11 +14,11 @@ def fs():
+     return ArrowFSWrapper(fs)
+ 
+ 
+-@pytest.fixture(scope="function")
+-def remote_dir(fs):
++@pytest.fixture(scope="function", params=[False, True])
++def remote_dir(fs, request):
+     directory = secrets.token_hex(16)
+     fs.makedirs(directory)
+-    yield directory
++    yield ("hdfs://" if request.param else "") + directory
+     fs.rm(directory, recursive=True)
+ 
+ 
+@@ -30,18 +30,19 @@ def strip_keys(original_entry):
+ 
+ def test_info(fs, remote_dir):
+     fs.touch(remote_dir + "/a.txt")
++    remote_dir_strip_protocol = fs._strip_protocol(remote_dir)
+     details = fs.info(remote_dir + "/a.txt")
+     assert details["type"] == "file"
+-    assert details["name"] == remote_dir + "/a.txt"
++    assert details["name"] == remote_dir_strip_protocol + "/a.txt"
+     assert details["size"] == 0
+ 
+     fs.mkdir(remote_dir + "/dir")
+     details = fs.info(remote_dir + "/dir")
+     assert details["type"] == "directory"
+-    assert details["name"] == remote_dir + "/dir"
++    assert details["name"] == remote_dir_strip_protocol + "/dir"
+ 
+     details = fs.info(remote_dir + "/dir/")
+-    assert details["name"] == remote_dir + "/dir/"
++    assert details["name"] == remote_dir_strip_protocol + "/dir/"
+ 
+ 
+ def test_move(fs, remote_dir):
+@@ -114,12 +115,14 @@ def test_rm(fs, remote_dir):
+ 
+ 
+ def test_ls(fs, remote_dir):
++    remote_dir_strip_protocol = fs._strip_protocol(remote_dir)
+     fs.mkdir(remote_dir + "dir/")
+     files = set()
+     for no in range(8):
+         file = remote_dir + f"dir/test_{no}"
++        # we also want to make sure `fs.touch` works with protocol
+         fs.touch(file)
+-        files.add(file)
++        files.add(remote_dir_strip_protocol + f"dir/test_{no}")
+ 
+     assert set(fs.ls(remote_dir + "dir/")) == files
+ 
+diff --git a/fsspec/implementations/tests/test_cached.py b/fsspec/implementations/tests/test_cached.py
+index 4ddc051..51c451e 100644
+--- a/fsspec/implementations/tests/test_cached.py
++++ b/fsspec/implementations/tests/test_cached.py
+@@ -153,6 +153,109 @@ def test_clear():
+     assert len(os.listdir(cache1)) < 2
+ 
+ 
++def test_clear_expired(tmp_path):
++    def __ager(cache_fn, fn):
++        """
++        Modify the cache file to virtually add time lag to selected files.
++
++        Parameters
++        ---------
++        cache_fn: str
++            cache path
++        fn: str
++            file name to be modified
++        """
++        import pathlib
++        import time
++
++        if os.path.exists(cache_fn):
++            with open(cache_fn, "rb") as f:
++                cached_files = pickle.load(f)
++                fn_posix = pathlib.Path(fn).as_posix()
++                cached_files[fn_posix]["time"] = cached_files[fn_posix]["time"] - 691200
++            assert os.access(cache_fn, os.W_OK), "Cache is not writable"
++            with open(cache_fn, "wb") as f:
++                pickle.dump(cached_files, f)
++            time.sleep(1)
++
++    origin = tmp_path.joinpath("origin")
++    cache1 = tmp_path.joinpath("cache1")
++    cache2 = tmp_path.joinpath("cache2")
++    cache3 = tmp_path.joinpath("cache3")
++
++    origin.mkdir()
++    cache1.mkdir()
++    cache2.mkdir()
++    cache3.mkdir()
++
++    data = b"test data"
++    f1 = origin.joinpath("afile")
++    f2 = origin.joinpath("bfile")
++    f3 = origin.joinpath("cfile")
++    f4 = origin.joinpath("dfile")
++
++    with open(f1, "wb") as f:
++        f.write(data)
++    with open(f2, "wb") as f:
++        f.write(data)
++    with open(f3, "wb") as f:
++        f.write(data)
++    with open(f4, "wb") as f:
++        f.write(data)
++
++    # populates first cache
++    fs = fsspec.filesystem(
++        "filecache", target_protocol="file", cache_storage=str(cache1), cache_check=1
++    )
++    assert fs.cat(str(f1)) == data
++
++    # populates "last" cache if file not found in first one
++    fs = fsspec.filesystem(
++        "filecache",
++        target_protocol="file",
++        cache_storage=[str(cache1), str(cache2)],
++        cache_check=1,
++    )
++    assert fs.cat(str(f2)) == data
++    assert fs.cat(str(f3)) == data
++    assert len(os.listdir(cache2)) == 3
++
++    # force the expiration
++    cache_fn = os.path.join(fs.storage[-1], "cache")
++    __ager(cache_fn, f2)
++
++    # remove from cache2 the expired files
++    fs.clear_expired_cache()
++    assert len(os.listdir(cache2)) == 2
++
++    # check complete cleanup
++    __ager(cache_fn, f3)
++
++    fs.clear_expired_cache()
++    assert not fs._check_file(f2)
++    assert not fs._check_file(f3)
++    assert len(os.listdir(cache2)) < 2
++
++    # check cache1 to be untouched after cleaning
++    assert len(os.listdir(cache1)) == 2
++
++    # check cleaning with 'same_name' option enabled
++    fs = fsspec.filesystem(
++        "filecache",
++        target_protocol="file",
++        cache_storage=[str(cache1), str(cache2), str(cache3)],
++        same_names=True,
++        cache_check=1,
++    )
++    assert fs.cat(str(f4)) == data
++
++    cache_fn = os.path.join(fs.storage[-1], "cache")
++    __ager(cache_fn, f4)
++
++    fs.clear_expired_cache()
++    assert not fs._check_file(str(f4))
++
++
+ def test_pop():
+     import tempfile
+ 
+diff --git a/fsspec/implementations/tests/test_common.py b/fsspec/implementations/tests/test_common.py
+index 4417213..fe88dc3 100644
+--- a/fsspec/implementations/tests/test_common.py
++++ b/fsspec/implementations/tests/test_common.py
+@@ -18,14 +18,15 @@ def test_created(fs: AbstractFileSystem, temp_file):
+             fs.rm(temp_file)
+ 
+ 
+-@pytest.mark.parametrize("fs", ["local"], indirect=["fs"])
++@pytest.mark.parametrize("fs", ["local", "memory", "arrow"], indirect=["fs"])
+ def test_modified(fs: AbstractFileSystem, temp_file):
+     try:
+         fs.touch(temp_file)
+-        created = fs.created(path=temp_file)
++        # created = fs.created(path=temp_file)
++        created = datetime.datetime.utcnow()  # pyarrow only have modified
+         time.sleep(0.05)
+         fs.touch(temp_file)
+-        modified = fs.modified(path=temp_file)
++        modified = fs.modified(path=temp_file).replace(tzinfo=None)
+         assert isinstance(modified, datetime.datetime)
+         assert modified > created
+     finally:

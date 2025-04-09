@@ -1,0 +1,270 @@
+diff --git a/bbutil/__init__.py b/bbutil/__init__.py
+index 9255076..0c14292 100644
+--- a/bbutil/__init__.py
++++ b/bbutil/__init__.py
+@@ -21,15 +21,15 @@ from bbutil.logging import Logging
+ 
+ __all__ = [
+     "database",
+-    "logging",
+     "lang",
++    "logging",
++    "worker",
+ 
+     "data",
+     "file",
+     "utils",
+ 
+     "log",
+-
+     "set_log"
+ ]
+ 
+diff --git a/bbutil/worker/__init__.py b/bbutil/worker/__init__.py
+new file mode 100644
+index 0000000..33e645f
+--- /dev/null
++++ b/bbutil/worker/__init__.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/python3
++# -*- coding: utf-8 -*-
++#
++#    Licensed under the Apache License, Version 2.0 (the "License");
++#    you may not use this file except in compliance with the License.
++#    You may obtain a copy of the License at
++#
++#        http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS,
++#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#    See the License for the specific language governing permissions and
++#    limitations under the License.
++#
++#    Copyright (C) 2017, Kai Raphahn <kai.raphahn@laburec.de>
++#
++
++import abc
++import threading
++import time
++
++from abc import ABCMeta
++from dataclasses import dataclass
++from typing import Optional
++
++import bbutil
++from bbutil.worker.callback import Callback
++
++__all__ = [
++    "Worker",
++
++    "callback"
++]
++
++
++@dataclass
++class Worker(metaclass=ABCMeta):
++
++    id: str = ""
++    abort: bool = False
++    interval: float = 0.01
++
++    _callback: Optional[Callback] = None
++    _error: bool = False
++    _running: bool = True
++
++    @property
++    def error(self) -> bool:
++        return self._error
++
++    @abc.abstractmethod
++    def prepare(self) -> bool:
++        pass
++
++    @abc.abstractmethod
++    def run(self) -> bool:
++        pass
++
++    @abc.abstractmethod
++    def close(self) -> bool:
++        pass
++
++    def set_callback(self, **kwargs):
++        if self._callback is None:
++            self._callback = Callback()
++
++        self._callback.set_callback(**kwargs)
++        return
++
++    def _do_step(self, step: str, function, callback_func):
++        if self.abort is True:
++            self._running = False
++            self.abort = False
++            self._callback.do_abort()
++            bbutil.log.warn(self.id, "Abort {0:s}".format(step))
++            return
++
++        callback_func()
++
++        _check = function()
++        if _check is False:
++            self._error = True
++            bbutil.log.error("{0:s}: {1:s} failed!".format(self.id, step))
++
++        if self._error is True:
++            self._running = False
++        return
++
++    def _execute(self):
++        if self._callback is None:
++            self._callback = Callback()
++
++        self._running = True
++        self._callback.do_start()
++
++        self._do_step("prepare", self.prepare, self._callback.do_prepare)
++        if self._running is False:
++            self._callback.do_stop()
++            return
++
++        self._do_step("run", self.run, self._callback.do_run)
++        if self._running is False:
++            self._callback.do_stop()
++            return
++
++        self._do_step("close", self.close, self._callback.do_close)
++        if self._running is False:
++            self._callback.do_stop()
++            return
++
++        self._callback.do_stop()
++        self._running = False
++        return
++
++    def start(self):
++        _t = threading.Thread(target=self._execute)
++        _t.start()
++        return
++
++    @property
++    def is_running(self):
++        return self._running
++
++    def wait(self):
++        _run = True
++
++        while _run is True:
++            time.sleep(self.interval)
++
++            if self._running is False:
++                _run = False
++        return
++
++    def execute(self) -> bool:
++        self._execute()
++
++        if self._error is True:
++            return False
++
++        return True
+diff --git a/bbutil/worker/callback.py b/bbutil/worker/callback.py
+new file mode 100644
+index 0000000..15c936c
+--- /dev/null
++++ b/bbutil/worker/callback.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/python3
++# -*- coding: utf-8 -*-
++#
++#    Licensed under the Apache License, Version 2.0 (the "License");
++#    you may not use this file except in compliance with the License.
++#    You may obtain a copy of the License at
++#
++#        http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS,
++#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#    See the License for the specific language governing permissions and
++#    limitations under the License.
++#
++#    Copyright (C) 2017, Kai Raphahn <kai.raphahn@laburec.de>
++#
++
++__all__ = [
++    "Callback"
++]
++
++
++class Callback(object):
++
++    def __init__(self):
++        self.start = None
++        self.stop = None
++        self.prepare = None
++        self.run = None
++        self.close = None
++        self.abort = None
++        return
++
++    def set_callback(self, **kwargs):
++        _value = kwargs.get("start", None)
++        if _value is not None:
++            self.start = _value
++
++        _value = kwargs.get("stop", None)
++        if _value is not None:
++            self.stop = _value
++
++        _value = kwargs.get("prepare", None)
++        if _value is not None:
++            self.prepare = _value
++
++        _value = kwargs.get("run", None)
++        if _value is not None:
++            self.run = _value
++
++        _value = kwargs.get("close", None)
++        if _value is not None:
++            self.close = _value
++
++        _value = kwargs.get("abort", None)
++        if _value is not None:
++            self.abort = _value
++        return
++
++    def do_start(self):
++        if self.start is None:
++            return
++        self.start()
++        return
++
++    def do_stop(self):
++        if self.stop is None:
++            return
++        self.stop()
++        return
++
++    def do_prepare(self):
++        if self.prepare is None:
++            return
++        self.prepare()
++        return
++
++    def do_run(self):
++        if self.run is None:
++            return
++        self.run()
++        return
++
++    def do_close(self):
++        if self.close is None:
++            return
++        self.close()
++        return
++
++    def do_abort(self):
++        if self.abort is None:
++            return
++        self.abort()
++        return

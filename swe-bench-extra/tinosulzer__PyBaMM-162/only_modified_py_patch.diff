@@ -1,0 +1,150 @@
+diff --git a/pybamm/__init__.py b/pybamm/__init__.py
+index ac4b6da7..98c5b202 100644
+--- a/pybamm/__init__.py
++++ b/pybamm/__init__.py
+@@ -78,8 +78,10 @@ from .expression_tree.unary_operators import (
+     Divergence,
+     Broadcast,
+     NumpyBroadcast,
++    SurfaceValue,
+     grad,
+     div,
++    surf,
+ )
+ from .expression_tree.function_parameter import FunctionParameter
+ from .expression_tree.scalar import Scalar
+diff --git a/pybamm/discretisations/discretisation.py b/pybamm/discretisations/discretisation.py
+index a572b4fb..18cff23e 100644
+--- a/pybamm/discretisations/discretisation.py
++++ b/pybamm/discretisations/discretisation.py
+@@ -212,6 +212,13 @@ class Discretisation(object):
+                 )
+             return symbol
+ 
++        elif isinstance(symbol, pybamm.SurfaceValue):
++            child = symbol.children[0]
++            discretised_child = self.process_symbol(child)
++            return self._spatial_methods[symbol.domain[0]].surface_value(
++                discretised_child
++            )
++
+         elif isinstance(symbol, pybamm.BinaryOperator):
+             return self.process_binary_operators(symbol)
+ 
+diff --git a/pybamm/expression_tree/unary_operators.py b/pybamm/expression_tree/unary_operators.py
+index 17ce41fd..abe2babb 100644
+--- a/pybamm/expression_tree/unary_operators.py
++++ b/pybamm/expression_tree/unary_operators.py
+@@ -210,6 +210,16 @@ class NumpyBroadcast(Broadcast):
+             return child_eval * self.broadcasting_vector
+ 
+ 
++class SurfaceValue(SpatialOperator):
++    """A node in the expression tree which gets the surface value of a variable.
++
++    **Extends:** :class:`SpatialOperator`
++    """
++
++    def __init__(self, child):
++        super().__init__("surf", child)
++
++
+ #
+ # Methods to call Gradient and Divergence
+ #
+@@ -251,3 +261,27 @@ def div(expression):
+     """
+ 
+     return Divergence(expression)
++
++
++#
++# Method to call SurfaceValue
++#
++
++
++def surf(variable):
++    """convenience function for creating a :class:`SurfaceValue`
++
++    Parameters
++    ----------
++
++    variable : :class:`Symbol`
++        the surface value of this variable will be returned
++
++    Returns
++    -------
++
++    :class:`GetSurfaceValue`
++        the surface value of ``variable``
++    """
++
++    return SurfaceValue(variable)
+diff --git a/pybamm/spatial_methods/finite_volume.py b/pybamm/spatial_methods/finite_volume.py
+index b172ad3d..86cc3f68 100644
+--- a/pybamm/spatial_methods/finite_volume.py
++++ b/pybamm/spatial_methods/finite_volume.py
+@@ -237,6 +237,33 @@ class FiniteVolume(pybamm.SpatialMethod):
+             left_ghost_cell, discretised_symbol, right_ghost_cell
+         )
+ 
++    def surface_value(self, discretised_symbol):
++        """
++        Uses linear extrapolation to get the surface value of a variable in the
++        Finite Volume Method.
++
++        Parameters
++        -----------
++        discretised_symbol : :class:`pybamm.StateVector`
++            The discretised variable (a state vector) from which to calculate
++            the surface value.
++
++        Returns
++        -------
++        :class:`pybamm.Variable`
++            The variable representing the surface value.
++        """
++        # Better to make class similar NodeToEdge and pass function?
++        # def surface_value(array):
++        #     "Linear extrapolation for surface value"
++        #     array[-1] + (array[-1] - array[-2]) / 2
++        # ... or make StateVector and add?
++        y_slice_stop = discretised_symbol.y_slice.stop
++        last_node = pybamm.StateVector(slice(y_slice_stop - 1, y_slice_stop))
++        penultimate_node = pybamm.StateVector(slice(y_slice_stop - 2, y_slice_stop - 1))
++        surface_value = (last_node + (last_node - penultimate_node) / 2)
++        return surface_value
++
+     #######################################################
+     # Can probably be moved outside of the spatial method
+     ######################################################
+diff --git a/pybamm/spatial_methods/spatial_method.py b/pybamm/spatial_methods/spatial_method.py
+index 1006ed32..b92104b7 100644
+--- a/pybamm/spatial_methods/spatial_method.py
++++ b/pybamm/spatial_methods/spatial_method.py
+@@ -102,6 +102,24 @@ class SpatialMethod:
+         """
+         raise NotImplementedError
+ 
++    def surface_value(self, discretised_symbol):
++        """
++        Returns the surface value using the approriate expression for the
++        spatial method.
++
++        Parameters
++        -----------
++        discretised_symbol : :class:`pybamm.StateVector`
++            The discretised variable (a state vector) from which to calculate
++            the surface value.
++
++        Returns
++        -------
++        :class:`pybamm.Variable`
++            The variable representing the surface value.
++        """
++        raise NotImplementedError
++
+     # We could possibly move the following outside of SpatialMethod
+     # depending on the requirements of the FiniteVolume
+ 
+

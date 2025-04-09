@@ -1,0 +1,129 @@
+diff --git a/starlette/testclient.py b/starlette/testclient.py
+index eb0e8be..471e623 100644
+--- a/starlette/testclient.py
++++ b/starlette/testclient.py
+@@ -88,9 +88,12 @@ class _WrapASGI2:
+ 
+ 
+ class _ASGIAdapter(requests.adapters.HTTPAdapter):
+-    def __init__(self, app: ASGI3App, raise_server_exceptions: bool = True) -> None:
++    def __init__(
++        self, app: ASGI3App, raise_server_exceptions: bool = True, root_path: str = ""
++    ) -> None:
+         self.app = app
+         self.raise_server_exceptions = raise_server_exceptions
++        self.root_path = root_path
+ 
+     def send(  # type: ignore
+         self, request: requests.PreparedRequest, *args: typing.Any, **kwargs: typing.Any
+@@ -131,7 +134,7 @@ class _ASGIAdapter(requests.adapters.HTTPAdapter):
+             scope = {
+                 "type": "websocket",
+                 "path": unquote(path),
+-                "root_path": "",
++                "root_path": self.root_path,
+                 "scheme": scheme,
+                 "query_string": query.encode(),
+                 "headers": headers,
+@@ -147,7 +150,7 @@ class _ASGIAdapter(requests.adapters.HTTPAdapter):
+             "http_version": "1.1",
+             "method": request.method,
+             "path": unquote(path),
+-            "root_path": "",
++            "root_path": self.root_path,
+             "scheme": scheme,
+             "query_string": query.encode(),
+             "headers": headers,
+@@ -365,6 +368,7 @@ class TestClient(requests.Session):
+         app: typing.Union[ASGI2App, ASGI3App],
+         base_url: str = "http://testserver",
+         raise_server_exceptions: bool = True,
++        root_path: str = "",
+     ) -> None:
+         super(TestClient, self).__init__()
+         if _is_asgi3(app):
+@@ -374,7 +378,9 @@ class TestClient(requests.Session):
+             app = typing.cast(ASGI2App, app)
+             asgi_app = _WrapASGI2(app)  #  type: ignore
+         adapter = _ASGIAdapter(
+-            asgi_app, raise_server_exceptions=raise_server_exceptions
++            asgi_app,
++            raise_server_exceptions=raise_server_exceptions,
++            root_path=root_path,
+         )
+         self.mount("http://", adapter)
+         self.mount("https://", adapter)
+diff --git a/tests/test_routing.py b/tests/test_routing.py
+index 3c0c4cd..9723e46 100644
+--- a/tests/test_routing.py
++++ b/tests/test_routing.py
+@@ -1,5 +1,6 @@
+ import pytest
+ 
++from starlette.applications import Starlette
+ from starlette.responses import JSONResponse, PlainTextResponse, Response
+ from starlette.routing import Host, Mount, NoMatchFound, Route, Router, WebSocketRoute
+ from starlette.testclient import TestClient
+@@ -164,12 +165,24 @@ def test_url_for():
+         app.url_path_for("homepage").make_absolute_url(base_url="https://example.org")
+         == "https://example.org/"
+     )
++    assert (
++        app.url_path_for("homepage").make_absolute_url(
++            base_url="https://example.org/root_path/"
++        )
++        == "https://example.org/root_path/"
++    )
+     assert (
+         app.url_path_for("user", username="tomchristie").make_absolute_url(
+             base_url="https://example.org"
+         )
+         == "https://example.org/users/tomchristie"
+     )
++    assert (
++        app.url_path_for("user", username="tomchristie").make_absolute_url(
++            base_url="https://example.org/root_path/"
++        )
++        == "https://example.org/root_path/users/tomchristie"
++    )
+     assert (
+         app.url_path_for("websocket_endpoint").make_absolute_url(
+             base_url="https://example.org"
+@@ -353,3 +366,37 @@ def test_subdomain_reverse_urls():
+         ).make_absolute_url("https://whatever")
+         == "https://foo.example.org/homepage"
+     )
++
++
++async def echo_urls(request):
++    return JSONResponse(
++        {
++            "index": request.url_for("index"),
++            "submount": request.url_for("mount:submount"),
++        }
++    )
++
++
++echo_url_routes = [
++    Route("/", echo_urls, name="index", methods=["GET"]),
++    Mount(
++        "/submount",
++        name="mount",
++        routes=[Route("/", echo_urls, name="submount", methods=["GET"])],
++    ),
++]
++
++
++def test_url_for_with_root_path():
++    app = Starlette(routes=echo_url_routes)
++    client = TestClient(app, base_url="https://www.example.org/", root_path="/sub_path")
++    response = client.get("/")
++    assert response.json() == {
++        "index": "https://www.example.org/sub_path/",
++        "submount": "https://www.example.org/sub_path/submount/",
++    }
++    response = client.get("/submount/")
++    assert response.json() == {
++        "index": "https://www.example.org/sub_path/",
++        "submount": "https://www.example.org/sub_path/submount/",
++    }

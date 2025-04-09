@@ -1,0 +1,124 @@
+diff --git a/xonsh/parsers/base.py b/xonsh/parsers/base.py
+index c4a6c524..76c2ba4f 100644
+--- a/xonsh/parsers/base.py
++++ b/xonsh/parsers/base.py
+@@ -1,5 +1,6 @@
+ """Implements the base xonsh parser."""
+ 
++import itertools
+ import os
+ import re
+ import textwrap
+@@ -3496,27 +3497,43 @@ class BaseParser:
+         """subproc_arg : subproc_arg_part"""
+         p[0] = p[1]
+ 
++    def _arg_part_combine(self, *arg_parts):
++        """Combines arg_parts. If all arg_parts are strings, concatenate the strings.
++        Otherwise, return a list of arg_parts."""
++        if all(ast.is_const_str(ap) for ap in arg_parts):
++            return ast.const_str(
++                "".join(ap.value for ap in arg_parts),
++                lineno=arg_parts[0].lineno,
++                col_offset=arg_parts[0].col_offset,
++            )
++        else:
++            return list(
++                itertools.chain.from_iterable(
++                    ap if isinstance(ap, list) else [ap] for ap in arg_parts
++                )
++            )
++
+     def p_subproc_arg_many(self, p):
+         """subproc_arg : subproc_arg subproc_arg_part"""
+         # This glues the string together after parsing
++        p[0] = self._arg_part_combine(p[1], p[2])
++
++    def p_subproc_arg_part_brackets(self, p):
++        """subproc_arg_part : lbracket_tok subproc_arg rbracket_tok"""
+         p1 = p[1]
+         p2 = p[2]
+-        if ast.is_const_str(p1) and ast.is_const_str(p2):
+-            p0 = ast.const_str(
+-                p1.value + p2.value, lineno=p1.lineno, col_offset=p1.col_offset
+-            )
+-        elif isinstance(p1, list):
+-            if isinstance(p2, list):
+-                p1.extend(p2)
+-            else:
+-                p1.append(p2)
+-            p0 = p1
+-        elif isinstance(p2, list):
+-            p2.insert(0, p1)
+-            p0 = p2
+-        else:
+-            p0 = [p1, p2]
+-        p[0] = p0
++        p3 = p[3]
++        p1 = ast.const_str(s=p1.value, lineno=p1.lineno, col_offset=p1.lexpos)
++        p3 = ast.const_str(s=p3.value, lineno=p3.lineno, col_offset=p3.lexpos)
++        p[0] = self._arg_part_combine(p1, p2, p3)
++
++    def p_subproc_arg_part_brackets_empty(self, p):
++        """subproc_arg_part : lbracket_tok rbracket_tok"""
++        p1 = p[1]
++        p2 = p[2]
++        p1 = ast.const_str(s=p1.value, lineno=p1.lineno, col_offset=p1.lexpos)
++        p2 = ast.const_str(s=p2.value, lineno=p2.lineno, col_offset=p2.lexpos)
++        p[0] = self._arg_part_combine(p1, p2)
+ 
+     def _attach_subproc_arg_part_rules(self):
+         toks = set(self.tokens)
+diff --git a/xonsh/procs/specs.py b/xonsh/procs/specs.py
+index 7c538a1b..660cfc85 100644
+--- a/xonsh/procs/specs.py
++++ b/xonsh/procs/specs.py
+@@ -250,6 +250,17 @@ def _redirect_streams(r, loc=None):
+     return stdin, stdout, stderr
+ 
+ 
++def _flatten_cmd_redirects(cmd):
++    """Transforms a command like ['ls', ('>', '/dev/null')] into ['ls', '>', '/dev/null']."""
++    new_cmd = []
++    for c in cmd:
++        if isinstance(c, tuple):
++            new_cmd.extend(c)
++        else:
++            new_cmd.append(c)
++    return new_cmd
++
++
+ def default_signal_pauser(n, f):
+     """Pauses a signal, as needed."""
+     signal.pause()
+@@ -352,7 +363,7 @@ class SubprocSpec:
+         else:
+             self.env = None
+         # pure attrs
+-        self.args = list(cmd)
++        self.args = _flatten_cmd_redirects(cmd)
+         self.alias = None
+         self.alias_name = None
+         self.alias_stack = XSH.env.get("__ALIAS_STACK", "").split(":")
+@@ -433,9 +444,7 @@ class SubprocSpec:
+             raise xt.XonshError(msg)
+ 
+     def get_command_str(self):
+-        return " ".join(
+-            " ".join(arg) if isinstance(arg, tuple) else arg for arg in self.args
+-        )
++        return " ".join(arg for arg in self.args)
+ 
+     #
+     # Execution methods
+@@ -883,6 +892,9 @@ def run_subproc(cmds, captured=False, envs=None):
+             print(f"TRACE SUBPROC: {cmds}, captured={captured}", file=sys.stderr)
+ 
+     specs = cmds_to_specs(cmds, captured=captured, envs=envs)
++    cmds = [
++        _flatten_cmd_redirects(cmd) if isinstance(cmd, list) else cmd for cmd in cmds
++    ]
+     if _should_set_title():
+         # context manager updates the command information that gets
+         # accessed by CurrentJobField when setting the terminal's title
+

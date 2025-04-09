@@ -1,0 +1,79 @@
+diff --git a/autode/smiles/angles.py b/autode/smiles/angles.py
+index ffec3bc..0695230 100644
+--- a/autode/smiles/angles.py
++++ b/autode/smiles/angles.py
+@@ -250,9 +250,10 @@ class Dihedral(Angle):
+             graph (nx.Graph):
+             atoms (list(autode.atoms.Atom)):
+         """
+-        return self._find_rot_idxs_from_pair(graph, atoms, pair=self.mid_idxs)
++        return self._find_rot_idxs_from_pair(graph, atoms, pair=self.mid_idxs,
++                                             max_bond_distance=1.5*self.mid_dist)
+ 
+-    def __init__(self, idxs, rot_idxs=None, phi0=None):
++    def __init__(self, idxs, rot_idxs=None, phi0=None, mid_dist=2.0):
+         """
+         A dihedral constructed from atom indexes and possibly indexes that
+         should be rotated, if this dihedral is altered::
+@@ -272,9 +273,13 @@ class Dihedral(Angle):
+                                          should be rotated else 0
+ 
+             phi0 (float | None): Ideal angle for this dihedral (radians)
++
++            mid_dist (float): Optimum distance between X-Y
+         """
+         super().__init__(idxs=idxs, rot_idxs=rot_idxs, phi0=phi0)
+ 
+         # Atom indexes of the central two atoms (X, Y)
+         _, idx_x, idx_y, _ = idxs
++
+         self.mid_idxs = (idx_x, idx_y)
++        self.mid_dist = mid_dist
+diff --git a/autode/smiles/builder.py b/autode/smiles/builder.py
+index baad827..4aa2593 100644
+--- a/autode/smiles/builder.py
++++ b/autode/smiles/builder.py
+@@ -300,6 +300,10 @@ class Builder(AtomCollection):
+ 
+             dihedral = Dihedral(dihedral_idxs)
+ 
++            # Optimum distance between the two middle atoms, used for
++            # determining if a bond exists thus a dihedral can be rotated
++            dihedral.mid_dist = self.bonds.first_involving(*dihedral.mid_idxs).r0
++
+             # If both atoms either side of this one are 'pi' atoms e.g. in a
+             # benzene ring, then the ideal angle must be 0 to close the ring
+             if all(self.atoms[idx].is_pi for idx in dihedral.mid_idxs):
+diff --git a/autode/smiles/parser.py b/autode/smiles/parser.py
+index 7a55d71..4eded90 100644
+--- a/autode/smiles/parser.py
++++ b/autode/smiles/parser.py
+@@ -40,9 +40,13 @@ class Parser:
+         """Approximate spin multiplicity (2S+1). For multiple unpaired
+         electrons will default to a singlet"""
+ 
+-        n_electrons = (sum([atom.atomic_number for atom in self.atoms])
++        n_electrons = (sum([at.atomic_number for at in self.atoms])
+                        - self.charge)
+ 
++        # Atoms have implicit hydrogens, so add them
++        n_electrons += sum(at.n_hydrogens if at.n_hydrogens is not None else 0
++                           for at in self.atoms)
++
+         return (n_electrons % 2) + 1
+ 
+     @property
+diff --git a/autode/smiles/smiles.py b/autode/smiles/smiles.py
+index 63d07c2..895e40b 100644
+--- a/autode/smiles/smiles.py
++++ b/autode/smiles/smiles.py
+@@ -70,6 +70,8 @@ def init_organic_smiles(molecule, smiles):
+     except RuntimeError:
+         raise RDKitFailed
+ 
++    logger.info('Using RDKit to initialise')
++
+     molecule.charge = Chem.GetFormalCharge(rdkit_mol)
+     molecule.mult = calc_multiplicity(molecule,
+                                       NumRadicalElectrons(rdkit_mol))
+

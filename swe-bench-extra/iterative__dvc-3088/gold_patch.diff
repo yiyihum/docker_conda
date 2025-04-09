@@ -1,0 +1,95 @@
+diff --git a/dvc/command/version.py b/dvc/command/version.py
+--- a/dvc/command/version.py
++++ b/dvc/command/version.py
+@@ -86,9 +86,9 @@ def get_fs_type(path):
+     @staticmethod
+     def get_linktype_support_info(repo):
+         links = {
+-            "reflink": System.reflink,
+-            "hardlink": System.hardlink,
+-            "symlink": System.symlink,
++            "reflink": (System.reflink, None),
++            "hardlink": (System.hardlink, System.is_hardlink),
++            "symlink": (System.symlink, System.is_symlink),
+         }
+ 
+         fname = "." + str(uuid.uuid4())
+@@ -98,18 +98,16 @@ def get_linktype_support_info(repo):
+ 
+         cache = []
+ 
+-        for name, link in links.items():
++        for name, (link, is_link) in links.items():
+             try:
+                 link(src, dst)
++                status = "supported"
++                if is_link and not is_link(dst):
++                    status = "broken"
+                 os.unlink(dst)
+-                supported = True
+             except DvcException:
+-                supported = False
+-            cache.append(
+-                "{name} - {supported}".format(
+-                    name=name, supported=True if supported else False
+-                )
+-            )
++                status = "not supported"
++            cache.append("{name} - {status}".format(name=name, status=status))
+         os.remove(src)
+ 
+         return ", ".join(cache)
+diff --git a/dvc/remote/base.py b/dvc/remote/base.py
+--- a/dvc/remote/base.py
++++ b/dvc/remote/base.py
+@@ -392,13 +392,24 @@ def _link(self, from_info, to_info, link_types):
+ 
+         self._try_links(from_info, to_info, link_types)
+ 
++    def _verify_link(self, path_info, link_type):
++        if self.cache_type_confirmed:
++            return
++
++        is_link = getattr(self, "is_{}".format(link_type), None)
++        if is_link and not is_link(path_info):
++            self.remove(path_info)
++            raise DvcException("failed to verify {}".format(link_type))
++
++        self.cache_type_confirmed = True
++
+     @slow_link_guard
+     def _try_links(self, from_info, to_info, link_types):
+         while link_types:
+             link_method = getattr(self, link_types[0])
+             try:
+                 self._do_link(from_info, to_info, link_method)
+-                self.cache_type_confirmed = True
++                self._verify_link(to_info, link_types[0])
+                 return
+ 
+             except DvcException as exc:
+diff --git a/dvc/remote/local.py b/dvc/remote/local.py
+--- a/dvc/remote/local.py
++++ b/dvc/remote/local.py
+@@ -178,6 +178,10 @@ def copy(self, from_info, to_info):
+     def symlink(from_info, to_info):
+         System.symlink(from_info, to_info)
+ 
++    @staticmethod
++    def is_symlink(path_info):
++        return System.is_symlink(path_info)
++
+     def hardlink(self, from_info, to_info):
+         # If there are a lot of empty files (which happens a lot in datasets),
+         # and the cache type is `hardlink`, we might reach link limits and
+@@ -204,6 +208,10 @@ def hardlink(self, from_info, to_info):
+ 
+         System.hardlink(from_info, to_info)
+ 
++    @staticmethod
++    def is_hardlink(path_info):
++        return System.is_hardlink(path_info)
++
+     @staticmethod
+     def reflink(from_info, to_info):
+         System.reflink(from_info, to_info)

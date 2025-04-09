@@ -1,0 +1,165 @@
+diff --git a/geopandas/_vectorized.py b/geopandas/_vectorized.py
+index e5736f2..45d383d 100644
+--- a/geopandas/_vectorized.py
++++ b/geopandas/_vectorized.py
+@@ -15,6 +15,7 @@ import shapely.geos
+ import shapely.ops
+ import shapely.wkb
+ import shapely.wkt
++import shapely.validation
+ 
+ from shapely.geometry.base import BaseGeometry
+ 
+@@ -975,6 +976,26 @@ def normalize(data):
+     return out
+ 
+ 
++def make_valid(data):
++    if compat.USE_SHAPELY_20:
++        return shapely.make_valid(data)
++    elif compat.USE_PYGEOS:
++        return pygeos.make_valid(data)
++    elif not compat.SHAPELY_GE_18:
++        raise NotImplementedError(
++            f"shapely >= 1.8 or PyGEOS is required, "
++            f"version {shapely.__version__} is installed"
++        )
++    else:
++        out = np.empty(len(data), dtype=object)
++        with compat.ignore_shapely2_warnings():
++            out[:] = [
++                shapely.validation.make_valid(geom) if geom is not None else None
++                for geom in data
++            ]
++    return out
++
++
+ def project(data, other, normalized=False):
+     if compat.USE_SHAPELY_20:
+         return shapely.line_locate_point(data, other, normalized=normalized)
+diff --git a/geopandas/array.py b/geopandas/array.py
+index c206556..779e729 100644
+--- a/geopandas/array.py
++++ b/geopandas/array.py
+@@ -514,6 +514,9 @@ class GeometryArray(ExtensionArray):
+     def normalize(self):
+         return GeometryArray(vectorized.normalize(self.data), crs=self.crs)
+ 
++    def make_valid(self):
++        return GeometryArray(vectorized.make_valid(self.data), crs=self.crs)
++
+     #
+     # Binary predicates
+     #
+@@ -1317,7 +1320,7 @@ class GeometryArray(ExtensionArray):
+         ExtensionArray
+         """
+         data = np.concatenate([ga.data for ga in to_concat])
+-        return GeometryArray(data, crs=to_concat[0].crs)
++        return GeometryArray(data, crs=_get_common_crs(to_concat))
+ 
+     def _reduce(self, name, skipna=True, **kwargs):
+         # including the base class version here (that raises by default)
+@@ -1388,3 +1391,26 @@ class GeometryArray(ExtensionArray):
+             else:
+                 return False
+         return (self == item).any()
++
++
++def _get_common_crs(arr_seq):
++
++    crs_set = {arr.crs for arr in arr_seq}
++    crs_not_none = [crs for crs in crs_set if crs is not None]
++    names = [crs.name for crs in crs_not_none]
++
++    if len(crs_not_none) == 0:
++        return None
++    if len(crs_not_none) == 1:
++        if len(crs_set) != 1:
++            warnings.warn(
++                "CRS not set for some of the concatenation inputs. "
++                f"Setting output's CRS as {names[0]} "
++                "(the single non-null crs provided)."
++            )
++        return crs_not_none[0]
++
++    raise ValueError(
++        f"Cannot determine common CRS for concatenation inputs, got {names}. "
++        "Use `to_crs()` to transform geometries to the same CRS before merging."
++    )
+diff --git a/geopandas/base.py b/geopandas/base.py
+index 437a611..8302b32 100644
+--- a/geopandas/base.py
++++ b/geopandas/base.py
+@@ -725,6 +725,45 @@ GeometryCollection
+         """
+         return _delegate_geo_method("normalize", self)
+ 
++    def make_valid(self):
++        """
++        Repairs invalid geometries.
++
++        Returns a ``GeoSeries`` with valid geometries.
++        If the input geometry is already valid, then it will be preserved.
++        In many cases, in order to create a valid geometry, the input
++        geometry must be split into multiple parts or multiple geometries.
++        If the geometry must be split into multiple parts of the same type
++        to be made valid, then a multi-part geometry will be returned
++        (e.g. a MultiPolygon).
++        If the geometry must be split into multiple parts of different types
++        to be made valid, then a GeometryCollection will be returned.
++
++        Examples
++        --------
++        >>> from shapely.geometry import MultiPolygon, Polygon, LineString, Point
++        >>> s = geopandas.GeoSeries(
++        ...     [
++        ...         Polygon([(0, 0), (0, 2), (1, 1), (2, 2), (2, 0), (1, 1), (0, 0)]),
++        ...         Polygon([(0, 2), (0, 1), (2, 0), (0, 0), (0, 2)]),
++        ...         LineString([(0, 0), (1, 1), (1, 0)]),
++        ...     ],
++        ...     crs='EPSG:3857',
++        ... )
++        >>> s
++        0    POLYGON ((0.000 0.000, 0.000 2.000, 1.000 1.00...
++        1    POLYGON ((0.000 2.000, 0.000 1.000, 2.000 0.00...
++        2    LINESTRING (0.000 0.000, 1.000 1.000, 1.000 0....
++        dtype: geometry
++
++        >>> s.make_valid()
++        0    MULTIPOLYGON (((1.000 1.000, 0.000 0.000, 0.00...
++        1    GEOMETRYCOLLECTION (POLYGON ((2.000 0.000, 0.0...
++        2    LINESTRING (0.000 0.000, 1.000 1.000, 1.000 0....
++        dtype: geometry
++        """
++        return _delegate_geo_method("make_valid", self)
++
+     #
+     # Reduction operations that return a Shapely geometry
+     #
+diff --git a/geopandas/tools/clip.py b/geopandas/tools/clip.py
+index c10b12b..a088db8 100644
+--- a/geopandas/tools/clip.py
++++ b/geopandas/tools/clip.py
+@@ -7,6 +7,7 @@ A module to clip vector data using GeoPandas.
+ """
+ import warnings
+ 
++import numpy as np
+ import pandas.api.types
+ from shapely.geometry import Polygon, MultiPolygon, box
+ 
+@@ -168,7 +169,11 @@ def clip(gdf, mask, keep_geom_type=False):
+     elif mask_is_list_like:
+         box_mask = mask
+     else:
+-        box_mask = mask.bounds
++        # Avoid empty tuple returned by .bounds when geometry is empty. A tuple of
++        # all nan values is consistent with the behavior of
++        # {GeoSeries, GeoDataFrame}.total_bounds for empty geometries.
++        # TODO(shapely) can simpely use mask.bounds once relying on Shapely 2.0
++        box_mask = mask.bounds if not mask.is_empty else (np.nan,) * 4
+     box_gdf = gdf.total_bounds
+     if not (
+         ((box_mask[0] <= box_gdf[2]) and (box_gdf[0] <= box_mask[2]))
+

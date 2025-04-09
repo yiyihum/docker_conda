@@ -1,0 +1,188 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b35ad65e..4f4c40a3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ - Ring fence SQLAlchemy dependency to a facade and integration tests.
+ - Add tests for examples.
+ - Add _from_str_ and _to_str_ to complement _from_dict_ and _to_dict_ for de-serializing and serializing from JSON.
++- Ring fence jsonschema dependency into a facade.
+ 
+ ## Version 0.12.1 - 2020-01-12
+ 
+diff --git a/open_alchemy/facades/__init__.py b/open_alchemy/facades/__init__.py
+index 2f7710ef..76fedf12 100644
+--- a/open_alchemy/facades/__init__.py
++++ b/open_alchemy/facades/__init__.py
+@@ -1,5 +1,6 @@
+ """Facades for ringfenced modules."""
+ # pylint: disable=useless-import-alias
+ 
++from . import jsonschema as jsonschema
+ from . import models as models
+ from . import sqlalchemy as sqlalchemy
+diff --git a/open_alchemy/facades/jsonschema/__init__.py b/open_alchemy/facades/jsonschema/__init__.py
+new file mode 100644
+index 00000000..b1ac6e30
+--- /dev/null
++++ b/open_alchemy/facades/jsonschema/__init__.py
+@@ -0,0 +1,48 @@
++"""Facade for jsonschema."""
++
++import functools
++import json
++import typing
++
++import jsonschema
++
++# Re mapping values
++ValidationError = jsonschema.ValidationError
++validate = jsonschema.validate  # pylint: disable=invalid-name
++
++
++def _filename_to_dict(filename: str) -> typing.Dict:
++    """
++    Map filename for a JSON file to the de-serialized dictionary.
++
++    Args:
++        filename: The name of the JSON file.
++
++    Returns:
++        The de-serialized contents of the file as a dictionary.
++
++    """
++    with open(filename) as in_file:
++        json_dict = json.loads(in_file.read())
++    return json_dict
++
++
++def resolver(
++    *filenames: str,
++) -> typing.Tuple[
++    jsonschema.RefResolver, typing.Tuple[typing.Dict[str, typing.Any], ...]
++]:
++    """
++    Create resolver for references to schemas in another file.
++
++    Args:
++        filenames: The names for the files to add to the resolver.
++
++    Returns:
++        The resolver and the underlying schemas as a dictionary.
++
++    """
++    schema_dicts = tuple(map(_filename_to_dict, filenames))
++    initial: typing.Dict[str, typing.Any] = {}
++    merged_schema = functools.reduce(lambda x, y: {**x, **y}, schema_dicts, initial)
++    return jsonschema.RefResolver.from_schema(merged_schema), schema_dicts
+diff --git a/open_alchemy/helpers/get_ext_prop/__init__.py b/open_alchemy/helpers/get_ext_prop/__init__.py
+index 4ebb4523..382f678b 100644
+--- a/open_alchemy/helpers/get_ext_prop/__init__.py
++++ b/open_alchemy/helpers/get_ext_prop/__init__.py
+@@ -4,19 +4,14 @@ import json
+ import os
+ import typing
+ 
+-import jsonschema
+-
+ from open_alchemy import exceptions
++from open_alchemy import facades
+ 
+ _DIRECTORY = os.path.dirname(__file__)
+ _SCHEMAS_FILE = os.path.join(_DIRECTORY, "extension-schemas.json")
+-with open(_SCHEMAS_FILE) as in_file:
+-    _SCHEMAS = json.load(in_file)
+ _COMMON_SCHEMAS_FILE = os.path.join(_DIRECTORY, "common-schemas.json")
+-with open(_COMMON_SCHEMAS_FILE) as in_file:
+-    _COMMON_SCHEMAS = json.load(in_file)
+-_resolver = jsonschema.RefResolver.from_schema(  # pylint: disable=invalid-name
+-    {**_COMMON_SCHEMAS, **_SCHEMAS}
++_resolver, (_SCHEMAS, _) = facades.jsonschema.resolver(  # pylint: disable=invalid-name
++    _SCHEMAS_FILE, _COMMON_SCHEMAS_FILE
+ )
+ 
+ 
+@@ -49,8 +44,8 @@ def get_ext_prop(
+ 
+     schema = _SCHEMAS.get(name)
+     try:
+-        jsonschema.validate(instance=value, schema=schema, resolver=_resolver)
+-    except jsonschema.ValidationError:
++        facades.jsonschema.validate(instance=value, schema=schema, resolver=_resolver)
++    except facades.jsonschema.ValidationError:
+         raise exceptions.MalformedExtensionPropertyError(
+             f"The value of the {json.dumps(name)} extension property is not "
+             "valid. "
+diff --git a/open_alchemy/table_args/factory.py b/open_alchemy/table_args/factory.py
+index 19703d6b..eaef2338 100644
+--- a/open_alchemy/table_args/factory.py
++++ b/open_alchemy/table_args/factory.py
+@@ -5,20 +5,19 @@ import json
+ import os
+ import typing
+ 
+-import jsonschema
+ from sqlalchemy import schema
+ 
+ from open_alchemy import exceptions
++from open_alchemy import facades
+ from open_alchemy import types
+ 
+ _DIRECTORY = os.path.dirname(__file__)
+ _PATHS = ("..", "helpers", "get_ext_prop")
+ _COMMON_SCHEMAS_FILE = os.path.join(_DIRECTORY, *_PATHS, "common-schemas.json")
+-with open(_COMMON_SCHEMAS_FILE) as in_file:
+-    _COMMON_SCHEMAS = json.load(in_file)
+-_resolver = jsonschema.RefResolver.from_schema(  # pylint: disable=invalid-name
+-    _COMMON_SCHEMAS
+-)
++(
++    _resolver,  # pylint: disable=invalid-name
++    (_COMMON_SCHEMAS,),
++) = facades.jsonschema.resolver(_COMMON_SCHEMAS_FILE)
+ 
+ 
+ def _spec_to_schema_name(
+@@ -39,15 +38,15 @@ def _spec_to_schema_name(
+ 
+     """
+     if schema_names is None:
+-        schema_names = _COMMON_SCHEMAS.keys()
++        schema_names = list(_COMMON_SCHEMAS.keys())
+ 
+     for name in schema_names:
+         try:
+-            jsonschema.validate(
++            facades.jsonschema.validate(
+                 instance=spec, schema=_COMMON_SCHEMAS[name], resolver=_resolver
+             )
+             return name
+-        except jsonschema.ValidationError:
++        except facades.jsonschema.ValidationError:
+             continue
+     raise exceptions.SchemaNotFoundError("Specification did not match any schemas.")
+ 
+diff --git a/open_alchemy/utility_base.py b/open_alchemy/utility_base.py
+index adaadc52..afa5552e 100644
+--- a/open_alchemy/utility_base.py
++++ b/open_alchemy/utility_base.py
+@@ -6,8 +6,6 @@ import json
+ import sys
+ import typing
+ 
+-import jsonschema
+-
+ from . import exceptions
+ from . import facades
+ from . import helpers
+@@ -134,8 +132,8 @@ class UtilityBase:
+         # Check dictionary
+         schema = cls._get_schema()
+         try:
+-            jsonschema.validate(instance=kwargs, schema=schema)
+-        except jsonschema.ValidationError:
++            facades.jsonschema.validate(instance=kwargs, schema=schema)
++        except facades.jsonschema.ValidationError:
+             raise exceptions.MalformedModelDictionaryError(
+                 "The dictionary passed to from_dict is not a valid instance of the "
+                 "model schema. "

@@ -1,0 +1,116 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ae4eb2e..6fc9f6f 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -37,3 +37,21 @@ def no_thread_leaks():
+     main = threading.main_thread()
+     assert not [th for th in threading._dangling
+                 if th is not main and th.is_alive()]
++
++
++@pytest.fixture(autouse=True)
++def no_warnings(recwarn):
++    """Fail on warning."""
++
++    yield
++
++    warnings = []
++    for warning in recwarn:  # pragma: no cover
++        message = str(warning.message)
++        if (
++            "Not importing directory" in message
++            or "Using or importing the ABCs" in message
++        ):
++            continue
++        warnings.append("{w.filename}:{w.lineno} {w.message}".format(w=warning))
++    assert not warnings
+diff --git a/tests/shell.py b/tests/shell.py
+index 3989158..376fdf1 100644
+--- a/tests/shell.py
++++ b/tests/shell.py
+@@ -29,6 +29,7 @@ import os.path
+ import tempfile
+ import shutil
+ import errno
++import time
+ 
+ 
+ # def tree(path='.', show_files=False):
+@@ -108,3 +109,14 @@ def mkdtemp():
+ 
+ def ls(path='.'):
+     return os.listdir(path)
++
++
++def msize(path):
++    """Modify the file size without updating the modified time."""
++    with open(path, 'w') as w:
++        w.write('')
++    os.utime(path, (0, 0))
++    time.sleep(0.4)
++    with open(path, 'w') as w:
++        w.write('0')
++    os.utime(path, (0, 0))
+diff --git a/tests/test_inotify_c.py b/tests/test_inotify_c.py
+index 8bd24b1..912195a 100644
+--- a/tests/test_inotify_c.py
++++ b/tests/test_inotify_c.py
+@@ -154,3 +154,17 @@ def test_raise_error(monkeypatch):
+         func()
+     assert exc.value.errno == -1
+     assert "Unknown error -1" in str(exc.value)
++
++
++def test_non_ascii_path():
++    """
++    Inotify can construct an event for a path containing non-ASCII.
++    """
++    path = p(u"\N{SNOWMAN}")
++    with watching(p('')):
++        os.mkdir(path)
++        event, _ = event_queue.get(timeout=5)
++        assert isinstance(event.src_path, type(u""))
++        assert event.src_path == path
++        # Just make sure it doesn't raise an exception.
++        assert repr(event)
+diff --git a/tests/test_observers_polling.py b/tests/test_observers_polling.py
+index 42bff6e..f94041a 100644
+--- a/tests/test_observers_polling.py
++++ b/tests/test_observers_polling.py
+@@ -41,7 +41,8 @@ from .shell import (
+     mkdtemp,
+     touch,
+     rm,
+-    mv
++    mv,
++    msize
+ )
+ 
+ 
+@@ -98,6 +99,12 @@ def test___init__(event_queue, emitter):
+     sleep(SLEEP_TIME)
+     rm(p('afile'))
+ 
++    sleep(SLEEP_TIME)
++    msize(p('bfile'))
++
++    sleep(SLEEP_TIME)
++    rm(p('bfile'))
++
+     sleep(SLEEP_TIME)
+     emitter.stop()
+ 
+@@ -131,6 +138,13 @@ def test___init__(event_queue, emitter):
+ 
+         DirModifiedEvent(p()),
+         FileDeletedEvent(p('afile')),
++
++        DirModifiedEvent(p()),
++        FileCreatedEvent(p('bfile')),
++        FileModifiedEvent(p('bfile')),
++
++        DirModifiedEvent(p()),
++        FileDeletedEvent(p('bfile')),
+     }
+ 
+     expected.add(FileMovedEvent(p('fromfile'), p('project', 'tofile')))

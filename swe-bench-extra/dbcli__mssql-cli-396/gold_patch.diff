@@ -1,0 +1,128 @@
+diff --git a/build.py b/build.py
+index d8c7ce3..8a82eca 100644
+--- a/build.py
++++ b/build.py
+@@ -173,6 +173,7 @@ def get_active_test_filepaths():
+         'tests/test_config.py '
+         'tests/test_naive_completion.py '
+         'tests/test_main.py '
++        'tests/test_multiline.py '
+         'tests/test_fuzzy_completion.py '
+         'tests/test_rowlimit.py '
+         'tests/test_sqlcompletion.py '
+diff --git a/mssqlcli/mssqlbuffer.py b/mssqlcli/mssqlbuffer.py
+index 581010c..d0fdced 100644
+--- a/mssqlcli/mssqlbuffer.py
++++ b/mssqlcli/mssqlbuffer.py
+@@ -1,5 +1,6 @@
+ from __future__ import unicode_literals
+-
++import re
++import sqlparse
+ from prompt_toolkit.enums import DEFAULT_BUFFER
+ from prompt_toolkit.filters import Condition
+ from prompt_toolkit.application import get_app
+@@ -21,10 +22,31 @@ def mssql_is_multiline(mssql_cli):
+ 
+ 
+ def _is_complete(sql):
+-    # A complete command is an sql statement that ends with a semicolon, unless
++    # A complete command is an sql statement that ends with a 'GO', unless
+     # there's an open quote surrounding it, as is common when writing a
+     # CREATE FUNCTION command
+-    return sql.endswith(';') and not is_open_quote(sql)
++    if sql is not None and sql != "":
++        # remove comments
++        sql = sqlparse.format(sql, strip_comments=True)
++
++        # check for open comments
++        # remove all closed quotes to isolate instances of open comments
++        sql_no_quotes = re.sub(r'".*?"|\'.*?\'', '', sql)
++        is_open_comment = len(re.findall(r'\/\*', sql_no_quotes)) > 0
++
++        # check that 'go' is only token on newline
++        lines = sql.split('\n')
++        lastline = lines[len(lines) - 1].lower().strip()
++        is_valid_go_on_lastline = lastline == 'go'
++
++        # check that 'go' is on last line, not in open quotes, and there's no open
++        # comment with closed comments and quotes removed.
++        # NOTE: this method fails when GO follows a closing '*/' block comment on the same line,
++        # we've taken a dependency with sqlparse
++        # (https://github.com/andialbrecht/sqlparse/issues/484)
++        return not is_open_quote(sql) and not is_open_comment and is_valid_go_on_lastline
++
++    return False
+ 
+ 
+ def _multiline_exception(text):
+diff --git a/mssqlcli/mssqlcliclient.py b/mssqlcli/mssqlcliclient.py
+index d7019cb..f4e26b0 100644
+--- a/mssqlcli/mssqlcliclient.py
++++ b/mssqlcli/mssqlcliclient.py
+@@ -230,7 +230,8 @@ class MssqlCliClient:
+         query_has_exception = query_response.exception_message
+         query_has_error_messages = query_messages[0].is_error if query_messages else False
+         query_has_batch_error = query_response.batch_summaries[0].has_error \
+-            if hasattr(query_response, 'batch_summaries') else False
++            if hasattr(query_response, 'batch_summaries') \
++                and len(query_response.batch_summaries) > 0 else False
+ 
+         query_failed = query_has_exception or query_has_batch_error or query_has_error_messages
+ 
+@@ -277,7 +278,8 @@ class MssqlCliClient:
+ 
+     @staticmethod
+     def _no_results_found_in(query_response):
+-        return not query_response.batch_summaries[0].result_set_summaries
++        return not query_response.batch_summaries \
++               or not query_response.batch_summaries[0].result_set_summaries
+ 
+     @staticmethod
+     def _no_rows_found_in(query_response):
+diff --git a/mssqlcli/mssqlclirc b/mssqlcli/mssqlclirc
+index 75e8b38..fc8deeb 100644
+--- a/mssqlcli/mssqlclirc
++++ b/mssqlcli/mssqlclirc
+@@ -10,13 +10,13 @@ smart_completion = True
+ wider_completion_menu = False
+ 
+ # Multi-line mode allows breaking up the sql statements into multiple lines. If
+-# this is set to True, then the end of the statements must have a semi-colon.
++# this is set to True, then the end of the statements must have 'GO'.
+ # If this is set to False then sql statements can't be split into multiple
+ # lines. End of line (return) is considered as the end of the statement.
+ multi_line = False
+ 
+ # If multi_line_mode is set to "tsql", in multi-line mode, [Enter] will execute
+-# the current input if the input ends in a semicolon.
++# the current input if the input ends in 'GO'.
+ # If multi_line_mode is set to "safe", in multi-line mode, [Enter] will always
+ # insert a newline, and [Esc] [Enter] or [Alt]-[Enter] must be used to execute
+ # a command.
+diff --git a/mssqlcli/mssqltoolbar.py b/mssqlcli/mssqltoolbar.py
+index 38cca71..7ee5e2d 100644
+--- a/mssqlcli/mssqltoolbar.py
++++ b/mssqlcli/mssqltoolbar.py
+@@ -39,7 +39,7 @@ def create_toolbar_tokens_func(mssql_cli):
+             if mssql_cli.multiline_mode == 'safe':
+                 result.append((token, ' ([Esc] [Enter] to execute]) '))
+             else:
+-                result.append((token, ' (Semi-colon [;] will end the line) '))
++                result.append((token, ' ([GO] statement will end the line) '))
+ 
+         if mssql_cli.vi_mode:
+             result.append(
+diff --git a/mssqlcli/packages/parseutils/utils.py b/mssqlcli/packages/parseutils/utils.py
+index 1376019..1f14772 100644
+--- a/mssqlcli/packages/parseutils/utils.py
++++ b/mssqlcli/packages/parseutils/utils.py
+@@ -113,7 +113,7 @@ def is_open_quote(sql):
+ 
+ def _parsed_is_open_quote(parsed):
+     # Look for unmatched single quotes, or unmatched dollar sign quotes
+-    return any(tok.match(Token.Error, ("'", "$")) for tok in parsed.flatten())
++    return any(tok.match(Token.Error, ("'", '"', "$")) for tok in parsed.flatten())
+ 
+ 
+ def parse_partial_identifier(word):

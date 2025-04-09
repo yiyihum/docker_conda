@@ -1,0 +1,174 @@
+diff --git a/tests/plugins/testplugin.py b/tests/plugins/testplugin.py
+index 06b693c4..66822ef4 100644
+--- a/tests/plugins/testplugin.py
++++ b/tests/plugins/testplugin.py
+@@ -37,6 +37,14 @@ class TestPlugin(Plugin):
+     def _get_streams(self):
+         if "empty" in self.url:
+             return
++
++        if "UnsortableStreamNames" in self.url:
++            def gen():
++                for i in range(3):
++                    yield "vod", HTTPStream(self.session, "http://test.se/stream")
++
++            return gen()
++
+         if "NoStreamsError" in self.url:
+             raise NoStreamsError(self.url)
+ 
+diff --git a/tests/test_cli_main.py b/tests/test_cli_main.py
+index dccd30a7..2b58ea5f 100644
+--- a/tests/test_cli_main.py
++++ b/tests/test_cli_main.py
+@@ -3,8 +3,9 @@ import os.path
+ import tempfile
+ 
+ import streamlink_cli.main
+-from streamlink_cli.main import resolve_stream_name, check_file_output
++from streamlink_cli.main import resolve_stream_name, format_valid_streams, check_file_output
+ from streamlink_cli.output import FileOutput
++from streamlink.plugin.plugin import Plugin
+ import unittest
+ from tests.mock import Mock, patch
+ 
+@@ -59,19 +60,71 @@ class TestCLIMain(unittest.TestCase):
+             tmpfile.close()
+ 
+     def test_resolve_stream_name(self):
+-        high = Mock()
+-        medium = Mock()
+-        low = Mock()
++        a = Mock()
++        b = Mock()
++        c = Mock()
++        d = Mock()
++        e = Mock()
+         streams = {
+-            "low": low,
+-            "medium": medium,
+-            "high": high,
+-            "worst": low,
+-            "best": high
++            "160p": a,
++            "360p": b,
++            "480p": c,
++            "720p": d,
++            "1080p": e,
++            "worst": b,
++            "best": d,
++            "worst-unfiltered": a,
++            "best-unfiltered": e
+         }
+-        self.assertEqual("high", resolve_stream_name(streams, "best"))
+-        self.assertEqual("low", resolve_stream_name(streams, "worst"))
+-        self.assertEqual("medium", resolve_stream_name(streams, "medium"))
+-        self.assertEqual("high", resolve_stream_name(streams, "high"))
+-        self.assertEqual("low", resolve_stream_name(streams, "low"))
+ 
++        self.assertEqual(resolve_stream_name(streams, "unknown"), "unknown")
++        self.assertEqual(resolve_stream_name(streams, "160p"), "160p")
++        self.assertEqual(resolve_stream_name(streams, "360p"), "360p")
++        self.assertEqual(resolve_stream_name(streams, "480p"), "480p")
++        self.assertEqual(resolve_stream_name(streams, "720p"), "720p")
++        self.assertEqual(resolve_stream_name(streams, "1080p"), "1080p")
++        self.assertEqual(resolve_stream_name(streams, "worst"), "360p")
++        self.assertEqual(resolve_stream_name(streams, "best"), "720p")
++        self.assertEqual(resolve_stream_name(streams, "worst-unfiltered"), "160p")
++        self.assertEqual(resolve_stream_name(streams, "best-unfiltered"), "1080p")
++
++    def test_format_valid_streams(self):
++        class FakePlugin:
++            @classmethod
++            def stream_weight(cls, stream):
++                return Plugin.stream_weight(stream)
++        a = Mock()
++        b = Mock()
++        c = Mock()
++
++        streams = {
++            "audio": a,
++            "720p": b,
++            "1080p": c,
++            "worst": b,
++            "best": c
++        }
++        self.assertEqual(
++            format_valid_streams(FakePlugin, streams),
++            ", ".join([
++                "audio",
++                "720p (worst)",
++                "1080p (best)"
++            ])
++        )
++
++        streams = {
++            "audio": a,
++            "720p": b,
++            "1080p": c,
++            "worst-unfiltered": b,
++            "best-unfiltered": c
++        }
++        self.assertEqual(
++            format_valid_streams(FakePlugin, streams),
++            ", ".join([
++                "audio",
++                "720p (worst-unfiltered)",
++                "1080p (best-unfiltered)"
++            ])
++        )
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 573aae37..e923ab53 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -99,12 +99,23 @@ class TestSession(unittest.TestCase):
+         self.assertTrue(isinstance(streams["480p"], RTMPStream))
+         self.assertTrue(isinstance(streams["480p_http"], HTTPStream))
+ 
+-    def test_plugin_stream_sorted_excludes(self):
++    def test_plugin_stream_sorting_excludes(self):
+         channel = self.session.resolve_url("http://test.se/channel")
+-        streams = channel.streams(sorting_excludes=["1080p", "3000k"])
+ 
++        streams = channel.streams(sorting_excludes=[])
+         self.assertTrue("best" in streams)
+         self.assertTrue("worst" in streams)
++        self.assertFalse("best-unfiltered" in streams)
++        self.assertFalse("worst-unfiltered" in streams)
++        self.assertTrue(streams["worst"] is streams["350k"])
++        self.assertTrue(streams["best"] is streams["1080p"])
++
++        streams = channel.streams(sorting_excludes=["1080p", "3000k"])
++        self.assertTrue("best" in streams)
++        self.assertTrue("worst" in streams)
++        self.assertFalse("best-unfiltered" in streams)
++        self.assertFalse("worst-unfiltered" in streams)
++        self.assertTrue(streams["worst"] is streams["350k"])
+         self.assertTrue(streams["best"] is streams["1500k"])
+ 
+         streams = channel.streams(sorting_excludes=[">=1080p", ">1500k"])
+@@ -113,6 +124,24 @@ class TestSession(unittest.TestCase):
+         streams = channel.streams(sorting_excludes=lambda q: not q.endswith("p"))
+         self.assertTrue(streams["best"] is streams["3000k"])
+ 
++        streams = channel.streams(sorting_excludes=lambda q: False)
++        self.assertFalse("best" in streams)
++        self.assertFalse("worst" in streams)
++        self.assertTrue("best-unfiltered" in streams)
++        self.assertTrue("worst-unfiltered" in streams)
++        self.assertTrue(streams["worst-unfiltered"] is streams["350k"])
++        self.assertTrue(streams["best-unfiltered"] is streams["1080p"])
++
++        channel = self.session.resolve_url("http://test.se/UnsortableStreamNames")
++        streams = channel.streams()
++        self.assertFalse("best" in streams)
++        self.assertFalse("worst" in streams)
++        self.assertFalse("best-unfiltered" in streams)
++        self.assertFalse("worst-unfiltered" in streams)
++        self.assertTrue("vod" in streams)
++        self.assertTrue("vod_alt" in streams)
++        self.assertTrue("vod_alt2" in streams)
++
+     def test_plugin_support(self):
+         channel = self.session.resolve_url("http://test.se/channel")
+         streams = channel.streams()

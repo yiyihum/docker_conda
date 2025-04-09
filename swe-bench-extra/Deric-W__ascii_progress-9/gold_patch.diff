@@ -1,0 +1,260 @@
+diff --git a/ascii_progress/__main__.py b/ascii_progress/__main__.py
+index f5d1e15..b550f91 100644
+--- a/ascii_progress/__main__.py
++++ b/ascii_progress/__main__.py
+@@ -16,7 +16,7 @@ for frames in (
+     (">))'>", "    >))'>", "        >))'>", "        <'((<", "    <'((<", "<'((<")
+ ):
+     sys.stdout.write("Working ")
+-    with Spinner(frames) as spinner:
++    with Spinner(frames).handle_exceptions("Done", "Exception") as spinner:
+         for _ in map(spinner.set_progress, range(1, 15)):
+             time.sleep(0.2)
+ 
+@@ -29,6 +29,6 @@ for bar_format in map(
+     )
+ ):
+     sys.stdout.write("Working ")
+-    with bar_format.bar(75) as bar:
++    with bar_format.bar(75).handle_exceptions("Done", "Exception") as bar:
+         for _ in bar:
+             time.sleep(0.02)
+diff --git a/ascii_progress/bar.py b/ascii_progress/bar.py
+index e660116..b5f0903 100644
+--- a/ascii_progress/bar.py
++++ b/ascii_progress/bar.py
+@@ -9,11 +9,23 @@ import sys
+ import math
+ from abc import abstractmethod
+ from string import Formatter
+-from typing import Callable, Sequence, TextIO, Tuple, Iterator, ContextManager, Mapping, Any, Union
++from typing import (
++    Callable,
++    Sequence,
++    TextIO,
++    Tuple,
++    Iterator,
++    ContextManager,
++    Mapping,
++    Any,
++    Union,
++    TypeVar
++)
+ 
+ __all__ = (
+     "LazyFormatter",
+     "LAZY_FORMATTER",
++    "BarContext",
+     "Bar",
+     "ThresholdDecorator",
+     "PercentDecorator",
+@@ -36,8 +48,48 @@ class LazyFormatter(Formatter):
+ 
+ LAZY_FORMATTER = LazyFormatter()
+ 
++T = TypeVar("T", bound="Bar")
++
++
++class BarContext(ContextManager[T]):
++    """context manager which handles exceptions while using a bar"""
++
++    bar: T
++
++    message: str
++
++    error: str
++
++    __slots__ = ("bar", "message", "error")
++
++    def __init__(self, bar: T, message: str, error: str) -> None:
++        self.bar = bar
++        self.message = message
++        self.error = error
++
++    def __eq__(self, other: object) -> bool:
++        if isinstance(other, BarContext):
++            return self.bar == other.bar \
++                and self.message == other.message \
++                and self.error == other.error
++        return NotImplemented
++
++    def __enter__(self) -> T:
++        return self.bar
++
++    def __exit__(self, type, value, traceback) -> bool:     # type: ignore
++        if type is None:
++            self.bar.replace(self.message, end="\n")
++        elif type is KeyboardInterrupt:
++            # add 2 \b and 2 spaces to handle additional ^C
++            # add 2 additional spaces to make up for missing padding
++            self.bar.replace("\b\b" + self.error, end="    \n")
++        else:
++            self.bar.replace(self.error, end="\n")
++        return False    # we dont handle exceptions
++
+ 
+-class Bar(ContextManager["Bar"], Iterator[None]):
++class Bar(Iterator[None]):
+     """abstract base class for progress bars"""
+ 
+     __slots__ = ()
+@@ -49,16 +101,6 @@ class Bar(ContextManager["Bar"], Iterator[None]):
+                 and self.width() == other.width()
+         return NotImplemented
+ 
+-    def __enter__(self) -> "Bar":
+-        return self
+-
+-    def __exit__(self, type, value, traceback) -> bool:     # type: ignore
+-        if type is KeyboardInterrupt:   # handle ^C
+-            self.replace("\b\bKeyboardInterrupt", end="  \n")
+-        else:
+-            self.replace("Finished")
+-        return False    # we dont handle exceptions
+-
+     def __iter__(self) -> "Bar":
+         return self
+ 
+@@ -97,6 +139,10 @@ class Bar(ContextManager["Bar"], Iterator[None]):
+         """return the size of the bar"""
+         raise NotImplementedError
+ 
++    def handle_exceptions(self: T, message: str, error: str) -> BarContext[T]:
++        """return a context manager which replaces the bar with message or error if a exceptions is raised"""
++        return BarContext(self, message, error)
++
+     def ratio(self) -> float:
+         """return the ration progress / target"""
+         return self.progress() / self.target()
+@@ -271,16 +317,14 @@ class PercentDecorator(ThresholdDecorator):
+     @classmethod
+     def with_inferred_thresholds(cls, bar: Bar) -> "PercentDecorator":
+         """create an instance with inferred thresholds"""
+-        lower_threshold, upper_threshold = calculate_thresholds(bar, 100)
+-        return cls(
+-            bar,
+-            lower_threshold,
+-            upper_threshold,
+-        )
++        return cls(bar, *calculate_thresholds(bar, 100))
+ 
+     def update_thresholds(self) -> None:
+         """update lower and upper thresholds"""
+-        self.lower_threshold, self.upper_threshold = calculate_thresholds(self.bar, 100)
++        self.lower_threshold, self.upper_threshold = calculate_thresholds(
++            self.bar,
++            100
++        )
+ 
+ 
+ class BarDecorator(ThresholdDecorator):
+@@ -291,16 +335,14 @@ class BarDecorator(ThresholdDecorator):
+     @classmethod
+     def with_inferred_thresholds(cls, bar: Bar) -> "BarDecorator":
+         """create an instance with inferred thresholds"""
+-        lower_threshold, upper_threshold = calculate_thresholds(bar, bar.width())
+-        return cls(
+-            bar,
+-            lower_threshold,
+-            upper_threshold,
+-        )
++        return cls(bar, *calculate_thresholds(bar, bar.width()))
+ 
+     def update_thresholds(self) -> None:
+         """update lower and upper thresholds"""
+-        self.lower_threshold, self.upper_threshold = calculate_thresholds(self.bar, self.bar.width())
++        self.lower_threshold, self.upper_threshold = calculate_thresholds(
++            self.bar,
++            self.bar.width()
++        )
+ 
+ 
+ class BarFormat:
+diff --git a/ascii_progress/spinner.py b/ascii_progress/spinner.py
+index 17edecd..c3fc287 100644
+--- a/ascii_progress/spinner.py
++++ b/ascii_progress/spinner.py
+@@ -6,14 +6,55 @@
+ # SPDX-License-Identifier: MIT
+ 
+ import sys
+-from typing import ContextManager, Iterator, TextIO, Sequence
++from typing import ContextManager, Iterator, TextIO, Sequence, TypeVar
+ 
+ __all__ = (
+-    "Spinner",
++    "SpinnerContext",
++    "Spinner"
+ )
+ 
++T = TypeVar("T", bound="Spinner")
+ 
+-class Spinner(ContextManager, Iterator[None]):
++
++class SpinnerContext(ContextManager[T]):
++    """context manager which handles exceptions while using the spinner"""
++
++    spinner: T
++
++    message: str
++
++    error: str
++
++    __slots__ = ("spinner", "message", "error")
++
++    def __init__(self, spinner: T, message: str, error: str) -> None:
++        self.spinner = spinner
++        self.message = message
++        self.error = error
++
++    def __eq__(self, other: object) -> bool:
++        if isinstance(other, SpinnerContext):
++            return self.spinner == other.spinner \
++                and self.message == other.message \
++                and self.error == other.error
++        return NotImplemented
++
++    def __enter__(self) -> T:
++        return self.spinner
++
++    def __exit__(self, type, value, traceback) -> bool:     # type: ignore
++        if type is None:
++            self.spinner.replace(self.message, end="\n")
++        elif type is KeyboardInterrupt:
++            # add 2 \b and 2 spaces to handle additional ^C
++            # add 2 additional spaces to make up for missing padding
++            self.spinner.replace("\b\b" + self.error, end="    \n")
++        else:
++            self.spinner.replace(self.error, end="\n")
++        return False    # we dont handle exceptions
++
++
++class Spinner(Iterator[None]):
+     """class for creating a spinning animation"""
+ 
+     frames: Sequence[str]
+@@ -43,16 +84,6 @@ class Spinner(ContextManager, Iterator[None]):
+                 and self.file is other.file
+         return NotImplemented
+ 
+-    def __enter__(self) -> "Spinner":
+-        return self
+-
+-    def __exit__(self, type, value, traceback) -> bool:     # type: ignore
+-        if type is KeyboardInterrupt:   # add 2 \b and 2 spaces to handle additional ^C
+-            self.replace("\b\bKeyboardInterrupt", end="  \n")
+-        else:
+-            self.replace("Finished")
+-        return False    # we dont handle exceptions
+-
+     def __iter__(self) -> "Spinner":
+         return self
+ 
+@@ -102,3 +133,7 @@ class Spinner(ContextManager, Iterator[None]):
+         # pad message to fully overwrite old frame and add end
+         self.file.write(message + " " * (len(self.current_frame) - len(message)) + end)
+         self.file.flush()
++
++    def handle_exceptions(self: T, message: str, error: str) -> SpinnerContext[T]:
++        """return a context manager which replaces the spinner with message or error if a exceptions is raised"""
++        return SpinnerContext(self, message, error)

@@ -1,0 +1,129 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d49b73c..363a4c0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,11 +13,12 @@ and this project adheres to [Semantic Versioning][semver].
+  - Fix progress example in json extension. ([#230])
+  - Fix `AttributeErrors` in `get_configuration_async`, `get_configuration_callback`, `get_configuration_threaded` commands in json extension. ([#307])
+  - Fix type annotations for `get_configuration_async` and `get_configuration` methods on `LanguageServer` and `LanguageServerProtocol` objects ([#307])
++ - Provide `version` param for publishing diagnostics ([#303]) 
+ 
+ [#230]: https://github.com/openlawlibrary/pygls/issues/230
++[#303]: https://github.com/openlawlibrary/pygls/issues/303
+ [#307]: https://github.com/openlawlibrary/pygls/issues/307
+ 
+-
+ ## [1.0.0] - 2/12/2022
+ ### Changed
+ BREAKING CHANGE: Replaced `pydantic` with [`lsprotocol`](https://github.com/microsoft/lsprotocol)
+diff --git a/pygls/protocol.py b/pygls/protocol.py
+index 4f0d012..5b2fcef 100644
+--- a/pygls/protocol.py
++++ b/pygls/protocol.py
+@@ -835,10 +835,71 @@ class LanguageServerProtocol(JsonRPCProtocol, metaclass=LSPMeta):
+ 
+         self.notify(LOG_TRACE, params)
+ 
+-    def publish_diagnostics(self, doc_uri: str, diagnostics: List[Diagnostic]) -> None:
+-        """Sends diagnostic notification to the client."""
+-        self.notify(TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS,
+-                    PublishDiagnosticsParams(uri=doc_uri, diagnostics=diagnostics))
++    def _publish_diagnostics_deprecator(
++        self,
++        params_or_uri: Union[str, PublishDiagnosticsParams],
++        diagnostics: Optional[List[Diagnostic]],
++        version: Optional[int],
++        **kwargs
++    ) -> PublishDiagnosticsParams:
++        if isinstance(params_or_uri, str):
++            message = "DEPRECATION: "
++            "`publish_diagnostics("
++            "self, doc_uri: str, diagnostics: List[Diagnostic], version: Optional[int] = None)`"
++            "will be replaced with `publish_diagnostics(self, params: PublishDiagnosticsParams)`"
++            logging.warning(message)
++
++            params = self._construct_publish_diagnostic_type(
++                params_or_uri,
++                diagnostics,
++                version,
++                **kwargs
++            )
++        else:
++            params = params_or_uri
++        return params
++
++    def _construct_publish_diagnostic_type(
++        self,
++        uri: str,
++        diagnostics: Optional[List[Diagnostic]],
++        version: Optional[int],
++        **kwargs
++    ) -> PublishDiagnosticsParams:
++        if diagnostics is None:
++            diagnostics = []
++
++        args = {
++            **{
++                "uri": uri,
++                "diagnostics": diagnostics,
++                "version": version
++            },
++            **kwargs
++        }
++
++        params = PublishDiagnosticsParams(**args)  # type:ignore
++        return params
++
++    def publish_diagnostics(
++        self,
++        params_or_uri: Union[str, PublishDiagnosticsParams],
++        diagnostics: Optional[List[Diagnostic]] = None,
++        version: Optional[int] = None,
++        **kwargs
++    ):
++        """
++        Sends diagnostic notification to the client.
++        Deprecation:
++          `uri`, `diagnostics` and `version` fields will be deprecated
++        """
++        params = self._publish_diagnostics_deprecator(
++            params_or_uri,
++            diagnostics,
++            version,
++            **kwargs
++        )
++        self.notify(TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS, params)
+ 
+     def register_capability(self, params: RegistrationParams,
+                             callback: Optional[Callable[[], None]] = None) -> Future:
+diff --git a/pygls/server.py b/pygls/server.py
+index 9fd48ab..4fd6953 100644
+--- a/pygls/server.py
++++ b/pygls/server.py
+@@ -408,9 +408,23 @@ class LanguageServer(Server):
+         """Gets the object to manage client's progress bar."""
+         return self.lsp.progress
+ 
+-    def publish_diagnostics(self, doc_uri: str, diagnostics: List[Diagnostic]):
+-        """Sends diagnostic notification to the client."""
+-        self.lsp.publish_diagnostics(doc_uri, diagnostics)
++    def publish_diagnostics(
++        self,
++        uri: str,
++        diagnostics: Optional[List[Diagnostic]] = None,
++        version: Optional[int] = None,
++        **kwargs
++    ):
++        """
++        Sends diagnostic notification to the client.
++        """
++        params = self.lsp._construct_publish_diagnostic_type(
++            uri,
++            diagnostics,
++            version,
++            **kwargs
++        )
++        self.lsp.publish_diagnostics(params, **kwargs)
+ 
+     def register_capability(self, params: RegistrationParams,
+                             callback: Optional[Callable[[], None]] = None) -> Future:

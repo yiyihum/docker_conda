@@ -1,0 +1,392 @@
+diff --git a/changelog.txt b/changelog.txt
+index 4bd9fb26..942b0a14 100644
+--- a/changelog.txt
++++ b/changelog.txt
+@@ -36,6 +36,7 @@ Removed
+ 
+  - Removed vendored ``tqdm`` module and replaced it with a requirement (#289).
+  - Removed support for ``rapidjson`` as an alternative JSON library (#285, #287).
++ - Removed tuple of keys implementation of Nested Dict (#272, #296).
+ 
+ 
+ [1.3.0] -- 2019-12-20
+diff --git a/signac/contrib/collection.py b/signac/contrib/collection.py
+index f5d03fd9..876f2dc7 100644
+--- a/signac/contrib/collection.py
++++ b/signac/contrib/collection.py
+@@ -20,10 +20,11 @@ import re
+ import sys
+ from itertools import islice
+ from numbers import Number
+-from collections.abc import Mapping
+ from math import isclose
+ 
+ from ..core import json
++from .utility import _nested_dicts_to_dotted_keys
++from .utility import _to_hashable
+ from .filterparse import parse_filter_arg
+ 
+ 
+@@ -56,51 +57,10 @@ def _flatten(container):
+             yield i
+ 
+ 
+-class _hashable_dict(dict):
+-    def __hash__(self):
+-        return hash(tuple(sorted(self.items())))
+-
+-
+-def _to_hashable(l):
+-    if type(l) is list:
+-        return tuple(_to_hashable(_) for _ in l)
+-    elif type(l) is dict:
+-        return _hashable_dict(l)
+-    else:
+-        return l
+-
+-
+ class _DictPlaceholder(object):
+     pass
+ 
+ 
+-def _encode_tree(x):
+-    if type(x) is list:
+-        return _to_hashable(x)
+-    else:
+-        return x
+-
+-
+-def _traverse_tree(t, encode=None, key=None):
+-    if encode is not None:
+-        t = encode(t)
+-    if isinstance(t, Mapping):
+-        if t:
+-            for k in t:
+-                k_ = k if key is None else '.'.join((key, k))
+-                for k__, v in _traverse_tree(t[k], key=k_, encode=encode):
+-                    yield k__, v
+-        elif key is not None:
+-            yield key, t
+-    else:
+-        yield key, t
+-
+-
+-def _traverse_filter(t):
+-    for key, value in _traverse_tree(t, encode=_encode_tree):
+-        yield key, value
+-
+-
+ def _valid_filter(f, top=True):
+     if f is None:
+         return True
+@@ -653,7 +613,7 @@ class Collection(object):
+         not_expression = expr.pop('$not', None)
+ 
+         # Reduce the result based on the remaining non-logical expression:
+-        for key, value in _traverse_filter(expr):
++        for key, value in _nested_dicts_to_dotted_keys(expr):
+             reduce_results(self._find_expression(key, value))
+             if not result_ids:          # No match, no need to continue...
+                 return set()
+diff --git a/signac/contrib/import_export.py b/signac/contrib/import_export.py
+index 05c439ac..9c20b6f6 100644
+--- a/signac/contrib/import_export.py
++++ b/signac/contrib/import_export.py
+@@ -18,6 +18,7 @@ from ..core import json
+ from .errors import StatepointParsingError
+ from .errors import DestinationExistsError
+ from .utility import _mkdir_p
++from .utility import _dotted_dict_to_nested_dicts
+ 
+ import logging
+ 
+@@ -53,7 +54,7 @@ def _make_schema_based_path_function(jobs, exclude_keys=None, delimiter_nested='
+ 
+     paths = dict()
+     for key_tokens, values in sp_index.items():
+-        key = delimiter_nested.join(map(str, key_tokens))
++        key = key_tokens.replace('.', delimiter_nested)
+         if exclude_keys and key in exclude_keys:
+             continue
+         for value, group in values.items():
+@@ -335,26 +336,11 @@ def _make_path_based_schema_function(schema_path):
+             for key in types:
+                 if key in sp:
+                     sp[key] = types[key](sp[key])
+-            return _convert_to_nested(sp)
++            return _dotted_dict_to_nested_dicts(sp, delimiter_nested=_DOT_MAGIC_WORD)
+ 
+     return parse_path
+ 
+ 
+-def _convert_to_nested(sp):
+-    """Convert a flat state point dict to a nested dict."""
+-    ret = dict()
+-    for key, value in sp.items():
+-        tokens = key.split(_DOT_MAGIC_WORD)
+-        if len(tokens) > 1:
+-            tmp = ret.setdefault(tokens[0], dict())
+-            for token in tokens[1:-1]:
+-                tmp = tmp.setdefault(token, dict())
+-            tmp[tokens[-1]] = value
+-        else:
+-            ret[tokens[0]] = value
+-    return ret
+-
+-
+ def _with_consistency_check(schema_function, read_sp_manifest_file):
+     "Check whether the state point detected from the schema function matches the manifest file."
+ 
+diff --git a/signac/contrib/project.py b/signac/contrib/project.py
+index 2e19da04..105c0cc0 100644
+--- a/signac/contrib/project.py
++++ b/signac/contrib/project.py
+@@ -551,8 +551,9 @@ class Project(object):
+         from .schema import _build_job_statepoint_index
+         if index is None:
+             index = [{'_id': job._id, 'statepoint': job.sp()} for job in self]
+-        for x in _build_job_statepoint_index(jobs=self, exclude_const=exclude_const, index=index):
+-            yield x
++        for x, y in _build_job_statepoint_index(
++                    jobs=self, exclude_const=exclude_const, index=index):
++            yield tuple(x.split('.')), y
+ 
+     def detect_schema(self, exclude_const=False, subset=None, index=None):
+         """Detect the project's state point schema.
+@@ -571,12 +572,14 @@ class Project(object):
+         :rtype:
+             `signac.contrib.schema.ProjectSchema`
+         """
++        from .schema import _build_job_statepoint_index
+         if index is None:
+             index = self.index(include_job_document=False)
+         if subset is not None:
+             subset = {str(s) for s in subset}
+             index = [doc for doc in index if doc['_id'] in subset]
+-        statepoint_index = self.build_job_statepoint_index(exclude_const=exclude_const, index=index)
++        statepoint_index = _build_job_statepoint_index(
++            jobs=self, exclude_const=exclude_const, index=index)
+         return ProjectSchema.detect(statepoint_index)
+ 
+     @deprecated(deprecated_in="1.3", removed_in="2.0", current_version=__version__,
+diff --git a/signac/contrib/schema.py b/signac/contrib/schema.py
+index f25c5edb..ced941d7 100644
+--- a/signac/contrib/schema.py
++++ b/signac/contrib/schema.py
+@@ -23,11 +23,11 @@ def _collect_by_type(values):
+ 
+ def _build_job_statepoint_index(jobs, exclude_const, index):
+     from .collection import Collection
+-    from .collection import _traverse_filter
+     from .collection import _DictPlaceholder
++    from .utility import _nested_dicts_to_dotted_keys
+     collection = Collection(index, _trust=True)
+     for doc in collection.find():
+-        for key, _ in _traverse_filter(doc):
++        for key, _ in _nested_dicts_to_dotted_keys(doc):
+             if key == '_id' or key.split('.')[0] != 'statepoint':
+                 continue
+             collection.index(key, build=True)
+@@ -42,7 +42,7 @@ def _build_job_statepoint_index(jobs, exclude_const, index):
+         if exclude_const and len(tmp[k]) == 1 \
+                 and len(tmp[k][list(tmp[k].keys())[0]]) == len(collection):
+             continue
+-        yield tuple(strip_prefix(k).split('.')), remove_dict_placeholder(tmp[k])
++        yield strip_prefix(k), remove_dict_placeholder(tmp[k])
+ 
+ 
+ class ProjectSchema(object):
+@@ -109,19 +109,21 @@ class ProjectSchema(object):
+         if depth > 0:
+             schema_dict = _Vividict()
+             for key, values in self._schema.items():
+-                if len(key) > 1:
+-                    for k in key[:-1]:
+-                        x = schema_dict[k]
+-                    x[key[-1]] = _fmt_values(values)
++                keys = key.split('.')
++                if len(keys) > 1:
++                    x = schema_dict[keys[0]]
++                    for k in keys[1:-1]:
++                        x = x[k]
++                    x[keys[-1]] = _fmt_values(values)
+                 else:
+-                    schema_dict[key[0]] = _fmt_values(values)
++                    schema_dict[keys[0]] = _fmt_values(values)
+             return pformat(schema_dict, depth=depth)
+         else:
+             ret = ['{']
+             for key in sorted(self._schema):
+                 values = self._schema[key]
+                 if values:
+-                    ret.append(" '{}': '{}',".format('.'.join(key), _fmt_values(values)))
++                    ret.append(" '{}': '{}',".format(key, _fmt_values(values)))
+             ret.append('}')
+             return '\n'.join(ret)
+ 
+@@ -136,13 +138,14 @@ class ProjectSchema(object):
+ 
+     def __contains__(self, key_or_keys):
+         if isinstance(key_or_keys, str):
+-            key_or_keys = key_or_keys.split('.')
+-        return tuple(key_or_keys) in self._schema
++            return key_or_keys in self._schema
++        key_or_keys = '.'.join(key_or_keys)
++        return key_or_keys in self._schema
+ 
+     def __getitem__(self, key_or_keys):
+         if isinstance(key_or_keys, str):
+-            key_or_keys = key_or_keys.split('.')
+-        return self._schema.__getitem__(tuple(key_or_keys))
++            return self._schema[key_or_keys]
++        return self._schema['.'.join(key_or_keys)]
+ 
+     def __iter__(self):
+         return iter(self._schema)
+@@ -181,11 +184,12 @@ class ProjectSchema(object):
+         iterators = itertools.tee(jobs_or_statepoints, len(self))
+         for key, it in zip(self, iterators):
+             values = []
++            keys = key.split('.')
+             for sp in it:
+                 if not isinstance(sp, Mapping):
+                     sp = sp.statepoint
+-                v = sp[key[0]]
+-                for k in key[1:]:
++                v = sp[keys[0]]
++                for k in keys[1:]:
+                     v = v[k]
+                 values.append(v)
+             s[key] = _collect_by_type(values)
+diff --git a/signac/contrib/utility.py b/signac/contrib/utility.py
+index f7b633c4..a318fd06 100644
+--- a/signac/contrib/utility.py
++++ b/signac/contrib/utility.py
+@@ -14,6 +14,7 @@ from datetime import timedelta
+ from contextlib import contextmanager
+ from deprecation import deprecated
+ from tempfile import TemporaryDirectory
++from collections.abc import Mapping
+ 
+ from ..version import __version__
+ 
+@@ -227,3 +228,65 @@ def _extract(filename):
+                 yield tmpdir
+         else:
+             raise RuntimeError("Unknown file type: '{}'.".format(filename))
++
++
++def _dotted_dict_to_nested_dicts(dotted_dict, delimiter_nested='.'):
++    """Convert dotted keys in the state point dict to a nested dict.
++
++    :param dotted_dict: A mapping with dots/delimiter_nested in its keys, e.g. {'a.b': 'c'}.
++    :param delimiter_nested: A string delimiter between keys, defaults to '.'.
++    :returns: A mapping instance with nested dicts, e.g. {'a': {'b': 'c'}}.
++    """
++    nested_dict = dict()
++    for key, value in dotted_dict.items():
++        tokens = key.split(delimiter_nested)
++        if len(tokens) > 1:
++            tmp = nested_dict.setdefault(tokens[0], dict())
++            for token in tokens[1:-1]:
++                tmp = tmp.setdefault(token, dict())
++            tmp[tokens[-1]] = value
++        else:
++            nested_dict[tokens[0]] = value
++    return nested_dict
++
++
++class _hashable_dict(dict):
++    def __hash__(self):
++        return hash(tuple(sorted(self.items())))
++
++
++def _to_hashable(l):
++    if type(l) is list:
++        return tuple(_to_hashable(_) for _ in l)
++    elif type(l) is dict:
++        return _hashable_dict(l)
++    else:
++        return l
++
++
++def _encode_tree(x):
++    if type(x) is list:
++        return _to_hashable(x)
++    else:
++        return x
++
++
++def _nested_dicts_to_dotted_keys(t, encode=_encode_tree, key=None):
++    """Generate tuples of key in dotted string format and value from nested dict.
++
++    :param t: A mapping instance with nested dicts, e.g. {'a': {'b': 'c'}}.
++    :param encode: By default, values are encoded to be hashable. Use ``None`` to skip encoding.
++    :yields: Tuples of dotted key and value e.g. ('a.b', 'c').
++    """
++    if encode is not None:
++        t = encode(t)
++    if isinstance(t, Mapping):
++        if t:
++            for k in t:
++                k_ = k if key is None else '.'.join((key, k))
++                for k__, v in _nested_dicts_to_dotted_keys(t[k], encode=encode, key=k_):
++                    yield k__, v
++        elif key is not None:
++            yield key, t
++    else:
++        yield key, t
+diff --git a/signac/diff.py b/signac/diff.py
+index 4b608f1d..b29b1b58 100644
+--- a/signac/diff.py
++++ b/signac/diff.py
+@@ -1,31 +1,8 @@
+ # Copyright (c) 2019 The Regents of the University of Michigan
+ # All rights reserved.
+ # This software is licensed under the BSD 3-Clause License.
+-from .contrib.collection import _traverse_filter
+-
+-
+-def _dotted_keys_to_nested_dicts(mapping):
+-    """Converts dictionaries with dot-separated keys into nested dictionaries.
+-
+-    :param mapping: A mapping with dots in its keys, e.g. {'a.b': 'c'}
+-    :returns: A mapping with nested keys, e.g. {'a': {'b': 'c'}}
+-    :rtype: dict
+-    """
+-    result = {}
+-
+-    def make_nested_dict(d, keys):
+-        item = d
+-        for key in keys[:-1]:
+-            if key not in item:
+-                item[key] = {}
+-            item = item[key]
+-        return item
+-
+-    for dotted_key, value in mapping.items():
+-        keys = dotted_key.split('.')
+-        make_nested_dict(result, keys)[keys[-1]] = value
+-
+-    return result
++from .contrib.utility import _dotted_dict_to_nested_dicts
++from .contrib.utility import _nested_dicts_to_dotted_keys
+ 
+ 
+ def diff_jobs(*jobs):
+@@ -72,13 +49,13 @@ def diff_jobs(*jobs):
+     else:
+         sps = {}
+         for job in jobs:
+-            sps[job] = set(_traverse_filter(job.sp()))
++            sps[job] = set(_nested_dicts_to_dotted_keys(job.sp()))
+ 
+         intersection = set.intersection(*sps.values())
+ 
+         diffs = {}
+         for job in jobs:
+             unique_sps = sps[job]-intersection
+-            diffs[job.id] = _dotted_keys_to_nested_dicts(dict(unique_sps))
++            diffs[job.id] = _dotted_dict_to_nested_dicts(dict(unique_sps))
+ 
+         return diffs

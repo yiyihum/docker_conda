@@ -1,0 +1,91 @@
+diff --git a/tests/func/experiments/executor/test_ssh.py b/tests/func/experiments/executor/test_ssh.py
+--- a/tests/func/experiments/executor/test_ssh.py
++++ b/tests/func/experiments/executor/test_ssh.py
+@@ -38,7 +38,7 @@ def test_init_from_stash(tmp_dir, scm, dvc, machine_instance, mocker):
+ 
+ @pytest.mark.needs_internet
+ @pytest.mark.parametrize("cloud", [pytest.lazy_fixture("git_ssh")])
+-def test_init_git(tmp_dir, scm, cloud, mocker):
++def test_init_git(tmp_dir, dvc, scm, cloud, mocker):
+     tmp_dir.scm_gen({"foo": "foo", "dir": {"bar": "bar"}}, commit="init")
+     baseline_rev = scm.get_rev()
+     tmp_dir.gen("foo", "stashed")
+@@ -59,7 +59,7 @@ def test_init_git(tmp_dir, scm, cloud, mocker):
+         fs_factory=partial(_ssh_factory, cloud),
+     )
+     infofile = str((root_url / "foo.run").path)
+-    executor.init_git(scm, rev, mock, infofile=infofile)
++    executor.init_git(dvc, scm, rev, mock, infofile=infofile)
+     assert root_url.path == executor._repo_abspath
+ 
+     fs = cloud._ssh
+diff --git a/tests/func/experiments/test_show.py b/tests/func/experiments/test_show.py
+--- a/tests/func/experiments/test_show.py
++++ b/tests/func/experiments/test_show.py
+@@ -10,15 +10,17 @@
+ 
+ from dvc.cli import main
+ from dvc.repo.experiments.executor.base import (
+-    EXEC_PID_DIR,
+-    EXEC_TMP_DIR,
+     BaseExecutor,
+     ExecutorInfo,
+     TaskStatus,
+ )
+ from dvc.repo.experiments.queue.base import QueueEntry
+ from dvc.repo.experiments.refs import CELERY_STASH, ExpRefInfo
+-from dvc.repo.experiments.utils import exp_refs_by_rev
++from dvc.repo.experiments.utils import (
++    EXEC_PID_DIR,
++    EXEC_TMP_DIR,
++    exp_refs_by_rev,
++)
+ from dvc.utils import relpath
+ from dvc.utils.fs import makedirs
+ from dvc.utils.serialize import YAMLFileCorruptedError
+diff --git a/tests/unit/test_rwlock.py b/tests/unit/test_rwlock.py
+--- a/tests/unit/test_rwlock.py
++++ b/tests/unit/test_rwlock.py
+@@ -1,3 +1,4 @@
++import json
+ import os
+ 
+ import pytest
+@@ -105,3 +106,37 @@ def test_broken_rwlock(tmp_path):
+     with pytest.raises(RWLockFileCorruptedError):
+         with _edit_rwlock(dir_path, localfs, False):
+             pass
++
++
++@pytest.mark.parametrize("return_value", [True, False])
++def test_corrupted_rwlock(tmp_path, mocker, return_value):
++    dir_path = os.fspath(tmp_path)
++    path = tmp_path / "rwlock"
++
++    foo = "foo"
++    bar = "bar"
++    cmd_foo = "cmd_foo"
++    cmd_bar = "cmd_bar"
++    mocker.patch("psutil.pid_exists", return_value=return_value)
++
++    corrupted_rwlock = {
++        "write": {foo: {"pid": 1234, "cmd": cmd_foo}},
++        "read": {
++            foo: [{"pid": 5555, "cmd": cmd_foo}],
++            bar: [
++                {"pid": 6666, "cmd": cmd_bar},
++                {"pid": 7777, "cmd": cmd_bar},
++            ],
++        },
++    }
++
++    path.write_text(json.dumps(corrupted_rwlock), encoding="utf-8")
++
++    if return_value:
++        with pytest.raises(LockError):
++            with rwlock(dir_path, localfs, "cmd_other", [], [foo, bar], False):
++                pass
++    else:
++        with rwlock(dir_path, localfs, "cmd_other", [], [foo, bar], False):
++            pass
++        assert path.read_text() == """{"read": {}}"""

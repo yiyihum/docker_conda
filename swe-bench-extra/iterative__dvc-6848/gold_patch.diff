@@ -1,0 +1,77 @@
+diff --git a/dvc/repo/experiments/__init__.py b/dvc/repo/experiments/__init__.py
+--- a/dvc/repo/experiments/__init__.py
++++ b/dvc/repo/experiments/__init__.py
+@@ -473,6 +473,17 @@ def _log_reproduced(self, revs: Iterable[str], tmp_dir: bool = False):
+             "\tdvc exp branch <exp> <branch>\n"
+         )
+ 
++    def _validate_new_ref(self, exp_ref: ExpRefInfo):
++        from .utils import check_ref_format
++
++        if not exp_ref.name:
++            return
++
++        check_ref_format(self.scm, exp_ref)
++
++        if self.scm.get_ref(str(exp_ref)):
++            raise ExperimentExistsError(exp_ref.name)
++
+     @scm_locked
+     def new(self, *args, checkpoint_resume: Optional[str] = None, **kwargs):
+         """Create a new experiment.
+@@ -485,6 +496,16 @@ def new(self, *args, checkpoint_resume: Optional[str] = None, **kwargs):
+                 *args, resume_rev=checkpoint_resume, **kwargs
+             )
+ 
++        name = kwargs.get("name", None)
++        baseline_sha = kwargs.get("baseline_rev") or self.repo.scm.get_rev()
++        exp_ref = ExpRefInfo(baseline_sha=baseline_sha, name=name)
++
++        try:
++            self._validate_new_ref(exp_ref)
++        except ExperimentExistsError as err:
++            if not (kwargs.get("force", False) or kwargs.get("reset", False)):
++                raise err
++
+         return self._stash_exp(*args, **kwargs)
+ 
+     def _resume_checkpoint(
+diff --git a/dvc/repo/experiments/utils.py b/dvc/repo/experiments/utils.py
+--- a/dvc/repo/experiments/utils.py
++++ b/dvc/repo/experiments/utils.py
+@@ -157,3 +157,12 @@ def resolve_exp_ref(
+         msg.extend([f"\t{info}" for info in exp_ref_list])
+         raise InvalidArgumentError("\n".join(msg))
+     return exp_ref_list[0]
++
++
++def check_ref_format(scm: "Git", ref: ExpRefInfo):
++    # "/" forbidden, only in dvc exp as we didn't support it for now.
++    if not scm.check_ref_format(str(ref)) or "/" in ref.name:
++        raise InvalidArgumentError(
++            f"Invalid exp name {ref.name}, the exp name must follow rules in "
++            "https://git-scm.com/docs/git-check-ref-format"
++        )
+diff --git a/dvc/scm/git/__init__.py b/dvc/scm/git/__init__.py
+--- a/dvc/scm/git/__init__.py
++++ b/dvc/scm/git/__init__.py
+@@ -346,6 +346,7 @@ def get_fs(self, rev: str):
+     status = partialmethod(_backend_func, "status")
+     merge = partialmethod(_backend_func, "merge")
+     validate_git_remote = partialmethod(_backend_func, "validate_git_remote")
++    check_ref_format = partialmethod(_backend_func, "check_ref_format")
+ 
+     def resolve_rev(self, rev: str) -> str:
+         from dvc.repo.experiments.utils import exp_refs_by_name
+diff --git a/dvc/scm/git/backend/dulwich/__init__.py b/dvc/scm/git/backend/dulwich/__init__.py
+--- a/dvc/scm/git/backend/dulwich/__init__.py
++++ b/dvc/scm/git/backend/dulwich/__init__.py
+@@ -681,3 +681,8 @@ def validate_git_remote(self, url: str, **kwargs):
+             os.path.join("", path)
+         ):
+             raise InvalidRemoteSCMRepo(url)
++
++    def check_ref_format(self, refname: str):
++        from dulwich.refs import check_ref_format
++
++        return check_ref_format(refname.encode())

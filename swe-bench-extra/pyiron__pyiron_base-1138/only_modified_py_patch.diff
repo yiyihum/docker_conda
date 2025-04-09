@@ -1,0 +1,265 @@
+diff --git a/pyiron_base/database/filetable.py b/pyiron_base/database/filetable.py
+index 2c44d0ed..e2c7bec5 100644
+--- a/pyiron_base/database/filetable.py
++++ b/pyiron_base/database/filetable.py
+@@ -534,9 +534,15 @@ class FileTable(IsDatabase, metaclass=FileTableSingleton):
+                     )
+                 ]
+             )
++            sanitized_paths = self._fileindex.dataframe.path.str.replace("\\", "/")
++            # The files_list is generated using project path values
++            # In pyiron, these are all forced to be posix-like with /
++            # But _fileindex is of type PyFileIndex, which does _not_ modify paths
++            # so to get the two compatible for an isin check, we need to sanitize the
++            # _fileindex.dataframe.path results
+             df_new = self._fileindex.dataframe[
+                 ~self._fileindex.dataframe.is_directory
+-                & ~self._fileindex.dataframe.path.isin(files_lst)
++                & ~sanitized_paths.isin(files_lst)
+             ]
+         else:
+             files_lst, working_dir_lst = [], []
+@@ -565,7 +571,11 @@ class FileTable(IsDatabase, metaclass=FileTableSingleton):
+                 "status": get_job_status_from_file(hdf5_file=path, job_name=job),
+                 "job": job,
+                 "subjob": "/" + job,
+-                "project": os.path.dirname(path) + "/",
++                "project": os.path.dirname(path).replace("\\", "/") + "/",
++                # pyiron Project paths are forced to be posix-like with / instead of \
++                # in order for the contains and endswith tests down in _get_job_table
++                # to work on windows, we need to make sure that the file table obeys
++                # this conversion
+                 "timestart": time,
+                 "timestop": time,
+                 "totalcputime": 0.0,
+diff --git a/pyiron_base/jobs/datamining.py b/pyiron_base/jobs/datamining.py
+index 9906b525..27cc533e 100644
+--- a/pyiron_base/jobs/datamining.py
++++ b/pyiron_base/jobs/datamining.py
+@@ -683,14 +683,19 @@ class TableJob(GenericJob):
+         with self.project_hdf5.open("input") as hdf5_input:
+             if "project" in hdf5_input.list_nodes():
+                 project_dict = hdf5_input["project"]
+-                project = self.project.__class__(
+-                    path=project_dict["path"],
+-                    user=project_dict["user"],
+-                    sql_query=project_dict["sql_query"],
+-                )
+-                project._filter = project_dict["filter"]
+-                project._inspect_mode = project_dict["inspect_mode"]
+-                self.analysis_project = project
++                if os.path.exists(project_dict["path"]):
++                    project = self.project.__class__(
++                        path=project_dict["path"],
++                        user=project_dict["user"],
++                        sql_query=project_dict["sql_query"],
++                    )
++                    project._filter = project_dict["filter"]
++                    project._inspect_mode = project_dict["inspect_mode"]
++                    self.analysis_project = project
++                else:
++                    self._logger.warning(
++                        f"Could not instantiate analysis_project, no such path {project_dict['path']}."
++                    )
+             if "filter" in hdf5_input.list_nodes():
+                 if hdf_version == "0.1.0":
+                     self.pyiron_table._filter_function_str = hdf5_input["filter"]
+diff --git a/pyiron_base/jobs/job/extension/server/runmode.py b/pyiron_base/jobs/job/extension/server/runmode.py
+index f9b3bed6..1854b227 100644
+--- a/pyiron_base/jobs/job/extension/server/runmode.py
++++ b/pyiron_base/jobs/job/extension/server/runmode.py
+@@ -26,7 +26,6 @@ run_mode_lst = [
+     "thread",
+     "worker",
+     "srun",
+-    "flux",
+     "interactive",
+     "interactive_non_modal",
+ ]
+diff --git a/pyiron_base/jobs/job/generic.py b/pyiron_base/jobs/job/generic.py
+index b7f690cb..978801e7 100644
+--- a/pyiron_base/jobs/job/generic.py
++++ b/pyiron_base/jobs/job/generic.py
+@@ -154,7 +154,6 @@ class GenericJob(JobCore):
+         self._compress_by_default = False
+         self._python_only_job = False
+         self._write_work_dir_warnings = True
+-        self._flux_executor = None
+         self.interactive_cache = None
+         self.error = GenericError(job=self)
+ 
+@@ -210,15 +209,6 @@ class GenericJob(JobCore):
+         self._executable_activate()
+         self._executable.executable_path = exe
+ 
+-    @property
+-    def flux_executor(self):
+-        return self._flux_executor
+-
+-    @flux_executor.setter
+-    def flux_executor(self, exe):
+-        self.server.run_mode.flux = True
+-        self._flux_executor = exe
+-
+     @property
+     def server(self):
+         """
+@@ -700,9 +690,9 @@ class GenericJob(JobCore):
+                 if repair and self.job_id and not self.status.finished:
+                     self._run_if_repair()
+                 elif status == "initialized":
+-                    return self._run_if_new(debug=debug)
++                    self._run_if_new(debug=debug)
+                 elif status == "created":
+-                    return self._run_if_created()
++                    self._run_if_created()
+                 elif status == "submitted":
+                     run_job_with_status_submitted(job=self)
+                 elif status == "running":
+@@ -1201,7 +1191,7 @@ class GenericJob(JobCore):
+         Args:
+             debug (bool): Debug Mode
+         """
+-        return run_job_with_status_initialized(job=self, debug=debug)
++        run_job_with_status_initialized(job=self, debug=debug)
+ 
+     def _run_if_created(self):
+         """
+diff --git a/pyiron_base/jobs/job/runfunction.py b/pyiron_base/jobs/job/runfunction.py
+index 80274024..895e738c 100644
+--- a/pyiron_base/jobs/job/runfunction.py
++++ b/pyiron_base/jobs/job/runfunction.py
+@@ -7,19 +7,10 @@ import os
+ import posixpath
+ import subprocess
+ 
+-from jinja2 import Template
+-
+ from pyiron_base.utils.deprecate import deprecate
+ from pyiron_base.jobs.job.wrapper import JobWrapper
+ from pyiron_base.state import state
+ 
+-try:
+-    import flux.job
+-
+-    flux_available = True
+-except ImportError:
+-    flux_available = False
+-
+ 
+ """
+ The function job.run() inside pyiron is executed differently depending on the status of the job object. This module 
+@@ -48,7 +39,6 @@ of the server object attached to the job object: job.server.run_mode
+     interactive_non_modal: run_job_with_runmode_interactive_non_modal
+     queue: run_job_with_runmode_queue
+     srun: run_job_with_runmode_srun
+-    flux: run_job_with_runmode_flux
+     thread: only affects children of a GenericMaster 
+     worker: only affects children of a GenericMaster 
+     
+@@ -86,7 +76,7 @@ def run_job_with_status_initialized(job, debug=False):
+         print("job exists already and therefore was not created!")
+     else:
+         job.save()
+-        return job.run()
++        job.run()
+ 
+ 
+ def run_job_with_status_created(job):
+@@ -112,16 +102,6 @@ def run_job_with_status_created(job):
+         job.run_static()
+     elif job.server.run_mode.srun:
+         run_job_with_runmode_srun(job=job)
+-    elif job.server.run_mode.flux:
+-        if job.server.gpus is not None:
+-            gpus_per_slot = int(job.server.gpus / job.server.cores)
+-        else:
+-            gpus_per_slot = None
+-        return run_job_with_runmode_flux(
+-            job=job,
+-            executor=job.flux_executor,
+-            gpus_per_slot=gpus_per_slot,
+-        )
+     elif (
+         job.server.run_mode.non_modal
+         or job.server.run_mode.thread
+@@ -451,53 +431,6 @@ def run_job_with_runmode_srun(job):
+     )
+ 
+ 
+-def run_job_with_runmode_flux(job, executor, gpus_per_slot=None):
+-    if not flux_available:
+-        raise ModuleNotFoundError(
+-            "No module named 'flux'. Running in flux mode is only available on Linux;"
+-            "For CPU jobs, please use `conda install -c conda-forge flux-core`; for "
+-            "GPU support you will additionally need "
+-            "`conda install -c conda-forge flux-sched libhwloc=*=cuda*`"
+-        )
+-    if not state.database.database_is_disabled:
+-        executable_template = Template(
+-            """\
+-#!/bin/bash
+-python -m pyiron_base.cli wrapper -p {{working_directory}} -j {{job_id}}
+-"""
+-        )
+-        exeuctable_str = executable_template.render(
+-            working_directory=job.working_directory,
+-            job_id=str(job.job_id),
+-        )
+-        job_name = "pi_" + str(job.job_id)
+-    else:
+-        executable_template = Template(
+-            """\
+-#!/bin/bash
+-python -m pyiron_base.cli wrapper -p {{working_directory}} -f {{file_name}}{{h5_path}}
+-"""
+-        )
+-        exeuctable_str = executable_template.render(
+-            working_directory=job.working_directory,
+-            file_name=job.project_hdf5.file_name,
+-            h5_path=job.project_hdf5.h5_path,
+-        )
+-        job_name = "pi_" + job.job_name
+-
+-    jobspec = flux.job.JobspecV1.from_batch_command(
+-        jobname=job_name,
+-        script=exeuctable_str,
+-        num_nodes=1,
+-        cores_per_slot=1,
+-        gpus_per_slot=gpus_per_slot,
+-        num_slots=job.server.cores,
+-    )
+-    jobspec.cwd = job.project_hdf5.working_directory
+-    jobspec.environment = dict(os.environ)
+-    return executor.submit(jobspec)
+-
+-
+ def run_time_decorator(func):
+     def wrapper(job):
+         if not state.database.database_is_disabled and job.job_id is not None:
+diff --git a/pyiron_base/project/maintenance.py b/pyiron_base/project/maintenance.py
+index d0232688..fa5c34bf 100644
+--- a/pyiron_base/project/maintenance.py
++++ b/pyiron_base/project/maintenance.py
+@@ -99,7 +99,7 @@ class LocalMaintenance:
+             recursive=recursive, progress=progress, convert_to_object=False, **kwargs
+         ):
+             hdf = job.project_hdf5
+-            hdf.rewrite_hdf(job.name)
++            hdf.rewrite_hdf5(job.name)
+ 
+ 
+ class UpdateMaintenance:
+@@ -119,9 +119,9 @@ class UpdateMaintenance:
+                 configuration.
+         """
+         mayor, minor = start_version.split(".")[0:2]
+-        if mayor != 0:
++        if int(mayor) != 0:
+             raise ValueError("Updates to version >0.x.y is not possible.")
+-        if minor < 4:
++        if int(minor) < 4:
+             self.base_v0_3_to_v0_4(project)
+ 
+     def base_v0_3_to_v0_4(self, project=None):
+

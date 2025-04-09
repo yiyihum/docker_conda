@@ -1,0 +1,121 @@
+diff --git a/src/setuptools_scm/_entrypoints.py b/src/setuptools_scm/_entrypoints.py
+index 8350968..e3be053 100644
+--- a/src/setuptools_scm/_entrypoints.py
++++ b/src/setuptools_scm/_entrypoints.py
+@@ -13,8 +13,8 @@ from . import _log
+ from . import version
+ 
+ if TYPE_CHECKING:
+-    from ._config import Configuration
+     from . import _types as _t
++    from ._config import Configuration, ParseFunction
+ 
+ 
+ log = _log.log.getChild("entrypoints")
+@@ -27,21 +27,14 @@ class EntrypointProtocol(Protocol):
+         pass
+ 
+ 
+-def _version_from_entrypoints(
+-    config: Configuration, fallback: bool = False
++def version_from_entrypoint(
++    config: Configuration, entrypoint: str, root: _t.PathT
+ ) -> version.ScmVersion | None:
+-    if fallback:
+-        entrypoint = "setuptools_scm.parse_scm_fallback"
+-        root = config.fallback_root
+-    else:
+-        entrypoint = "setuptools_scm.parse_scm"
+-        root = config.absolute_root
+-
+     from .discover import iter_matching_entrypoints
+ 
+     log.debug("version_from_ep %s in %s", entrypoint, root)
+     for ep in iter_matching_entrypoints(root, entrypoint, config):
+-        fn = ep.load()
++        fn: ParseFunction = ep.load()
+         maybe_version: version.ScmVersion | None = fn(root, config=config)
+         log.debug("%s found %r", ep, maybe_version)
+         if maybe_version is not None:
+diff --git a/src/setuptools_scm/_get_version.py b/src/setuptools_scm/_get_version.py
+index a1afe2d..d2fe9e1 100644
+--- a/src/setuptools_scm/_get_version.py
++++ b/src/setuptools_scm/_get_version.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import logging
+ import re
+ import warnings
+ from pathlib import Path
+@@ -8,30 +9,41 @@ from typing import NoReturn
+ from typing import Pattern
+ 
+ from . import _config
++from . import _entrypoints
++from . import _run_cmd
+ from . import _types as _t
+ from ._config import Configuration
+-from ._entrypoints import _version_from_entrypoints
+ from ._overrides import _read_pretended_version_for
+ from ._version_cls import _validate_version_cls
+ from .version import format_version as _format_version
+ from .version import ScmVersion
+ 
++_log = logging.getLogger(__name__)
++
+ 
+ def parse_scm_version(config: Configuration) -> ScmVersion | None:
+-    if config.parse is not None:
+-        parse_result = config.parse(config.absolute_root, config=config)
+-        if parse_result is not None and not isinstance(parse_result, ScmVersion):
+-            raise TypeError(
+-                f"version parse result was {str!r}\n"
+-                "please return a parsed version (ScmVersion)"
+-            )
+-        return parse_result
+-    else:
+-        return _version_from_entrypoints(config)
++    try:
++        if config.parse is not None:
++            parse_result = config.parse(config.absolute_root, config=config)
++            if parse_result is not None and not isinstance(parse_result, ScmVersion):
++                raise TypeError(
++                    f"version parse result was {str!r}\n"
++                    "please return a parsed version (ScmVersion)"
++                )
++            return parse_result
++        else:
++            entrypoint = "setuptools_scm.parse_scm"
++            root = config.absolute_root
++            return _entrypoints.version_from_entrypoint(config, entrypoint, root)
++    except _run_cmd.CommandNotFoundError as e:
++        _log.exception("command %s not found while parsing the scm, using fallbacks", e)
++        return None
+ 
+ 
+ def parse_fallback_version(config: Configuration) -> ScmVersion | None:
+-    return _version_from_entrypoints(config, fallback=True)
++    entrypoint = "setuptools_scm.parse_scm_fallback"
++    root = config.fallback_root
++    return _entrypoints.version_from_entrypoint(config, entrypoint, root)
+ 
+ 
+ def _do_parse(config: Configuration) -> ScmVersion | None:
+diff --git a/src/setuptools_scm/_run_cmd.py b/src/setuptools_scm/_run_cmd.py
+index 3c938d8..046749a 100644
+--- a/src/setuptools_scm/_run_cmd.py
++++ b/src/setuptools_scm/_run_cmd.py
+@@ -189,6 +189,10 @@ def has_command(
+     return res
+ 
+ 
++class CommandNotFoundError(LookupError, FileNotFoundError):
++    pass
++
++
+ def require_command(name: str) -> None:
+     if not has_command(name, warn=False):
+-        raise OSError(f"{name!r} was not found")
++        raise CommandNotFoundError(name)
+

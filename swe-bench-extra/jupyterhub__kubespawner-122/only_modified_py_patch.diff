@@ -1,0 +1,117 @@
+diff --git a/kubespawner/objects.py b/kubespawner/objects.py
+index ae0d42e..f31af8e 100644
+--- a/kubespawner/objects.py
++++ b/kubespawner/objects.py
+@@ -170,7 +170,7 @@ def make_pod(
+     notebook_container.image_pull_policy = image_pull_policy
+     notebook_container.lifecycle = lifecycle_hooks
+     notebook_container.resources = V1ResourceRequirements()
+-    
++
+     if service_account is None:
+         # Add a hack to ensure that no service accounts are mounted in spawned pods
+         # This makes sure that we don"t accidentally give access to the whole
+@@ -187,6 +187,9 @@ def make_pod(
+         hack_volume_mount.mount_path = "/var/run/secrets/kubernetes.io/serviceaccount"
+         hack_volume_mount.read_only = True
+         hack_volume_mounts = [hack_volume_mount]
++
++        # Non-hacky way of not mounting service accounts
++        pod.spec.automount_service_account_token = False
+     else:
+         hack_volumes = []
+         hack_volume_mounts = []
+@@ -250,7 +253,8 @@ def make_pvc(
+     storage_class,
+     access_modes,
+     storage,
+-    labels
++    labels,
++    annotations={}
+     ):
+     """
+     Make a k8s pvc specification for running a user notebook.
+@@ -272,9 +276,7 @@ def make_pvc(
+     pvc.api_version = "v1"
+     pvc.metadata = V1ObjectMeta()
+     pvc.metadata.name = name
+-    pvc.metadata.annotations = {}
+-    if storage_class:
+-        pvc.metadata.annotations.update({"volume.beta.kubernetes.io/storage-class": storage_class})
++    pvc.metadata.annotations = annotations
+     pvc.metadata.labels = {}
+     pvc.metadata.labels.update(labels)
+     pvc.spec = V1PersistentVolumeClaimSpec()
+@@ -282,6 +284,10 @@ def make_pvc(
+     pvc.spec.resources = V1ResourceRequirements()
+     pvc.spec.resources.requests = {"storage": storage}
+ 
++    if storage_class:
++        pvc.metadata.annotations.update({"volume.beta.kubernetes.io/storage-class": storage_class})
++        pvc.spec.storage_class_name = storage_class
++
+     return pvc
+ 
+ def make_ingress(
+diff --git a/kubespawner/spawner.py b/kubespawner/spawner.py
+index e3da4d9..163303a 100644
+--- a/kubespawner/spawner.py
++++ b/kubespawner/spawner.py
+@@ -783,12 +783,8 @@ class KubeSpawner(Spawner):
+         labels = {
+             'heritage': 'jupyterhub',
+             'app': 'jupyterhub',
+-            'hub.jupyter.org/username': escapism.escape(self.user.name)
+         }
+ 
+-        if self.name:
+-            # FIXME: Make sure this is dns safe?
+-            labels['hub.jupyter.org/servername'] = self.name
+         labels.update(extra_labels)
+         return labels
+ 
+@@ -801,6 +797,17 @@ class KubeSpawner(Spawner):
+         labels.update(self.pod_reflector.labels)
+         return self._build_common_labels(labels)
+ 
++    def _build_common_annotations(self, extra_annotations):
++        # Annotations don't need to be escaped
++        annotations = {
++            'hub.jupyter.org/username': self.user.name
++        }
++        if self.name:
++            annotations['hub.jupyter.org/servername'] = self.name
++
++        annotations.update(extra_annotations)
++        return annotations
++
+     @gen.coroutine
+     def get_pod_manifest(self):
+         """
+@@ -822,7 +829,7 @@ class KubeSpawner(Spawner):
+             real_cmd = None
+ 
+         labels = self._build_pod_labels(self._expand_all(self.singleuser_extra_labels))
+-        annotations = self._expand_all(self.singleuser_extra_annotations)
++        annotations = self._build_common_annotations(self._expand_all(self.singleuser_extra_annotations))
+ 
+         return make_pod(
+             name=self.pod_name,
+@@ -861,12 +868,15 @@ class KubeSpawner(Spawner):
+         """
+         labels = self._build_common_labels(self._expand_all(self.user_storage_extra_labels))
+ 
++        annotations = self._build_common_annotations({})
++
+         return make_pvc(
+             name=self.pvc_name,
+             storage_class=self.user_storage_class,
+             access_modes=self.user_storage_access_modes,
+             storage=self.user_storage_capacity,
+-            labels=labels
++            labels=labels,
++            annotations=annotations
+         )
+ 
+     def is_pod_running(self, pod):
+

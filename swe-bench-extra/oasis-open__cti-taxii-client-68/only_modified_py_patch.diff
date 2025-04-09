@@ -1,0 +1,258 @@
+diff --git a/taxii2client/common.py b/taxii2client/common.py
+index cfd9d05..f8765d9 100644
+--- a/taxii2client/common.py
++++ b/taxii2client/common.py
+@@ -137,6 +137,15 @@ def _grab_total_items(resp):
+         ), e)
+ 
+ 
++class TokenAuth(requests.auth.AuthBase):
++    def __init__(self, key):
++        self.key = key
++
++    def __call__(self, r):
++        r.headers['Authorization'] = 'Token {}'.format(self.key)
++        return r
++
++
+ class _TAXIIEndpoint(object):
+     """Contains some data and functionality common to all TAXII endpoint
+     classes: a URL, connection, and ability to close the connection.  It also
+@@ -145,7 +154,7 @@ class _TAXIIEndpoint(object):
+ 
+     """
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None, version="2.0"):
++                 proxies=None, version="2.0", auth=None):
+         """Create a TAXII endpoint.
+ 
+         Args:
+@@ -158,13 +167,13 @@ class _TAXIIEndpoint(object):
+             version (str): The spec version this connection is meant to follow.
+ 
+         """
+-        if conn and (user or password):
+-            raise InvalidArgumentsError("A connection and user/password may"
+-                                        " not both be provided.")
++        if (conn and ((user or password) or auth)) or ((user or password) and auth):
++            raise InvalidArgumentsError("Only one of a connection, username/password, or auth object may"
++                                        " be provided.")
+         elif conn:
+             self._conn = conn
+         else:
+-            self._conn = _HTTPConnection(user, password, verify, proxies, version=version)
++            self._conn = _HTTPConnection(user, password, verify, proxies, version=version, auth=auth)
+ 
+         # Add trailing slash to TAXII endpoint if missing
+         # https://github.com/oasis-open/cti-taxii-client/issues/50
+@@ -201,7 +210,7 @@ class _HTTPConnection(object):
+     """
+ 
+     def __init__(self, user=None, password=None, verify=True, proxies=None,
+-                 user_agent=DEFAULT_USER_AGENT, version="2.0"):
++                 user_agent=DEFAULT_USER_AGENT, version="2.0", auth=None):
+         """Create a connection session.
+ 
+         Args:
+@@ -219,8 +228,12 @@ class _HTTPConnection(object):
+         self.session.verify = verify
+         # enforce that we always have a connection-default user agent.
+         self.user_agent = user_agent or DEFAULT_USER_AGENT
++
+         if user and password:
+             self.session.auth = requests.auth.HTTPBasicAuth(user, password)
++        elif auth:
++            self.session.auth = auth
++
+         if proxies:
+             self.session.proxies.update(proxies)
+         self.version = version
+diff --git a/taxii2client/v20/__init__.py b/taxii2client/v20/__init__.py
+index 1df3a2d..f8421a8 100644
+--- a/taxii2client/v20/__init__.py
++++ b/taxii2client/v20/__init__.py
+@@ -62,7 +62,7 @@ class Status(_TAXIIEndpoint):
+     # aren't other endpoints to call on the Status object.
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None, status_info=None):
++                 proxies=None, status_info=None, auth=None):
+         """Create an API root resource endpoint.
+ 
+         Args:
+@@ -79,7 +79,7 @@ class Status(_TAXIIEndpoint):
+                 (optional)
+ 
+         """
+-        super(Status, self).__init__(url, conn, user, password, verify, proxies)
++        super(Status, self).__init__(url, conn, user, password, verify, proxies, auth=auth)
+         self.__raw = None
+         if status_info:
+             self._populate_fields(**status_info)
+@@ -223,7 +223,7 @@ class Collection(_TAXIIEndpoint):
+     """
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None, collection_info=None):
++                 proxies=None, collection_info=None, auth=None):
+         """
+         Initialize a new Collection.  Either user/password or conn may be
+         given, but not both.  The latter is intended for internal use, when
+@@ -247,7 +247,7 @@ class Collection(_TAXIIEndpoint):
+ 
+         """
+ 
+-        super(Collection, self).__init__(url, conn, user, password, verify, proxies)
++        super(Collection, self).__init__(url, conn, user, password, verify, proxies, auth=auth)
+ 
+         self._loaded = False
+         self.__raw = None
+@@ -496,7 +496,7 @@ class ApiRoot(_TAXIIEndpoint):
+     """
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None):
++                 proxies=None, auth=None):
+         """Create an API root resource endpoint.
+ 
+         Args:
+@@ -510,7 +510,7 @@ class ApiRoot(_TAXIIEndpoint):
+                 (optional)
+ 
+         """
+-        super(ApiRoot, self).__init__(url, conn, user, password, verify, proxies)
++        super(ApiRoot, self).__init__(url, conn, user, password, verify, proxies, auth=auth)
+ 
+         self._loaded_collections = False
+         self._loaded_information = False
+@@ -639,7 +639,7 @@ class Server(_TAXIIEndpoint):
+     """
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None):
++                 proxies=None, auth=None):
+         """Create a server discovery endpoint.
+ 
+         Args:
+@@ -653,7 +653,7 @@ class Server(_TAXIIEndpoint):
+                 (optional)
+ 
+         """
+-        super(Server, self).__init__(url, conn, user, password, verify, proxies)
++        super(Server, self).__init__(url, conn, user, password, verify, proxies, auth=auth)
+ 
+         self._user = user
+         self._password = password
+@@ -661,6 +661,7 @@ class Server(_TAXIIEndpoint):
+         self._proxies = proxies
+         self._loaded = False
+         self.__raw = None
++        self._auth = auth
+ 
+     @property
+     def title(self):
+@@ -719,7 +720,8 @@ class Server(_TAXIIEndpoint):
+                                    user=self._user,
+                                    password=self._password,
+                                    verify=self._verify,
+-                                   proxies=self._proxies)
++                                   proxies=self._proxies,
++                                   auth=self._auth)
+                            for url in roots]
+         # If 'default' is one of the existing API Roots, reuse that object
+         # rather than creating a duplicate. The TAXII 2.0 spec says that the
+diff --git a/taxii2client/v21/__init__.py b/taxii2client/v21/__init__.py
+index 0be971b..ccc1d7a 100644
+--- a/taxii2client/v21/__init__.py
++++ b/taxii2client/v21/__init__.py
+@@ -26,7 +26,7 @@ class Status(_TAXIIEndpoint):
+     # aren't other endpoints to call on the Status object.
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None, status_info=None):
++                 proxies=None, status_info=None, auth=None):
+         """Create an API root resource endpoint.
+ 
+         Args:
+@@ -43,7 +43,7 @@ class Status(_TAXIIEndpoint):
+                 (optional)
+ 
+         """
+-        super(Status, self).__init__(url, conn, user, password, verify, proxies, "2.1")
++        super(Status, self).__init__(url, conn, user, password, verify, proxies, "2.1", auth=auth)
+         self.__raw = None
+         if status_info:
+             self._populate_fields(**status_info)
+@@ -186,7 +186,7 @@ class Collection(_TAXIIEndpoint):
+     """
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None, collection_info=None):
++                 proxies=None, collection_info=None, auth=None):
+         """
+         Initialize a new Collection.  Either user/password or conn may be
+         given, but not both.  The latter is intended for internal use, when
+@@ -210,7 +210,7 @@ class Collection(_TAXIIEndpoint):
+ 
+         """
+ 
+-        super(Collection, self).__init__(url, conn, user, password, verify, proxies, "2.1")
++        super(Collection, self).__init__(url, conn, user, password, verify, proxies, "2.1", auth=auth)
+ 
+         self._loaded = False
+         self.__raw = None
+@@ -461,7 +461,7 @@ class ApiRoot(_TAXIIEndpoint):
+     """
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None):
++                 proxies=None, auth=None):
+         """Create an API root resource endpoint.
+ 
+         Args:
+@@ -475,7 +475,7 @@ class ApiRoot(_TAXIIEndpoint):
+                 (optional)
+ 
+         """
+-        super(ApiRoot, self).__init__(url, conn, user, password, verify, proxies, "2.1")
++        super(ApiRoot, self).__init__(url, conn, user, password, verify, proxies, "2.1", auth=auth)
+ 
+         self._loaded_collections = False
+         self._loaded_information = False
+@@ -604,7 +604,7 @@ class Server(_TAXIIEndpoint):
+     """
+ 
+     def __init__(self, url, conn=None, user=None, password=None, verify=True,
+-                 proxies=None):
++                 proxies=None, auth=None):
+         """Create a server discovery endpoint.
+ 
+         Args:
+@@ -618,7 +618,7 @@ class Server(_TAXIIEndpoint):
+                 (optional)
+ 
+         """
+-        super(Server, self).__init__(url, conn, user, password, verify, proxies, "2.1")
++        super(Server, self).__init__(url, conn, user, password, verify, proxies, "2.1", auth=auth)
+ 
+         self._user = user
+         self._password = password
+@@ -626,6 +626,7 @@ class Server(_TAXIIEndpoint):
+         self._proxies = proxies
+         self._loaded = False
+         self.__raw = None
++        self._auth = auth
+ 
+     @property
+     def title(self):
+@@ -685,7 +686,8 @@ class Server(_TAXIIEndpoint):
+                     user=self._user,
+                     password=self._password,
+                     verify=self._verify,
+-                    proxies=self._proxies)
++                    proxies=self._proxies,
++                    auth=self._auth)
+             for url in roots
+         ]
+         # If 'default' is one of the existing API Roots, reuse that object
+

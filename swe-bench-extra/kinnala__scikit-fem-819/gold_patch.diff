@@ -1,0 +1,129 @@
+diff --git a/skfem/assembly/basis/abstract_basis.py b/skfem/assembly/basis/abstract_basis.py
+index 46aeeb95..4827b5de 100644
+--- a/skfem/assembly/basis/abstract_basis.py
++++ b/skfem/assembly/basis/abstract_basis.py
+@@ -239,15 +239,13 @@ class AbstractBasis:
+             raise ValueError
+ 
+         if elements is not None:
+-            elements = self._get_dofs_normalize_elements(elements)
+-            return self.dofs.get_element_dofs(elements,
+-                                              skip_dofnames=skip)
++            elements = self._normalize_elements(elements)
++            return self.dofs.get_element_dofs(elements, skip_dofnames=skip)
+ 
+-        facets = self._get_dofs_normalize_facets(facets)
+-        return self.dofs.get_facet_dofs(facets,
+-                                        skip_dofnames=skip)
++        facets = self._normalize_facets(facets)
++        return self.dofs.get_facet_dofs(facets, skip_dofnames=skip)
+ 
+-    def _get_dofs_normalize_facets(self, facets):
++    def _normalize_facets(self, facets):
+         if isinstance(facets, ndarray):
+             return facets
+         if facets is None:
+@@ -255,7 +253,7 @@ class AbstractBasis:
+         elif isinstance(facets, (tuple, list, set)):
+             return np.unique(
+                 np.concatenate(
+-                    [self._get_dofs_normalize_facets(f) for f in facets]
++                    [self._normalize_facets(f) for f in facets]
+                 )
+             )
+         elif callable(facets):
+@@ -268,7 +266,7 @@ class AbstractBasis:
+                 raise ValueError("Boundary '{}' not found.".format(facets))
+         raise NotImplementedError
+ 
+-    def _get_dofs_normalize_elements(self, elements):
++    def _normalize_elements(self, elements):
+         if isinstance(elements, ndarray):
+             return elements
+         if callable(elements):
+@@ -276,7 +274,7 @@ class AbstractBasis:
+         elif isinstance(elements, (tuple, list, set)):
+             return np.unique(
+                 np.concatenate(
+-                    [self._get_dofs_normalize_elements(e) for e in elements]
++                    [self._normalize_elements(e) for e in elements]
+                 )
+             )
+         elif isinstance(elements, str):
+diff --git a/skfem/assembly/basis/boundary_facet_basis.py b/skfem/assembly/basis/boundary_facet_basis.py
+index e7a961a6..6470983e 100644
+--- a/skfem/assembly/basis/boundary_facet_basis.py
++++ b/skfem/assembly/basis/boundary_facet_basis.py
+@@ -52,9 +52,10 @@ class BoundaryFacetBasis(AbstractBasis):
+             Optional :class:`~skfem.assembly.Dofs` object.
+ 
+         """
+-        logger.info("Initializing {}({}, {})".format(type(self).__name__,
+-                                                     type(mesh).__name__,
+-                                                     type(elem).__name__))
++        typestr = ("{}({}, {})".format(type(self).__name__,
++                                       type(mesh).__name__,
++                                       type(elem).__name__))
++        logger.info("Initializing " + typestr)
+         super(BoundaryFacetBasis, self).__init__(mesh,
+                                                  elem,
+                                                  mapping,
+@@ -67,7 +68,11 @@ class BoundaryFacetBasis(AbstractBasis):
+         if facets is None:
+             self.find = np.nonzero(self.mesh.f2t[1] == -1)[0]
+         else:
+-            self.find = facets
++            self.find = self._normalize_facets(facets)
++
++        if len(self.find) == 0:
++            logger.warning("Initializing {} with zero facets.".format(typestr))
++
+         self.tind = self.mesh.f2t[_side, self.find]
+         self._side = _side  # for debugging
+ 
+diff --git a/skfem/assembly/basis/cell_basis.py b/skfem/assembly/basis/cell_basis.py
+index 23523d95..969426f3 100644
+--- a/skfem/assembly/basis/cell_basis.py
++++ b/skfem/assembly/basis/cell_basis.py
+@@ -82,9 +82,10 @@ class CellBasis(AbstractBasis):
+ 
+         if elements is None:
+             self.nelems = mesh.nelements
++            self.tind = None
+         else:
+             self.nelems = len(elements)
+-        self.tind = elements
++            self.tind = self._normalize_elements(elements)
+ 
+         self.dx = (np.abs(self.mapping.detDF(self.X, tind=elements))
+                    * np.tile(self.W, (self.nelems, 1)))
+diff --git a/skfem/mapping/mapping_mortar.py b/skfem/mapping/mapping_mortar.py
+index fcea0900..99c6a653 100644
+--- a/skfem/mapping/mapping_mortar.py
++++ b/skfem/mapping/mapping_mortar.py
+@@ -71,7 +71,8 @@ class MappingMortar(Mapping):
+         # find unique supermesh facets by combining nodes from both sides
+         param_p1 = param(p1)
+         param_p2 = param(p2)
+-        _, ix = np.unique(np.concatenate((param_p1, param_p2)),
++        _, ix = np.unique(np.concatenate((param_p1.round(decimals=10),
++                                          param_p2.round(decimals=10))),
+                           return_index=True)
+         ixorig = np.concatenate((p1_ix, p2_ix + mesh1.p.shape[1]))[ix]
+         p = np.array([np.hstack((param(mesh1.p), param(mesh2.p)))])
+diff --git a/skfem/visuals/matplotlib.py b/skfem/visuals/matplotlib.py
+index 5eb3c835..304bc8b9 100644
+--- a/skfem/visuals/matplotlib.py
++++ b/skfem/visuals/matplotlib.py
+@@ -99,7 +99,10 @@ def draw_mesh2d(m: Mesh2D, **kwargs) -> Axes:
+         ys.append(t)
+         ys.append(v)
+         ys.append(None)
+-    ax.plot(xs, ys, 'k', linewidth='0.5')
++    ax.plot(xs,
++            ys,
++            kwargs['color'] if 'color' in kwargs else 'k',
++            linewidth=kwargs['linewidth'] if 'linewidth' in kwargs else .5)
+ 
+     if "node_numbering" in kwargs:
+         for itr in range(m.p.shape[1]):

@@ -1,0 +1,86 @@
+diff --git a/bowler/tests/lib.py b/bowler/tests/lib.py
+index 1d17ba3..b1f4c29 100644
+--- a/bowler/tests/lib.py
++++ b/bowler/tests/lib.py
+@@ -71,7 +71,7 @@ class BowlerTestCase(unittest.TestCase):
+         def local_modifier(node, capture, filename):
+             # When in_process=False, this runs in another process.  See notes below.
+             try:
+-                modifier(node, capture, filename)
++                return modifier(node, capture, filename)
+             except Exception as e:
+                 exception_queue.put(e)
+ 
+diff --git a/bowler/tests/query.py b/bowler/tests/query.py
+index 9debe83..db87c8c 100644
+--- a/bowler/tests/query.py
++++ b/bowler/tests/query.py
+@@ -5,7 +5,10 @@
+ # This source code is licensed under the MIT license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++from unittest import mock
++
+ from ..query import SELECTORS, Query
++from ..types import TOKEN, BowlerException, Leaf
+ from .lib import BowlerTestCase
+ 
+ 
+@@ -61,14 +64,55 @@ def g(x): pass
+         def selector(arg):
+             return Query(arg).select_function("f")
+ 
+-        def modifier(q):
++        def add_modifier(q):
+             return q.add_argument("y", "5")
+ 
+         output = self.run_bowler_modifier(
+-            input, selector_func=selector, modifier_func=modifier
++            input, selector_func=selector, modifier_func=add_modifier
+         )
+         expected = """\
+ def f(x, y=5): pass
+ def g(x): pass
+ [f(), g()]"""
+         self.assertMultiLineEqual(expected, output)
++
++    def test_modifier_return_value(self):
++        input = "a+b"
++
++        def modifier(node, capture, filename):
++            new_op = Leaf(TOKEN.MINUS, "-")
++            return new_op
++
++        output = self.run_bowler_modifier(input, "'+'", modifier)
++        self.assertEqual("a-b", output)
++
++    def test_modifier_return_value_multiple(self):
++        input = "a+b"
++
++        def noop_modifier(node, capture, filename):
++            print("Noop modifier")
++            pass
++
++        def modifier(node, capture, filename):
++            print("Modifier")
++            new_op = Leaf(TOKEN.MINUS, "-")
++            return new_op
++
++        def add_ok_modifier(q):
++            return q.modify(noop_modifier).modify(modifier)
++
++        output = self.run_bowler_modifier(input, "'+'", modifier_func=add_ok_modifier)
++        self.assertEqual("a-b", output)
++
++        def add_bad_modifier(q):
++            return q.modify(modifier).modify(noop_modifier)
++
++        with mock.patch("bowler.tool.log.error") as error:
++            output = self.run_bowler_modifier(
++                input, "'+'", modifier_func=add_bad_modifier
++            )
++            self.assertEqual("a+b", output)  # unmodified
++            self.assertTrue(error.call_args)
++            self.assertIn(
++                "Only the last fixer/callback may return", error.call_args[0][0]
++            )

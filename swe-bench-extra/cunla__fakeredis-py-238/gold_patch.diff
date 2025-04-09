@@ -1,0 +1,106 @@
+diff --git a/docs/about/changelog.md b/docs/about/changelog.md
+index d3f5938..e623e2a 100644
+--- a/docs/about/changelog.md
++++ b/docs/about/changelog.md
+@@ -5,6 +5,12 @@ description: Change log of all fakeredis releases
+ 
+ ## Next release
+ 
++## v2.18.2
++
++### 🐛 Bug Fixes
++
++- Fix error on blocking XREADGROUP #237
++
+ ## v2.18.1
+ 
+ ### 🐛 Bug Fixes
+diff --git a/fakeredis/_basefakesocket.py b/fakeredis/_basefakesocket.py
+index 06684e6..fa37767 100644
+--- a/fakeredis/_basefakesocket.py
++++ b/fakeredis/_basefakesocket.py
+@@ -208,10 +208,10 @@ class BaseFakeSocket:
+         else:
+             return result
+ 
+-    def _blocking(self, timeout, func):
++    def _blocking(self, timeout: Union[float, int], func: Callable):
+         """Run a function until it succeeds or timeout is reached.
+ 
+-        The timeout must be an integer, and 0 means infinite. The function
++        The timeout is in seconds, and 0 means infinite. The function
+         is called with a boolean to indicate whether this is the first call.
+         If it returns None, it is considered to have "failed" and is retried
+         each time the condition variable is notified, until the timeout is
+@@ -222,16 +222,11 @@ class BaseFakeSocket:
+         ret = func(True)
+         if ret is not None or self._in_transaction:
+             return ret
+-        if timeout:
+-            deadline = time.time() + timeout
+-        else:
+-            deadline = None
++        deadline = time.time() + timeout if timeout else None
+         while True:
+             timeout = deadline - time.time() if deadline is not None else None
+             if timeout is not None and timeout <= 0:
+                 return None
+-            # Python <3.2 doesn't return a status from wait. On Python 3.2+
+-            # we bail out early on False.
+             if self._db.condition.wait(timeout=timeout) is False:
+                 return None  # Timeout expired
+             ret = func(False)
+diff --git a/fakeredis/commands_mixins/streams_mixin.py b/fakeredis/commands_mixins/streams_mixin.py
+index b08ed11..a2f3d03 100644
+--- a/fakeredis/commands_mixins/streams_mixin.py
++++ b/fakeredis/commands_mixins/streams_mixin.py
+@@ -107,7 +107,7 @@ class StreamsCommandsMixin:
+         for item, start_id in stream_start_id_list:
+             stream_results = self._xrange(item.value, start_id, max_inf, False, count)
+             if first_pass and (count is None or len(stream_results) < count):
+-                raise SimpleError(msgs.WRONGTYPE_MSG)
++                return None
+             if len(stream_results) > 0:
+                 res.append([item.key, stream_results])
+         return res
+@@ -124,7 +124,7 @@ class StreamsCommandsMixin:
+         for group, stream_name, start_id in group_params:
+             stream_results = group.group_read(consumer_name, start_id, count, noack)
+             if first_pass and (count is None or len(stream_results) < count):
+-                raise SimpleError(msgs.WRONGTYPE_MSG)
++                return None
+             if len(stream_results) > 0 or start_id != b">":
+                 res.append([stream_name, stream_results])
+         return res
+@@ -173,7 +173,7 @@ class StreamsCommandsMixin:
+             return self._xread(stream_start_id_list, count, False)
+         else:
+             return self._blocking(
+-                timeout, functools.partial(self._xread, stream_start_id_list, count)
++                timeout / 1000.0, functools.partial(self._xread, stream_start_id_list, count)
+             )
+ 
+     @command(name="XREADGROUP", fixed=(bytes, bytes, bytes), repeat=(bytes,))
+@@ -183,11 +183,9 @@ class StreamsCommandsMixin:
+         (count, timeout, noack), left_args = extract_args(
+             args, ("+count", "+block", "noack"), error_on_unexpected=False
+         )
+-        if (
+-                len(left_args) < 3
++        if (len(left_args) < 3
+                 or not casematch(left_args[0], b"STREAMS")
+-                or len(left_args) % 2 != 1
+-        ):
++                or len(left_args) % 2 != 1):
+             raise SimpleError(msgs.SYNTAX_ERROR_MSG)
+         left_args = left_args[1:]
+         num_streams = int(len(left_args) / 2)
+@@ -218,7 +216,7 @@ class StreamsCommandsMixin:
+             return self._xreadgroup(consumer_name, group_params, count, noack, False)
+         else:
+             return self._blocking(
+-                timeout,
++                timeout / 1000.0,
+                 functools.partial(
+                     self._xreadgroup, consumer_name, group_params, count, noack
+                 ),

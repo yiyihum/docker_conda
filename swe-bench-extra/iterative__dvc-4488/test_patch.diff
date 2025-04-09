@@ -1,0 +1,96 @@
+diff --git a/tests/func/experiments/test_experiments.py b/tests/func/experiments/test_experiments.py
+--- a/tests/func/experiments/test_experiments.py
++++ b/tests/func/experiments/test_experiments.py
+@@ -76,3 +76,27 @@ def test_checkout(tmp_dir, scm, dvc):
+     dvc.experiments.checkout(exp_b)
+     assert (tmp_dir / "params.yaml").read_text().strip() == "foo: 3"
+     assert (tmp_dir / "metrics.yaml").read_text().strip() == "foo: 3"
++
++
++def test_get_baseline(tmp_dir, scm, dvc):
++    tmp_dir.gen("copy.py", COPY_SCRIPT)
++    tmp_dir.gen("params.yaml", "foo: 1")
++    stage = dvc.run(
++        cmd="python copy.py params.yaml metrics.yaml",
++        metrics_no_cache=["metrics.yaml"],
++        params=["foo"],
++        name="copy-file",
++    )
++    scm.add(["dvc.yaml", "dvc.lock", "copy.py", "params.yaml", "metrics.yaml"])
++    scm.commit("init")
++    expected = scm.get_rev()
++    assert dvc.experiments.get_baseline(expected) is None
++
++    dvc.reproduce(stage.addressing, experiment=True, params=["foo=2"])
++    rev = dvc.experiments.scm.get_rev()
++    assert dvc.experiments.get_baseline(rev) == expected
++
++    dvc.reproduce(
++        stage.addressing, experiment=True, params=["foo=3"], queue=True
++    )
++    assert dvc.experiments.get_baseline("stash@{0}") == expected
+diff --git a/tests/unit/command/test_plots.py b/tests/unit/command/test_plots.py
+--- a/tests/unit/command/test_plots.py
++++ b/tests/unit/command/test_plots.py
+@@ -2,7 +2,7 @@
+ from dvc.command.plots import CmdPlotsDiff, CmdPlotsShow
+ 
+ 
+-def test_metrics_diff(dvc, mocker):
++def test_plots_diff(dvc, mocker):
+     cli_args = parse_args(
+         [
+             "plots",
+@@ -24,6 +24,7 @@ def test_metrics_diff(dvc, mocker):
+             "x_title",
+             "--y-label",
+             "y_title",
++            "--experiment",
+             "HEAD",
+             "tag1",
+             "tag2",
+@@ -50,10 +51,11 @@ def test_metrics_diff(dvc, mocker):
+             "x_label": "x_title",
+             "y_label": "y_title",
+         },
++        experiment=True,
+     )
+ 
+ 
+-def test_metrics_show(dvc, mocker):
++def test_plots_show(dvc, mocker):
+     cli_args = parse_args(
+         [
+             "plots",
+diff --git a/tests/unit/repo/plots/test_diff.py b/tests/unit/repo/plots/test_diff.py
+--- a/tests/unit/repo/plots/test_diff.py
++++ b/tests/unit/repo/plots/test_diff.py
+@@ -13,4 +13,27 @@
+     ],
+ )
+ def test_revisions(mocker, arg_revisions, is_dirty, expected_revisions):
+-    assert _revisions(arg_revisions, is_dirty) == expected_revisions
++    mock_scm = mocker.Mock()
++    mock_scm.configure_mock(**{"is_dirty.return_value": is_dirty})
++    mock_repo = mocker.Mock(scm=mock_scm)
++    assert _revisions(mock_repo, arg_revisions, False) == expected_revisions
++
++
++@pytest.mark.parametrize(
++    "arg_revisions,baseline,expected_revisions",
++    [
++        (["v1"], "v0", ["v1", "v0"]),
++        (["v1"], None, ["v1", "workspace"]),
++        (["v1", "v2"], "v0", ["v1", "v2"]),
++        (["v1", "v2"], None, ["v1", "v2"]),
++    ],
++)
++def test_revisions_experiment(
++    mocker, arg_revisions, baseline, expected_revisions
++):
++    mock_scm = mocker.Mock()
++    mock_scm.configure_mock(**{"is_dirty.return_value": False})
++    mock_experiments = mocker.Mock()
++    mock_experiments.configure_mock(**{"get_baseline.return_value": baseline})
++    mock_repo = mocker.Mock(scm=mock_scm, experiments=mock_experiments)
++    assert _revisions(mock_repo, arg_revisions, True) == expected_revisions

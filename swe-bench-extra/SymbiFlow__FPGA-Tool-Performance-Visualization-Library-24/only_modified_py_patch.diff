@@ -1,0 +1,145 @@
+diff --git a/ftpvl/fetchers.py b/ftpvl/fetchers.py
+index e70bc9d..1e9559b 100644
+--- a/ftpvl/fetchers.py
++++ b/ftpvl/fetchers.py
+@@ -1,4 +1,5 @@
+ """ Fetchers are responsible for ingesting and standardizing data for future processing. """
++from datetime import datetime
+ import json
+ from typing import Any, Dict, List
+ 
+@@ -228,6 +229,37 @@ class HydraFetcher(Fetcher):
+ 
+         return data
+ 
++    def _check_legacy_icebreaker(self, row):
++        """
++        Returns True if row is from a test on an Icebreaker board before Jul 31,
++        2020.
++
++        This is useful because these legacy tests recorded frequency in MHz
++        instead of Hz, while all other boards record in Hz. This flag can be
++        used to check if the units need to be changed.
++
++        Parameters
++        ----------
++        row : dict
++            a dictionary that is the result of decoding a meta.json file
++
++        Returns
++        -------
++        bool
++            Returns true if row is icebreaker board before Aug 1, 2020. False
++            otherwise.
++        """
++        date = None
++        board = None
++        try:
++            date = row["date"] # format: 2020-07-17T22:12:41
++            board = row["board"]
++            timestamp = datetime.strptime(date, "%Y-%m-%dT%H:%M:%S")
++            return timestamp < datetime(2020, 7, 31) and board == "icebreaker"
++        except KeyError:
++            print("Warning: Unable to find date and board in meta.json, required for supporting legacy Icebreaker.")
++            return False # Assume not legacy icebreaker
++
+     def _preprocess(self, data: List[Dict]) -> pd.DataFrame:
+         """
+         Using data from _download(), processes and standardizes the data and
+@@ -237,13 +269,21 @@ class HydraFetcher(Fetcher):
+ 
+         processed_data = []
+         for row in flattened_data:
++            legacy_icestorm = self._check_legacy_icebreaker(row)
+             processed_row = {}
+             if self.mapping is None:
+                 processed_row = row
+             else:
+                 for in_col_name, out_col_name in self.mapping.items():
+                     processed_row[out_col_name] = row[in_col_name]
+-            processed_row["freq"] = Helpers.get_actual_freq(row, self.hydra_clock_names)
++
++            actual_freq = Helpers.get_actual_freq(row, self.hydra_clock_names)
++            if actual_freq:
++                if legacy_icestorm:
++                    # freq in MHz, no change needed
++                    processed_row["freq"] = actual_freq
++                else:
++                    processed_row["freq"] = actual_freq / 1_000_000 # convert hz to mhz
+             processed_row.update(Helpers.get_versions(row))
+             processed_data.append(processed_row)
+ 
+diff --git a/ftpvl/helpers.py b/ftpvl/helpers.py
+index d326384..54a0121 100644
+--- a/ftpvl/helpers.py
++++ b/ftpvl/helpers.py
+@@ -62,39 +62,19 @@ def get_versions(obj: dict) -> dict:
+     return {k: v for k, v in obj.items() if k.startswith("versions.")}
+ 
+ 
+-def rescale_actual_freq(freq: Union[int, float]) -> Union[int, float]:
+-    """
+-    Given a frequency with an unspecified unit, returns frequency in megahertz
+-    by assuming the original unit is hertz if input frequency is greater than 1
+-    million.
+-
+-    Parameters
+-    ----------
+-    freq : Union[int, float]
+-        a number that is a frequency
+-
+-    Returns
+-    -------
+-    Union[int, float]
+-        the input frequency in megahertz
+-    """
+-    one_mhz = 1_000_000
+-    if freq > one_mhz:
+-        return freq / one_mhz
+-    else:
+-        return freq
+-
+-
+ def get_actual_freq(obj: dict, hydra_clock_names: list = None) -> Union[int, float]:
+     """
+     Given a flattened object decoded from meta.json, return the actual frequency
+-    as a number in megahertz.
++    as a number.
+ 
+     Since a meta.json object might contain multiple frequencies, we look through
+     all clock names specified in hydra_clock_names and use the first one in the
+     list. If none of the specified clock names exists in the object, we use
+     the shortest clock name to find the frequency.
+ 
++    The output of this function returns a number with undetermined units. 
++    External logic should handle converting units if necessary.
++
+     Parameters
+     ----------
+     obj : dict
+@@ -114,13 +94,13 @@ def get_actual_freq(obj: dict, hydra_clock_names: list = None) -> Union[int, flo
+ 
+     # if max_freq is unnested
+     if "max_freq" in obj:
+-        return rescale_actual_freq(obj["max_freq"])
++        return obj["max_freq"]
+     else:
+         # check if max_freq contains clock_name in HYDRA_CLOCK_NAMES
+         for clock_name in hydra_clock_names:
+             key = f"max_freq.{clock_name}.actual"
+             if key in obj:
+-                return rescale_actual_freq(obj[key])
++                return obj[key]
+ 
+         # if none of those exist, choose the shortest one or return None
+         max_freq_keys = [
+@@ -128,7 +108,7 @@ def get_actual_freq(obj: dict, hydra_clock_names: list = None) -> Union[int, flo
+         ]
+         if len(max_freq_keys) > 0:
+             shortest_clock_name = min(max_freq_keys, key=len)
+-            return rescale_actual_freq(obj[shortest_clock_name])
++            return obj[shortest_clock_name]
+         else:
+             return None
+ 
+

@@ -1,0 +1,260 @@
+diff --git a/catalog_persistence/databases.py b/catalog_persistence/databases.py
+index 9dd6f9a..66ae954 100644
+--- a/catalog_persistence/databases.py
++++ b/catalog_persistence/databases.py
+@@ -19,6 +19,8 @@ class ChangeType(Enum):
+ 
+ class BaseDBManager(metaclass=abc.ABCMeta):
+ 
++    _attachments_properties_key = 'attachments_properties'
++
+     @abc.abstractmethod
+     def drop_database(self) -> None:
+         return NotImplemented
+@@ -55,6 +57,46 @@ class BaseDBManager(metaclass=abc.ABCMeta):
+     def list_attachments(self, id) -> list:
+         return NotImplemented
+ 
++    def add_attachment_properties_to_document_record(self,
++                                            document_id,
++                                            file_id,
++                                            file_properties):
++        """
++        Acrescenta propriedades (file_properties) do arquivo (file_id)
++        ao registro (record)
++        Retorna registro (record) atualizado
++        """
++        _file_properties = {
++            k: v
++            for k, v in file_properties.items()
++            if k not in ['content', 'filename']
++        }
++        document = self.read(document_id)
++        document_record = {
++            'document_id': document['document_id'],
++            'document_type': document['document_type'],
++            'content': document['content'],
++            'created_date': document['created_date'],
++        }
++        properties = document.get(self._attachments_properties_key, {})
++        if file_id not in properties.keys():
++            properties[file_id] = {}
++
++        properties[file_id].update(
++            _file_properties)
++
++        document_record.update(
++            {
++                self._attachments_properties_key:
++                properties
++            }
++        )
++        return document_record
++
++    def get_attachment_properties(self, id, file_id):
++        doc = self.read(id)
++        return doc.get(self._attachments_properties_key, {}).get(file_id)
++
+ 
+ class InMemoryDBManager(BaseDBManager):
+ 
+@@ -138,18 +180,6 @@ class InMemoryDBManager(BaseDBManager):
+             content_properties['content_size']
+         self.database.update({id: doc})
+ 
+-    def _add_attachment_properties(self, record, file_id, file_properties):
+-        """
+-        """
+-        if not record.get(self._attachments_properties_key):
+-            record[self._attachments_properties_key] = {}
+-        if not record[self._attachments_properties_key].get(file_id):
+-            record[self._attachments_properties_key][file_id] = {}
+-
+-        record[self._attachments_properties_key][file_id].update(
+-            file_properties)
+-        return record
+-
+     def get_attachment(self, id, file_id):
+         doc = self.read(id)
+         if (doc.get(self._attachments_key) and
+@@ -251,18 +281,6 @@ class CouchDBManager(BaseDBManager):
+             content_type=content_properties.get('content_type')
+         )
+ 
+-    def _add_attachment_properties(self, record, file_id, file_properties):
+-        """
+-        """
+-        if not record.get(self._attachments_properties_key):
+-            record[self._attachments_properties_key] = {}
+-        if not record[self._attachments_properties_key].get(file_id):
+-            record[self._attachments_properties_key][file_id] = {}
+-
+-        record[self._attachments_properties_key][file_id].update(
+-            file_properties)
+-        return record
+-
+     def get_attachment(self, id, file_id):
+         doc = self.read(id)
+         attachment = self.database.get_attachment(doc, file_id)
+@@ -415,15 +433,9 @@ class DatabaseService:
+                                        file_id,
+                                        content,
+                                        file_properties)
+-        document = self.db_manager.read(document_id)
+-        document_record = {
+-            'document_id': document['document_id'],
+-            'document_type': document['document_type'],
+-            'content': document['content'],
+-            'created_date': document['created_date']
+-        }
+-        document_record = self.db_manager._add_attachment_properties(
+-                document_record,
++        document_record = self.db_manager. \
++            add_attachment_properties_to_document_record(
++                document_id,
+                 file_id,
+                 file_properties
+             )
+@@ -445,6 +457,22 @@ class DatabaseService:
+         """
+         return self.db_manager.get_attachment(document_id, file_id)
+ 
++    def get_attachment_properties(self, document_id, file_id):
++        """
++        Recupera arquivo anexos ao registro de um documento pelo ID do
++        documento e ID do anexo.
++        Params:
++        document_id: ID do documento ao qual o arquivo está anexado
++        file_id: identificação do arquivo anexado a ser recuperado
++
++        Retorno:
++        Arquivo anexo
++
++        Erro:
++        DocumentNotFound: documento não encontrado na base de dados.
++        """
++        return self.db_manager.get_attachment_properties(document_id, file_id)
++
+ 
+ def sort_results(results, sort):
+     scores = [list() for i in results]
+diff --git a/catalogmanager/__init__.py b/catalogmanager/__init__.py
+index 544aa3c..72d9f45 100644
+--- a/catalogmanager/__init__.py
++++ b/catalogmanager/__init__.py
+@@ -49,6 +49,14 @@ def get_article_file(article_id, db_host, db_port, username, password):
+     return article_services.get_article_file(article_id)
+ 
+ 
++def get_asset_file(article_id, asset_id, db_host, db_port, username, password):
++    article_services = _get_article_service(db_host,
++                                            db_port,
++                                            username,
++                                            password)
++    return article_services.get_asset_file(article_id, asset_id)
++
++
+ def set_assets_public_url(article_id, xml_content, assets_filenames,
+                           public_url):
+     article = Article(article_id)
+diff --git a/catalogmanager/article_services.py b/catalogmanager/article_services.py
+index 798e737..6fb9ef3 100644
+--- a/catalogmanager/article_services.py
++++ b/catalogmanager/article_services.py
+@@ -8,7 +8,6 @@ from catalog_persistence.databases import (
+         DatabaseService,
+         DocumentNotFound
+     )
+-from .data_services import DataServices
+ from .models.article_model import (
+     Article,
+ )
+@@ -41,7 +40,6 @@ class ArticleServicesMissingAssetFileException(Exception):
+ class ArticleServices:
+ 
+     def __init__(self, articles_db_manager, changes_db_manager):
+-        self.article_data_services = DataServices('articles')
+         self.article_db_service = DatabaseService(
+             articles_db_manager, changes_db_manager)
+ 
+@@ -130,13 +128,23 @@ class ArticleServices:
+                 missing.append(file_id)
+         return asset_files, missing
+ 
+-    def get_asset_file(self, article_id, file_id):
++    def get_asset_file(self, article_id, asset_id):
+         try:
+-            return self.article_db_service.get_attachment(
++            content = self.article_db_service.get_attachment(
+                 document_id=article_id,
+-                file_id=file_id
++                file_id=asset_id
+             )
++            properties = self.article_db_service.get_attachment_properties(
++                document_id=article_id,
++                file_id=asset_id
++            )
++            content_type = '' if properties is None else properties.get(
++                'content_type',
++                ''
++            )
++            return content_type, content
+         except DocumentNotFound:
+             raise ArticleServicesException(
+-                'Missing asset file: {}. '.format(file_id)
++                'Asset file {} (Article {}) not found. '.format(
++                    asset_id, article_id)
+             )
+diff --git a/catalogmanager/data_services.py b/catalogmanager/data_services.py
+deleted file mode 100644
+index 628787e..0000000
+--- a/catalogmanager/data_services.py
++++ /dev/null
+@@ -1,10 +0,0 @@
+-# coding = utf-8
+-
+-
+-class DataServices:
+-
+-    def __init__(self, name):
+-        self.name = name
+-
+-    def location(self, record_id):
+-        return '/{}/{}'.format(self.name, record_id)
+diff --git a/catalogmanager_api/__init__.py b/catalogmanager_api/__init__.py
+index 16c7e28..2333542 100644
+--- a/catalogmanager_api/__init__.py
++++ b/catalogmanager_api/__init__.py
+@@ -29,6 +29,7 @@ def main(global_config, **settings):
+     config.include(includeme)
+     config.add_route('home', '/')
+     config.add_route('get_article_xml', '/articles/{id}/xml')
++    config.add_route('get_asset_file', '/articles/{id}/{asset_id}')
+ 
+     ini_settings = get_appsettings(global_config['__file__'])
+     config.registry.settings['database_host'] = \
+diff --git a/catalogmanager_api/views/article.py b/catalogmanager_api/views/article.py
+index 513b7c4..eff8aab 100644
+--- a/catalogmanager_api/views/article.py
++++ b/catalogmanager_api/views/article.py
+@@ -94,3 +94,20 @@ class Article:
+                     "message": e.message
+                 }
+             )
++
++    @view_config(route_name='get_asset_file')
++    def get_asset_file(self):
++        try:
++            content_type, content = catalogmanager.get_asset_file(
++                article_id=self.request.matchdict['id'],
++                asset_id=self.request.matchdict['asset_id'],
++                **self.db_settings
++            )
++            return Response(content_type=content_type, body=content)
++        except catalogmanager.article_services.ArticleServicesException as e:
++            return Response(
++                json={
++                    "error": "404",
++                    "message": e.message
++                }
++            )

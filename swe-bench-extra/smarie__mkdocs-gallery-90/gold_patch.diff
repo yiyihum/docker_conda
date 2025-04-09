@@ -1,0 +1,193 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 680bacd..b3d415e 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -1,5 +1,9 @@
+ # Changelog
+ 
++### 0.10.0 - Support for asynchronous code
++
++- Gallery scripts now support top-level asynchronous code. PR [#90](https://github.com/smarie/mkdocs-gallery/pull/90) by [pmeier](https://github.com/pmeier)
++
+ ### 0.9.0 - Pyvista
+ 
+ - Pyvista can now be used in gallery examples as in `sphinx-gallery`. PR [#91](https://github.com/smarie/mkdocs-gallery/pull/91) by [Louis-Pujol](https://github.com/Louis-Pujol)
+diff --git a/docs/examples/plot_12_async.py b/docs/examples/plot_12_async.py
+new file mode 100644
+index 0000000..4aa6f3e
+--- /dev/null
++++ b/docs/examples/plot_12_async.py
+@@ -0,0 +1,76 @@
++"""
++# Support for asynchronous code
++
++[PEP 429](https://peps.python.org/pep-0492), which was first implemented in
++[Python 3.5](https://docs.python.org/3/whatsnew/3.5.html#whatsnew-pep-492), added initial syntax for asynchronous
++programming in Python: `async` and `await`. 
++
++While this was a major improvement in particular for UX development, one major
++downside is that it "poisons" the caller's code base. If you want to `await` a coroutine, you have to be inside a `async def`
++context. Doing so turns the function into a coroutine function and thus forces the caller to also `await` its results.
++Rinse and repeat until you reach the beginning of the stack.
++
++Since version `0.10.0`, `mkdocs-gallery` is now able to automatically detect code blocks using async programming, and to handle them nicely so that you don't have to wrap them. This feature is enabled by default and does not require any configuration option. Generated notebooks remain consistent with [`jupyter` notebooks](https://jupyter.org/), or rather the [`IPython` kernel](https://ipython.org/) running
++the code inside of them, that is equipped with 
++[background handling to allow top-level asynchronous code](https://ipython.readthedocs.io/en/stable/interactive/autoawait.html).
++"""
++
++import asyncio
++import time
++
++
++async def afn():
++    start = time.time()
++    await asyncio.sleep(0.3)
++    stop = time.time()
++    return stop - start
++
++
++f"I waited for {await afn():.1f} seconds!"
++
++
++# %%
++# Without any handling, the snippet above would trigger a `SyntaxError`, since we are using `await` outside of an
++# asynchronous context. With the handling, it works just fine.
++#
++# The background handling will only be applied if it is actually needed. Meaning, you can still run your asynchronous
++# code manually if required.
++
++asyncio.run(afn())
++
++
++# %%
++# Apart from `await` all other asynchronous syntax is supported as well.
++#
++# ## Asynchronous Generators
++
++
++async def agen():
++    for chunk in "I'm an async iterator!".split():
++        yield chunk
++
++
++async for chunk in agen():
++    print(chunk, end=" ")
++
++
++# %%
++# ## Asynchronous Comprehensions
++
++" ".join([chunk async for chunk in agen()])
++
++# %%
++# ## Asynchronous Context Managers
++
++import contextlib
++
++
++@contextlib.asynccontextmanager
++async def acm():
++    print("Entering asynchronous context manager!")
++    yield
++    print("Exiting asynchronous context manager!")
++
++
++async with acm():
++    print("Inside the context!")
+diff --git a/src/mkdocs_gallery/gen_single.py b/src/mkdocs_gallery/gen_single.py
+index 55a64d7..3967e97 100644
+--- a/src/mkdocs_gallery/gen_single.py
++++ b/src/mkdocs_gallery/gen_single.py
+@@ -27,7 +27,7 @@ from functools import partial
+ from io import StringIO
+ from pathlib import Path
+ from shutil import copyfile
+-from textwrap import indent
++from textwrap import indent, dedent
+ from time import time
+ from typing import List, Set, Tuple
+ 
+@@ -739,6 +739,72 @@ def _reset_cwd_syspath(cwd, path_to_remove):
+     os.chdir(cwd)
+ 
+ 
++def _parse_code(bcontent, src_file, *, compiler_flags):
++    code_ast = compile(bcontent, src_file, "exec", compiler_flags | ast.PyCF_ONLY_AST, dont_inherit=1)
++    if _needs_async_handling(bcontent, src_file, compiler_flags=compiler_flags):
++        code_ast = _apply_async_handling(code_ast, compiler_flags=compiler_flags)
++    return code_ast
++
++
++def _needs_async_handling(bcontent, src_file, *, compiler_flags) -> bool:
++    try:
++        compile(bcontent, src_file, "exec", compiler_flags, dont_inherit=1)
++    except SyntaxError as error:
++        # mkdocs-gallery supports top-level async code similar to jupyter notebooks.
++        # Without handling, this will raise a SyntaxError. In such a case, we apply a
++        # minimal async handling and try again. If the error persists, we bubble it up
++        # and let the caller handle it.
++        try:
++            compile(
++                f"async def __async_wrapper__():\n{indent(bcontent, ' ' * 4)}",
++                src_file,
++                "exec",
++                compiler_flags,
++                dont_inherit=1,
++            )
++        except SyntaxError:
++            # Raise the original error to avoid leaking the internal async handling to
++            # generated output.
++            raise error from None
++        else:
++            return True
++    else:
++        return False
++
++
++def _apply_async_handling(code_ast, *, compiler_flags):
++    async_handling = compile(
++        dedent(
++            """
++                async def __async_wrapper__():
++                    # original AST goes here
++                    return locals()
++                import asyncio as __asyncio__
++                __async_wrapper_locals__ = __asyncio__.run(__async_wrapper__())
++                __async_wrapper_result__ = __async_wrapper_locals__.pop("__async_wrapper_result__", None)
++                globals().update(__async_wrapper_locals__)
++                __async_wrapper_result__
++                """
++        ),
++        "<_apply_async_handling()>",
++        "exec",
++        compiler_flags | ast.PyCF_ONLY_AST,
++        dont_inherit=1,
++    )
++
++    *original_body, last_node = code_ast.body
++    if isinstance(last_node, ast.Expr):
++        last_node = ast.Assign(
++            targets=[ast.Name(id="__async_wrapper_result__", ctx=ast.Store())], value=last_node.value
++        )
++    original_body.append(last_node)
++
++    async_wrapper = async_handling.body[0]
++    async_wrapper.body = [*original_body, *async_wrapper.body]
++
++    return ast.fix_missing_locations(async_handling)
++
++
+ def execute_code_block(compiler, block, script: GalleryScript):
+     """Execute the code block of the example file.
+ 
+@@ -788,9 +854,7 @@ def execute_code_block(compiler, block, script: GalleryScript):
+ 
+     try:
+         ast_Module = _ast_module()
+-        code_ast = ast_Module([bcontent])
+-        flags = ast.PyCF_ONLY_AST | compiler.flags
+-        code_ast = compile(bcontent, src_file, "exec", flags, dont_inherit=1)
++        code_ast = _parse_code(bcontent, src_file, compiler_flags=compiler.flags)
+         ast.increment_lineno(code_ast, lineno - 1)
+ 
+         is_last_expr, mem_max = _exec_and_get_memory(compiler, ast_Module, code_ast, script=script)

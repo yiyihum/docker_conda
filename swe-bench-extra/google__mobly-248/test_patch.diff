@@ -1,0 +1,192 @@
+diff --git a/mobly/base_test.py b/mobly/base_test.py
+index 355603e..e85551a 100644
+--- a/mobly/base_test.py
++++ b/mobly/base_test.py
+@@ -343,12 +343,12 @@ class BaseTestClass(object):
+                     test_method(*args, **kwargs)
+                 else:
+                     test_method()
+-            except signals.TestPass as e:
+-                raise e
+-            except Exception as e:
++            except signals.TestPass:
++                raise
++            except Exception:
+                 logging.exception('Exception occurred in %s.',
+                                   self.current_test_name)
+-                raise e
++                raise
+             finally:
+                 try:
+                     self._teardown_test(test_name)
+@@ -531,8 +531,8 @@ class BaseTestClass(object):
+             class_record = records.TestResultRecord('setup_generated_tests',
+                                                     self.TAG)
+             class_record.test_begin()
+-            class_record.test_fail(e)
+-            self.results.fail_class(class_record)
++            class_record.test_error(e)
++            self.results.add_class_error(class_record)
+             return self.results
+         logging.info('==========> %s <==========', self.TAG)
+         # Devise the actual test methods to run in the test class.
+@@ -551,18 +551,18 @@ class BaseTestClass(object):
+         except signals.TestAbortClass as e:
+             # The test class is intentionally aborted.
+             # Skip all tests peacefully.
+-            e.details = 'Test class aborted due to: %s' % e.details
++            e.details = 'setup_class aborted due to: %s' % e.details
+             self._skip_remaining_tests(e)
+             return self.results
+         except Exception as e:
+             # Setup class failed for unknown reasons.
+             # Fail the class and skip all tests.
+-            logging.exception('Failed to setup %s.', self.TAG)
++            logging.exception('Error in setup_class %s.', self.TAG)
+             class_record = records.TestResultRecord('setup_class', self.TAG)
+             class_record.test_begin()
+-            class_record.test_fail(e)
++            class_record.test_error(e)
+             self._exec_procedure_func(self._on_fail, class_record)
+-            self.results.fail_class(class_record)
++            self.results.add_class_error(class_record)
+             self._skip_remaining_tests(e)
+             return self.results
+         finally:
+diff --git a/tests/mobly/base_test_test.py b/tests/mobly/base_test_test.py
+index 65caf6f..da036ea 100755
+--- a/tests/mobly/base_test_test.py
++++ b/tests/mobly/base_test_test.py
+@@ -20,6 +20,10 @@ from mobly import base_test
+ from mobly import config_parser
+ from mobly import signals
+ 
++from tests.mobly import records_test
++
++validate_test_result = records_test.validate_test_result
++
+ MSG_EXPECTED_EXCEPTION = "This is an expected exception."
+ MSG_EXPECTED_TEST_FAILURE = "This is an expected test failure."
+ MSG_UNEXPECTED_EXCEPTION = "Unexpected exception!"
+@@ -187,7 +191,9 @@ class BaseTestTest(unittest.TestCase):
+         bt_cls = MockBaseTest(self.mock_test_cls_configs)
+         bt_cls.run()
+         actual_record = bt_cls.results.error[0]
++        validate_test_result(bt_cls.results)
+         self.assertEqual(actual_record.test_name, "setup_class")
++
+         self.assertEqual(actual_record.details, MSG_EXPECTED_EXCEPTION)
+         self.assertIsNone(actual_record.extras)
+         expected_summary = ("Error 1, Executed 0, Failed 0, Passed 0, "
+@@ -540,6 +546,7 @@ class BaseTestTest(unittest.TestCase):
+         signal for the entire class, which is different from raising other
+         exceptions in `setup_class`.
+         """
++
+         class MockBaseTest(base_test.BaseTestClass):
+             def setup_class(self):
+                 asserts.abort_class(MSG_EXPECTED_EXCEPTION)
+@@ -555,6 +562,7 @@ class BaseTestTest(unittest.TestCase):
+ 
+         bt_cls = MockBaseTest(self.mock_test_cls_configs)
+         bt_cls.run(test_names=["test_1", "test_2", "test_3"])
++        self.assertEqual(len(bt_cls.results.skipped), 3)
+         self.assertEqual(bt_cls.results.summary_str(),
+                          ("Error 0, Executed 0, Failed 0, Passed 0, "
+                           "Requested 3, Skipped 3"))
+@@ -966,6 +974,7 @@ class BaseTestTest(unittest.TestCase):
+         bt_cls = MockBaseTest(self.mock_test_cls_configs)
+         bt_cls.run()
+         actual_record = bt_cls.results.error[0]
++        validate_test_result(bt_cls.results)
+         self.assertEqual(actual_record.test_name, "test_ha")
+         self.assertEqual(
+             actual_record.details,
+diff --git a/tests/mobly/records_test.py b/tests/mobly/records_test.py
+index 9500d1d..f1ee1ed 100755
+--- a/tests/mobly/records_test.py
++++ b/tests/mobly/records_test.py
+@@ -18,6 +18,26 @@ from mobly import records
+ from mobly import signals
+ 
+ 
++def validate_test_result(result):
++    """Validate basic properties of a test result.
++
++    The records in each bucket of the test result should have the corresponding
++    result enum.
++
++    Args:
++        result: The TestResult object to validate.
++    """
++    buckets = [
++        (result.passed, records.TestResultEnums.TEST_RESULT_PASS),
++        (result.failed, records.TestResultEnums.TEST_RESULT_FAIL),
++        (result.error, records.TestResultEnums.TEST_RESULT_ERROR),
++        (result.skipped, records.TestResultEnums.TEST_RESULT_SKIP),
++    ]
++    for bucket_list, expected_enum in buckets:
++        for record in bucket_list:
++            assert record.result == expected_enum
++
++
+ class RecordsTest(unittest.TestCase):
+     """This test class tests the implementation of classes in mobly.records.
+     """
+@@ -208,7 +228,7 @@ class RecordsTest(unittest.TestCase):
+         with self.assertRaisesRegexp(TypeError, expected_msg):
+             tr1 += "haha"
+ 
+-    def test_result_fail_class_with_test_signal(self):
++    def test_result_add_class_error_with_test_signal(self):
+         record1 = records.TestResultRecord(self.tn)
+         record1.test_begin()
+         s = signals.TestPass(self.details, self.float_extra)
+@@ -217,13 +237,13 @@ class RecordsTest(unittest.TestCase):
+         tr.add_record(record1)
+         s = signals.TestFailure(self.details, self.float_extra)
+         record2 = records.TestResultRecord("SomeTest", s)
+-        tr.fail_class(record2)
++        tr.add_class_error(record2)
+         self.assertEqual(len(tr.passed), 1)
+         self.assertEqual(len(tr.error), 1)
+         self.assertEqual(len(tr.executed), 1)
+ 
+-    def test_result_fail_class_with_special_error(self):
+-        """Call TestResult.fail_class with an error class that requires more
++    def test_result_add_class_error_with_special_error(self):
++        """Call TestResult.add_class_error with an error class that requires more
+         than one arg to instantiate.
+         """
+         record1 = records.TestResultRecord(self.tn)
+@@ -239,7 +259,7 @@ class RecordsTest(unittest.TestCase):
+ 
+         se = SpecialError("haha", 42)
+         record2 = records.TestResultRecord("SomeTest", se)
+-        tr.fail_class(record2)
++        tr.add_class_error(record2)
+         self.assertEqual(len(tr.passed), 1)
+         self.assertEqual(len(tr.error), 1)
+         self.assertEqual(len(tr.executed), 1)
+@@ -271,17 +291,18 @@ class RecordsTest(unittest.TestCase):
+         tr = records.TestResult()
+         tr.add_record(record1)
+         tr.add_record(record2)
++        validate_test_result(tr)
+         self.assertFalse(tr.is_all_pass)
+ 
+-    def test_is_all_pass_with_fail_class(self):
+-        """Verifies that is_all_pass yields correct value when fail_class is
++    def test_is_all_pass_with_add_class_error(self):
++        """Verifies that is_all_pass yields correct value when add_class_error is
+         used.
+         """
+         record1 = records.TestResultRecord(self.tn)
+         record1.test_begin()
+         record1.test_fail(Exception("haha"))
+         tr = records.TestResult()
+-        tr.fail_class(record1)
++        tr.add_class_error(record1)
+         self.assertFalse(tr.is_all_pass)
+ 
+     def test_is_test_executed(self):

@@ -1,0 +1,101 @@
+diff --git a/particula/particle.py b/particula/particle.py
+index 3b9e2f7..8e85fd2 100644
+--- a/particula/particle.py
++++ b/particula/particle.py
+@@ -35,7 +35,7 @@ class ParticleDistribution(Vapor):
+ 
+         self.spacing = kwargs.get("spacing", "linspace")
+         self.nbins = in_scalar(kwargs.get("nbins", 1000)).m
+-        self.nparticles = in_scalar(kwargs.get("nparticles", 1e5))
++        self.nparticles = in_scalar(kwargs.get("nparticles", 1e5)).m
+         self.volume = in_volume(kwargs.get("volume", 1e-6))
+         self.cutoff = in_scalar(kwargs.get("cutoff", 0.9999)).m
+         self.gsigma = in_scalar(kwargs.get("gsigma", 1.25)).m
+@@ -89,7 +89,8 @@ class ParticleDistribution(Vapor):
+             interval=self.pre_radius(),
+             disttype="lognormal",
+             gsigma=self.gsigma,
+-            mode=self.mode
++            mode=self.mode,
++            nparticles=self.nparticles
+         )
+ 
+     def pre_distribution(self):
+@@ -102,7 +103,9 @@ class ParticleDistribution(Vapor):
+                 mode    : geometric mean radius of the particles
+         """
+ 
+-        return self.nparticles*self.pre_discretize()/self.volume
++        return np.array(
++            [self.nparticles]
++        ).sum()*self.pre_discretize()/self.volume
+ 
+ 
+ class ParticleInstances(ParticleDistribution):
+diff --git a/particula/util/distribution_discretization.py b/particula/util/distribution_discretization.py
+index 76facea..93a8e43 100644
+--- a/particula/util/distribution_discretization.py
++++ b/particula/util/distribution_discretization.py
+@@ -11,6 +11,7 @@ def discretize(
+     disttype="lognormal",
+     gsigma=in_scalar(1.25).m,
+     mode=in_radius(100e-9).m,
++    nparticles=in_scalar(1e5).m,
+     **kwargs
+ ):
+     """ discretize the distribution of the particles
+@@ -30,13 +31,17 @@ def discretize(
+     if not isinstance(interval, u.Quantity):
+         interval = u.Quantity(interval, " ")
+ 
+-    if disttype == "lognormal":
+-        dist = lognorm.pdf(
+-            x=interval.m,
+-            s=np.log(gsigma),
+-            scale=mode,
+-        )/interval.u
+-    else:
++    if disttype != "lognormal":
+         raise ValueError("the 'disttype' must be 'lognormal' for now!")
+ 
+-    return dist
++    return ((
++        lognorm.pdf(
++            x=interval.m,
++            s=np.reshape(np.log(gsigma), (np.array([gsigma]).size, 1)),
++            scale=np.reshape([mode], (np.array([mode]).size, 1)),
++        ) / interval.u
++        * np.reshape([nparticles], (np.array([nparticles]).size, 1))
++        ).sum(axis=0) /
++        np.array([nparticles]).sum() /
++        np.max([np.array([mode]).size, np.array([gsigma]).size])
++    )
+diff --git a/particula/util/radius_cutoff.py b/particula/util/radius_cutoff.py
+index 2212046..346ce66 100644
+--- a/particula/util/radius_cutoff.py
++++ b/particula/util/radius_cutoff.py
+@@ -26,10 +26,19 @@ def cut_rad(
+ 
+     _ = kwargs.get("something", None)
+ 
+-    (rad_start, rad_end) = lognorm.interval(
+-        alpha=cutoff,
+-        s=np.log(gsigma),
+-        scale=mode,
+-    )
++    if np.array([mode]).size == 1:
++        (rad_start, rad_end) = lognorm.interval(
++            alpha=cutoff,
++            s=np.log(gsigma),
++            scale=mode,
++        )
++    else:
++        (rad_start_pre, rad_end_pre) = lognorm.interval(
++            alpha=cutoff,
++            s=np.log(gsigma),
++            scale=mode,
++        )
++        rad_start = rad_start_pre.min()
++        rad_end = rad_end_pre.max()
+ 
+     return (rad_start, rad_end)

@@ -1,0 +1,189 @@
+diff --git a/dwave/cloud/client.py b/dwave/cloud/client.py
+index 7986b84..db3c444 100644
+--- a/dwave/cloud/client.py
++++ b/dwave/cloud/client.py
+@@ -73,7 +73,7 @@ from dwave.cloud.config import load_config, parse_float, parse_int, parse_boolea
+ from dwave.cloud.solver import Solver, available_solvers
+ from dwave.cloud.concurrency import PriorityThreadPoolExecutor
+ from dwave.cloud.upload import ChunkedData
+-from dwave.cloud.events import dispatch_event
++from dwave.cloud.events import dispatches_events
+ from dwave.cloud.utils import (
+     TimeoutingHTTPAdapter, BaseUrlSession, user_agent,
+     datetime_to_timestamp, utcnow, epochnow, cached, retried, is_caused_by)
+@@ -343,6 +343,7 @@ class Client(object):
+         logger.debug("Creating %s.Client() with: %r", _client, config)
+         return _clients[_client](**config)
+ 
++    @dispatches_events('client_init')
+     def __init__(self, endpoint=None, token=None, solver=None, **kwargs):
+         # for (reasonable) backwards compatibility, accept only the first few
+         # positional args.
+@@ -354,9 +355,6 @@ class Client(object):
+         if solver is not None:
+             kwargs.setdefault('solver', solver)
+ 
+-        dispatched_args = kwargs.copy()
+-        dispatch_event('before_client_init', obj=self, args=dispatched_args)
+-
+         logger.debug("Client init called with: %r", kwargs)
+ 
+         # derive instance-level defaults from class defaults and init defaults
+@@ -523,9 +521,6 @@ class Client(object):
+         self._encode_problem_executor = \
+             ThreadPoolExecutor(self._ENCODE_PROBLEM_THREAD_COUNT)
+ 
+-        dispatch_event(
+-            'after_client_init', obj=self, args=dispatched_args, return_value=None)
+-
+     def create_session(self):
+         """Create a new requests session based on client's (self) params.
+ 
+@@ -728,6 +723,7 @@ class Client(object):
+         self._load(future)
+         return future
+ 
++    @dispatches_events('get_solvers')
+     def get_solvers(self, refresh=False, order_by='avg_load', **filters):
+         """Return a filtered list of solvers handled by this client.
+ 
+@@ -913,9 +909,6 @@ class Client(object):
+             )
+         """
+ 
+-        args = dict(refresh=refresh, order_by=order_by, filters=filters)
+-        dispatch_event('before_get_solvers', obj=self, args=args)
+-
+         def covers_op(prop, val):
+             """Does LHS `prop` (range) fully cover RHS `val` (range or item)?"""
+ 
+@@ -1064,9 +1057,6 @@ class Client(object):
+         if sort_reverse:
+             solvers.reverse()
+ 
+-        dispatch_event(
+-            'after_get_solvers', obj=self, args=args, return_value=solvers)
+-
+         return solvers
+ 
+     def solvers(self, refresh=False, **filters):
+diff --git a/dwave/cloud/events.py b/dwave/cloud/events.py
+index 8e9b53d..66a0a39 100644
+--- a/dwave/cloud/events.py
++++ b/dwave/cloud/events.py
+@@ -19,6 +19,8 @@ inspection.
+ """
+ 
+ import logging
++import inspect
++from functools import wraps
+ 
+ __all__ = ['add_handler']
+ 
+@@ -41,13 +43,17 @@ _client_event_hooks_registry = {
+ def add_handler(name, handler):
+     """Register a `handler` function to be called on event `name`.
+ 
+-    Handler's signature are::
++    Handler signatures are::
+ 
+         def before_event_handler(event_name, obj, args):
+-            pass
++            # called just before `obj.method(**args)` executes
+ 
+         def after_event_handler(event_name, obj, args, return_value):
+-            pass
++            # function succeeded with `return_value`
++
++        def after_event_handler(event_name, obj, args, exception):
++            # function failed with `exception` raised
++            # after event handler invocation, exception is re-raised
+ 
+     """
+ 
+@@ -73,3 +79,35 @@ def dispatch_event(name, *args, **kwargs):
+         except Exception as e:
+             logger.debug("Exception in {!r} event handler {!r}: {!r}".format(
+                 name, handler, e))
++
++
++class dispatches_events:
++    """Decorate function to :func:`.dispatch_event` on entry and exit."""
++
++    def __init__(self, basename):
++        self.before_eventname = 'before_' + basename
++        self.after_eventname = 'after_' + basename
++
++    def __call__(self, fn):
++        if not callable(fn):
++            raise TypeError("decorated object must be callable")
++
++        @wraps(fn)
++        def wrapped(*pargs, **kwargs):
++            sig = inspect.signature(fn)
++            bound = sig.bind(*pargs, **kwargs)
++            bound.apply_defaults()
++            args = bound.arguments
++            obj = args.pop('self', None)
++
++            dispatch_event(self.before_eventname, obj=obj, args=args)
++            try:
++                rval = fn(*pargs, **kwargs)
++            except Exception as exc:
++                dispatch_event(self.after_eventname, obj=obj, args=args, exception=exc)
++                raise
++            else:
++                dispatch_event(self.after_eventname, obj=obj, args=args, return_value=rval)
++                return rval
++
++        return wrapped
+diff --git a/dwave/cloud/solver.py b/dwave/cloud/solver.py
+index 56b7f34..fbaf0a8 100644
+--- a/dwave/cloud/solver.py
++++ b/dwave/cloud/solver.py
+@@ -40,7 +40,7 @@ from dwave.cloud.coders import (
+ from dwave.cloud.utils import uniform_iterator, reformat_qubo_as_ising
+ from dwave.cloud.computation import Future
+ from dwave.cloud.concurrency import Present
+-from dwave.cloud.events import dispatch_event
++from dwave.cloud.events import dispatches_events
+ 
+ # Use numpy if available for fast encoding/decoding
+ try:
+@@ -404,6 +404,7 @@ class BaseUnstructuredSolver(BaseSolver):
+ 
+         return body_data
+ 
++    @dispatches_events('sample')
+     def sample_problem(self, problem, problem_type=None, label=None, **params):
+         """Sample from the specified problem.
+ 
+@@ -877,6 +878,7 @@ class StructuredSolver(BaseSolver):
+         return self._sample(problem_type, bqm.linear, bqm.quadratic, bqm.offset,
+                             params, label=label, undirected_biases=True)
+ 
++    @dispatches_events('sample')
+     def _sample(self, type_, linear, quadratic, offset, params,
+                 label=None, undirected_biases=False):
+         """Internal method for `sample_ising`, `sample_qubo` and `sample_bqm`.
+@@ -906,11 +908,6 @@ class StructuredSolver(BaseSolver):
+             :class:`~dwave.cloud.computation.Future`
+         """
+ 
+-        args = dict(type_=type_, linear=linear, quadratic=quadratic,
+-                    offset=offset, params=params, label=label,
+-                    undirected_biases=undirected_biases)
+-        dispatch_event('before_sample', obj=self, args=args)
+-
+         # Check the problem
+         if not self.check_problem(linear, quadratic):
+             raise InvalidProblemError("Problem graph incompatible with solver.")
+@@ -948,8 +945,6 @@ class StructuredSolver(BaseSolver):
+         logger.debug("Submitting new problem to: %s", self.id)
+         self.client._submit(body, computation)
+ 
+-        dispatch_event('after_sample', obj=self, args=args, return_value=computation)
+-
+         return computation
+ 
+     def _format_params(self, type_, params):

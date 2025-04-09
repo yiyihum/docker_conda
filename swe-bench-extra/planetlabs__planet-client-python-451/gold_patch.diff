@@ -1,0 +1,417 @@
+diff --git a/docs/guide.md b/docs/guide.md
+index 757874d..d594900 100644
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -183,7 +183,7 @@ the context of a `Session` with the `OrdersClient`:
+ >>> async def main():
+ ...     async with Session() as sess:
+ ...         cl = OrdersClient(sess)
+-...         order_id = await cl.create_order(request)
++...         order = await cl.create_order(request)
+ ...
+ >>> asyncio.run(main())
+ 
+@@ -210,13 +210,13 @@ from planet import reporting
+ ...         with reporting.StateBar(state='creating') as bar:
+ ...             # create order
+ ...             order = await cl.create_order(request)
+-...             bar.update(state='created', order_id=order.id)
++...             bar.update(state='created', order_id=order['id'])
+ ...
+ ...             # poll
+-...             await cl.poll(order.id, report=bar.update)
++...             await cl.poll(order['id'], report=bar.update)
+ ...
+ ...         # download
+-...         await cl.download_order(order.id)
++...         await cl.download_order(order['id'])
+ ...
+ >>> asyncio.run(create_poll_and_download())
+ ```
+diff --git a/planet/__init__.py b/planet/__init__.py
+index 504c209..8eb5800 100644
+--- a/planet/__init__.py
++++ b/planet/__init__.py
+@@ -12,7 +12,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ from .http import Session
+-from .models import Order
+ from . import order_request, reporting
+ from .__version__ import __version__  # NOQA
+ from .auth import Auth
+@@ -21,7 +20,6 @@ from .clients import OrdersClient
+ __all__ = [
+     Session,
+     OrdersClient,
+-    Order,
+     order_request,
+     reporting,
+     Auth,
+diff --git a/planet/cli/cli.py b/planet/cli/cli.py
+index d463144..726debb 100644
+--- a/planet/cli/cli.py
++++ b/planet/cli/cli.py
+@@ -30,8 +30,13 @@ LOGGER = logging.getLogger(__name__)
+               default="warning",
+               help=("Optional: set verbosity level to warning, info, or debug.\
+                   Defaults to warning."))
++@click.option('--quiet',
++              is_flag=True,
++              default=False,
++              help='Disable ANSI control output.')
+ @click.version_option(version=planet.__version__)
+-def main(ctx, verbosity):
++@click.version_option(version=planet.__version__)
++def main(ctx, verbosity, quiet):
+     """Planet API Client
+     Parameters:
+         ctx -- context object
+@@ -41,6 +46,7 @@ def main(ctx, verbosity):
+     # ensure that ctx.obj exists and is a dict (in case `cli()` is called
+     # by means other than the `if` block below)
+     ctx.ensure_object(dict)
++    ctx.obj['QUIET'] = quiet
+ 
+ 
+ def _configure_logging(verbosity):
+diff --git a/planet/cli/orders.py b/planet/cli/orders.py
+index 01f677e..e1da200 100644
+--- a/planet/cli/orders.py
++++ b/planet/cli/orders.py
+@@ -66,9 +66,10 @@ def orders(ctx, base_url):
+ async def list(ctx, state, limit, pretty):
+     '''List orders'''
+     async with orders_client(ctx) as cl:
+-        orders = await cl.list_orders(state=state, limit=limit, as_json=True)
++        orders = await cl.list_orders(state=state, limit=limit)
++        orders_list = [o async for o in orders]
+ 
+-    echo_json(orders, pretty)
++    echo_json(orders_list, pretty)
+ 
+ 
+ @orders.command()
+@@ -85,7 +86,7 @@ async def get(ctx, order_id, pretty):
+     async with orders_client(ctx) as cl:
+         order = await cl.get_order(str(order_id))
+ 
+-    echo_json(order.json, pretty)
++    echo_json(order, pretty)
+ 
+ 
+ @orders.command()
+@@ -135,15 +136,11 @@ def split_list_arg(ctx, param, value):
+               type=int,
+               default=5,
+               help='Maximum number of polls. Set to zero for no limit.')
+-@click.option('--quiet',
+-              is_flag=True,
+-              default=False,
+-              help='Disable ANSI control output.')
+ @click.option('--state',
+               help='State prior to a final state that will end polling.',
+               type=click.Choice(planet.clients.orders.ORDER_STATE_SEQUENCE,
+                                 case_sensitive=False))
+-async def wait(ctx, order_id, delay, max_attempts, quiet, state):
++async def wait(ctx, order_id, delay, max_attempts, state):
+     """Wait until order reaches desired state.
+ 
+     Reports the state of the order on the last poll.
+@@ -165,6 +162,7 @@ async def wait(ctx, order_id, delay, max_attempts, quiet, state):
+     If --state is specified, polling will complete when the specified earlier
+     state is reached or passed.
+     """
++    quiet = ctx.obj['QUIET']
+     async with orders_client(ctx) as cl:
+         with planet.reporting.StateBar(order_id=order_id,
+                                        disable=quiet) as bar:
+@@ -181,11 +179,6 @@ async def wait(ctx, order_id, delay, max_attempts, quiet, state):
+ @translate_exceptions
+ @coro
+ @click.argument('order_id', type=click.UUID)
+-@click.option('-q',
+-              '--quiet',
+-              is_flag=True,
+-              default=False,
+-              help='Disable ANSI control output.')
+ @click.option('-o',
+               '--overwrite',
+               is_flag=True,
+@@ -198,8 +191,9 @@ async def wait(ctx, order_id, delay, max_attempts, quiet, state):
+                               resolve_path=True,
+                               writable=True,
+                               file_okay=False))
+-async def download(ctx, order_id, quiet, overwrite, dest):
++async def download(ctx, order_id, overwrite, dest):
+     """Download order by order ID."""
++    quiet = ctx.obj['QUIET']
+     async with orders_client(ctx) as cl:
+         await cl.download_order(str(order_id),
+                                 directory=dest,
+@@ -319,4 +313,4 @@ async def create(ctx,
+     async with orders_client(ctx) as cl:
+         order = await cl.create_order(request)
+ 
+-    echo_json(order.json, pretty)
++    echo_json(order, pretty)
+diff --git a/planet/clients/orders.py b/planet/clients/orders.py
+index dfa7ffb..82da519 100644
+--- a/planet/clients/orders.py
++++ b/planet/clients/orders.py
+@@ -22,7 +22,7 @@ import uuid
+ from .. import exceptions
+ from ..constants import PLANET_BASE_URL
+ from ..http import Session
+-from ..models import Order, Orders, Request, Response, StreamingBody
++from ..models import Paged, Request, Response, StreamingBody
+ 
+ BASE_URL = f'{PLANET_BASE_URL}/compute/ops'
+ STATS_PATH = '/stats/orders/v2'
+@@ -37,6 +37,14 @@ ORDER_STATE_SEQUENCE = \
+ LOGGER = logging.getLogger(__name__)
+ 
+ 
++class Orders(Paged):
++    '''Asynchronous iterator over Orders from a paged response describing
++    orders.'''
++    LINKS_KEY = '_links'
++    NEXT_KEY = 'next'
++    ITEMS_KEY = 'orders'
++
++
+ class OrderStates():
+     SEQUENCE = ORDER_STATE_SEQUENCE
+ 
+@@ -114,7 +122,7 @@ class OrdersClient():
+         '''
+         return await self._session.request(request)
+ 
+-    async def create_order(self, request: dict) -> str:
++    async def create_order(self, request: dict) -> dict:
+         '''Create an order request.
+ 
+         Example:
+@@ -132,17 +140,16 @@ class OrdersClient():
+         ...     )
+         ...     async with Session() as sess:
+         ...         cl = OrdersClient(sess)
+-        ...         order_id = await cl.create_order(request)
++        ...         order = await cl.create_order(request)
+         ...
+         >>> asyncio.run(main())
+-
+         ```
+ 
+         Parameters:
+             request: order request definition
+ 
+         Returns:
+-            The ID of the order
++            JSON description of the created order
+ 
+         Raises:
+             planet.exceptions.APIError: On API error.
+@@ -151,18 +158,16 @@ class OrdersClient():
+ 
+         req = self._request(url, method='POST', json=request)
+         resp = await self._do_request(req)
++        return resp.json()
+ 
+-        order = Order(resp.json())
+-        return order
+-
+-    async def get_order(self, order_id: str) -> Order:
++    async def get_order(self, order_id: str) -> dict:
+         '''Get order details by Order ID.
+ 
+         Parameters:
+             order_id: The ID of the order
+ 
+         Returns:
+-            Order information
++            JSON description of the order
+ 
+         Raises:
+             planet.exceptions.ClientError: If order_id is not a valid UUID.
+@@ -173,9 +178,7 @@ class OrdersClient():
+ 
+         req = self._request(url, method='GET')
+         resp = await self._do_request(req)
+-
+-        order = Order(resp.json())
+-        return order
++        return resp.json()
+ 
+     async def cancel_order(self, order_id: str) -> dict:
+         '''Cancel a queued order.
+@@ -290,14 +293,16 @@ class OrdersClient():
+                 state.
+         """
+         order = await self.get_order(order_id)
+-        if not OrderStates.is_final(order.state):
++
++        order_state = order['state']
++        if not OrderStates.is_final(order_state):
+             raise exceptions.ClientError(
+                 'Order cannot be downloaded because the order state '
+-                f'({order.state}) is not a final state. '
++                f'({order_state}) is not a final state. '
+                 'Consider using wait functionality before '
+                 'attempting to download.')
+ 
+-        locations = order.locations
++        locations = self._get_order_locations(order)
+         LOGGER.info(
+             f'downloading {len(locations)} assets from order {order_id}')
+ 
+@@ -310,6 +315,12 @@ class OrdersClient():
+         ]
+         return filenames
+ 
++    @staticmethod
++    def _get_order_locations(order):
++        links = order['_links']
++        results = links.get('results', None)
++        return list(r['location'] for r in results if r)
++
+     async def wait(self,
+                    order_id: str,
+                    state: str = None,
+@@ -372,12 +383,12 @@ class OrdersClient():
+             t = time.time()
+ 
+             order = await self.get_order(order_id)
+-            current_state = order.state
++            current_state = order['state']
+ 
+-            LOGGER.debug(state)
++            LOGGER.debug(current_state)
+ 
+             if callback:
+-                callback(order.state)
++                callback(current_state)
+ 
+             if OrderStates.is_final(current_state) or \
+                     (state and OrderStates.reached(state, current_state)):
+@@ -395,17 +406,12 @@ class OrdersClient():
+ 
+         return current_state
+ 
+-    async def list_orders(
+-            self,
+-            state: str = None,
+-            limit: int = None,
+-            as_json: bool = False) -> typing.Union[typing.List[Order], dict]:
++    async def list_orders(self, state: str = None, limit: int = None):
+         """Get all order requests.
+ 
+         Parameters:
+             state: Filter orders to given state.
+             limit: Limit orders to given limit.
+-            as_json: Return orders as a json dict.
+ 
+         Returns:
+             User orders that match the query
+@@ -425,15 +431,5 @@ class OrdersClient():
+         else:
+             params = None
+ 
+-        orders = await self._get_orders(url, params=params, limit=limit)
+-
+-        if as_json:
+-            ret = [o.json async for o in orders]
+-        else:
+-            ret = [o async for o in orders]
+-        return ret
+-
+-    async def _get_orders(self, url, params=None, limit=None):
+         request = self._request(url, 'GET', params=params)
+-
+         return Orders(request, self._do_request, limit=limit)
+diff --git a/planet/models.py b/planet/models.py
+index af01e7b..482126c 100644
+--- a/planet/models.py
++++ b/planet/models.py
+@@ -14,7 +14,6 @@
+ """Manage data for requests and responses."""
+ import copy
+ from datetime import datetime
+-import json
+ import logging
+ import mimetypes
+ import random
+@@ -347,73 +346,3 @@ class Paged():
+             LOGGER.debug('end of the pages')
+             next_link = False
+         return next_link
+-
+-
+-class Order():
+-    '''Managing description of an order returned from Orders API.
+-
+-    :param data: Response json describing order
+-    :type data: dict
+-    '''
+-    LINKS_KEY = '_links'
+-    RESULTS_KEY = 'results'
+-    LOCATION_KEY = 'location'
+-
+-    def __init__(self, data):
+-        self.data = data
+-
+-    def __str__(self):
+-        return "<Order> " + json.dumps(self.data)
+-
+-    @property
+-    def results(self):
+-        '''Results for each item in order.
+-
+-        :return: result for each item in order
+-        :rtype: list of dict
+-        '''
+-        links = self.data[self.LINKS_KEY]
+-        results = links.get(self.RESULTS_KEY, None)
+-        return results
+-
+-    @property
+-    def locations(self):
+-        '''Download locations for order results.
+-
+-        :return: download locations in order
+-        :rtype: list of str
+-        '''
+-        return list(r[self.LOCATION_KEY] for r in self.results)
+-
+-    @property
+-    def state(self):
+-        '''State of the order.
+-
+-        :return: state of order
+-        :rtype: str
+-        '''
+-        return self.data['state']
+-
+-    @property
+-    def id(self):
+-        '''ID of the order.
+-
+-        :return: id of order
+-        :rtype: str
+-        '''
+-        return self.data['id']
+-
+-    @property
+-    def json(self):
+-        return self.data
+-
+-
+-class Orders(Paged):
+-    '''Asynchronous iterator over Orders from a paged response describing
+-    orders.'''
+-    LINKS_KEY = '_links'
+-    NEXT_KEY = 'next'
+-    ITEMS_KEY = 'orders'
+-
+-    async def __anext__(self):
+-        return Order(await super().__anext__())

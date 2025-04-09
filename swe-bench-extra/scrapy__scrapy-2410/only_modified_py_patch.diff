@@ -1,0 +1,140 @@
+diff --git a/scrapy/commands/fetch.py b/scrapy/commands/fetch.py
+index f09a873c1..7d4840529 100644
+--- a/scrapy/commands/fetch.py
++++ b/scrapy/commands/fetch.py
+@@ -5,6 +5,7 @@ from w3lib.url import is_url
+ from scrapy.commands import ScrapyCommand
+ from scrapy.http import Request
+ from scrapy.exceptions import UsageError
++from scrapy.utils.datatypes import SequenceExclude
+ from scrapy.utils.spider import spidercls_for_request, DefaultSpider
+ 
+ class Command(ScrapyCommand):
+@@ -27,6 +28,8 @@ class Command(ScrapyCommand):
+             help="use this spider")
+         parser.add_option("--headers", dest="headers", action="store_true", \
+             help="print response HTTP headers instead of body")
++        parser.add_option("--no-redirect", dest="no_redirect", action="store_true", \
++            default=False, help="do not handle HTTP 3xx status codes and print response as-is")
+ 
+     def _print_headers(self, headers, prefix):
+         for key, values in headers.items():
+@@ -50,7 +53,12 @@ class Command(ScrapyCommand):
+             raise UsageError()
+         cb = lambda x: self._print_response(x, opts)
+         request = Request(args[0], callback=cb, dont_filter=True)
+-        request.meta['handle_httpstatus_all'] = True
++        # by default, let the framework handle redirects,
++        # i.e. command handles all codes expect 3xx
++        if not opts.no_redirect:
++            request.meta['handle_httpstatus_list'] = SequenceExclude(range(300, 400))
++        else:
++            request.meta['handle_httpstatus_all'] = True
+ 
+         spidercls = DefaultSpider
+         spider_loader = self.crawler_process.spider_loader
+diff --git a/scrapy/commands/shell.py b/scrapy/commands/shell.py
+index 7be7f7256..40a58d94a 100644
+--- a/scrapy/commands/shell.py
++++ b/scrapy/commands/shell.py
+@@ -36,6 +36,8 @@ class Command(ScrapyCommand):
+             help="evaluate the code in the shell, print the result and exit")
+         parser.add_option("--spider", dest="spider",
+             help="use this spider")
++        parser.add_option("--no-redirect", dest="no_redirect", action="store_true", \
++            default=False, help="do not handle HTTP 3xx status codes and print response as-is")
+ 
+     def update_vars(self, vars):
+         """You can use this function to update the Scrapy objects that will be
+@@ -68,7 +70,7 @@ class Command(ScrapyCommand):
+         self._start_crawler_thread()
+ 
+         shell = Shell(crawler, update_vars=self.update_vars, code=opts.code)
+-        shell.start(url=url)
++        shell.start(url=url, redirect=not opts.no_redirect)
+ 
+     def _start_crawler_thread(self):
+         t = Thread(target=self.crawler_process.start,
+diff --git a/scrapy/shell.py b/scrapy/shell.py
+index 183ee1f70..6f94635a1 100644
+--- a/scrapy/shell.py
++++ b/scrapy/shell.py
+@@ -20,6 +20,7 @@ from scrapy.item import BaseItem
+ from scrapy.settings import Settings
+ from scrapy.spiders import Spider
+ from scrapy.utils.console import start_python_console
++from scrapy.utils.datatypes import SequenceExclude
+ from scrapy.utils.misc import load_object
+ from scrapy.utils.response import open_in_browser
+ from scrapy.utils.conf import get_config
+@@ -40,11 +41,11 @@ class Shell(object):
+         self.code = code
+         self.vars = {}
+ 
+-    def start(self, url=None, request=None, response=None, spider=None):
++    def start(self, url=None, request=None, response=None, spider=None, redirect=True):
+         # disable accidental Ctrl-C key press from shutting down the engine
+         signal.signal(signal.SIGINT, signal.SIG_IGN)
+         if url:
+-            self.fetch(url, spider)
++            self.fetch(url, spider, redirect=redirect)
+         elif request:
+             self.fetch(request, spider)
+         elif response:
+@@ -98,14 +99,16 @@ class Shell(object):
+         self.spider = spider
+         return spider
+ 
+-    def fetch(self, request_or_url, spider=None):
++    def fetch(self, request_or_url, spider=None, redirect=True, **kwargs):
+         if isinstance(request_or_url, Request):
+             request = request_or_url
+-            url = request.url
+         else:
+             url = any_to_uri(request_or_url)
+-            request = Request(url, dont_filter=True)
+-            request.meta['handle_httpstatus_all'] = True
++            request = Request(url, dont_filter=True, **kwargs)
++            if redirect:
++                request.meta['handle_httpstatus_list'] = SequenceExclude(range(300, 400))
++            else:
++                request.meta['handle_httpstatus_all'] = True
+         response = None
+         try:
+             response, spider = threads.blockingCallFromThread(
+@@ -144,10 +147,13 @@ class Shell(object):
+             if self._is_relevant(v):
+                 b.append("  %-10s %s" % (k, v))
+         b.append("Useful shortcuts:")
+-        b.append("  shelp()           Shell help (print this help)")
+         if self.inthread:
+-            b.append("  fetch(req_or_url) Fetch request (or URL) and "
+-                     "update local objects")
++            b.append("  fetch(url[, redirect=True]) "
++                     "Fetch URL and update local objects "
++                     "(by default, redirects are followed)")
++            b.append("  fetch(req)                  "
++                     "Fetch a scrapy.Request and update local objects ")
++        b.append("  shelp()           Shell help (print this help)")
+         b.append("  view(response)    View response in a browser")
+ 
+         return "\n".join("[s] %s" % l for l in b)
+diff --git a/scrapy/utils/datatypes.py b/scrapy/utils/datatypes.py
+index d04b43176..e516185bd 100644
+--- a/scrapy/utils/datatypes.py
++++ b/scrapy/utils/datatypes.py
+@@ -304,3 +304,13 @@ class LocalCache(OrderedDict):
+         while len(self) >= self.limit:
+             self.popitem(last=False)
+         super(LocalCache, self).__setitem__(key, value)
++
++
++class SequenceExclude(object):
++    """Object to test if an item is NOT within some sequence."""
++
++    def __init__(self, seq):
++        self.seq = seq
++
++    def __contains__(self, item):
++        return item not in self.seq
+

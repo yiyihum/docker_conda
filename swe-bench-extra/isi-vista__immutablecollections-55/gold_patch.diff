@@ -1,0 +1,125 @@
+diff --git a/immutablecollections/__init__.py b/immutablecollections/__init__.py
+index af96c53..d987edb 100644
+--- a/immutablecollections/__init__.py
++++ b/immutablecollections/__init__.py
+@@ -26,7 +26,11 @@ frozenset([1, 2, 3]), both of which are equal to the regular set {1, 2, 3}.
+ from attr.exceptions import FrozenInstanceError
+ 
+ from immutablecollections.immutablecollection import ImmutableCollection
+-from immutablecollections._immutabledict import immutabledict, ImmutableDict
++from immutablecollections._immutabledict import (
++    immutabledict,
++    ImmutableDict,
++    immutabledict_from_unique_keys,
++)
+ from immutablecollections._immutableset import (
+     immutableset,
+     immutableset_from_unique_elements,
+diff --git a/immutablecollections/_immutabledict.py b/immutablecollections/_immutabledict.py
+index 924c46a..e238a12 100644
+--- a/immutablecollections/_immutabledict.py
++++ b/immutablecollections/_immutabledict.py
+@@ -5,6 +5,8 @@ from typing import (
+     Mapping,
+     TypeVar,
+     Tuple,
++    Set,
++    List,
+     Iterator,
+     Optional,
+     Union,
+@@ -32,7 +34,7 @@ InstantiationTypes = (Mapping, Iterable)  # pylint:disable=invalid-name
+ 
+ 
+ def immutabledict(
+-    iterable: Optional[AllowableSourceType] = None
++    iterable: Optional[AllowableSourceType] = None, *, forbid_duplicate_keys: bool = False
+ ) -> "ImmutableDict[KT, VT]":
+     """
+     Create an immutable dictionary with the given mappings.
+@@ -51,7 +53,8 @@ def immutabledict(
+ 
+     if isinstance(iterable, ImmutableDict):
+         # if an ImmutableDict is input, we can safely just return it,
+-        # since the object can safely be shared
++        # since the object can safely be shared.
++        # It is also guaranteed not to have repeat keys
+         return iterable
+ 
+     if isinstance(iterable, Dict) and not DICT_ITERATION_IS_DETERMINISTIC:
+@@ -66,6 +69,29 @@ def immutabledict(
+             f"Cannot create an immutabledict from {type(iterable)}, only {InstantiationTypes}"
+         )
+ 
++    if forbid_duplicate_keys:
++        keys: List[KT]
++        # `for x in dict` grabs keys, but `for x in pairs` grabs pairs, so we must branch
++        if isinstance(iterable, Mapping):
++            # duplicate keys are possible if input is e.g. a multidict
++            keys = list(iterable.keys())
++        else:
++            # iterable must be a (key, value) pair iterable
++            iterable = list(iterable)  # in case iterable is consumed by iteration
++            keys = [key for key, value in iterable]
++        seen: Set[KT] = set()
++        duplicated: Set[KT] = set()
++        for key in keys:
++            if key in seen:
++                duplicated.add(key)
++            else:
++                seen.add(key)
++        if duplicated:
++            raise ValueError(
++                "forbid_duplicate_keys=True, but some keys "
++                "occur multiple times in input: {}".format(duplicated)
++            )
++
+     ret: ImmutableDict[KT, VT] = _RegularDictBackedImmutableDict(iterable)
+     if ret:
+         return ret
+@@ -73,6 +99,16 @@ def immutabledict(
+         return _EMPTY
+ 
+ 
++def immutabledict_from_unique_keys(
++    iterable: Optional[AllowableSourceType] = None
++) -> "ImmutableDict[KT, VT]":
++    """
++    Create an immutable dictionary with the given mappings, but raise ValueError if
++    *iterable* contains the same item twice. More information in `immutabledict`
++    """
++    return immutabledict(iterable, forbid_duplicate_keys=True)
++
++
+ class ImmutableDict(ImmutableCollection[KT], Mapping[KT, VT], metaclass=ABCMeta):
+     """
+     A ``Mapping`` implementation which is locally immutable.
+diff --git a/immutablecollections/_immutableset.py b/immutablecollections/_immutableset.py
+index 593b362..aec7731 100644
+--- a/immutablecollections/_immutableset.py
++++ b/immutablecollections/_immutableset.py
+@@ -92,6 +92,7 @@ def immutableset(
+                 "iteration order, specify disable_order_check=True"
+             )
+ 
++    duplicated = set()  # only used if forbid_duplicate_elements=True
+     iteration_order = []
+     containment_set: MutableSet[T] = set()
+     for value in iterable:
+@@ -99,9 +100,13 @@ def immutableset(
+             containment_set.add(value)
+             iteration_order.append(value)
+         elif forbid_duplicate_elements:
+-            raise ValueError(
+-                "Input collection has duplicate items and forbid_duplicate_elements=False"
+-            )
++            duplicated.add(value)
++
++    if forbid_duplicate_elements and duplicated:
++        raise ValueError(
++            "forbid_duplicate_elements=True, but some elements "
++            "occur multiple times in input: {}".format(duplicated)
++        )
+ 
+     if iteration_order:
+         if len(iteration_order) == 1:

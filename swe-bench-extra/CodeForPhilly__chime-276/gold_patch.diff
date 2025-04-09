@@ -1,0 +1,162 @@
+diff --git a/settings.cfg b/settings.cfg
+index 040d6e2..f8d1a3b 100644
+--- a/settings.cfg
++++ b/settings.cfg
+@@ -8,6 +8,6 @@
+ --icu-rate 0.0075
+ --market_share 0.15
+ --n-days 60
+---susceptible 4119405
++--population 4119405
+ --ventilated-los 10
+ --ventilated-rate 0.005
+diff --git a/src/penn_chime/cli.py b/src/penn_chime/cli.py
+index 4fed0f7..a4ec533 100644
+--- a/src/penn_chime/cli.py
++++ b/src/penn_chime/cli.py
+@@ -91,7 +91,7 @@ def parse_args():
+             1.0,
+             "Social Distancing Reduction Rate: 0.0 - 1.0",
+         ),
+-        ("--susceptible", int, 1, None, "Regional Population >= 1"),
++        ("--population", int, 1, None, "Regional Population >= 1"),
+         ("--ventilated-los", int, 0, None, "Ventilated Length of Stay (days)"),
+         ("--ventilated-rate", float, 0.0, 1.0, "Ventilated Rate: 0.0 - 1.0"),
+     ):
+@@ -110,7 +110,7 @@ def main():
+         market_share=a.market_share,
+         n_days=a.n_days,
+         relative_contact_rate=a.relative_contact_rate,
+-        susceptible=a.susceptible,
++        population=a.population,
+ 
+         hospitalized=RateLos(a.hospitalized_rate, a.hospitalized_los),
+         icu=RateLos(a.icu_rate, a.icu_los),
+diff --git a/src/penn_chime/defaults.py b/src/penn_chime/defaults.py
+index dd28427..9b60cd0 100644
+--- a/src/penn_chime/defaults.py
++++ b/src/penn_chime/defaults.py
+@@ -7,15 +7,12 @@ class Regions:
+     """Arbitrary number of counties."""
+ 
+     def __init__(self, **kwargs):
+-        susceptible = 0
++        population = 0
+         for key, value in kwargs.items():
+             setattr(self, key, value)
+-            susceptible += value
+-        self._susceptible = susceptible
++            population += value
++        self.population = population
+ 
+-    @property
+-    def susceptible(self):
+-        return self._susceptible
+ 
+ 
+ class Constants:
+@@ -55,4 +52,4 @@ class Constants:
+         self.recovery_days = recovery_days
+ 
+     def __repr__(self) -> str:
+-        return f"Constants(susceptible_default: {self.region.susceptible}, known_infected: {self.known_infected})"
++        return f"Constants(population_default: {self.region.population}, known_infected: {self.known_infected})"
+diff --git a/src/penn_chime/models.py b/src/penn_chime/models.py
+index cc4858d..97fb33c 100644
+--- a/src/penn_chime/models.py
++++ b/src/penn_chime/models.py
+@@ -18,8 +18,7 @@ from .parameters import Parameters
+ class SimSirModel:
+ 
+     def __init__(self, p: Parameters) -> SimSirModel:
+-        # TODO missing initial recovered value
+-        susceptible = p.susceptible
++        # TODO missing initial non-zero 'recovered' value
+         recovered = 0.0
+         recovery_days = p.recovery_days
+ 
+@@ -40,6 +39,8 @@ class SimSirModel:
+             p.current_hospitalized / p.market_share / p.hospitalized.rate
+         )
+ 
++        susceptible = p.population - infected
++
+         detection_probability = (
+             p.known_infected / infected if infected > 1.0e-7 else None
+         )
+diff --git a/src/penn_chime/parameters.py b/src/penn_chime/parameters.py
+index 17b9722..7ea14da 100644
+--- a/src/penn_chime/parameters.py
++++ b/src/penn_chime/parameters.py
+@@ -17,7 +17,7 @@ class Parameters:
+         doubling_time: float,
+         known_infected: int,
+         relative_contact_rate: float,
+-        susceptible: int,
++        population: int,
+ 
+         hospitalized: RateLos,
+         icu: RateLos,
+@@ -33,7 +33,7 @@ class Parameters:
+         self.doubling_time = doubling_time
+         self.known_infected = known_infected
+         self.relative_contact_rate = relative_contact_rate
+-        self.susceptible = susceptible
++        self.population = population
+ 
+         self.hospitalized = hospitalized
+         self.icu = icu
+diff --git a/src/penn_chime/presentation.py b/src/penn_chime/presentation.py
+index 7523295..8925561 100644
+--- a/src/penn_chime/presentation.py
++++ b/src/penn_chime/presentation.py
+@@ -41,7 +41,7 @@ def display_header(st, m, p):
+ 
+     infected_population_warning_str = (
+         """(Warning: The number of estimated infections is greater than the total regional population. Please verify the values entered in the sidebar.)"""
+-        if m.infected > p.susceptible
++        if m.infected > p.population
+         else ""
+     )
+ 
+@@ -92,7 +92,7 @@ and daily growth rate of **{daily_growth_t:.2f}%**.
+             detection_prob_str=detection_prob_str,
+             current_hosp=p.current_hospitalized,
+             hosp_rate=p.hospitalized.rate,
+-            S=p.susceptible,
++            S=p.population,
+             market_share=p.market_share,
+             recovery_days=p.recovery_days,
+             r_naught=m.r_naught,
+@@ -238,11 +238,11 @@ def display_sidebar(st, d: Constants) -> Parameters:
+         step=1.0,
+         format="%f",
+     )
+-    susceptible_input = NumberInputWrapper(
++    population_input = NumberInputWrapper(
+         st_obj,
+         "Regional Population",
+         min_value=1,
+-        value=d.region.susceptible,
++        value=d.region.population,
+         step=100000,
+         format="%i",
+     )
+@@ -261,7 +261,7 @@ def display_sidebar(st, d: Constants) -> Parameters:
+ 
+     # Build in desired order
+     st.sidebar.markdown("### Regional Parameters [ℹ]({docs_url}/what-is-chime/parameters)".format(docs_url=DOCS_URL))
+-    susceptible = susceptible_input()
++    population = population_input()
+     market_share = market_share_input()
+     known_infected = known_infected_input()
+     current_hospitalized = current_hospitalized_input()
+@@ -298,7 +298,7 @@ def display_sidebar(st, d: Constants) -> Parameters:
+         max_y_axis=max_y_axis,
+         n_days=n_days,
+         relative_contact_rate=relative_contact_rate / 100.0,
+-        susceptible=susceptible,
++        population=population,
+ 
+         hospitalized=RateLos(hospitalized_rate/ 100.0, hospitalized_los),
+         icu=RateLos(icu_rate/ 100.0, icu_los),

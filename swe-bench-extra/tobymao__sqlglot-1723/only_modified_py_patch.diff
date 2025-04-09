@@ -1,0 +1,222 @@
+diff --git a/sqlglot/dialects/clickhouse.py b/sqlglot/dialects/clickhouse.py
+index fa370be0..55df83cb 100644
+--- a/sqlglot/dialects/clickhouse.py
++++ b/sqlglot/dialects/clickhouse.py
+@@ -33,7 +33,6 @@ class ClickHouse(Dialect):
+ 
+         KEYWORDS = {
+             **tokens.Tokenizer.KEYWORDS,
+-            "ASOF": TokenType.ASOF,
+             "ATTACH": TokenType.COMMAND,
+             "DATETIME64": TokenType.DATETIME64,
+             "FINAL": TokenType.FINAL,
+@@ -98,7 +97,6 @@ class ClickHouse(Dialect):
+ 
+         TABLE_ALIAS_TOKENS = {*parser.Parser.TABLE_ALIAS_TOKENS} - {
+             TokenType.ANY,
+-            TokenType.ASOF,
+             TokenType.SEMI,
+             TokenType.ANTI,
+             TokenType.SETTINGS,
+@@ -183,7 +181,7 @@ class ClickHouse(Dialect):
+ 
+                 return self.expression(exp.CTE, this=statement, alias=statement and statement.this)
+ 
+-        def _parse_join_side_and_kind(
++        def _parse_join_parts(
+             self,
+         ) -> t.Tuple[t.Optional[Token], t.Optional[Token], t.Optional[Token]]:
+             is_global = self._match(TokenType.GLOBAL) and self._prev
+@@ -202,7 +200,7 @@ class ClickHouse(Dialect):
+             join = super()._parse_join(skip_join_token)
+ 
+             if join:
+-                join.set("global", join.args.pop("natural", None))
++                join.set("global", join.args.pop("method", None))
+             return join
+ 
+         def _parse_function(
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index cdb09c9e..73dea5c6 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1653,11 +1653,15 @@ class Join(Expression):
+         "side": False,
+         "kind": False,
+         "using": False,
+-        "natural": False,
++        "method": False,
+         "global": False,
+         "hint": False,
+     }
+ 
++    @property
++    def method(self) -> str:
++        return self.text("method").upper()
++
+     @property
+     def kind(self) -> str:
+         return self.text("kind").upper()
+@@ -2797,12 +2801,12 @@ class Select(Subqueryable):
+         Returns:
+             Select: the modified expression.
+         """
+-        parse_args = {"dialect": dialect, **opts}
++        parse_args: t.Dict[str, t.Any] = {"dialect": dialect, **opts}
+ 
+         try:
+-            expression = maybe_parse(expression, into=Join, prefix="JOIN", **parse_args)  # type: ignore
++            expression = maybe_parse(expression, into=Join, prefix="JOIN", **parse_args)
+         except ParseError:
+-            expression = maybe_parse(expression, into=(Join, Expression), **parse_args)  # type: ignore
++            expression = maybe_parse(expression, into=(Join, Expression), **parse_args)
+ 
+         join = expression if isinstance(expression, Join) else Join(this=expression)
+ 
+@@ -2810,14 +2814,14 @@ class Select(Subqueryable):
+             join.this.replace(join.this.subquery())
+ 
+         if join_type:
+-            natural: t.Optional[Token]
++            method: t.Optional[Token]
+             side: t.Optional[Token]
+             kind: t.Optional[Token]
+ 
+-            natural, side, kind = maybe_parse(join_type, into="JOIN_TYPE", **parse_args)  # type: ignore
++            method, side, kind = maybe_parse(join_type, into="JOIN_TYPE", **parse_args)  # type: ignore
+ 
+-            if natural:
+-                join.set("natural", True)
++            if method:
++                join.set("method", method.text)
+             if side:
+                 join.set("side", side.text)
+             if kind:
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index f1ec3985..2e9f96ad 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -1313,7 +1313,7 @@ class Generator:
+         op_sql = " ".join(
+             op
+             for op in (
+-                "NATURAL" if expression.args.get("natural") else None,
++                expression.method,
+                 "GLOBAL" if expression.args.get("global") else None,
+                 expression.side,
+                 expression.kind,
+diff --git a/sqlglot/optimizer/optimize_joins.py b/sqlglot/optimizer/optimize_joins.py
+index 43436cbb..4e0c3a1d 100644
+--- a/sqlglot/optimizer/optimize_joins.py
++++ b/sqlglot/optimizer/optimize_joins.py
+@@ -1,7 +1,7 @@
+ from sqlglot import exp
+ from sqlglot.helper import tsort
+ 
+-JOIN_ATTRS = ("on", "side", "kind", "using", "natural")
++JOIN_ATTRS = ("on", "side", "kind", "using", "method")
+ 
+ 
+ def optimize_joins(expression):
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 8e3552f3..caeea1ae 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -284,6 +284,7 @@ class Parser(metaclass=_Parser):
+ 
+     TABLE_ALIAS_TOKENS = ID_VAR_TOKENS - {
+         TokenType.APPLY,
++        TokenType.ASOF,
+         TokenType.FULL,
+         TokenType.LEFT,
+         TokenType.LOCK,
+@@ -387,6 +388,11 @@ class Parser(metaclass=_Parser):
+         TokenType.EXCEPT,
+     }
+ 
++    JOIN_METHODS = {
++        TokenType.NATURAL,
++        TokenType.ASOF,
++    }
++
+     JOIN_SIDES = {
+         TokenType.LEFT,
+         TokenType.RIGHT,
+@@ -477,7 +483,7 @@ class Parser(metaclass=_Parser):
+         exp.Where: lambda self: self._parse_where(),
+         exp.Window: lambda self: self._parse_named_window(),
+         exp.With: lambda self: self._parse_with(),
+-        "JOIN_TYPE": lambda self: self._parse_join_side_and_kind(),
++        "JOIN_TYPE": lambda self: self._parse_join_parts(),
+     }
+ 
+     STATEMENT_PARSERS = {
+@@ -2166,11 +2172,11 @@ class Parser(metaclass=_Parser):
+ 
+         return expression
+ 
+-    def _parse_join_side_and_kind(
++    def _parse_join_parts(
+         self,
+     ) -> t.Tuple[t.Optional[Token], t.Optional[Token], t.Optional[Token]]:
+         return (
+-            self._match(TokenType.NATURAL) and self._prev,
++            self._match_set(self.JOIN_METHODS) and self._prev,
+             self._match_set(self.JOIN_SIDES) and self._prev,
+             self._match_set(self.JOIN_KINDS) and self._prev,
+         )
+@@ -2180,14 +2186,14 @@ class Parser(metaclass=_Parser):
+             return self.expression(exp.Join, this=self._parse_table())
+ 
+         index = self._index
+-        natural, side, kind = self._parse_join_side_and_kind()
++        method, side, kind = self._parse_join_parts()
+         hint = self._prev.text if self._match_texts(self.JOIN_HINTS) else None
+         join = self._match(TokenType.JOIN)
+ 
+         if not skip_join_token and not join:
+             self._retreat(index)
+             kind = None
+-            natural = None
++            method = None
+             side = None
+ 
+         outer_apply = self._match_pair(TokenType.OUTER, TokenType.APPLY, False)
+@@ -2199,12 +2205,10 @@ class Parser(metaclass=_Parser):
+         if outer_apply:
+             side = Token(TokenType.LEFT, "LEFT")
+ 
+-        kwargs: t.Dict[
+-            str, t.Optional[exp.Expression] | bool | str | t.List[t.Optional[exp.Expression]]
+-        ] = {"this": self._parse_table()}
++        kwargs: t.Dict[str, t.Any] = {"this": self._parse_table()}
+ 
+-        if natural:
+-            kwargs["natural"] = True
++        if method:
++            kwargs["method"] = method.text
+         if side:
+             kwargs["side"] = side.text
+         if kind:
+@@ -2217,7 +2221,7 @@ class Parser(metaclass=_Parser):
+         elif self._match(TokenType.USING):
+             kwargs["using"] = self._parse_wrapped_id_vars()
+ 
+-        return self.expression(exp.Join, **kwargs)  # type: ignore
++        return self.expression(exp.Join, **kwargs)
+ 
+     def _parse_index(
+         self,
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index b00583f9..d33874b9 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -492,6 +492,7 @@ class Tokenizer(metaclass=_Tokenizer):
+         "ANY": TokenType.ANY,
+         "ASC": TokenType.ASC,
+         "AS": TokenType.ALIAS,
++        "ASOF": TokenType.ASOF,
+         "AUTOINCREMENT": TokenType.AUTO_INCREMENT,
+         "AUTO_INCREMENT": TokenType.AUTO_INCREMENT,
+         "BEGIN": TokenType.BEGIN,
+

@@ -1,0 +1,184 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 82eff64..7d78e56 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@ All notable changes in **salt-lint** are documented below.
+ ## [Unreleased]
+ ### Fixed
+ - Append the contents of the `CHANGELOG.md` file to the long description of the package instead of the duplicate `README.md` contents ([#234](https://github.com/warpnet/salt-lint/pull/234)).
++- Ignore Jinja specific rules in Jinja escaped blocks ([#236](https://github.com/warpnet/salt-lint/pull/236)).
+ 
+ ## [0.5.1] (2021-01-19)
+ ### Fixed
+diff --git a/saltlint/linter/rule.py b/saltlint/linter/rule.py
+index e006699..fc3fded 100644
+--- a/saltlint/linter/rule.py
++++ b/saltlint/linter/rule.py
+@@ -7,7 +7,7 @@ import six
+ 
+ from saltlint.utils import get_rule_skips_from_line, get_file_type
+ from saltlint.linter.match import Match
+-from saltlint.utils import LANGUAGE_SLS
++from saltlint.utils import LANGUAGE_SLS, LANGUAGE_JINJA
+ 
+ 
+ class Rule(object):
+@@ -89,6 +89,44 @@ class Rule(object):
+         return matches
+ 
+ 
++class JinjaRule(Rule):
++    languages = [LANGUAGE_SLS, LANGUAGE_JINJA]
++    tags = ['formatting', 'jinja']
++
++    # Regex for matching all escaped Jinja blocks in the text
++    jinja_escape_regex = re.compile(
++        r"{%[+-]?\s?raw\s?[+-]?%}.*{%[+-]?\s?endraw\s?[+-]?%}",
++        re.DOTALL | re.MULTILINE
++    )
++
++    def matchlines(self, file, text):
++        """
++        Match the text line by line but ignore all escaped Jinja blocks, e.g.
++        content between {% raw %} and {% endraw %}.
++
++        Returns a list of Match objects.
++        """
++        escaped_text = text
++        # Replace escaped Jinja blocks with the same number of empty lines
++        for match in self.jinja_escape_regex.finditer(text):
++            start = match.start()
++            end = match.end()
++            # Get the number of newlines in the escaped match
++            lines = text[start:end].splitlines()
++            num_of_lines = len(lines) - 1
++
++            # Replace escaped Jinja block in the escaped text by newlines to
++            # keep all the line numbers consistent
++            pre_text = escaped_text[:start]
++            post_text = escaped_text[end:]
++            newlines = '\n' * num_of_lines
++            escaped_text = pre_text + newlines + post_text
++
++        # Call the matchlines() on the parent class with the escaped text
++        matches = super(JinjaRule, self).matchlines(file, escaped_text)  # pylint: disable=R1725
++        return matches
++
++
+ class DeprecationRule(Rule):
+     id = None
+     state = None
+diff --git a/saltlint/rules/JinjaCommentHasSpacesRule.py b/saltlint/rules/JinjaCommentHasSpacesRule.py
+index cb93f30..ce61646 100644
+--- a/saltlint/rules/JinjaCommentHasSpacesRule.py
++++ b/saltlint/rules/JinjaCommentHasSpacesRule.py
+@@ -1,20 +1,17 @@
+ # -*- coding: utf-8 -*-
+ # Copyright (c) 2016 Will Thames and contributors
+ # Copyright (c) 2018 Ansible Project
+-# Modified work Copyright (c) 2020 Warpnet B.V.
++# Modified work Copyright (c) 2020-2021 Warpnet B.V.
+ 
+ import re
+-from saltlint.linter.rule import Rule
+-from saltlint.utils import LANGUAGE_JINJA, LANGUAGE_SLS
++from saltlint.linter.rule import JinjaRule
+ 
+ 
+-class JinjaCommentHasSpacesRule(Rule):
++class JinjaCommentHasSpacesRule(JinjaRule):
+     id = '209'
+     shortdesc = "Jinja comment should have spaces before and after: '{# comment #}'"
+     description = "Jinja comment should have spaces before and after: '{# comment #}'"
+     severity = 'LOW'
+-    languages = [LANGUAGE_SLS, LANGUAGE_JINJA]
+-    tags = ['formatting', 'jinja']
+     version_added = 'v0.0.5'
+ 
+     bracket_regex = re.compile(r"{#[^ \-\+]|{#[\-\+][^ ]|[^ \-\+]#}|[^ ][\-\+]#}")
+diff --git a/saltlint/rules/JinjaPillarGrainsGetFormatRule.py b/saltlint/rules/JinjaPillarGrainsGetFormatRule.py
+index accace3..8b53c5e 100644
+--- a/saltlint/rules/JinjaPillarGrainsGetFormatRule.py
++++ b/saltlint/rules/JinjaPillarGrainsGetFormatRule.py
+@@ -1,22 +1,19 @@
+ # -*- coding: utf-8 -*-
+ # Copyright (c) 2016 Will Thames and contributors
+ # Copyright (c) 2018 Ansible Project
+-# Modified work Copyright (c) 2020 Warpnet B.V.
++# Modified work Copyright (c) 2020-2021 Warpnet B.V.
+ 
+ import re
+-from saltlint.linter.rule import Rule
+-from saltlint.utils import LANGUAGE_JINJA, LANGUAGE_SLS
++from saltlint.linter.rule import JinjaRule
+ 
+ 
+-class JinjaPillarGrainsGetFormatRule(Rule):
++class JinjaPillarGrainsGetFormatRule(JinjaRule):
+     id = '211'
+     shortdesc = 'pillar.get or grains.get should be formatted differently'
+     description = "pillar.get and grains.get should always be formatted " \
+                   "like salt['pillar.get']('item'), grains['item1'] or " \
+                   " pillar.get('item')"
+     severity = 'HIGH'
+-    languages = [LANGUAGE_SLS, LANGUAGE_JINJA]
+-    tags = ['formatting', 'jinja']
+     version_added = 'v0.0.10'
+ 
+     bracket_regex = re.compile(r"{{( |\-|\+)?.(pillar|grains).get\[.+}}")
+diff --git a/saltlint/rules/JinjaStatementHasSpacesRule.py b/saltlint/rules/JinjaStatementHasSpacesRule.py
+index 0ef024e..696f591 100644
+--- a/saltlint/rules/JinjaStatementHasSpacesRule.py
++++ b/saltlint/rules/JinjaStatementHasSpacesRule.py
+@@ -1,20 +1,17 @@
+ # -*- coding: utf-8 -*-
+ # Copyright (c) 2016 Will Thames and contributors
+ # Copyright (c) 2018 Ansible Project
+-# Modified work Copyright (c) 2020 Warpnet B.V.
++# Modified work Copyright (c) 2020-2021 Warpnet B.V.
+ 
+ import re
+-from saltlint.linter.rule import Rule
+-from saltlint.utils import LANGUAGE_JINJA, LANGUAGE_SLS
++from saltlint.linter.rule import JinjaRule
+ 
+ 
+-class JinjaStatementHasSpacesRule(Rule):
++class JinjaStatementHasSpacesRule(JinjaRule):
+     id = '202'
+     shortdesc = "Jinja statement should have spaces before and after: '{% statement %}'"
+     description = "Jinja statement should have spaces before and after: '{% statement %}'"
+     severity = 'LOW'
+-    languages = [LANGUAGE_SLS, LANGUAGE_JINJA]
+-    tags = ['formatting', 'jinja']
+     version_added = 'v0.0.2'
+ 
+     bracket_regex = re.compile(r"{%[^ \-\+]|{%[\-\+][^ ]|[^ \-\+]%}|[^ ][\-\+]%}")
+diff --git a/saltlint/rules/JinjaVariableHasSpacesRule.py b/saltlint/rules/JinjaVariableHasSpacesRule.py
+index 946222b..03433b6 100644
+--- a/saltlint/rules/JinjaVariableHasSpacesRule.py
++++ b/saltlint/rules/JinjaVariableHasSpacesRule.py
+@@ -1,20 +1,17 @@
+ # -*- coding: utf-8 -*-
+ # Copyright (c) 2016 Will Thames and contributors
+ # Copyright (c) 2018 Ansible Project
+-# Modified work Copyright (c) 2020 Warpnet B.V.
++# Modified work Copyright (c) 2020-2021 Warpnet B.V.
+ 
+ import re
+-from saltlint.linter.rule import Rule
+-from saltlint.utils import LANGUAGE_JINJA, LANGUAGE_SLS
++from saltlint.linter.rule import JinjaRule
+ 
+ 
+-class JinjaVariableHasSpacesRule(Rule):
++class JinjaVariableHasSpacesRule(JinjaRule):
+     id = '206'
+     shortdesc = "Jinja variables should have spaces before and after: '{{ var_name }}'"
+     description = "Jinja variables should have spaces before and after: '{{ var_name }}'"
+     severity = 'LOW'
+-    languages = [LANGUAGE_SLS, LANGUAGE_JINJA]
+-    tags = ['formatting', 'jinja']
+     version_added = 'v0.0.1'
+ 
+     bracket_regex = re.compile(r"{{[^ \-\+\d]|{{[-\+][^ ]|[^ \-\+\d]}}|[^ {][-\+\d]}}")

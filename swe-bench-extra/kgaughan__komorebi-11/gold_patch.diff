@@ -1,0 +1,236 @@
+diff --git a/Makefile b/Makefile
+index c9ef6f9..89313eb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -26,4 +26,7 @@ lint:
+ 	poetry run flake8 --max-line-length=105 --ignore=E203 --per-file-ignores="komorebi/oembed.py:N802" komorebi
+ 	poetry run pylint komorebi
+ 
+-.PHONY: clean develop run build tidy lint
++test:
++	poetry run python -m unittest discover -bf tests
++
++.PHONY: clean develop run build tidy lint test
+diff --git a/komorebi/blog.py b/komorebi/blog.py
+index 75168d0..21bf6ab 100644
+--- a/komorebi/blog.py
++++ b/komorebi/blog.py
+@@ -16,7 +16,7 @@ from flask_httpauth import HTTPBasicAuth
+ import markdown
+ from passlib.apache import HtpasswdFile
+ 
+-from . import db, forms, oembed, time, xmlutils
++from . import db, forms, futz, oembed, time, xmlutils
+ 
+ blog = Blueprint("blog", __name__)
+ blog.add_app_template_filter(time.to_iso_date)
+@@ -51,14 +51,22 @@ def process_archive(records):
+         if record["year"] != year:
+             if last_month != 0:
+                 for i in range(1, 13 - last_month):
+-                    yield {"n": 0, "year": year, "month": last_month + i}
++                    yield {
++                        "n": 0,
++                        "year": year,
++                        "month": last_month + i,
++                    }
+             year = record["year"]
+             last_month = 0
+ 
+         # Pad out between months in a year.
+         if record["month"] - 1 != last_month:
+             for i in range(1, record["month"] - last_month):
+-                yield {"n": 0, "year": record["year"], "month": last_month + i}
++                yield {
++                    "n": 0,
++                    "year": record["year"],
++                    "month": last_month + i,
++                }
+ 
+         yield record
+         last_month = record["month"]
+@@ -161,13 +169,22 @@ def add_entry():
+ 
+         try:
+             entry_id = db.add_entry(
+-                link=form.link.data, title=title, via=form.via.data, note=form.note.data
++                link=form.link.data,
++                title=title,
++                via=form.via.data,
++                note=form.note.data,
+             )
+         except IntegrityError:
+             flash("That links already exists", "error")
+         else:
+             if data:
+-                db.add_oembed(entry_id, data["html"], data["width"], data["height"])
++                futzed, width, height = futz.futz(data["html"])
++                db.add_oembed(
++                    entry_id,
++                    futz.futz(data["html"]),
++                    width,
++                    height,
++                )
+             return redirect(url_for(".entry", entry_id=entry_id))
+     return render_template("entry_edit.html", form=form)
+ 
+@@ -212,3 +229,9 @@ def md(text):
+ @blog.app_template_filter()
+ def extract_hostname(url):
+     return parse.urlparse(url).netloc
++
++
++@blog.app_template_filter("futz")
++def futz_markup(markup):
++    futzed, _, _ = futz.futz(markup)
++    return futzed
+diff --git a/komorebi/futz.py b/komorebi/futz.py
+new file mode 100644
+index 0000000..87e0afd
+--- /dev/null
++++ b/komorebi/futz.py
+@@ -0,0 +1,131 @@
++"""
++Futz with OEmbed data to fix it up.
++"""
++
++import dataclasses
++import html
++from html.parser import HTMLParser
++import io
++
++# See: https://html.spec.whatwg.org/multipage/syntax.html#void-elements
++SELF_CLOSING = {
++    "area",
++    "base",
++    "br",
++    "col",
++    "command",
++    "embed",
++    "hr",
++    "img",
++    "input",
++    "keygen",
++    "link",
++    "meta",
++    "param",
++    "source",
++    "track",
++    "wbr",
++}
++
++
++@dataclasses.dataclass
++class Element:
++    tag: str
++    attrs: dict = dataclasses.field(default_factory=dict)
++    children: list = dataclasses.field(default_factory=list)
++
++    def __getitem__(self, i):
++        return self.children[i]
++
++    def __len__(self):
++        return len(self.children)
++
++    def __iter__(self):
++        return iter(self.children)
++
++    def serialize(self, dest=None) -> io.TextIOBase:
++        if dest is None:
++            dest = io.StringIO()
++        if self.tag is not None:
++            dest.write("<" + self.tag)
++            for key, value in self.attrs.items():
++                dest.write(" " + key)
++                if value is not None:
++                    dest.write('="' + html.escape(value, quote=True) + '"')
++            dest.write(">")
++        for child in self.children:
++            if isinstance(child, str):
++                dest.write(html.escape(child, quote=False))
++            elif isinstance(child, Element):
++                child.serialize(dest)
++        if self.tag is not None and self.tag not in SELF_CLOSING:
++            dest.write("</" + self.tag + ">")
++
++        return dest
++
++
++class Parser(HTMLParser):
++    """
++    Parses a HTML document into
++    """
++
++    def __init__(self):
++        super().__init__()
++        self.root = Element(tag=None)
++        self.stack = [self.root]
++
++    def close(self):
++        super().close()
++
++    @property
++    def top(self):
++        return self.stack[-1]
++
++    def handle_starttag(self, tag, attrs):
++        elem = Element(tag=tag, attrs=dict(attrs))
++        self.top.children.append(elem)
++        if tag not in SELF_CLOSING:
++            self.stack.append(elem)
++
++    def handle_startendtag(self, tag, attrs):
++        elem = Element(tag=tag, attrs=attrs)
++        self.top.children.append(elem)
++
++    def handle_endtag(self, tag):
++        if tag not in SELF_CLOSING:
++            while len(self.stack) > 1:
++                self.stack.pop()
++                if tag == self.top.tag:
++                    break
++
++    def handle_data(self, data):
++        if data != "":
++            self.top.children.append(data)
++
++
++def futz(markup):
++    """
++    Performs various kinds of cleanup on OEmbed data
++    """
++    parser = Parser()
++    parser.feed(markup)
++
++    width = 0
++    height = 0
++    for elem in parser.root:
++        if isinstance(elem, str) or elem.tag != "iframe":
++            continue
++        elem.attrs["loading"] = "lazy"
++        del elem.attrs["allowfullscreen"]
++        width = max(1, int(elem.attrs.get("width", "1")))
++        # Fix undersized YT embeds
++        if width < 560:
++            height = max(1, int(elem.attrs.get("height", "1")))
++            height = int(height * 560.0 / width)
++            elem.attrs["height"] = str(height)
++            width = 560
++            elem.attrs["width"] = "560"
++
++    with io.StringIO() as fo:
++        parser.root.serialize(fo)
++        return fo.getvalue(), width, height
+diff --git a/komorebi/templates/macros.html b/komorebi/templates/macros.html
+index ca118b9..6021dc1 100644
+--- a/komorebi/templates/macros.html
++++ b/komorebi/templates/macros.html
+@@ -21,7 +21,7 @@
+ 		</div>
+ 	</header>
+ 
+-	{% if entry.html %}<div class="oembed">{{ entry.html | safe}}</div>{% endif %}
++	{% if entry.html %}<div class="oembed">{{ entry.html | futz | safe }}</div>{% endif %}
+ 	{{ entry.note | markdown | safe }}
+ </article>
+ {%- endmacro %}

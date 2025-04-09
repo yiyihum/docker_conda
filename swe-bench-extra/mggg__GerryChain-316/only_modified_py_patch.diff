@@ -1,0 +1,94 @@
+diff --git a/gerrychain/constraints/validity.py b/gerrychain/constraints/validity.py
+index 4a1f663..cf6e352 100644
+--- a/gerrychain/constraints/validity.py
++++ b/gerrychain/constraints/validity.py
+@@ -1,5 +1,6 @@
+ from ..updaters import CountySplit
+ from .bounds import Bounds
++import numpy
+ 
+ 
+ class Validator:
+@@ -31,6 +32,10 @@ class Validator:
+         # check each constraint function and fail when a constraint test fails
+         for constraint in self.constraints:
+             is_valid = constraint(partition)
++            # Coerce NumPy booleans
++            if isinstance(is_valid, numpy.bool_):
++                is_valid = bool(is_valid)
++
+             if is_valid is False:
+                 return False
+             elif is_valid is True:
+diff --git a/gerrychain/partition/partition.py b/gerrychain/partition/partition.py
+index 83c4b9a..b893aee 100644
+--- a/gerrychain/partition/partition.py
++++ b/gerrychain/partition/partition.py
+@@ -6,6 +6,7 @@ from ..graph import Graph
+ from ..updaters import compute_edge_flows, flows_from_changes
+ from .assignment import get_assignment
+ from .subgraphs import SubgraphView
++from ..updaters import cut_edges
+ 
+ 
+ class Partition:
+@@ -15,7 +16,9 @@ class Partition:
+     aggregations and calculations that we want to optimize.
+     """
+ 
+-    default_updaters = {}
++    default_updaters = {
++        "cut_edges": cut_edges
++    }
+ 
+     def __init__(
+         self, graph=None, assignment=None, updaters=None, parent=None, flips=None
+@@ -46,6 +49,7 @@ class Partition:
+ 
+         if updaters is None:
+             updaters = dict()
++
+         self.updaters = self.default_updaters.copy()
+         self.updaters.update(updaters)
+ 
+diff --git a/gerrychain/tree.py b/gerrychain/tree.py
+index 60e0f2f..c56761a 100644
+--- a/gerrychain/tree.py
++++ b/gerrychain/tree.py
+@@ -202,20 +202,31 @@ def recursive_tree_part(
+     """
+     flips = {}
+     remaining_nodes = set(graph.nodes)
++    # We keep a running tally of deviation from ``epsilon`` at each partition
++    # and use it to tighten the population constraints on a per-partition
++    # basis such that every partition, including the last partition, has a
++    # population within +/-``epsilon`` of the target population.
++    # For instance, if district n's population exceeds the target by 2%
++    # with a +/-2% epsilon, then district n+1's population should be between
++    # 98% of the target population and the target population.
++    debt = 0
+ 
+     for part in parts[:-1]:
++        min_pop = max(pop_target * (1 - epsilon), pop_target * (1 - epsilon) - debt)
++        max_pop = min(pop_target * (1 + epsilon), pop_target * (1 + epsilon) - debt)
+         nodes = method(
+             graph.subgraph(remaining_nodes),
+             pop_col=pop_col,
+-            pop_target=pop_target,
+-            epsilon=epsilon,
++            pop_target=(min_pop + max_pop) / 2,
++            epsilon=(max_pop - min_pop) / (2 * pop_target),
+             node_repeats=node_repeats,
+         )
+ 
++        part_pop = 0
+         for node in nodes:
+             flips[node] = part
+-        # update pop_target?
+-
++            part_pop += graph.nodes[node][pop_col]
++        debt += part_pop - pop_target
+         remaining_nodes -= nodes
+ 
+     # All of the remaining nodes go in the last part
+

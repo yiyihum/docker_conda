@@ -1,0 +1,281 @@
+diff --git a/tern/analyze/common.py b/tern/analyze/common.py
+index df4889a..e5835c9 100644
+--- a/tern/analyze/common.py
++++ b/tern/analyze/common.py
+@@ -31,9 +31,11 @@ logger = logging.getLogger(constants.logger_name)
+ 
+ 
+ def get_shell_commands(shell_command_line):
+-    '''Given a shell command line, get a list of Command objects'''
++    '''Given a shell command line, get a list of Command objects and report on
++    branch statements'''
+     statements = general.split_command(shell_command_line)
+     command_list = []
++    branch_report = ''
+     # traverse the statements, pick out the loop and commands.
+     for stat in statements:
+         if 'command' in stat:
+@@ -43,7 +45,13 @@ def get_shell_commands(shell_command_line):
+             for st in loop_stat:
+                 if 'command' in st:
+                     command_list.append(Command(st['command']))
+-    return command_list
++        elif 'branch' in stat:
++            branch_report = branch_report + '\n'.join(stat['content']) + '\n\n'
++    if branch_report:
++        # add prefix
++        branch_report = '\nNon-deterministic branching statement: \n' + \
++                        branch_report
++    return command_list, branch_report
+ 
+ 
+ def load_from_cache(layer, redo=False):
+@@ -201,7 +209,7 @@ def get_os_release(base_layer):
+     return pretty_name.strip('"')
+ 
+ 
+-def collate_list_metadata(shell, listing):
++def collate_list_metadata(shell, listing, work_dir):
+     '''Given the shell and the listing for the package manager, collect
+     metadata that gets returned as a list'''
+     pkg_dict = {}
+@@ -212,7 +220,7 @@ def collate_list_metadata(shell, listing):
+         return pkg_dict, msgs, warnings
+     for item in command_lib.base_keys:
+         if item in listing.keys():
+-            items, msg = command_lib.get_pkg_attr_list(shell, listing[item])
++            items, msg = command_lib.get_pkg_attr_list(shell, listing[item], work_dir)
+             msgs = msgs + msg
+             pkg_dict.update({item: items})
+         else:
+@@ -290,7 +298,7 @@ def get_deb_package_licenses(deb_copyrights):
+     return deb_licenses
+ 
+ 
+-def add_base_packages(image_layer, binary, shell):
++def add_base_packages(image_layer, binary, shell, work_dir=None):
+     '''Given the image layer, the binary to invoke and shell:
+         1. get the listing from the base.yml
+         2. Invoke any commands against the base layer
+@@ -313,7 +321,7 @@ def add_base_packages(image_layer, binary, shell):
+         image_layer.origins.add_notice_to_origins(
+             origin_layer, Notice(snippet_msg, 'info'))
+         # get all the packages in the base layer
+-        pkg_dict, invoke_msg, warnings = collate_list_metadata(shell, listing)
++        pkg_dict, invoke_msg, warnings = collate_list_metadata(shell, listing, work_dir)
+ 
+         if listing.get("pkg_format") == "deb":
+             pkg_dict["pkg_licenses"] = get_deb_package_licenses(
+@@ -338,7 +346,7 @@ def add_base_packages(image_layer, binary, shell):
+                 listing_key=binary), 'error'))
+ 
+ 
+-def fill_package_metadata(pkg_obj, pkg_listing, shell):
++def fill_package_metadata(pkg_obj, pkg_listing, shell, work_dir):
+     '''Given a Package object and the Package listing from the command
+     library, fill in the attribute value returned from looking up the
+     data and methods of the package listing.
+@@ -351,7 +359,7 @@ def fill_package_metadata(pkg_obj, pkg_listing, shell):
+         pkg_listing, 'version')
+     if version_listing:
+         version_list, invoke_msg = command_lib.get_pkg_attr_list(
+-            shell, version_listing, package_name=pkg_obj.name)
++            shell, version_listing, work_dir, package_name=pkg_obj.name)
+         if version_list:
+             pkg_obj.version = version_list[0]
+         else:
+@@ -365,7 +373,7 @@ def fill_package_metadata(pkg_obj, pkg_listing, shell):
+         pkg_listing, 'license')
+     if license_listing:
+         license_list, invoke_msg = command_lib.get_pkg_attr_list(
+-            shell, license_listing, package_name=pkg_obj.name)
++            shell, license_listing, work_dir, package_name=pkg_obj.name)
+         if license_list:
+             pkg_obj.license = license_list[0]
+         else:
+@@ -379,7 +387,7 @@ def fill_package_metadata(pkg_obj, pkg_listing, shell):
+         pkg_listing, 'proj_url')
+     if url_listing:
+         url_list, invoke_msg = command_lib.get_pkg_attr_list(
+-            shell, url_listing, package_name=pkg_obj.name)
++            shell, url_listing, work_dir, package_name=pkg_obj.name)
+         if url_list:
+             pkg_obj.proj_url = url_list[0]
+         else:
+@@ -390,7 +398,7 @@ def fill_package_metadata(pkg_obj, pkg_listing, shell):
+             origin_str, Notice(listing_msg, 'warning'))
+ 
+ 
+-def get_package_dependencies(package_listing, package_name, shell):
++def get_package_dependencies(package_listing, package_name, shell, work_dir=None):
+     '''The package listing is the result of looking up the command name in the
+     command library. Given this listing, the package name and the shell
+     return a list of package dependency names'''
+@@ -398,7 +406,7 @@ def get_package_dependencies(package_listing, package_name, shell):
+         package_listing, 'deps')
+     if deps_listing:
+         deps_list, invoke_msg = command_lib.get_pkg_attr_list(
+-            shell, deps_listing, package_name=package_name)
++            shell, deps_listing, work_dir, package_name=package_name)
+         if deps_list:
+             return list(set(deps_list)), ''
+         return [], invoke_msg
+@@ -457,6 +465,7 @@ def consolidate_commands(command_list):
+         new_list.append(command_list.pop(0))
+ 
+     while command_list:
++        # match the first command with its following commands.
+         first = command_list.pop(0)
+         for _ in range(0, len(command_list)):
+             second = command_list.pop(0)
+@@ -465,8 +474,11 @@ def consolidate_commands(command_list):
+                 new_list.append(second)
+             else:
+                 if not first.merge(second):
+-                    command_list.append(first)
+-                new_list.append(first)
++                    # Unable to merge second, we should keep second command.
++                    command_list.append(second)
++        # after trying to merge with all following commands, add first command
++        # to the new_dict.
++        new_list.append(first)
+     return new_list
+ 
+ 
+@@ -478,7 +490,7 @@ def filter_install_commands(shell_command_line):
+         3. Return installed command objects, and messages for ignored commands
+         and unrecognized commands'''
+     report = ''
+-    command_list = get_shell_commands(shell_command_line)
++    command_list, branch_report = get_shell_commands(shell_command_line)
+     for command in command_list:
+         command_lib.set_command_attrs(command)
+     ignore_msgs, filter1 = remove_ignored_commands(command_list)
+@@ -487,11 +499,12 @@ def filter_install_commands(shell_command_line):
+         report = report + formats.ignored + ignore_msgs
+     if unrec_msgs:
+         report = report + formats.unrecognized + unrec_msgs
+-
++    if branch_report:
++        report = report + branch_report
+     return consolidate_commands(filter2), report
+ 
+ 
+-def add_snippet_packages(image_layer, command, pkg_listing, shell):
++def add_snippet_packages(image_layer, command, pkg_listing, shell, work_dir):
+     '''Given an image layer object, a command object, the package listing
+     and the shell used to invoke commands, add package metadata to the layer
+     object. We assume the filesystem is already mounted and ready
+@@ -524,7 +537,7 @@ def add_snippet_packages(image_layer, command, pkg_listing, shell):
+     # get package metadata for each package name
+     for pkg_name in unique_pkgs:
+         pkg = Package(pkg_name)
+-        fill_package_metadata(pkg, pkg_invoke, shell)
++        fill_package_metadata(pkg, pkg_invoke, shell, work_dir)
+         image_layer.add_package(pkg)
+ 
+ 
+diff --git a/tern/analyze/docker/analyze.py b/tern/analyze/docker/analyze.py
+index 6c2bccc..b112edb 100644
+--- a/tern/analyze/docker/analyze.py
++++ b/tern/analyze/docker/analyze.py
+@@ -106,7 +106,12 @@ def analyze_subsequent_layers(image_obj, shell, master_list, redo, dfobj=None,
+                               dfile_lock=False):
+     # get packages for subsequent layers
+     curr_layer = 1
++    work_dir = None
+     while curr_layer < len(image_obj.layers):  # pylint:disable=too-many-nested-blocks
++        # If workdir changes, update value accordingly
++        # so we can later execute base.yml commands from the workdir.
++        if image_obj.layers[curr_layer].get_layer_workdir() is not None:
++            work_dir = image_obj.layers[curr_layer].get_layer_workdir()
+         # if there is no shell, try to see if it exists in the current layer
+         if not shell:
+             shell = common.get_shell(image_obj.layers[curr_layer])
+@@ -126,7 +131,7 @@ def analyze_subsequent_layers(image_obj, shell, master_list, redo, dfobj=None,
+                 if isinstance(pkg_listing, str):
+                     try:
+                         common.add_base_packages(
+-                            image_obj.layers[curr_layer], pkg_listing, shell)
++                            image_obj.layers[curr_layer], pkg_listing, shell, work_dir)
+                     except KeyboardInterrupt:
+                         logger.critical(errors.keyboard_interrupt)
+                         abort_analysis()
+@@ -134,7 +139,7 @@ def analyze_subsequent_layers(image_obj, shell, master_list, redo, dfobj=None,
+                     try:
+                         common.add_snippet_packages(
+                             image_obj.layers[curr_layer], command, pkg_listing,
+-                            shell)
++                            shell, work_dir)
+                     except KeyboardInterrupt:
+                         logger.critical(errors.keyboard_interrupt)
+                         abort_analysis()
+diff --git a/tern/classes/image_layer.py b/tern/classes/image_layer.py
+index 46a74ad..484b802 100644
+--- a/tern/classes/image_layer.py
++++ b/tern/classes/image_layer.py
+@@ -327,3 +327,10 @@ class ImageLayer:
+                 file_data.set_checksum('sha256', attrs_tuple[2])
+                 file_data.extattrs = attrs_tuple[0]
+                 self.add_file(file_data)
++
++    def get_layer_workdir(self):
++        # If the layer is created by a WORKDIR command then return the workdir
++        match = re.search(r"\bWORKDIR\ (\/\w+)+\b", self.created_by)
++        if match:
++            return match.group().split()[1]
++        return None
+diff --git a/tern/command_lib/command_lib.py b/tern/command_lib/command_lib.py
+index c28c1b1..d3dc999 100644
+--- a/tern/command_lib/command_lib.py
++++ b/tern/command_lib/command_lib.py
+@@ -205,7 +205,7 @@ def invoke_in_rootfs(snippet_list, shell, package=''):
+         raise
+ 
+ 
+-def get_pkg_attr_list(shell, attr_dict, package_name='', chroot=True,
++def get_pkg_attr_list(shell, attr_dict, work_dir, package_name='', chroot=True,  # pylint:disable=too-many-arguments
+                       override=''):
+     '''The command library has package attributes listed like this:
+         {invoke: {1: {container: [command1, command2]},
+@@ -225,6 +225,9 @@ def get_pkg_attr_list(shell, attr_dict, package_name='', chroot=True,
+             if 'container' in attr_dict['invoke'][step].keys():
+                 snippet_list = attr_dict['invoke'][step]['container']
+                 result = ''
++                # If work_dir exist cd into it
++                if work_dir is not None:
++                    snippet_list.insert(0, 'cd ' + work_dir)
+                 # if we need to run in a chroot environment
+                 if chroot:
+                     try:
+diff --git a/tern/tools/verify_invoke.py b/tern/tools/verify_invoke.py
+index 95a6265..d016430 100644
+--- a/tern/tools/verify_invoke.py
++++ b/tern/tools/verify_invoke.py
+@@ -28,6 +28,15 @@ def look_up_lib(keys):
+     return subd
+ 
+ 
++def get_workdir(image_obj):
++    # get the workdir from the image config where the commands will be executed
++    config = image_obj.get_image_config(image_obj.get_image_manifest())
++    workdir = config['config']['WorkingDir']
++    if workdir == '':
++        return None
++    return workdir
++
++
+ if __name__ == '__main__':
+     parser = argparse.ArgumentParser(
+         description='''
+@@ -78,8 +87,9 @@ if __name__ == '__main__':
+             info_dict = look_up_lib(args.keys)
+         # try to invoke the commands
+         try:
++            work_dir = get_workdir(image_obj)
+             result = command_lib.get_pkg_attr_list(
+-                args.shell, info_dict, args.package)
++                args.shell, info_dict, work_dir, args.package)
+             print('Output list: ' + ' '.join(result[0]))
+             print('Error messages: ' + result[1])
+             print('Number of elements: ' + str(len(result[0])))

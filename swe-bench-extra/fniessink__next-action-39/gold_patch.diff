@@ -1,0 +1,145 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5353797..b08b416 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
+ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
+ 
++## [0.1.0] - 2018-05-13
++
++### Added
++
++- Take due date into account when determining the next action. Tasks due earlier take precedence. Closes #33.
++
+ ## [0.0.9] - 2018-05-13
+ 
+ ### Added
+diff --git a/README.md b/README.md
+index 3a98d93..beca8e8 100644
+--- a/README.md
++++ b/README.md
+@@ -7,7 +7,7 @@
+ [![Codacy Badge](https://api.codacy.com/project/badge/Grade/746457c462cd4d9fa23f05424fa932b4)](https://www.codacy.com/app/frank_10/next-action?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=fniessink/next-action&amp;utm_campaign=Badge_Grade)
+ [![Codacy Badge](https://api.codacy.com/project/badge/Coverage/746457c462cd4d9fa23f05424fa932b4)](https://www.codacy.com/app/frank_10/next-action?utm_source=github.com&utm_medium=referral&utm_content=fniessink/next-action&utm_campaign=Badge_Coverage)
+ 
+-Determine the next action to work on from a list of actions in a todo.txt file. *Next-action* is pre-alpha-stage at the moment, so its functionality is still rather limited.
++Determine the next action to work on from a list of actions in a todo.txt file. *Next-action* is alpha-stage at the moment, so its functionality is still rather limited.
+ 
+ Don't know what *Todo.txt* is? See <https://github.com/todotxt/todo.txt> for the *Todo.txt* specification.
+ 
+@@ -50,7 +50,7 @@ $ next-action
+ (A) Call mom @phone
+ ```
+ 
+-The next action is determined using priority. Creation date is considered after priority, with older tasks getting precedence over newer tasks.
++The next action is determined using priority. Due date is considered after priority, with tasks due earlier getting precedence over tasks due later. Creation date is considered after due date, with older tasks getting precedence over newer tasks.
+ 
+ Completed tasks (~~`x This is a completed task`~~) and tasks with a creation date in the future (`9999-01-01 Start preparing for five-digit years`) are not considered when determining the next action.
+ 
+@@ -97,7 +97,7 @@ $ next-action --all @store
+ 
+ Note again that completed tasks and task with a future creation date are never shown since they can't be a next action.
+ 
+-*Next-action* being still pre-alpha-stage, this is it for the moment. Stay tuned for more options.
++*Next-action* being still alpha-stage, this is it for the moment. Stay tuned for more options.
+ 
+ ## Develop
+ 
+diff --git a/next_action/__init__.py b/next_action/__init__.py
+index f916b9e..9aa288e 100644
+--- a/next_action/__init__.py
++++ b/next_action/__init__.py
+@@ -1,4 +1,4 @@
+ """ Main Next-action package. """
+ 
+ __title__ = "next-action"
+-__version__ = "0.0.9"
++__version__ = "0.1.0"
+diff --git a/next_action/pick_action.py b/next_action/pick_action.py
+index a950112..444f65a 100644
+--- a/next_action/pick_action.py
++++ b/next_action/pick_action.py
+@@ -8,7 +8,7 @@ from .todotxt import Task
+ 
+ def sort_key(task: Task) -> Tuple[str, datetime.date]:
+     """ Return the sort key for a task. """
+-    return (task.priority() or "ZZZ", task.creation_date() or datetime.date.max)
++    return (task.priority() or "ZZZ", task.due_date() or datetime.date.max, task.creation_date() or datetime.date.max)
+ 
+ 
+ def next_actions(tasks: Sequence[Task], contexts: Set[str] = None, projects: Set[str] = None) -> Sequence[Task]:
+@@ -19,5 +19,5 @@ def next_actions(tasks: Sequence[Task], contexts: Set[str] = None, projects: Set
+     tasks_in_context = filter(lambda task: contexts <= task.contexts() if contexts else True, actionable_tasks)
+     # Next, select the tasks that belong to at least one of the given projects, if any
+     tasks_in_project = filter(lambda task: projects & task.projects() if projects else True, tasks_in_context)
+-    # Finally, sort by priority and creation date
++    # Finally, sort by priority, due date and creation date
+     return sorted(tasks_in_project, key=sort_key)
+diff --git a/next_action/todotxt/task.py b/next_action/todotxt/task.py
+index 6ea1319..0ee3042 100644
+--- a/next_action/todotxt/task.py
++++ b/next_action/todotxt/task.py
+@@ -3,10 +3,14 @@
+ import datetime
+ import re
+ from typing import Optional, Set
++from typing.re import Match  # pylint: disable=import-error
+ 
+ 
+ class Task(object):
+     """ A task from a line in a todo.txt file. """
++
++    iso_date_reg_exp = r"(\d{4})-(\d{1,2})-(\d{1,2})"
++
+     def __init__(self, todo_txt: str) -> None:
+         self.text = todo_txt
+ 
+@@ -28,13 +32,13 @@ class Task(object):
+ 
+     def creation_date(self) -> Optional[datetime.date]:
+         """ Return the creation date of the task. """
+-        match = re.match(r"(?:\([A-Z]\) )?(\d{4})-(\d{1,2})-(\d{1,2})", self.text)
+-        if match:
+-            try:
+-                return datetime.date(*(int(group) for group in match.groups()))
+-            except ValueError:
+-                pass
+-        return None
++        match = re.match(r"(?:\([A-Z]\) )?{0}\b".format(self.iso_date_reg_exp), self.text)
++        return self.__create_date(match)
++
++    def due_date(self) -> Optional[datetime.date]:
++        """ Return the due date of the task. """
++        match = re.search(r"\bdue:{0}\b".format(self.iso_date_reg_exp), self.text)
++        return self.__create_date(match)
+ 
+     def is_completed(self) -> bool:
+         """ Return whether the task is completed or not. """
+@@ -48,3 +52,13 @@ class Task(object):
+     def __prefixed_items(self, prefix: str) -> Set[str]:
+         """ Return the prefixed items in the task. """
+         return {match.group(1) for match in re.finditer(" {0}([^ ]+)".format(prefix), self.text)}
++
++    @staticmethod
++    def __create_date(match: Match) -> Optional[datetime.date]:
++        """ Create a date from the match, if possible. """
++        if match:
++            try:
++                return datetime.date(*(int(group) for group in match.groups()))
++            except ValueError:
++                pass
++        return None
+diff --git a/setup.py b/setup.py
+index bdbb6cd..67b4fd0 100644
+--- a/setup.py
++++ b/setup.py
+@@ -24,7 +24,7 @@ and more.""",
+     },
+     test_suite="tests",
+     classifiers=[
+-        "Development Status :: 2 - Pre-Alpha",
++        "Development Status :: 3 - Alpha",
+         "Environment :: Console",
+         "Intended Audience :: End Users/Desktop",
+         "License :: OSI Approved :: Apache Software License",

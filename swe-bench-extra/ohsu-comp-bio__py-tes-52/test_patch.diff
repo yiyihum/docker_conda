@@ -1,0 +1,793 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index e01138f..b273973 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -29,7 +29,12 @@ jobs:
+         run: pip install .
+ 
+       - name: Lint with Flake8
+-        run: flake8 .
++        run: flake8 --max-line-length=120 .
+ 
+       - name: Run unit tests
+-        run: coverage run --source tes -m pytest -W ignore::DeprecationWarning
++        run: |
++          pytest \
++            --cov=tes/ \
++            --cov-branch \
++            --cov-report=term-missing \
++            --cov-fail-under=99
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/requirements.txt b/tests/requirements.txt
+index 45208ca..8f67ab0 100644
+--- a/tests/requirements.txt
++++ b/tests/requirements.txt
+@@ -2,4 +2,5 @@ coverage>=6.5.0
+ coveralls>=3.3.1
+ flake8>=5.0.4
+ pytest>=7.2.1
++pytest-cov>=4.0.0
+ requests_mock>=1.10.0
+diff --git a/tests/test_client.py b/tests/test_client.py
+index 08b2448..52ade42 100644
+--- a/tests/test_client.py
++++ b/tests/test_client.py
+@@ -53,7 +53,7 @@ class TestHTTPClient(unittest.TestCase):
+             )
+             self.cli.create_task(self.task)
+             self.assertEqual(m.last_request.text, self.task.as_json())
+-            self.assertEqual(m.last_request.timeout, self.cli.timeout)
++            self.assertAlmostEqual(m.last_request.timeout, self.cli.timeout)
+ 
+             m.post(
+                 "%s/ga4gh/tes/v1/tasks" % (self.mock_url),
+@@ -62,6 +62,9 @@ class TestHTTPClient(unittest.TestCase):
+             with self.assertRaises(requests.HTTPError):
+                 self.cli.create_task(self.task)
+ 
++            with self.assertRaises(TypeError):
++                self.cli.create_task('not_a_task_object')  # type: ignore
++
+     def test_get_task(self):
+         with requests_mock.Mocker() as m:
+             m.get(
+@@ -79,7 +82,7 @@ class TestHTTPClient(unittest.TestCase):
+                     self.mock_url, self.mock_id
+                 )
+             )
+-            self.assertEqual(m.last_request.timeout, self.cli.timeout)
++            self.assertAlmostEqual(m.last_request.timeout, self.cli.timeout)
+ 
+             m.get(
+                 requests_mock.ANY,
+@@ -102,7 +105,7 @@ class TestHTTPClient(unittest.TestCase):
+                 m.last_request.url,
+                 "%s/ga4gh/tes/v1/tasks?view=MINIMAL" % (self.mock_url)
+             )
+-            self.assertEqual(m.last_request.timeout, self.cli.timeout)
++            self.assertAlmostEqual(m.last_request.timeout, self.cli.timeout)
+ 
+             # empty response
+             m.get(
+@@ -137,7 +140,7 @@ class TestHTTPClient(unittest.TestCase):
+                 "%s/ga4gh/tes/v1/tasks/%s:cancel" % (
+                     self.mock_url, self.mock_id)
+             )
+-            self.assertEqual(m.last_request.timeout, self.cli.timeout)
++            self.assertAlmostEqual(m.last_request.timeout, self.cli.timeout)
+ 
+             m.post(
+                 "%s/ga4gh/tes/v1/tasks/%s:cancel" % (
+@@ -167,7 +170,7 @@ class TestHTTPClient(unittest.TestCase):
+                 m.last_request.url,
+                 "%s/ga4gh/tes/v1/service-info" % (self.mock_url)
+             )
+-            self.assertEqual(m.last_request.timeout, self.cli.timeout)
++            self.assertAlmostEqual(m.last_request.timeout, self.cli.timeout)
+ 
+             m.get(
+                 "%s/ga4gh/tes/v1/service-info" % (self.mock_url),
+@@ -203,104 +206,124 @@ class TestHTTPClient(unittest.TestCase):
+             )
+             self.cli.wait(self.mock_id, timeout=2)
+ 
++    def test_request_params(self):
++
++        cli = HTTPClient(url="http://fakehost:8000", timeout=5)
++        vals = cli._request_params()
++        self.assertAlmostEqual(vals["timeout"], 5)
++        self.assertEqual(vals["headers"]["Content-type"], "application/json")
++        self.assertRaises(KeyError, lambda: vals["headers"]["Authorization"])
++        self.assertRaises(KeyError, lambda: vals["auth"])
++        self.assertRaises(KeyError, lambda: vals["data"])
++        self.assertRaises(KeyError, lambda: vals["params"])
++
++        cli = HTTPClient(url="http://fakehost:8000", user="user",
++                         password="password", token="token")
++        vals = cli._request_params(data='{"json": "string"}',
++                                   params={"query_param": "value"})
++        self.assertAlmostEqual(vals["timeout"], 10)
++        self.assertEqual(vals["headers"]["Content-type"], "application/json")
++        self.assertEqual(vals["headers"]["Authorization"], "Bearer token")
++        self.assertEqual(vals["auth"], ("user", "password"))
++        self.assertEqual(vals["data"], '{"json": "string"}')
++        self.assertEqual(vals["params"], {"query_param": "value"})
++
++    def test_append_suffixes_to_url(self):
++        urls = ["http://example.com", "http://example.com/"]
++        urls_order = ["http://example1.com", "http://example2.com"]
++        suffixes = ["foo", "/foo", "foo/", "/foo/"]
++        no_suffixes = ["", "/", "//", "///"]
++        suffixes_order = ["1", "2"]
++
++        results = append_suffixes_to_url(urls=urls, suffixes=suffixes)
++        assert len(results) == len(urls) * len(suffixes)
++        assert all(url == 'http://example.com/foo' for url in results)
++
++        results = append_suffixes_to_url(urls=urls, suffixes=no_suffixes)
++        assert len(results) == len(urls) * len(no_suffixes)
++        assert all(url == 'http://example.com' for url in results)
++
++        results = append_suffixes_to_url(urls=urls_order, suffixes=suffixes_order)
++        assert len(results) == len(urls_order) * len(suffixes_order)
++        assert results[0] == 'http://example1.com/1'
++        assert results[1] == 'http://example1.com/2'
++        assert results[2] == 'http://example2.com/1'
++        assert results[3] == 'http://example2.com/2'
++
++    def test_send_request(self):
++        mock_url = "http://example.com"
++        mock_id = "mock_id"
++        mock_urls = append_suffixes_to_url([mock_url], ["/suffix", "/"])
++
++        # invalid method
++        with pytest.raises(ValueError):
++            send_request(paths=mock_urls, method="invalid")
++
++        # errors for all paths
++        with requests_mock.Mocker() as m:
++            m.get(requests_mock.ANY, exc=requests.exceptions.ConnectTimeout)
++            with pytest.raises(requests.HTTPError):
++                send_request(paths=mock_urls)
++
++        # error on first path, 200 on second
++        with requests_mock.Mocker() as m:
++            m.get(mock_urls[0], exc=requests.exceptions.ConnectTimeout)
++            m.get(mock_urls[1], status_code=200)
++            response = send_request(paths=mock_urls)
++            assert response.status_code == 200
++            assert m.last_request.url.rstrip('/') == f"{mock_url}"
++
++        # error on first path, 404 on second
++        with requests_mock.Mocker() as m:
++            m.get(mock_urls[0], exc=requests.exceptions.ConnectTimeout)
++            m.get(mock_urls[1], status_code=404)
++            with pytest.raises(requests.HTTPError):
++                send_request(paths=mock_urls)
++
++        # 404 on first path, error on second
++        with requests_mock.Mocker() as m:
++            m.get(mock_urls[0], status_code=404)
++            m.get(mock_urls[1], exc=requests.exceptions.ConnectTimeout)
++            with pytest.raises(requests.HTTPError):
++                send_request(paths=mock_urls)
++
++        # 404 on first path, 200 on second
++        with requests_mock.Mocker() as m:
++            m.get(mock_urls[0], status_code=404)
++            m.get(mock_urls[1], status_code=200)
++            response = send_request(paths=mock_urls)
++            assert response.status_code == 200
++            assert m.last_request.url.rstrip('/') == f"{mock_url}"
++
++        # POST 200
++        with requests_mock.Mocker() as m:
++            m.post(f"{mock_url}/suffix/foo/{mock_id}:bar", status_code=200)
++            paths = append_suffixes_to_url(mock_urls, ["/foo/{id}:bar"])
++            response = send_request(paths=paths, method="post", json={},
++                                    id=mock_id)
++            assert response.status_code == 200
++            assert m.last_request.url == f"{mock_url}/suffix/foo/{mock_id}:bar"
++
++        # GET 200
++        with requests_mock.Mocker() as m:
++            m.get(f"{mock_url}/suffix/foo/{mock_id}", status_code=200)
++            paths = append_suffixes_to_url(mock_urls, ["/foo/{id}"])
++            response = send_request(paths=paths, id=mock_id)
++            assert response.status_code == 200
++            assert m.last_request.url == f"{mock_url}/suffix/foo/{mock_id}"
++
++        # POST 404
++        with requests_mock.Mocker() as m:
++            m.post(requests_mock.ANY, status_code=404, json={})
++            paths = append_suffixes_to_url(mock_urls, ["/foo"])
++            with pytest.raises(requests.HTTPError):
++                send_request(paths=paths, method="post", json={})
++            assert m.last_request.url == f"{mock_url}/foo"
+ 
+-def test_append_suffixes_to_url():
+-    urls = ["http://example.com", "http://example.com/"]
+-    urls_order = ["http://example1.com", "http://example2.com"]
+-    suffixes = ["foo", "/foo", "foo/", "/foo/"]
+-    no_suffixes = ["", "/", "//", "///"]
+-    suffixes_order = ["1", "2"]
+-
+-    results = append_suffixes_to_url(urls=urls, suffixes=suffixes)
+-    assert len(results) == len(urls) * len(suffixes)
+-    assert all(url == 'http://example.com/foo' for url in results)
+-
+-    results = append_suffixes_to_url(urls=urls, suffixes=no_suffixes)
+-    assert len(results) == len(urls) * len(no_suffixes)
+-    assert all(url == 'http://example.com' for url in results)
+-
+-    results = append_suffixes_to_url(urls=urls_order, suffixes=suffixes_order)
+-    assert len(results) == len(urls_order) * len(suffixes_order)
+-    assert results[0] == 'http://example1.com/1'
+-    assert results[1] == 'http://example1.com/2'
+-    assert results[2] == 'http://example2.com/1'
+-    assert results[3] == 'http://example2.com/2'
+-
+-
+-def test_send_request():
+-    mock_url = "http://example.com"
+-    mock_id = "mock_id"
+-    mock_urls = append_suffixes_to_url([mock_url], ["/suffix", "/"])
+-
+-    # invalid method
+-    with pytest.raises(ValueError):
+-        send_request(paths=mock_urls, method="invalid")
+-
+-    # errors for all paths
+-    with requests_mock.Mocker() as m:
+-        m.get(requests_mock.ANY, exc=requests.exceptions.ConnectTimeout)
+-        with pytest.raises(requests.HTTPError):
+-            send_request(paths=mock_urls)
+-
+-    # error on first path, 200 on second
+-    with requests_mock.Mocker() as m:
+-        m.get(mock_urls[0], exc=requests.exceptions.ConnectTimeout)
+-        m.get(mock_urls[1], status_code=200)
+-        response = send_request(paths=mock_urls)
+-        assert response.status_code == 200
+-        assert m.last_request.url.rstrip('/') == f"{mock_url}"
+-
+-    # error on first path, 404 on second
+-    with requests_mock.Mocker() as m:
+-        m.get(mock_urls[0], exc=requests.exceptions.ConnectTimeout)
+-        m.get(mock_urls[1], status_code=404)
+-        with pytest.raises(requests.HTTPError):
+-            send_request(paths=mock_urls)
+-
+-    # 404 on first path, error on second
+-    with requests_mock.Mocker() as m:
+-        m.get(mock_urls[0], status_code=404)
+-        m.get(mock_urls[1], exc=requests.exceptions.ConnectTimeout)
+-        with pytest.raises(requests.HTTPError):
+-            send_request(paths=mock_urls)
+-
+-    # 404 on first path, 200 on second
+-    with requests_mock.Mocker() as m:
+-        m.get(mock_urls[0], status_code=404)
+-        m.get(mock_urls[1], status_code=200)
+-        response = send_request(paths=mock_urls)
+-        assert response.status_code == 200
+-        assert m.last_request.url.rstrip('/') == f"{mock_url}"
+-
+-    # POST 200
+-    with requests_mock.Mocker() as m:
+-        m.post(f"{mock_url}/suffix/foo/{mock_id}:bar", status_code=200)
+-        paths = append_suffixes_to_url(mock_urls, ["/foo/{id}:bar"])
+-        response = send_request(paths=paths, method="post", json={},
+-                                id=mock_id)
+-        assert response.status_code == 200
+-        assert m.last_request.url == f"{mock_url}/suffix/foo/{mock_id}:bar"
+-
+-    # GET 200
+-    with requests_mock.Mocker() as m:
+-        m.get(f"{mock_url}/suffix/foo/{mock_id}", status_code=200)
+-        paths = append_suffixes_to_url(mock_urls, ["/foo/{id}"])
+-        response = send_request(paths=paths, id=mock_id)
+-        assert response.status_code == 200
+-        assert m.last_request.url == f"{mock_url}/suffix/foo/{mock_id}"
+-
+-    # POST 404
+-    with requests_mock.Mocker() as m:
+-        m.post(requests_mock.ANY, status_code=404, json={})
+-        paths = append_suffixes_to_url(mock_urls, ["/foo"])
+-        with pytest.raises(requests.HTTPError):
+-            send_request(paths=paths, method="post", json={})
+-        assert m.last_request.url == f"{mock_url}/foo"
+-
+-    # GET 500
+-    with requests_mock.Mocker() as m:
+-        m.get(f"{mock_url}/suffix/foo", status_code=500)
+-        paths = append_suffixes_to_url(mock_urls, ["/foo"])
+-        with pytest.raises(requests.HTTPError):
+-            send_request(paths=paths)
+-        assert m.last_request.url == f"{mock_url}/suffix/foo"
++        # GET 500
++        with requests_mock.Mocker() as m:
++            m.get(f"{mock_url}/suffix/foo", status_code=500)
++            paths = append_suffixes_to_url(mock_urls, ["/foo"])
++            with pytest.raises(requests.HTTPError):
++                send_request(paths=paths)
++            assert m.last_request.url == f"{mock_url}/suffix/foo"
+diff --git a/tests/test_models.py b/tests/test_models.py
+index 2c8dd95..c1cebd7 100644
+--- a/tests/test_models.py
++++ b/tests/test_models.py
+@@ -1,67 +1,250 @@
+ import json
+ import unittest
+ 
+-from tes.models import Task, Executor, Input, Output, strconv
++from copy import deepcopy
+ 
++from tes.models import (
++    Executor,
++    ExecutorLog,
++    Input,
++    Output,
++    OutputFileLog,
++    Resources,
++    Task,
++    TaskLog,
++    datetime_json_handler,
++    int64conv,
++    list_of,
++    strconv,
++    timestampconv,
++    _drop_none,
++)
+ 
+-class TestModels(unittest.TestCase):
+-    task = Task(
+-        executors=[
+-            Executor(
+-                image="alpine",
+-                command=["echo", "hello"]
+-            )
+-        ]
+-    )
+-
+-    expected = {
+-        "executors": [
+-            {
+-                "image": "alpine",
+-                "command": ["echo", "hello"]
+-            }
+-        ]
+-    }
+ 
+-    def test_strconv(self):
+-        self.assertTrue(strconv("foo"), u"foo")
+-        self.assertTrue(strconv(["foo", "bar"]), [u"foo", u"bar"])
+-        self.assertTrue(strconv(("foo", "bar")), (u"foo", u"bar"))
+-        self.assertTrue(strconv(1), 1)
++task_valid = Task(
++    executors=[
++        Executor(
++            image="alpine",
++            command=["echo", "hello"]
++        )
++    ]
++)
++
++
++datetm = "2018-01-01T00:00:00Z"
++task_valid_full = Task(
++    id="foo",
++    state="COMPLETE",
++    name="some_task",
++    description="some description",
++    resources=Resources(
++        cpu_cores=1,
++        ram_gb=2,
++        disk_gb=3,
++        preemptible=True,
++        zones=["us-east-1", "us-west-1"],
++    ),
++    executors=[
++        Executor(
++            image="alpine",
++            command=["echo", "hello"],
++            workdir="/abs/path",
++            stdin="/abs/path",
++            stdout="/abs/path",
++            stderr="/abs/path",
++            env={"VAR": "value"}
++        ),
++        Executor(
++            image="alpine",
++            command=["echo", "worls"]
++        )
++    ],
++    inputs=[
++        Input(
++            url="s3:/some/path",
++            path="/abs/path"
++        ),
++        Input(
++            content="foo",
++            path="/abs/path"
++        )
++    ],
++    outputs=[
++        Output(
++            url="s3:/some/path",
++            path="/abs/path"
++        )
++    ],
++    volumes=[],
++    tags={"key": "value", "key2": "value2"},
++    logs=[
++        TaskLog(
++            start_time=datetm,  # type: ignore
++            end_time=datetm,  # type: ignore
++            metadata={"key": "value", "key2": "value2"},
++            logs=[
++                ExecutorLog(
++                    start_time=datetm,  # type: ignore
++                    end_time=datetm,  # type: ignore
++                    exit_code=0,
++                    stdout="hello",
++                    stderr="world"
++                )
++            ],
++            outputs=[
++                OutputFileLog(
++                    url="s3:/some/path",
++                    path="/abs/path",
++                    size_bytes=int64conv(123)  # type: ignore
++                )
++            ],
++            system_logs=[
++                "some system log message",
++                "some other system log message"
++            ]
++        )
++    ],
++    creation_time=datetm  # type: ignore
++)
+ 
++task_invalid = Task(
++    executors=[
++        Executor(  # type: ignore
++            image="alpine",
++            command=["echo", "hello"],
++            stdin="relative/path",
++            stdout="relative/path",
++            stderr="relative/path",
++            env={1: 2}
++        )
++    ],
++    inputs=[
++        Input(
++            url="s3:/some/path",
++            content="foo"
++        ),
++        Input(
++            path="relative/path"
++        )
++    ],
++    outputs=[
++        Output(),
++        Output(
++            url="s3:/some/path",
++            path="relative/path"
++        )
++    ],
++    volumes=['/abs/path', 'relative/path'],
++    tags={1: 2}
++)
++
++expected = {
++    "executors": [
++        {
++            "image": "alpine",
++            "command": ["echo", "hello"]
++        }
++    ]
++}
++
++
++class TestModels(unittest.TestCase):
++
++    def test_list_of(self):
++        validator = list_of(str)
++        self.assertEqual(list_of(str), validator)
++        self.assertEqual(
++            repr(validator),
++            "<instance_of validator for type <class 'str'>>"
++        )
+         with self.assertRaises(TypeError):
+             Input(
+-                url="s3:/some/path", path="/opt/foo", content=123
++                url="s3:/some/path",
++                path="/opt/foo",
++                content=123  # type: ignore
+             )
+-
+-    def test_list_of(self):
+         with self.assertRaises(TypeError):
+             Task(
+                 inputs=[
+                     Input(
+                         url="s3:/some/path", path="/opt/foo"
+                     ),
+-                    "foo"
++                    "foo"  # type: ignore
+                 ]
+             )
+ 
++    def test_drop_none(self):
++        self.assertEqual(_drop_none({}), {})
++        self.assertEqual(_drop_none({"foo": None}), {})
++        self.assertEqual(_drop_none({"foo": 1}), {"foo": 1})
++        self.assertEqual(_drop_none({"foo": None, "bar": 1}), {"bar": 1})
++        self.assertEqual(_drop_none({"foo": [1, None, 2]}), {"foo": [1, 2]})
++        self.assertEqual(_drop_none({"foo": {"bar": None}}), {"foo": {}})
++        self.assertEqual(
++            _drop_none({"foo": {"bar": None}, "baz": 1}),
++            {"foo": {}, "baz": 1}
++        )
++
++    def test_strconv(self):
++        self.assertTrue(strconv("foo"), u"foo")
++        self.assertTrue(strconv(["foo", "bar"]), [u"foo", u"bar"])
++        self.assertTrue(strconv(("foo", "bar")), (u"foo", u"bar"))
++        self.assertTrue(strconv(1), 1)
++        self.assertTrue(strconv([1]), [1])
++
++    def test_int64conv(self):
++        self.assertEqual(int64conv("1"), 1)
++        self.assertEqual(int64conv("-1"), -1)
++        self.assertIsNone(int64conv(None))
++
++    def test_timestampconv(self):
++        tm = timestampconv("2018-02-01T00:00:00Z")
++        self.assertIsNotNone(tm)
++        assert tm is not None
++        self.assertAlmostEqual(tm.year, 2018)
++        self.assertAlmostEqual(tm.month, 2)
++        self.assertAlmostEqual(tm.day, 1)
++        self.assertAlmostEqual(tm.hour, 0)
++        self.assertAlmostEqual(tm.timestamp(), 1517443200.0)
++        self.assertIsNone(timestampconv(None))
++
++    def test_datetime_json_handler(self):
++        tm = timestampconv("2018-02-01T00:00:00Z")
++        tm_iso = '2018-02-01T00:00:00+00:00'
++        assert tm is not None
++        self.assertEqual(datetime_json_handler(tm), tm_iso)
++        with self.assertRaises(TypeError):
++            datetime_json_handler(None)
++        with self.assertRaises(TypeError):
++            datetime_json_handler("abc")
++        with self.assertRaises(TypeError):
++            datetime_json_handler(2001)
++        with self.assertRaises(TypeError):
++            datetime_json_handler(tm_iso)
++
+     def test_as_dict(self):
+-        self.assertEqual(self.task.as_dict(), self.expected)
++        task = deepcopy(task_valid)
++        self.assertEqual(task.as_dict(), expected)
++        with self.assertRaises(KeyError):
++            task.as_dict()['inputs']
++        self.assertIsNone(task.as_dict(drop_empty=False)['inputs'])
+ 
+     def test_as_json(self):
+-        self.assertEqual(self.task.as_json(), json.dumps(self.expected))
++        task = deepcopy(task_valid)
++        self.assertEqual(task.as_json(), json.dumps(expected))
+ 
+     def test_is_valid(self):
+-        self.assertTrue(self.task.is_valid()[0])
++        task = deepcopy(task_valid)
++        self.assertTrue(task.is_valid()[0])
+ 
+-        task2 = self.task
+-        task2.inputs = [Input(path="/opt/foo")]
+-        self.assertFalse(task2.is_valid()[0])
++        task = deepcopy(task_valid_full)
++        self.assertTrue(task.is_valid()[0])
+ 
+-        task3 = self.task
+-        task3.outputs = [
+-            Output(
+-                url="s3:/some/path", path="foo"
+-            )
+-        ]
+-        self.assertFalse(task3.is_valid()[0])
++        task = deepcopy(task_invalid)
++        task.executors[0].image = None  # type: ignore
++        task.executors[0].command = None  # type: ignore
++        self.assertFalse(task.is_valid()[0])
++
++        task = deepcopy(task_invalid)
++        task.executors = None
++        self.assertFalse(task.is_valid()[0])
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index c07dd09..b7fe5ed 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -5,7 +5,23 @@ import json
+ import unittest
+ 
+ from tes.utils import camel_to_snake, unmarshal, UnmarshalError
+-from tes.models import Input, Task, CreateTaskResponse
++from tes.models import (
++    CancelTaskRequest,
++    CancelTaskResponse,
++    CreateTaskResponse,
++    Executor,
++    ExecutorLog,
++    GetTaskRequest,
++    Input,
++    ListTasksRequest,
++    ListTasksResponse,
++    Output,
++    OutputFileLog,
++    Resources,
++    ServiceInfo,
++    Task,
++    TaskLog,
++)
+ 
+ 
+ class TestUtils(unittest.TestCase):
+@@ -19,7 +35,110 @@ class TestUtils(unittest.TestCase):
+         self.assertEqual(camel_to_snake(case3), "foo_bar")
+ 
+     def test_unmarshal(self):
+-        test_invalid_dict = {"adfasd": "bar"}
++
++        # test unmarshalling with no or minimal contents
++        try:
++            unmarshal(
++                CancelTaskRequest(id="foo").as_json(),
++                CancelTaskRequest
++            )
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(CancelTaskResponse().as_json(), CancelTaskResponse)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(
++                CreateTaskResponse(id="foo").as_json(),
++                CreateTaskResponse
++            )
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(Executor(
++                image="alpine", command=["echo", "hello"]).as_json(),
++                Executor
++            )
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(ExecutorLog().as_json(), ExecutorLog)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(
++                GetTaskRequest(id="foo", view="BASIC").as_json(),
++                GetTaskRequest
++            )
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(Input().as_json(), Input)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(ListTasksRequest().as_json(), ListTasksRequest)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(ListTasksResponse().as_json(), ListTasksResponse)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(Output().as_json(), Output)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(OutputFileLog().as_json(), OutputFileLog)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(Resources().as_json(), Resources)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(ServiceInfo().as_json(), ServiceInfo)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(Task().as_json(), Task)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        try:
++            unmarshal(TaskLog().as_json(), TaskLog)
++        except Exception:
++            self.fail("Raised ExceptionType unexpectedly!")
++
++        # test special cases
++        self.assertIsNone(unmarshal(None, Input))
++        with self.assertRaises(TypeError):
++            unmarshal([], Input)
++        with self.assertRaises(TypeError):
++            unmarshal(1, Input)
++        with self.assertRaises(TypeError):
++            unmarshal(1.3, Input)
++        with self.assertRaises(TypeError):
++            unmarshal(True, Input)
++        with self.assertRaises(TypeError):
++            unmarshal('foo', Input)
++
++        # test with some interesting contents
++        test_invalid_dict = {"foo": "bar"}
+         test_invalid_str = json.dumps(test_invalid_dict)
+         with self.assertRaises(UnmarshalError):
+             unmarshal(test_invalid_dict, CreateTaskResponse)
+@@ -33,7 +152,7 @@ class TestUtils(unittest.TestCase):
+         }
+         test_simple_str = json.dumps(test_simple_dict)
+         o1 = unmarshal(test_simple_dict, Input)
+-        o2 = unmarshal(test_simple_str, Input)
++        o2 = unmarshal(test_simple_str, Input, convert_camel_case=False)
+         self.assertTrue(isinstance(o1, Input))
+         self.assertTrue(isinstance(o2, Input))
+         self.assertEqual(o1, o2)
+@@ -92,6 +211,13 @@ class TestUtils(unittest.TestCase):
+                     ]
+                 }
+             ],
++            "resources": {
++                "cpu_cores": 1,
++                "ram_gb": 2,
++                "disk_gb": 3,
++                "preemptible": True,
++                "zones": ["us-east-1", "us-west-1"]
++            },
+             "creation_time": "2017-10-09T17:00:00.0Z"
+         }
+ 
+@@ -100,7 +226,7 @@ class TestUtils(unittest.TestCase):
+         o2 = unmarshal(test_complex_str, Task)
+         self.assertTrue(isinstance(o1, Task))
+         self.assertTrue(isinstance(o2, Task))
+-        self.assertEqual(o1, o2)
++        self.assertAlmostEqual(o1, o2)
+         expected = test_complex_dict.copy()
+ 
+         # handle expected conversions
+@@ -122,7 +248,6 @@ class TestUtils(unittest.TestCase):
+         expected["creation_time"] = dateutil.parser.parse(
+             expected["creation_time"]
+         )
+-
+         self.assertEqual(o1.as_dict(), expected)
+ 
+     def test_unmarshal_types(self):

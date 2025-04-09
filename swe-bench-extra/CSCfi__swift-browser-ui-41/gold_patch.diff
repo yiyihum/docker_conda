@@ -1,0 +1,151 @@
+diff --git a/docs/source/_static/api.yml b/docs/source/_static/api.yml
+index a46ecf9b..720d80bf 100644
+--- a/docs/source/_static/api.yml
++++ b/docs/source/_static/api.yml
+@@ -156,11 +156,34 @@ paths:
+     get:
+       tags:
+         - API Endpoints
+-      summary: Get container or object(s) metadata.
++      summary: Get container metadata.
+       parameters:
+       - name: container
+         in: query
+-        description: The container the metadata of which is to be queried, or the container in which the queried objects are.
++        description: The container the metadata of which is to be queried.
++        schema:
++          type: string
++          example: test-container-1
++      responses:
++        200:
++          description: OK
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/Meta'
++        403:
++          description: Unauthorized
++        404:
++          description: Not Found
++  /bucket/object/meta:
++    get:
++      tags:
++        - API Endpoints
++      summary: Get object(s) metadata.
++      parameters:
++      - name: container
++        in: query
++        description: The container in which the queried objects are.
+         schema:
+           type: string
+           example: test-container-1
+@@ -181,7 +204,6 @@ paths:
+           description: Unauthorized
+         404:
+           description: Not Found
+-
+ components:
+   schemas:
+ 
+diff --git a/swift_browser_ui/api.py b/swift_browser_ui/api.py
+index 6490830a..c4b2b00e 100644
+--- a/swift_browser_ui/api.py
++++ b/swift_browser_ui/api.py
+@@ -263,7 +263,46 @@ async def get_object_metadata(conn, meta_cont, meta_obj):
+         raise aiohttp.web.HTTPNotFound()
+ 
+ 
+-async def get_metadata(request):
++async def get_metadata_bucket(request):
++    """Get metadata for a container."""
++    session = api_check(request)
++    request.app['Log'].info(
++        'API cal for project listing from {0}, sess: {1} :: {2}'.format(
++            request.remote,
++            session,
++            time.ctime(),
++        )
++    )
++
++    # Get required variables from query string
++    meta_cont = (
++        request.query['container']
++        if 'container' in request.query.keys()
++        else None
++    )
++    conn = request.app['Creds'][session]['ST_conn']
++    # Get container listing if no object list was specified
++    ret = conn.stat(meta_cont)
++
++    if not ret['success']:
++        raise aiohttp.web.HTTPNotFound()
++
++    # Strip any unnecessary information from the metadata headers
++    ret['headers'] = dict(filter(
++        lambda i: "x-container-meta" in i[0],
++        ret['headers'].items()
++    ))
++    ret['headers'] = {
++        k.replace("x-container-meta-", ""): v
++        for k, v in ret['headers'].items()
++    }
++
++    return aiohttp.web.json_response(
++        [ret['container'], ret['headers']]
++    )
++
++
++async def get_metadata_object(request):
+     """Get metadata for a container or for an object."""
+     session = api_check(request)
+     request.app['Log'].info(
+@@ -295,26 +334,6 @@ async def get_metadata(request):
+ 
+     conn = request.app['Creds'][session]['ST_conn']
+ 
+-    # Get container listing if no object list was specified
+-    if not meta_obj:
+-        ret = conn.stat(meta_cont)
+-
+-        if not ret['success']:
+-            raise aiohttp.web.HTTPNotFound()
+-
+-        # Strip any unnecessary information from the metadata headers
+-        ret['headers'] = dict(filter(
+-            lambda i: "x-container-meta" in i[0],
+-            ret['headers'].items()
+-        ))
+-        ret['headers'] = {
+-            k.replace("x-container-meta-", ""): v
+-            for k, v in ret['headers'].items()
+-        }
+-
+-        return aiohttp.web.json_response(
+-            [ret['container'], ret['headers']]
+-        )
+     # Otherwise get object listing (object listing won't need to throw an
+     # exception here incase of a failure – the function handles that)
+     return aiohttp.web.json_response(
+diff --git a/swift_browser_ui/server.py b/swift_browser_ui/server.py
+index fc6c9af6..481324fd 100644
+--- a/swift_browser_ui/server.py
++++ b/swift_browser_ui/server.py
+@@ -19,7 +19,7 @@ from .login import sso_query_end
+ from .login import token_rescope
+ from .api import list_buckets, list_objects, download_object, os_list_projects
+ from .api import get_os_user, get_os_active_project
+-from .api import get_metadata, get_project_metadata
++from .api import get_metadata_object, get_metadata_bucket, get_project_metadata
+ from .api import swift_list_shared_objects
+ from .settings import setd
+ from .middlewares import error_middleware
+@@ -116,7 +116,8 @@ async def servinit():
+         aiohttp.web.get('/api/username', get_os_user),
+         aiohttp.web.get('/api/projects', os_list_projects),
+         aiohttp.web.get('/api/project/active', get_os_active_project),
+-        aiohttp.web.get('/api/bucket/meta', get_metadata),
++        aiohttp.web.get('/api/bucket/meta', get_metadata_bucket),
++        aiohttp.web.get('/api/bucket/object/meta', get_metadata_object),
+         aiohttp.web.get('/api/project/meta', get_project_metadata),
+     ])
+ 

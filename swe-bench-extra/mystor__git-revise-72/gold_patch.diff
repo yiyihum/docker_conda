@@ -1,0 +1,137 @@
+diff --git a/gitrevise/merge.py b/gitrevise/merge.py
+index 9e0348d..bfe6b09 100644
+--- a/gitrevise/merge.py
++++ b/gitrevise/merge.py
+@@ -204,7 +204,7 @@ def merge_blobs(
+         print(f"Conflict applying '{labels[2]}'")
+         print(f"  Path: '{path}'")
+         if input("  Edit conflicted file? (Y/n) ").lower() == "n":
+-            raise MergeConflict("user aborted")
++            raise MergeConflict("user aborted")  # pylint: disable=W0707
+ 
+         # Open the editor on the conflicted file. We ensure the relative path
+         # matches the path of the original file for a better editor experience.
+@@ -222,6 +222,6 @@ def merge_blobs(
+ 
+         # Was the merge successful?
+         if input("  Merge successful? (y/N) ").lower() != "y":
+-            raise MergeConflict("user aborted")
++            raise MergeConflict("user aborted")  # pylint: disable=W0707
+ 
+     return Blob(current.repo, merged)
+diff --git a/gitrevise/todo.py b/gitrevise/todo.py
+index 511010b..40f1b61 100644
+--- a/gitrevise/todo.py
++++ b/gitrevise/todo.py
+@@ -1,8 +1,8 @@
+ import re
+ from enum import Enum
+-from typing import List, Optional
++from typing import Dict, List, Optional, Set
+ 
+-from .odb import Commit, Repository
++from .odb import Commit, Oid, Repository
+ from .utils import run_editor, run_sequence_editor, edit_commit_message, cut_commit
+ 
+ 
+@@ -104,8 +104,24 @@ def validate_todos(old: List[Step], new: List[Step]):
+             raise ValueError("'index' actions follow all non-index todo items")
+ 
+ 
++class CyclicFixupError(Exception):
++    pass
++
++
++def count_fixup_commits(
++    fixups: Dict[Oid, List[Oid]], visited: Set[Oid], node: Oid
++) -> int:
++    if node in visited:
++        raise CyclicFixupError(f"fixups would create cycle in {node}")
++    visited.add(node)
++    return 1 + sum(
++        count_fixup_commits(fixups, visited, fixup) for fixup in fixups.get(node, [])
++    )
++
++
+ def autosquash_todos(todos: List[Step]) -> List[Step]:
+     new_todos = todos[:]
++    fixups: Dict[Oid, List[Oid]] = {}
+ 
+     for step in todos:
+         # Check if this is a fixup! or squash! commit, and ignore it otherwise.
+@@ -125,11 +141,19 @@ def autosquash_todos(todos: List[Step]) -> List[Step]:
+                 needle
+             ) or target.commit.oid.hex().startswith(needle):
+                 found = idx
++                if target.commit.oid not in fixups:
++                    fixups[target.commit.oid] = []
++                fixups[target.commit.oid] += [step.commit.oid]
++                number_of_transitive_fixup_commits = (
++                    count_fixup_commits(fixups, set(), target.commit.oid) - 1
++                )
+                 break
+ 
+         if found is not None:
+             # Insert a new `fixup` or `squash` step in the correct place.
+-            new_todos.insert(found + 1, Step(kind, step.commit))
++            new_todos.insert(
++                found + number_of_transitive_fixup_commits, Step(kind, step.commit)
++            )
+             # Remove the existing step.
+             new_todos.remove(step)
+ 
+diff --git a/gitrevise/tui.py b/gitrevise/tui.py
+index feaa94b..7942854 100644
+--- a/gitrevise/tui.py
++++ b/gitrevise/tui.py
+@@ -12,7 +12,13 @@ from .utils import (
+     cut_commit,
+     local_commits,
+ )
+-from .todo import apply_todos, build_todos, edit_todos, autosquash_todos
++from .todo import (
++    CyclicFixupError,
++    apply_todos,
++    build_todos,
++    edit_todos,
++    autosquash_todos,
++)
+ from .merge import MergeConflict
+ from . import __version__
+ 
+@@ -219,6 +225,9 @@ def main(argv: Optional[List[str]] = None):
+     except CalledProcessError as err:
+         print(f"subprocess exited with non-zero status: {err.returncode}")
+         sys.exit(1)
++    except CyclicFixupError as err:
++        print(f"todo error: {err}")
++        sys.exit(1)
+     except EditorError as err:
+         print(f"editor error: {err}")
+         sys.exit(1)
+diff --git a/gitrevise/utils.py b/gitrevise/utils.py
+index 6e290dc..7c9a9ad 100644
+--- a/gitrevise/utils.py
++++ b/gitrevise/utils.py
+@@ -70,7 +70,7 @@ def edit_file_with_editor(editor: str, path: Path) -> bytes:
+             cmd = ["sh", "-c", f'{editor} "$@"', editor, path.name]
+         run(cmd, check=True, cwd=path.parent)
+     except CalledProcessError as err:
+-        raise EditorError(f"Editor exited with status {err}")
++        raise EditorError(f"Editor exited with status {err}") from err
+     return path.read_bytes()
+ 
+ 
+@@ -85,8 +85,10 @@ def get_commentchar(repo: Repository, text: bytes) -> bytes:
+                 pass
+         try:
+             return chars[:1]
+-        except IndexError:
+-            raise EditorError("Unable to automatically select a comment character")
++        except IndexError as err:
++            raise EditorError(
++                "Unable to automatically select a comment character"
++            ) from err
+     if commentchar == b"":
+         raise EditorError("core.commentChar must not be empty")
+     return commentchar

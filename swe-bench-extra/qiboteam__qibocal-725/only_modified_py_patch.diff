@@ -1,0 +1,194 @@
+diff --git a/src/qibocal/protocols/characterization/__init__.py b/src/qibocal/protocols/characterization/__init__.py
+index 0d05a986..7fd5da59 100644
+--- a/src/qibocal/protocols/characterization/__init__.py
++++ b/src/qibocal/protocols/characterization/__init__.py
+@@ -5,7 +5,7 @@ from .allxy.allxy_drag_pulse_tuning import allxy_drag_pulse_tuning
+ from .allxy.drag_pulse_tuning import drag_pulse_tuning
+ from .classification import single_shot_classification
+ from .coherence.spin_echo import spin_echo
+-from .coherence.spin_echo_sequence import spin_echo_sequence
++from .coherence.spin_echo_signal import spin_echo_signal
+ from .coherence.t1 import t1
+ from .coherence.t1_sequences import t1_sequences
+ from .coherence.t1_signal import t1_signal
+@@ -88,7 +88,7 @@ class Operation(Enum):
+     time_of_flight_readout = time_of_flight_readout
+     single_shot_classification = single_shot_classification
+     spin_echo = spin_echo
+-    spin_echo_sequence = spin_echo_sequence
++    spin_echo_signal = spin_echo_signal
+     allxy = allxy
+     allxy_drag_pulse_tuning = allxy_drag_pulse_tuning
+     drag_pulse_tuning = drag_pulse_tuning
+diff --git a/src/qibocal/protocols/characterization/coherence/spin_echo.py b/src/qibocal/protocols/characterization/coherence/spin_echo.py
+index 2e41a172..f4357dd4 100644
+--- a/src/qibocal/protocols/characterization/coherence/spin_echo.py
++++ b/src/qibocal/protocols/characterization/coherence/spin_echo.py
+@@ -1,3 +1,4 @@
++from copy import deepcopy
+ from dataclasses import dataclass, field
+ from typing import Optional
+ 
+@@ -26,6 +27,9 @@ class SpinEchoParameters(Parameters):
+     """Final delay between pulses [ns]."""
+     delay_between_pulses_step: int
+     """Step delay between pulses [ns]."""
++    unrolling: bool = False
++    """If ``True`` it uses sequence unrolling to deploy multiple sequences in a single instrument call.
++    Defaults to ``False``."""
+ 
+ 
+ @dataclass
+@@ -83,8 +87,15 @@ def _acquisition(
+         params.delay_between_pulses_step,
+     )
+ 
++    options = ExecutionParameters(
++        nshots=params.nshots,
++        relaxation_time=params.relaxation_time,
++        acquisition_type=AcquisitionType.DISCRIMINATION,
++        averaging_mode=AveragingMode.SINGLESHOT,
++    )
++
+     data = SpinEchoData()
+-    probs = {qubit: [] for qubit in targets}
++    sequences, all_ro_pulses = [], []
+     # sweep the parameter
+     for wait in ro_wait_range:
+         # save data as often as defined by points
+@@ -94,28 +105,35 @@ def _acquisition(
+             RX90_pulses2[qubit].start = RX_pulses[qubit].finish + wait // 2
+             ro_pulses[qubit].start = RX90_pulses2[qubit].finish
+ 
+-        # execute the pulse sequence
+-        results = platform.execute_pulse_sequence(
+-            sequence,
+-            ExecutionParameters(
+-                nshots=params.nshots,
+-                relaxation_time=params.relaxation_time,
+-                acquisition_type=AcquisitionType.DISCRIMINATION,
+-                averaging_mode=AveragingMode.SINGLESHOT,
+-            ),
+-        )
++        sequences.append(deepcopy(sequence))
++        all_ro_pulses.append(deepcopy(sequence).ro_pulses)
+ 
+-        for qubit in targets:
+-            prob = results[ro_pulses[qubit].serial].probability(state=0)
+-            probs[qubit].append(prob)
++    if params.unrolling:
++        results = platform.execute_pulse_sequences(sequences, options)
+ 
+-    for qubit in targets:
+-        errors = [np.sqrt(prob * (1 - prob) / params.nshots) for prob in probs[qubit]]
+-        data.register_qubit(
+-            t1.CoherenceProbType,
+-            (qubit),
+-            dict(wait=ro_wait_range, prob=probs[qubit], error=errors),
+-        )
++    elif not params.unrolling:
++        results = [
++            platform.execute_pulse_sequence(sequence, options) for sequence in sequences
++        ]
++
++    for ig, (wait, ro_pulses) in enumerate(zip(ro_wait_range, all_ro_pulses)):
++        for qubit in targets:
++            serial = ro_pulses.get_qubit_pulses(qubit)[0].serial
++            if params.unrolling:
++                result = results[serial][0]
++            else:
++                result = results[ig][serial]
++            prob = result.probability(state=0)
++            error = np.sqrt(prob * (1 - prob) / params.nshots)
++            data.register_qubit(
++                t1.CoherenceProbType,
++                (qubit),
++                dict(
++                    wait=np.array([wait]),
++                    prob=np.array([prob]),
++                    error=np.array([error]),
++                ),
++            )
+ 
+     return data
+ 
+diff --git a/src/qibocal/protocols/characterization/coherence/spin_echo_sequence.py b/src/qibocal/protocols/characterization/coherence/spin_echo_signal.py
+similarity index 82%
+rename from src/qibocal/protocols/characterization/coherence/spin_echo_sequence.py
+rename to src/qibocal/protocols/characterization/coherence/spin_echo_signal.py
+index 22cd2dd3..76ffd023 100644
+--- a/src/qibocal/protocols/characterization/coherence/spin_echo_sequence.py
++++ b/src/qibocal/protocols/characterization/coherence/spin_echo_signal.py
+@@ -1,3 +1,4 @@
++from copy import deepcopy
+ from dataclasses import dataclass
+ 
+ import numpy as np
+@@ -67,7 +68,15 @@ def _acquisition(
+         params.delay_between_pulses_step,
+     )
+ 
++    options = ExecutionParameters(
++        nshots=params.nshots,
++        relaxation_time=params.relaxation_time,
++        acquisition_type=AcquisitionType.INTEGRATION,
++        averaging_mode=AveragingMode.CYCLIC,
++    )
++
+     data = SpinEchoSignalData()
++    sequences, all_ro_pulses = [], []
+ 
+     # sweep the parameter
+     for wait in ro_wait_range:
+@@ -78,19 +87,24 @@ def _acquisition(
+             RX90_pulses2[qubit].start = RX_pulses[qubit].finish + wait // 2
+             ro_pulses[qubit].start = RX90_pulses2[qubit].finish
+ 
+-        # execute the pulse sequence
+-        results = platform.execute_pulse_sequence(
+-            sequence,
+-            ExecutionParameters(
+-                nshots=params.nshots,
+-                relaxation_time=params.relaxation_time,
+-                acquisition_type=AcquisitionType.INTEGRATION,
+-                averaging_mode=AveragingMode.CYCLIC,
+-            ),
+-        )
++        sequences.append(deepcopy(sequence))
++        all_ro_pulses.append(deepcopy(sequence).ro_pulses)
+ 
++    if params.unrolling:
++        results = platform.execute_pulse_sequences(sequences, options)
++
++    elif not params.unrolling:
++        results = [
++            platform.execute_pulse_sequence(sequence, options) for sequence in sequences
++        ]
++
++    for ig, (wait, ro_pulses) in enumerate(zip(ro_wait_range, all_ro_pulses)):
+         for qubit in targets:
+-            result = results[ro_pulses[qubit].serial]
++            serial = ro_pulses.get_qubit_pulses(qubit)[0].serial
++            if params.unrolling:
++                result = results[serial][0]
++            else:
++                result = results[ig][serial]
+             data.register_qubit(
+                 CoherenceType,
+                 (qubit),
+@@ -100,6 +114,7 @@ def _acquisition(
+                     phase=np.array([result.phase]),
+                 ),
+             )
++
+     return data
+ 
+ 
+@@ -170,5 +185,5 @@ def _update(results: SpinEchoSignalResults, platform: Platform, target: QubitId)
+     update.t2_spin_echo(results.t2_spin_echo[target], platform, target)
+ 
+ 
+-spin_echo_sequence = Routine(_acquisition, _fit, _plot, _update)
++spin_echo_signal = Routine(_acquisition, _fit, _plot, _update)
+ """SpinEcho Routine object."""
+

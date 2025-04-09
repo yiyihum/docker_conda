@@ -1,0 +1,183 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 255be7d..5ab8620 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,11 +3,16 @@
+ ### Features
+ 1. [#281](https://github.com/influxdata/influxdb-client-python/pull/281): `FluxTable`, `FluxColumn` and `FluxRecord` objects have helpful reprs
+ 1. [#293](https://github.com/influxdata/influxdb-client-python/pull/293): `dataframe_serializer` supports batching
++1. [#301](https://github.com/influxdata/influxdb-client-python/pull/301): Add `proxy_headers` to configuration options
++
++### Documentation
++1. [#301](https://github.com/influxdata/influxdb-client-python/pull/301): How to configure proxy
+ 
+ ### Bug Fixes
+ 1. [#283](https://github.com/influxdata/influxdb-client-python/pull/283): Set proxy server in config file
+ 1. [#290](https://github.com/influxdata/influxdb-client-python/pull/290): `Threshold` domain models mapping 
+ 1. [#290](https://github.com/influxdata/influxdb-client-python/pull/290): `DashboardService` responses types
++1. [#303](https://github.com/influxdata/influxdb-client-python/pull/303): Backslash escaping in serialization to Line protocol
+ 
+ ## 1.19.0 [2021-07-09]
+ 
+diff --git a/README.rst b/README.rst
+index 268770c..0198265 100644
+--- a/README.rst
++++ b/README.rst
+@@ -76,6 +76,7 @@ InfluxDB 2.0 client features
+     - `How to use Jupyter + Pandas + InfluxDB 2`_
+ - Advanced Usage
+     - `Gzip support`_
++    - `Proxy configuration`_
+     - `Delete data`_
+ 
+ Installation
+@@ -1059,6 +1060,41 @@ Gzip support
+ 
+ .. marker-gzip-end
+ 
++Proxy configuration
++^^^^^^^^^^^^^^^^^^^
++.. marker-proxy-start
++
++You can configure the client to tunnel requests through an HTTP proxy.
++The following proxy options are supported:
++
++- ``proxy`` - Set this to configure the http proxy to be used, ex. ``http://localhost:3128``
++- ``proxy_headers`` - A dictionary containing headers that will be sent to the proxy. Could be used for proxy authentication.
++
++.. code-block:: python
++
++   from influxdb_client import InfluxDBClient
++
++   with InfluxDBClient(url="http://localhost:8086",
++                       token="my-token",
++                       org="my-org",
++                       proxy="http://localhost:3128") as client:
++
++.. note::
++
++    If your proxy notify the client with permanent redirect (``HTTP 301``) to **different host**.
++    The client removes ``Authorization`` header, because otherwise the contents of ``Authorization`` is sent to third parties
++    which is a security vulnerability.
++
++    You can change this behaviour by:
++
++    .. code-block:: python
++
++       from urllib3 import Retry
++       Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset()
++       Retry.DEFAULT.remove_headers_on_redirect = Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT
++
++.. marker-proxy-end
++
+ Delete data
+ ^^^^^^^^^^^
+ .. marker-delete-start
+diff --git a/docs/usage.rst b/docs/usage.rst
+index 26f8315..f563181 100644
+--- a/docs/usage.rst
++++ b/docs/usage.rst
+@@ -10,18 +10,18 @@ Query
+   :start-after: marker-query-start
+   :end-before: marker-query-end
+ 
+-Pandas DataFrame
+-^^^^^^^^^^^^^^^^
+-.. include:: ../README.rst
+-  :start-after: marker-pandas-start
+-  :end-before: marker-pandas-end
+-
+ Write
+ ^^^^^
+ .. include:: ../README.rst
+   :start-after: marker-writes-start
+   :end-before: marker-writes-end
+ 
++Pandas DataFrame
++^^^^^^^^^^^^^^^^
++.. include:: ../README.rst
++  :start-after: marker-pandas-start
++  :end-before: marker-pandas-end
++
+ Delete data
+ ^^^^^^^^^^^
+ .. include:: ../README.rst
+@@ -34,6 +34,12 @@ Gzip support
+   :start-after: marker-gzip-start
+   :end-before: marker-gzip-end
+ 
++Proxy configuration
++^^^^^^^^^^^^^^^^^^^
++.. include:: ../README.rst
++  :start-after: marker-proxy-start
++  :end-before: marker-proxy-end
++
+ Debugging
+ ^^^^^^^^^
+ 
+diff --git a/influxdb_client/client/influxdb_client.py b/influxdb_client/client/influxdb_client.py
+index 9ee7179..e0c471e 100644
+--- a/influxdb_client/client/influxdb_client.py
++++ b/influxdb_client/client/influxdb_client.py
+@@ -38,6 +38,8 @@ class InfluxDBClient(object):
+         :key bool verify_ssl: Set this to false to skip verifying SSL certificate when calling API from https server.
+         :key str ssl_ca_cert: Set this to customize the certificate file to verify the peer.
+         :key str proxy: Set this to configure the http proxy to be used (ex. http://localhost:3128)
++        :key str proxy_headers: A dictionary containing headers that will be sent to the proxy. Could be used for proxy
++                                authentication.
+         :key int connection_pool_maxsize: Number of connections to save that can be reused by urllib3.
+                                           Defaults to "multiprocessing.cpu_count() * 5".
+         :key urllib3.util.retry.Retry retries: Set the default retry strategy that is used for all HTTP requests
+@@ -63,6 +65,7 @@ class InfluxDBClient(object):
+         conf.verify_ssl = kwargs.get('verify_ssl', True)
+         conf.ssl_ca_cert = kwargs.get('ssl_ca_cert', None)
+         conf.proxy = kwargs.get('proxy', None)
++        conf.proxy_headers = kwargs.get('proxy_headers', None)
+         conf.connection_pool_maxsize = kwargs.get('connection_pool_maxsize', conf.connection_pool_maxsize)
+         conf.timeout = timeout
+ 
+diff --git a/influxdb_client/client/write/point.py b/influxdb_client/client/write/point.py
+index 98af23e..04d3c9c 100644
+--- a/influxdb_client/client/write/point.py
++++ b/influxdb_client/client/write/point.py
+@@ -18,7 +18,6 @@ EPOCH = UTC.localize(datetime.utcfromtimestamp(0))
+ DEFAULT_WRITE_PRECISION = WritePrecision.NS
+ 
+ _ESCAPE_MEASUREMENT = str.maketrans({
+-    '\\': r'\\',      # Note: this is wrong. Backslashes are not escaped like this in measurements.
+     ',': r'\,',
+     ' ': r'\ ',
+     '\n': r'\n',
+@@ -27,7 +26,6 @@ _ESCAPE_MEASUREMENT = str.maketrans({
+ })
+ 
+ _ESCAPE_KEY = str.maketrans({
+-    '\\': r'\\',      # Note: this is wrong. Backslashes are not escaped like this in keys.
+     ',': r'\,',
+     '=': r'\=',
+     ' ': r'\ ',
+diff --git a/influxdb_client/configuration.py b/influxdb_client/configuration.py
+index 53b55d6..0132cf1 100644
+--- a/influxdb_client/configuration.py
++++ b/influxdb_client/configuration.py
+@@ -112,6 +112,8 @@ class Configuration(six.with_metaclass(TypeWithDefault, object)):
+ 
+         # Proxy URL
+         self.proxy = None
++        # A dictionary containing headers that will be sent to the proxy
++        self.proxy_headers = None
+         # Safe chars for path_param
+         self.safe_chars_for_path_param = ''
+ 
+diff --git a/influxdb_client/rest.py b/influxdb_client/rest.py
+index c77f5f7..49a3592 100644
+--- a/influxdb_client/rest.py
++++ b/influxdb_client/rest.py
+@@ -107,6 +107,7 @@ class RESTClientObject(object):
+                 cert_file=configuration.cert_file,
+                 key_file=configuration.key_file,
+                 proxy_url=configuration.proxy,
++                proxy_headers=configuration.proxy_headers,
+                 **addition_pool_args
+             )
+         else:

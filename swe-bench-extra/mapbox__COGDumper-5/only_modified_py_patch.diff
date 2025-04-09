@@ -1,0 +1,328 @@
+diff --git a/cogdumper/cog_tiles.py b/cogdumper/cog_tiles.py
+index 0acc0c7..318bb1b 100644
+--- a/cogdumper/cog_tiles.py
++++ b/cogdumper/cog_tiles.py
+@@ -1,5 +1,7 @@
+ """Function for extracting tiff tiles."""
+ 
++import os
++
+ from abc import abstractmethod
+ from math import ceil
+ import struct
+@@ -41,16 +43,18 @@ class COGTiff:
+         reader:
+             A reader that implements the cogdumper.cog_tiles.AbstractReader methods
+         """
+-        self._init = False
+         self._endian = '<'
+         self._version = 42
+         self.read = reader
+         self._big_tiff = False
++        self.header = ''
+         self._offset = 0
+         self._image_ifds = []
+         self._mask_ifds = []
+ 
+-    def ifds(self):
++        self.read_header()
++
++    def _ifds(self):
+         """Reads TIFF image file directories from a COG recursively.
+         Parameters
+         -----------
+@@ -68,10 +72,24 @@ class COGTiff:
+             next_offset = 0
+             pos = 0
+             tags = []
++
++            fallback_size = 4096 if self._big_tiff else 1024
++            if self._offset > len(self.header):
++                byte_starts = len(self.header)
++                byte_ends = byte_starts + self._offset + fallback_size
++                self.header += self.read(byte_starts, byte_ends)
++
+             if self._big_tiff:
+-                bytes = self.read(self._offset, 8)
++                bytes = self.header[self._offset: self._offset + 8]
+                 num_tags = struct.unpack(f'{self._endian}Q', bytes)[0]
+-                bytes = self.read(self._offset + 8, (num_tags * 20) + 8)
++
++                byte_starts = self._offset + 8
++                byte_ends = (num_tags * 20) + 8 + byte_starts
++                if byte_ends > len(self.header):
++                    s = len(self.header)
++                    self.header += self.read(s, byte_ends)
++
++                bytes = self.header[byte_starts: byte_ends]
+ 
+                 for t in range(0, num_tags):
+                     code = struct.unpack(
+@@ -100,7 +118,14 @@ class COGTiff:
+                                 f'{self._endian}Q',
+                                 bytes[pos + 12: pos + 20]
+                             )[0]
+-                            data = self.read(data_offset, tag_len)
++
++                            byte_starts = data_offset
++                            byte_ends = byte_starts + tag_len
++                            if byte_ends > len(self.header):
++                                s = len(self.header)
++                                self.header += self.read(s, byte_ends)
++
++                            data = self.header[byte_starts: byte_ends]
+ 
+                         tags.append(
+                             {
+@@ -116,12 +141,20 @@ class COGTiff:
+                 self._offset = self._offset + 8 + pos
+                 next_offset = struct.unpack(
+                     f'{self._endian}Q',
+-                    self.read(self._offset, 8)
++                    self.header[self._offset: self._offset + 8]
+                 )[0]
+             else:
+-                bytes = self.read(self._offset, 2)
++                bytes = self.header[self._offset: self._offset + 2]
+                 num_tags = struct.unpack(f'{self._endian}H', bytes)[0]
+-                bytes = self.read(self._offset + 2, (num_tags * 12) + 2)
++
++                byte_starts = self._offset + 2
++                byte_ends = (num_tags * 12) + 2 + byte_starts
++                if byte_ends > len(self.header):
++                    s = len(self.header)
++                    self.header += self.read(s, byte_ends)
++
++                bytes = self.header[byte_starts: byte_ends]
++
+                 for t in range(0, num_tags):
+                     code = struct.unpack(
+                         f'{self._endian}H',
+@@ -149,7 +182,13 @@ class COGTiff:
+                                 f'{self._endian}L',
+                                 bytes[pos + 8: pos + 12]
+                             )[0]
+-                            data = self.read(data_offset, tag_len)
++
++                            byte_starts = data_offset
++                            byte_ends = byte_starts + tag_len
++                            if byte_ends > len(self.header):
++                                s = len(self.header)
++                                self.header += self.read(s, byte_ends)
++                            data = self.header[byte_starts: byte_ends]
+ 
+                         tags.append(
+                             {
+@@ -165,7 +204,7 @@ class COGTiff:
+                 self._offset = self._offset + 2 + pos
+                 next_offset = struct.unpack(
+                     f'{self._endian}L',
+-                    self.read(self._offset, 4)
++                    self.header[self._offset: self._offset + 4]
+                 )[0]
+ 
+             self._offset = next_offset
+@@ -176,22 +215,25 @@ class COGTiff:
+             }
+ 
+     def read_header(self):
++        """Read and parse COG header."""
++        buff_size = int(os.environ.get('COG_INGESTED_BYTES_AT_OPEN', '16384'))
++        self.header = self.read(0, buff_size)
++
+         # read first 4 bytes to determine tiff or bigtiff and byte order
+-        bytes = self.read(0, 4)
+-        if bytes[:2] == b'MM':
++        if self.header[:2] == b'MM':
+             self._endian = '>'
+ 
+-        self._version = struct.unpack(f'{self._endian}H', bytes[2:4])[0]
++        self._version = struct.unpack(f'{self._endian}H', self.header[2:4])[0]
+ 
+         if self._version == 42:
+             # TIFF
+             self._big_tiff = False
+             # read offset to first IFD
+-            self._offset = struct.unpack(f'{self._endian}L', self.read(4, 4))[0]
++            self._offset = struct.unpack(f'{self._endian}L', self.header[4:8])[0]
+         elif self._version == 43:
+             # BIGTIFF
+             self._big_tiff = True
+-            bytes = self.read(4, 12)
++            bytes = self.header[4:16]
+             bytesize = struct.unpack(f'{self._endian}H', bytes[0:2])[0]
+             w = struct.unpack(f'{self._endian}H', bytes[2:4])[0]
+             self._offset = struct.unpack(f'{self._endian}Q', bytes[4:])[0]
+@@ -203,7 +245,7 @@ class COGTiff:
+         self._init = True
+ 
+         # for JPEG we need to read all IFDs, they are at the front of the file
+-        for ifd in self.ifds():
++        for ifd in self._ifds():
+             mime_type = 'image/jpeg'
+             # tile offsets are an extension but if they aren't in the file then
+             # you can't get a tile back!
+@@ -293,9 +335,7 @@ class COGTiff:
+             self._mask_ifds = []
+ 
+     def get_tile(self, x, y, z):
+-        if self._init is False:
+-            self.read_header()
+-
++        """Read tile data."""
+         if z < len(self._image_ifds):
+             image_ifd = self._image_ifds[z]
+             idx = (y * image_ifd['ny_tiles']) + x
+@@ -326,6 +366,4 @@ class COGTiff:
+ 
+     @property
+     def version(self):
+-        if self._init is False:
+-            self.read_header()
+         return self._version
+diff --git a/cogdumper/filedumper.py b/cogdumper/filedumper.py
+index f1454dd..27596a6 100644
+--- a/cogdumper/filedumper.py
++++ b/cogdumper/filedumper.py
+@@ -1,7 +1,10 @@
+ """A utility to dump tiles directly from a local tiff file."""
+ 
++import logging
+ from cogdumper.cog_tiles import AbstractReader
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class Reader(AbstractReader):
+     """Wraps the remote COG."""
+@@ -10,5 +13,8 @@ class Reader(AbstractReader):
+         self._handle = handle
+ 
+     def read(self, offset, length):
++        start = offset
++        stop = offset + length - 1
++        logger.info(f'Reading bytes: {start} to {stop}')
+         self._handle.seek(offset)
+         return self._handle.read(length)
+diff --git a/cogdumper/httpdumper.py b/cogdumper/httpdumper.py
+index d76f225..8ea2a1d 100644
+--- a/cogdumper/httpdumper.py
++++ b/cogdumper/httpdumper.py
+@@ -1,11 +1,15 @@
+ """A utility to dump tiles directly from a tiff file on a http server."""
+ 
++import logging
++
+ import requests
+ from requests.auth import HTTPBasicAuth
+ 
+ from cogdumper.errors import TIFFError
+ from cogdumper.cog_tiles import AbstractReader
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class Reader(AbstractReader):
+     """Wraps the remote COG."""
+@@ -37,6 +41,7 @@ class Reader(AbstractReader):
+     def read(self, offset, length):
+         start = offset
+         stop = offset + length - 1
++        logger.info(f'Reading bytes: {start} to {stop}')
+         headers = {'Range': f'bytes={start}-{stop}'}
+         r = self.session.get(self.url, auth=self.auth, headers=headers)
+         if r.status_code != requests.codes.partial_content:
+diff --git a/cogdumper/s3dumper.py b/cogdumper/s3dumper.py
+index ce60f6e..9b66652 100644
+--- a/cogdumper/s3dumper.py
++++ b/cogdumper/s3dumper.py
+@@ -1,11 +1,14 @@
+ """A utility to dump tiles directly from a tiff file in an S3 bucket."""
+ 
+ import os
++import logging
+ 
+ import boto3
+ 
+ from cogdumper.cog_tiles import AbstractReader
+ 
++logger = logging.getLogger(__name__)
++
+ region = os.environ.get('AWS_REGION', 'us-east-1')
+ s3 = boto3.resource('s3', region_name=region)
+ 
+@@ -14,12 +17,15 @@ class Reader(AbstractReader):
+     """Wraps the remote COG."""
+ 
+     def __init__(self, bucket_name, key):
++        """Init reader object."""
+         self.bucket = bucket_name
+         self.key = key
++        self.source = s3.Object(self.bucket, self.key)
+ 
+     def read(self, offset, length):
++        """Read method."""
+         start = offset
+         stop = offset + length - 1
+-        r = s3.meta.client.get_object(Bucket=self.bucket, Key=self.key,
+-                                      Range=f'bytes={start}-{stop}')
++        logger.info(f'Reading bytes: {start} to {stop}')
++        r = self.source.get(Range=f'bytes={start}-{stop}')
+         return r['Body'].read()
+diff --git a/cogdumper/scripts/cli.py b/cogdumper/scripts/cli.py
+index 5fdccb3..bd366af 100644
+--- a/cogdumper/scripts/cli.py
++++ b/cogdumper/scripts/cli.py
+@@ -1,5 +1,5 @@
+ """cli."""
+-
++import logging
+ import mimetypes
+ 
+ import click
+@@ -25,8 +25,13 @@ def cogdumper():
+               help='local output directory')
+ @click.option('--xyz', type=click.INT, default=[0, 0, 0], nargs=3,
+               help='xyz tile coordinates where z is the overview level')
+-def s3(bucket, key, output, xyz):
++@click.option('--verbose', '-v', is_flag=True, help='Show logs')
++@click.version_option(version=cogdumper_version, message='%(version)s')
++def s3(bucket, key, output, xyz, verbose):
+     """Read AWS S3 hosted dataset."""
++    if verbose:
++        logging.basicConfig(level=logging.INFO)
++
+     reader = S3Reader(bucket, key)
+     cog = COGTiff(reader.read)
+     mime_type, tile = cog.get_tile(*xyz)
+@@ -50,9 +55,13 @@ def s3(bucket, key, output, xyz):
+               help='local output directory')
+ @click.option('--xyz', type=click.INT, default=[0, 0, 0], nargs=3,
+               help='xyz tile coordinates where z is the overview level')
++@click.option('--verbose', '-v', is_flag=True, help='Show logs')
+ @click.version_option(version=cogdumper_version, message='%(version)s')
+-def http(server, path, resource, output, xyz=None):
++def http(server, path, resource, output, xyz, verbose):
+     """Read web hosted dataset."""
++    if verbose:
++        logging.basicConfig(level=logging.INFO)
++
+     reader = HTTPReader(server, path, resource)
+     cog = COGTiff(reader.read)
+     mime_type, tile = cog.get_tile(*xyz)
+@@ -74,9 +83,13 @@ def http(server, path, resource, output, xyz=None):
+               help='local output directory')
+ @click.option('--xyz', type=click.INT, default=[0, 0, 0], nargs=3,
+               help='xyz tile coordinate where z is the overview level')
++@click.option('--verbose', '-v', is_flag=True, help='Show logs')
+ @click.version_option(version=cogdumper_version, message='%(version)s')
+-def file(file, output, xyz=None):
++def file(file, output, xyz, verbose):
+     """Read local dataset."""
++    if verbose:
++        logging.basicConfig(level=logging.INFO)
++
+     with open(file, 'rb') as src:
+         reader = FileReader(src)
+         cog = COGTiff(reader.read)
+

@@ -1,0 +1,116 @@
+diff --git a/docs/releases.rst b/docs/releases.rst
+index ea32618..517a41c 100644
+--- a/docs/releases.rst
++++ b/docs/releases.rst
+@@ -18,6 +18,7 @@ See also :ref:`api_stability`.
+ `git main <https://github.com/meejah/txtorcon>`_ *will likely become v23.6.0*
+ 
+  * Fix test-failures on Python 3.12
++ * Particular GETINFO hanging (`#389 <https://github.com/meejah/txtorcon/issues/389>`_)
+ 
+ 
+ v23.5.0
+diff --git a/txtorcon/torcontrolprotocol.py b/txtorcon/torcontrolprotocol.py
+index 887bd0a..e882160 100644
+--- a/txtorcon/torcontrolprotocol.py
++++ b/txtorcon/torcontrolprotocol.py
+@@ -232,6 +232,12 @@ class TorControlProtocol(LineOnlyReceiver):
+     :class:`txtorcon.TorState`, which is also the place to go if you
+     wish to add your own stream or circuit listeners.
+     """
++    # override Twisted's LineOnlyReceiver maximum line-length. At
++    # least "GETINFO md/id/X" for some Xse exceeds 16384 (2**14, the
++    # default) and thus causes the control connection to
++    # fail. control.c defines MAX_COMMAND_LINE_LENGTH as 1024*1024 so
++    # we use that
++    MAX_LENGTH = 2 ** 20
+ 
+     def __init__(self, password_function=None):
+         """
+@@ -274,11 +280,6 @@ class TorControlProtocol(LineOnlyReceiver):
+         :func:`when_disconnected` instead)
+         """
+ 
+-        self._when_disconnected = SingleObserver()
+-        """
+-        Internal use. A :class:`SingleObserver` for when_disconnected()
+-        """
+-
+         self._when_disconnected = SingleObserver()
+         """
+         Private. See :func:`.when_disconnected`
+@@ -356,7 +357,7 @@ class TorControlProtocol(LineOnlyReceiver):
+         self.stop_debug()
+ 
+     def start_debug(self):
+-        self.debuglog = open('txtorcon-debug.log', 'w')
++        self.debuglog = open('txtorcon-debug.log', 'wb')
+ 
+     def stop_debug(self):
+         def noop(*args, **kw):
+@@ -692,10 +693,14 @@ class TorControlProtocol(LineOnlyReceiver):
+     def connectionLost(self, reason):
+         "Protocol API"
+         txtorlog.msg('connection terminated: ' + str(reason))
+-        if reason.check(ConnectionDone):
+-            self._when_disconnected.fire(self)
+-        else:
+-            self._when_disconnected.fire(reason)
++        self._when_disconnected.fire(
++            Failure(
++                TorDisconnectError(
++                    text="Tor connection terminated",
++                    error=reason,
++                )
++            )
++        )
+ 
+         # ...and this is why we don't do on_disconnect = Deferred() :(
+         # and instead should have had on_disconnect() method that
+@@ -712,8 +717,10 @@ class TorControlProtocol(LineOnlyReceiver):
+             else:
+                 self.on_disconnect.errback(reason)
+         self.on_disconnect = None
+-        self._when_disconnected.fire(self)
++
+         outstanding = [self.command] + self.commands if self.command else self.commands
++        self.command = None
++        self.defer = None
+         for d, cmd, cmd_arg in outstanding:
+             if not d.called:
+                 d.errback(
+@@ -754,6 +761,10 @@ class TorControlProtocol(LineOnlyReceiver):
+         if len(self.commands):
+             self.command = self.commands.pop(0)
+             (d, cmd, cmd_arg) = self.command
++
++            if self._when_disconnected.already_fired(d):
++                return
++
+             self.defer = d
+ 
+             self.debuglog.write(cmd + b'\n')
+diff --git a/txtorcon/util.py b/txtorcon/util.py
+index 4b772e3..406a0f5 100644
+--- a/txtorcon/util.py
++++ b/txtorcon/util.py
+@@ -473,6 +473,19 @@ class SingleObserver(object):
+         self._observers = []
+         self._fired = self._NotFired
+ 
++    def has_fired(self):
++        return self._fired is not self._NotFired
++
++    def already_fired(self, d):
++        """
++        If we have already fired, callback `d` with our result.
++        :returns bool: True if we already fired, False otherwise
++        """
++        if self.has_fired():
++            d.callback(self._fired)
++            return True
++        return False
++
+     def when_fired(self):
+         d = defer.Deferred()
+         if self._fired is not self._NotFired:

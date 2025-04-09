@@ -1,0 +1,166 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 251d276..b560594 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -25,7 +25,7 @@ jobs:
+     strategy:
+       matrix:
+         os: [ubuntu-latest]
+-        root-version: ["6.24", "6.26", "6.28", "6.30"]
++        root-version: ["", "6.24", "6.26", "6.28", "6.30"]
+         python-version: ["3.6", "3.7", "3.8", "3.9", "3.10", "3.11"]
+         exclude:
+           - root-version: "6.24"
+@@ -55,6 +55,7 @@ jobs:
+     - uses: actions/checkout@v4
+ 
+     - name: Setup Micromamba environment
++      if: ${{ matrix.root-version }}
+       uses: mamba-org/setup-micromamba@v1
+       with:
+         environment-name: ci
+@@ -68,7 +69,22 @@ jobs:
+           channels:
+             - conda-forge
+ 
++    - name: Setup Micromamba environment without ROOT
++      if: ${{ !matrix.root-version }}
++      uses: mamba-org/setup-micromamba@v1
++      with:
++        environment-name: ci
++        create-args: >-
++          python=${{ matrix.python-version }}
++          imagemagick
++          ghostscript
++          pip
++        condarc: |
++          channels:
++            - conda-forge
++
+     - name: ROOT info
++      if: ${{ matrix.root-version }}
+       run: |
+         root-config --version
+         root-config --python-version
+@@ -94,23 +110,30 @@ jobs:
+ 
+     # Use python -m pytest to add current working dir as src/ dir layout not used
+     - name: Run pytest
++      if: ${{ matrix.root-version }}
+       run: |
+         python -m pytest tests
+ 
++    - name: Run pytest without ROOT
++      if: ${{ !matrix.root-version }}
++      run: |
++        python -m pytest tests -m 'not needs_root'
++
+     - name: Report coverage with Codecov
++      if: ${{ matrix.root-version }}
+       uses: codecov/codecov-action@v3
+       with:
+         files: ./coverage.xml
+         flags: unittests-${{ matrix.python-version }}
+ 
+     - name: Save notebooks
+-      if: ${{ always() }}
++      if: ${{ always() && matrix.root-version }}
+       run: |
+         python -m jupyter kernelspec list
+         python -m jupyter nbconvert --ExecutePreprocessor.timeout=600 --ExecutePreprocessor.allow_errors=True --to html --execute examples/*.ipynb
+ 
+     - name: Upload notebooks
+-      if: ${{ always() }}
++      if: ${{ always() && matrix.root-version }}
+       uses: actions/upload-artifact@v4
+       with:
+         name: notebooks-${{ matrix.root-version }}-${{ matrix.python-version }}-${{ matrix.os }} py3-${{ matrix.root-version }}-${{ matrix.python-version }}-${{ matrix.os }}
+diff --git a/tests/test_cfilereader.py b/tests/test_cfilereader.py
+index b77511f..d19c47a 100644
+--- a/tests/test_cfilereader.py
++++ b/tests/test_cfilereader.py
+@@ -3,8 +3,10 @@
+ from unittest import TestCase
+ import os
+ import numpy as np
++import pytest
+ from hepdata_lib.c_file_reader import CFileReader
+ 
++@pytest.mark.needs_root
+ class TestCFileReader(TestCase):
+     """Test the CFileReader class."""
+ 
+diff --git a/tests/test_notebooks.py b/tests/test_notebooks.py
+index 7783579..b74b0de 100644
+--- a/tests/test_notebooks.py
++++ b/tests/test_notebooks.py
+@@ -13,6 +13,7 @@ def common_kwargs(tmpdir):
+         'cwd' : 'examples'
+     }
+ 
++@pytest.mark.needs_root
+ def test_correlation(common_kwargs):# pylint: disable=redefined-outer-name
+     """Tests examples/correlation.ipynb"""
+     pm.execute_notebook('examples/correlation.ipynb', **common_kwargs)
+@@ -21,14 +22,21 @@ def test_getting_started(common_kwargs):# pylint: disable=redefined-outer-name
+     """Tests examples/Getting_started.ipynb"""
+     pm.execute_notebook('examples/Getting_started.ipynb', **common_kwargs)
+ 
++@pytest.mark.needs_root
+ def test_reading_histograms(common_kwargs):# pylint: disable=redefined-outer-name
+     """Tests examples/reading_histograms.ipynb"""
+     pm.execute_notebook('examples/reading_histograms.ipynb', **common_kwargs)
+ 
++@pytest.mark.needs_root
+ def test_combine_limits(common_kwargs):# pylint: disable=redefined-outer-name
+     """Tests examples/combine_limits.ipynb"""
+     pm.execute_notebook('examples/combine_limits.ipynb', **common_kwargs)
+ 
++@pytest.mark.needs_root
+ def test_c_file(common_kwargs):# pylint: disable=redefined-outer-name
+     """Tests examples/read_c_file.ipynb"""
+     pm.execute_notebook('examples/read_c_file.ipynb', **common_kwargs)
++
++def test_scikithep_histograms(common_kwargs):# pylint: disable=redefined-outer-name
++    """Tests examples/reading_scikithep_histograms.ipynb"""
++    pm.execute_notebook('examples/reading_scikithep_histograms.ipynb', **common_kwargs)
+diff --git a/tests/test_rootfilereader.py b/tests/test_rootfilereader.py
+index 4cd0c52..23d1d94 100644
+--- a/tests/test_rootfilereader.py
++++ b/tests/test_rootfilereader.py
+@@ -5,12 +5,17 @@ from array import array
+ import os
+ import ctypes
+ import numpy as np
+-import ROOT
++import pytest
++try:
++    import ROOT
++except ImportError as e:
++    print(f'Cannot import ROOT: {str(e)}')
+ from hepdata_lib.root_utils import (RootFileReader, get_graph_points,
+                                     get_hist_1d_points, get_hist_2d_points)
+ from .test_utilities import float_compare, tuple_compare, histogram_compare_1d, make_tmp_root_file
+ 
+ 
++@pytest.mark.needs_root
+ class TestRootFileReader(TestCase):
+     """Test the RootFileReader class."""
+ 
+diff --git a/tests/test_utilities.py b/tests/test_utilities.py
+index eee8d9d..21ebbb0 100644
+--- a/tests/test_utilities.py
++++ b/tests/test_utilities.py
+@@ -4,8 +4,10 @@
+ import os
+ import random
+ import string
+-
+-import ROOT
++try:
++    import ROOT
++except ImportError as e:
++    print(f'Cannot import ROOT: {str(e)}')
+ from future.utils import raise_from
+ 
+ 

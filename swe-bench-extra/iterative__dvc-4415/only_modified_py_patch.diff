@@ -1,0 +1,452 @@
+diff --git a/dvc/dependency/param.py b/dvc/dependency/param.py
+--- a/dvc/dependency/param.py
++++ b/dvc/dependency/param.py
+@@ -2,12 +2,11 @@
+ from collections import defaultdict
+ 
+ import dpath.util
+-import toml
+-import yaml
+ from voluptuous import Any
+ 
+ from dvc.dependency.local import LocalDependency
+ from dvc.exceptions import DvcException
++from dvc.utils.serialize import PARSERS, ParseError
+ 
+ 
+ class MissingParamsError(DvcException):
+@@ -22,8 +21,6 @@ class ParamsDependency(LocalDependency):
+     PARAM_PARAMS = "params"
+     PARAM_SCHEMA = {PARAM_PARAMS: Any(dict, list, None)}
+     DEFAULT_PARAMS_FILE = "params.yaml"
+-    PARAMS_FILE_LOADERS = defaultdict(lambda: yaml.safe_load)
+-    PARAMS_FILE_LOADERS.update({".toml": toml.load})
+ 
+     def __init__(self, stage, path, params):
+         info = {}
+@@ -88,12 +85,12 @@ def read_params(self):
+         if not self.exists:
+             return {}
+ 
++        suffix = self.path_info.suffix.lower()
++        parser = PARSERS[suffix]
+         with self.repo.tree.open(self.path_info, "r") as fobj:
+             try:
+-                config = self.PARAMS_FILE_LOADERS[
+-                    self.path_info.suffix.lower()
+-                ](fobj)
+-            except (yaml.YAMLError, toml.TomlDecodeError) as exc:
++                config = parser(fobj.read(), self.path_info)
++            except ParseError as exc:
+                 raise BadParamFileError(
+                     f"Unable to read parameters from '{self}'"
+                 ) from exc
+diff --git a/dvc/exceptions.py b/dvc/exceptions.py
+--- a/dvc/exceptions.py
++++ b/dvc/exceptions.py
+@@ -182,22 +182,6 @@ def __init__(self):
+         )
+ 
+ 
+-class YAMLFileCorruptedError(DvcException):
+-    def __init__(self, path):
+-        path = relpath(path)
+-        super().__init__(
+-            f"unable to read: '{path}', YAML file structure is corrupted"
+-        )
+-
+-
+-class TOMLFileCorruptedError(DvcException):
+-    def __init__(self, path):
+-        path = relpath(path)
+-        super().__init__(
+-            f"unable to read: '{path}', TOML file structure is corrupted"
+-        )
+-
+-
+ class RecursiveAddingWhileUsingFilename(DvcException):
+     def __init__(self):
+         super().__init__(
+diff --git a/dvc/repo/metrics/show.py b/dvc/repo/metrics/show.py
+--- a/dvc/repo/metrics/show.py
++++ b/dvc/repo/metrics/show.py
+@@ -1,12 +1,11 @@
+ import logging
+ import os
+ 
+-import yaml
+-
+ from dvc.exceptions import NoMetricsError
+ from dvc.path_info import PathInfo
+ from dvc.repo import locked
+ from dvc.repo.tree import RepoTree
++from dvc.utils.serialize import YAMLFileCorruptedError, parse_yaml
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -72,8 +71,8 @@ def _read_metrics(repo, metrics, rev):
+         try:
+             with tree.open(metric, "r") as fobj:
+                 # NOTE this also supports JSON
+-                val = yaml.safe_load(fobj)
+-        except (FileNotFoundError, yaml.YAMLError):
++                val = parse_yaml(fobj.read(), metric)
++        except (FileNotFoundError, YAMLFileCorruptedError):
+             logger.debug(
+                 "failed to read '%s' on '%s'", metric, rev, exc_info=True
+             )
+diff --git a/dvc/repo/params/show.py b/dvc/repo/params/show.py
+--- a/dvc/repo/params/show.py
++++ b/dvc/repo/params/show.py
+@@ -1,12 +1,10 @@
+ import logging
+ 
+-import toml
+-import yaml
+-
+ from dvc.dependency.param import ParamsDependency
+ from dvc.exceptions import DvcException
+ from dvc.path_info import PathInfo
+ from dvc.repo import locked
++from dvc.utils.serialize import PARSERS, ParseError
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -33,12 +31,12 @@ def _read_params(repo, configs, rev):
+         if not repo.tree.exists(config):
+             continue
+ 
++        suffix = config.suffix.lower()
++        parser = PARSERS[suffix]
+         with repo.tree.open(config, "r") as fobj:
+             try:
+-                res[str(config)] = ParamsDependency.PARAMS_FILE_LOADERS[
+-                    config.suffix.lower()
+-                ](fobj)
+-            except (yaml.YAMLError, toml.TomlDecodeError):
++                res[str(config)] = parser(fobj.read(), config)
++            except ParseError:
+                 logger.debug(
+                     "failed to read '%s' on '%s'", config, rev, exc_info=True
+                 )
+diff --git a/dvc/repo/plots/data.py b/dvc/repo/plots/data.py
+--- a/dvc/repo/plots/data.py
++++ b/dvc/repo/plots/data.py
+@@ -5,9 +5,8 @@
+ from collections import OrderedDict
+ from copy import copy
+ 
+-import yaml
+ from funcy import first
+-from yaml import SafeLoader
++from ruamel.yaml import YAML
+ 
+ from dvc.exceptions import DvcException
+ 
+@@ -208,18 +207,7 @@ def raw(self, header=True, **kwargs):  # pylint: disable=arguments-differ
+ 
+ class YAMLPlotData(PlotData):
+     def raw(self, **kwargs):
+-        class OrderedLoader(SafeLoader):
+-            pass
+-
+-        def construct_mapping(loader, node):
+-            loader.flatten_mapping(node)
+-            return OrderedDict(loader.construct_pairs(node))
+-
+-        OrderedLoader.add_constructor(
+-            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping
+-        )
+-
+-        return yaml.load(self.content, OrderedLoader)
++        return YAML().load(self.content)
+ 
+     def _processors(self):
+         parent_processors = super()._processors()
+diff --git a/dvc/repo/reproduce.py b/dvc/repo/reproduce.py
+--- a/dvc/repo/reproduce.py
++++ b/dvc/repo/reproduce.py
+@@ -120,9 +120,10 @@ def reproduce(
+ 
+ def _parse_params(path_params):
+     from flatten_json import unflatten
+-    from yaml import YAMLError, safe_load
++    from ruamel.yaml import YAMLError
+ 
+     from dvc.dependency.param import ParamsDependency
++    from dvc.utils.serialize import loads_yaml
+ 
+     ret = {}
+     for path_param in path_params:
+@@ -133,7 +134,7 @@ def _parse_params(path_params):
+             try:
+                 # interpret value strings using YAML rules
+                 key, value = param_str.split("=")
+-                params[key] = safe_load(value)
++                params[key] = loads_yaml(value)
+             except (ValueError, YAMLError):
+                 raise InvalidArgumentError(
+                     f"Invalid param/value pair '{param_str}'"
+diff --git a/dvc/scm/git.py b/dvc/scm/git.py
+--- a/dvc/scm/git.py
++++ b/dvc/scm/git.py
+@@ -5,7 +5,6 @@
+ import shlex
+ from functools import partial
+ 
+-import yaml
+ from funcy import cached_property
+ from pathspec.patterns import GitWildMatchPattern
+ 
+@@ -20,6 +19,7 @@
+ )
+ from dvc.utils import fix_env, is_binary, relpath
+ from dvc.utils.fs import path_isin
++from dvc.utils.serialize import dump_yaml, load_yaml
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -316,11 +316,7 @@ def install(self, use_pre_commit_tool=False):
+             return
+ 
+         config_path = os.path.join(self.root_dir, ".pre-commit-config.yaml")
+-
+-        config = {}
+-        if os.path.exists(config_path):
+-            with open(config_path) as fobj:
+-                config = yaml.safe_load(fobj)
++        config = load_yaml(config_path) if os.path.exists(config_path) else {}
+ 
+         entry = {
+             "repo": "https://github.com/iterative/dvc",
+@@ -349,8 +345,7 @@ def install(self, use_pre_commit_tool=False):
+             return
+ 
+         config["repos"].append(entry)
+-        with open(config_path, "w+") as fobj:
+-            yaml.dump(config, fobj)
++        dump_yaml(config_path, config)
+ 
+     def cleanup_ignores(self):
+         for path in self.ignored_paths:
+diff --git a/dvc/stage/cache.py b/dvc/stage/cache.py
+--- a/dvc/stage/cache.py
++++ b/dvc/stage/cache.py
+@@ -2,7 +2,6 @@
+ import os
+ from contextlib import contextmanager
+ 
+-import yaml
+ from funcy import first
+ from voluptuous import Invalid
+ 
+@@ -10,7 +9,7 @@
+ from dvc.schema import COMPILED_LOCK_FILE_STAGE_SCHEMA
+ from dvc.utils import dict_sha256, relpath
+ from dvc.utils.fs import makedirs
+-from dvc.utils.serialize import dump_yaml
++from dvc.utils.serialize import YAMLFileCorruptedError, dump_yaml, load_yaml
+ 
+ from .loader import StageLoader
+ from .serialize import to_single_stage_lockfile
+@@ -54,11 +53,10 @@ def _load_cache(self, key, value):
+         path = self._get_cache_path(key, value)
+ 
+         try:
+-            with open(path) as fobj:
+-                return COMPILED_LOCK_FILE_STAGE_SCHEMA(yaml.safe_load(fobj))
++            return COMPILED_LOCK_FILE_STAGE_SCHEMA(load_yaml(path))
+         except FileNotFoundError:
+             return None
+-        except (yaml.error.YAMLError, Invalid):
++        except (YAMLFileCorruptedError, Invalid):
+             logger.warning("corrupted cache file '%s'.", relpath(path))
+             os.unlink(path)
+             return None
+diff --git a/dvc/utils/__init__.py b/dvc/utils/__init__.py
+--- a/dvc/utils/__init__.py
++++ b/dvc/utils/__init__.py
+@@ -1,7 +1,6 @@
+ """Helpers for other modules."""
+ 
+ import hashlib
+-import io
+ import json
+ import logging
+ import math
+@@ -12,7 +11,6 @@
+ 
+ import colorama
+ import nanotime
+-from ruamel.yaml import YAML
+ from shortuuid import uuid
+ 
+ logger = logging.getLogger(__name__)
+@@ -237,18 +235,6 @@ def current_timestamp():
+     return int(nanotime.timestamp(time.time()))
+ 
+ 
+-def from_yaml_string(s):
+-    return YAML().load(io.StringIO(s))
+-
+-
+-def to_yaml_string(data):
+-    stream = io.StringIO()
+-    yaml = YAML()
+-    yaml.default_flow_style = False
+-    yaml.dump(data, stream)
+-    return stream.getvalue()
+-
+-
+ def colorize(message, color=None):
+     """Returns a message in a specified color."""
+     if not color:
+diff --git a/dvc/utils/serialize/__init__.py b/dvc/utils/serialize/__init__.py
+--- a/dvc/utils/serialize/__init__.py
++++ b/dvc/utils/serialize/__init__.py
+@@ -1,2 +1,8 @@
++from collections import defaultdict
++
++from ._common import *  # noqa, pylint: disable=wildcard-import
+ from ._toml import *  # noqa, pylint: disable=wildcard-import
+ from ._yaml import *  # noqa, pylint: disable=wildcard-import
++
++PARSERS = defaultdict(lambda: parse_yaml)  # noqa: F405
++PARSERS.update({".toml": parse_toml})  # noqa: F405
+diff --git a/dvc/utils/serialize/_toml.py b/dvc/utils/serialize/_toml.py
+--- a/dvc/utils/serialize/_toml.py
++++ b/dvc/utils/serialize/_toml.py
+@@ -1,6 +1,17 @@
+ import toml
++from funcy import reraise
+ 
+-from dvc.exceptions import TOMLFileCorruptedError
++from ._common import ParseError
++
++
++class TOMLFileCorruptedError(ParseError):
++    def __init__(self, path):
++        super().__init__(path, "TOML file structure is corrupted")
++
++
++def parse_toml(text, path, decoder=None):
++    with reraise(toml.TomlDecodeError, TOMLFileCorruptedError(path)):
++        return toml.loads(text, decoder=decoder)
+ 
+ 
+ def parse_toml_for_update(text, path):
+@@ -10,12 +21,10 @@ def parse_toml_for_update(text, path):
+     keys may be re-ordered between load/dump, but this function will at
+     least preserve comments.
+     """
+-    try:
+-        return toml.loads(text, decoder=toml.TomlPreserveCommentDecoder())
+-    except toml.TomlDecodeError as exc:
+-        raise TOMLFileCorruptedError(path) from exc
++    decoder = toml.TomlPreserveCommentDecoder()
++    return parse_toml(text, path, decoder=decoder)
+ 
+ 
+ def dump_toml(path, data):
+-    with open(path, "w", encoding="utf-8") as fobj:
++    with open(path, "w+", encoding="utf-8") as fobj:
+         toml.dump(data, fobj, encoder=toml.TomlPreserveCommentEncoder())
+diff --git a/dvc/utils/serialize/_yaml.py b/dvc/utils/serialize/_yaml.py
+--- a/dvc/utils/serialize/_yaml.py
++++ b/dvc/utils/serialize/_yaml.py
+@@ -1,14 +1,16 @@
++import io
+ from collections import OrderedDict
+ 
++from funcy import reraise
+ from ruamel.yaml import YAML
+ from ruamel.yaml.error import YAMLError
+ 
+-from dvc.exceptions import YAMLFileCorruptedError
++from ._common import ParseError
+ 
+-try:
+-    from yaml import CSafeLoader as SafeLoader
+-except ImportError:
+-    from yaml import SafeLoader
++
++class YAMLFileCorruptedError(ParseError):
++    def __init__(self, path):
++        super().__init__(path, "YAML file structure is corrupted")
+ 
+ 
+ def load_yaml(path):
+@@ -16,13 +18,10 @@ def load_yaml(path):
+         return parse_yaml(fd.read(), path)
+ 
+ 
+-def parse_yaml(text, path):
+-    try:
+-        import yaml
+-
+-        return yaml.load(text, Loader=SafeLoader) or {}
+-    except yaml.error.YAMLError as exc:
+-        raise YAMLFileCorruptedError(path) from exc
++def parse_yaml(text, path, typ="safe"):
++    yaml = YAML(typ=typ)
++    with reraise(YAMLError, YAMLFileCorruptedError(path)):
++        return yaml.load(text) or {}
+ 
+ 
+ def parse_yaml_for_update(text, path):
+@@ -34,20 +33,30 @@ def parse_yaml_for_update(text, path):
+ 
+     This one is, however, several times slower than simple `parse_yaml()`.
+     """
+-    try:
+-        yaml = YAML()
+-        return yaml.load(text) or {}
+-    except YAMLError as exc:
+-        raise YAMLFileCorruptedError(path) from exc
++    return parse_yaml(text, path, typ="rt")
++
++
++def _get_yaml():
++    yaml = YAML()
++    yaml.default_flow_style = False
++
++    # tell Dumper to represent OrderedDict as normal dict
++    yaml_repr_cls = yaml.Representer
++    yaml_repr_cls.add_representer(OrderedDict, yaml_repr_cls.represent_dict)
++    return yaml
+ 
+ 
+ def dump_yaml(path, data):
+-    with open(path, "w", encoding="utf-8") as fd:
+-        yaml = YAML()
+-        yaml.default_flow_style = False
+-        # tell Dumper to represent OrderedDict as
+-        # normal dict
+-        yaml.Representer.add_representer(
+-            OrderedDict, yaml.Representer.represent_dict
+-        )
++    yaml = _get_yaml()
++    with open(path, "w+", encoding="utf-8") as fd:
+         yaml.dump(data, fd)
++
++
++def loads_yaml(s):
++    return YAML(typ="safe").load(s)
++
++
++def dumps_yaml(d):
++    stream = io.StringIO()
++    YAML().dump(d, stream)
++    return stream.getvalue()
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -60,7 +60,6 @@ def run(self):
+     "grandalf==0.6",
+     "distro>=1.3.0",
+     "appdirs>=1.4.3",
+-    "PyYAML>=5.1.2,<5.4",  # Compatibility with awscli
+     "ruamel.yaml>=0.16.1",
+     "toml>=0.10.1",
+     "funcy>=1.14",
+

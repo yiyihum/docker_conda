@@ -1,0 +1,80 @@
+diff --git a/dvc/ignore.py b/dvc/ignore.py
+--- a/dvc/ignore.py
++++ b/dvc/ignore.py
+@@ -115,8 +115,12 @@ def __call__(self, root, dirs, files):
+ 
+ 
+ class CleanTree(BaseTree):
+-    def __init__(self, tree):
++    def __init__(self, tree, tree_root=None):
+         self.tree = tree
++        if tree_root:
++            self._tree_root = tree_root
++        else:
++            self._tree_root = self.tree.tree_root
+ 
+     @cached_property
+     def dvcignore(self):
+@@ -124,7 +128,7 @@ def dvcignore(self):
+ 
+     @property
+     def tree_root(self):
+-        return self.tree.tree_root
++        return self._tree_root
+ 
+     def open(self, path, mode="r", encoding="utf-8"):
+         if self.isfile(path):
+@@ -146,8 +150,11 @@ def isdir(self, path):
+         )
+ 
+     def _valid_dirname(self, path):
+-        dirname, basename = os.path.split(os.path.normpath(path))
+-        dirs, _ = self.dvcignore(os.path.abspath(dirname), [basename], [])
++        path = os.path.abspath(path)
++        if path == self.tree_root:
++            return True
++        dirname, basename = os.path.split(path)
++        dirs, _ = self.dvcignore(dirname, [basename], [])
+         if dirs:
+             return True
+         return False
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -17,6 +17,7 @@
+ from dvc.ignore import CleanTree
+ from dvc.path_info import PathInfo
+ from dvc.repo.tree import RepoTree
++from dvc.scm.tree import is_working_tree
+ from dvc.utils.fs import path_isin
+ 
+ from ..stage.exceptions import StageFileDoesNotExistError, StageNotFound
+@@ -133,7 +134,13 @@ def tree(self):
+ 
+     @tree.setter
+     def tree(self, tree):
+-        self._tree = tree if isinstance(tree, CleanTree) else CleanTree(tree)
++        if is_working_tree(tree) or tree.tree_root == self.root_dir:
++            root = None
++        else:
++            root = self.root_dir
++        self._tree = (
++            tree if isinstance(tree, CleanTree) else CleanTree(tree, root)
++        )
+         # Our graph cache is no longer valid, as it was based on the previous
+         # tree.
+         self._reset()
+diff --git a/dvc/repo/brancher.py b/dvc/repo/brancher.py
+--- a/dvc/repo/brancher.py
++++ b/dvc/repo/brancher.py
+@@ -48,6 +48,9 @@ def brancher(  # noqa: E302
+         if revs:
+             for sha, names in group_by(scm.resolve_rev, revs).items():
+                 self.tree = scm.get_tree(sha)
+-                yield ", ".join(names)
++                # ignore revs that don't contain repo root
++                # (i.e. revs from before a subdir=True repo was init'ed)
++                if self.tree.exists(self.root_dir):
++                    yield ", ".join(names)
+     finally:
+         self.tree = saved_tree

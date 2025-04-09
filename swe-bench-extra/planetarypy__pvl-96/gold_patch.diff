@@ -1,0 +1,162 @@
+diff --git a/HISTORY.rst b/HISTORY.rst
+index fb9ec0e..266e002 100644
+--- a/HISTORY.rst
++++ b/HISTORY.rst
+@@ -10,7 +10,7 @@ The format is based on `Keep a Changelog <https://keepachangelog.com/en/1.0.0/>`
+ and this project adheres to `Semantic Versioning <https://semver.org/spec/v2.0.0.html>`_.
+ 
+ When updating this file, please add an entry for your change under
+-Unreleased_ and one of the following headings:
++`Not Yet Released`_ and one of the following headings:
+ 
+ - Added - for new features.
+ - Changed - for changes in existing functionality.
+@@ -27,8 +27,8 @@ underlined with dashes under Unreleased_ with the version number
+ and the release date, in year-month-day format (see examples below).
+ 
+ 
+-Unreleased
+-----------
++Not Yet Released
++----------------
+ 
+ Added
+ +++++
+@@ -39,7 +39,7 @@ Added
+ * pvl.load() now has an `encoding=` parameter that is identical in usage
+   to the parameter passed to `open()`, and will attempt to decode the whole
+   file as if it had been encoded thusly.  If it encounters a decoding error,
+-  it will fall back to decoding the bytes one at a time as ASCII text. (Issue 93)
++  it will fall back to decoding the bytes one at a time as ASCII text (Issue 93).
+ 
+ Fixed
+ +++++
+@@ -49,7 +49,11 @@ Fixed
+   so that if there are weird UTF characters in the PVL-text, you'll get
+   those weird UTF characters in the returned dict-like.  When the
+   stricter PVL, ODL, or PDS3 dialects are used to "load" PVL-text,
+-  they will properly fail to parse this text. (Issue 93).
++  they will properly fail to parse this text (Issue 93).
++* Empty parameters inside groups or objects (but not at the end), would
++  cause the default "Omni" parsing strategy to go into an infinite
++  loop.  Empty parameters in PVL, ODL, and PDS3 continue to not be
++  allowed (Issue 95).
+ 
+ 
+ 1.2.1 (2021-05-31)
+diff --git a/README.rst b/README.rst
+index 3206cfa..534a36b 100644
+--- a/README.rst
++++ b/README.rst
+@@ -162,7 +162,7 @@ with ``dict``-style access::
+     ... ])
+     >>> print(module['foo'])
+     bar
+-    >>> print(module.getlist('foo'))
++    >>> print(module.getall('foo'))
+     ['bar', 'remember me?']
+     >>> print(module.items())
+     ItemsView(PVLModule([
+diff --git a/pvl/collections.py b/pvl/collections.py
+index 5eebdbd..4687f2b 100644
+--- a/pvl/collections.py
++++ b/pvl/collections.py
+@@ -305,6 +305,21 @@ class OrderedMultiDict(dict, MutableMappingSequence):
+     def pop(self, *args, **kwargs):
+         """Removes all items with the specified *key*."""
+ 
++        if len(args) == 0 and len(kwargs) == 0:
++            if not self:
++                raise KeyError(
++                    "pop(): {!s} ".format(type(self).__name__) + "is empty"
++                )
++
++            key, _ = item = self.__items.pop()
++            values = dict_getitem(self, key)
++            values.pop()
++
++            if not values:
++                dict_delitem(self, key)
++
++            return item
++
+         warnings.warn(
+             "The pop(k) function removes "
+             "all keys with value k to remain backwards compatible with the "
+@@ -314,9 +329,6 @@ class OrderedMultiDict(dict, MutableMappingSequence):
+             FutureWarning,
+         )
+ 
+-        if len(args) == 0 and len(kwargs) == 0:
+-            return self.popitem()
+-
+         return self.popall(*args, *kwargs)
+ 
+     def popitem(self):
+@@ -329,22 +341,7 @@ class OrderedMultiDict(dict, MutableMappingSequence):
+             "Consider using the list-like .pop(), without an argument instead.",
+             FutureWarning,
+         )
+-        # Yes, I know .pop() without an argument just redirects here, but it
+-        # won't always.
+-
+-        if not self:
+-            raise KeyError(
+-                "popitem(): {!s} ".format(type(self).__name__) + "is empty"
+-            )
+-
+-        key, _ = item = self.__items.pop()
+-        values = dict_getitem(self, key)
+-        values.pop()
+-
+-        if not values:
+-            dict_delitem(self, key)
+-
+-        return item
++        return self.pop()
+ 
+     def copy(self):
+         return type(self)(self)
+diff --git a/pvl/parser.py b/pvl/parser.py
+index bf3c04f..af34b4f 100644
+--- a/pvl/parser.py
++++ b/pvl/parser.py
+@@ -305,7 +305,7 @@ class PVLParser(object):
+         """
+         raise Exception
+ 
+-    def parse_aggregation_block(self, tokens: abc.Generator):
++    def parse_aggregation_block(self, tokens: abc.Generator):  # noqa: C901
+         """Parses the tokens for an Aggregation Block, and returns
+         the modcls object that is the result of the parsing and
+         decoding.
+@@ -339,8 +339,18 @@ class PVLParser(object):
+                     # t = next(tokens)
+                     # print(f'parsing agg block, next token is: {t}')
+                     # tokens.send(t)
+-                    self.parse_end_aggregation(begin, block_name, tokens)
+-                    break
++                    try:
++                        self.parse_end_aggregation(begin, block_name, tokens)
++                        break
++                    except ValueError as ve:
++                        try:
++                            (agg, keep_parsing) = self.parse_module_post_hook(
++                                agg, tokens
++                            )
++                            if not keep_parsing:
++                                raise ve
++                        except Exception:
++                            raise ve
+ 
+         return block_name, agg
+ 
+@@ -839,7 +849,7 @@ class OmniParser(PVLParser):
+         EmptyValueAtLine object.
+         """
+         # It enables this by checking to see if the next thing is an
+-        # '=' which means there was an empty assigment at the previous
++        # '=' which means there was an empty assignment at the previous
+         # equals sign, and then unwinding the stack to give the
+         # previous assignment the EmptyValueAtLine() object and trying
+         # to continue parsing.

@@ -1,0 +1,96 @@
+diff --git a/docs/source/guide/intro.rst b/docs/source/guide/intro.rst
+index 13c6274..2cff470 100644
+--- a/docs/source/guide/intro.rst
++++ b/docs/source/guide/intro.rst
+@@ -54,7 +54,9 @@ from ``traits_futures.api``:
+   *must* have a parameter called "progress".  A value for this parameter will
+   be passed (by name) by the executor machinery. The value passed for the
+   "progress" parameter can then be called to send progress reports to the
+-  associated |ProgressFuture| object.
++  associated |ProgressFuture| object. If the future has been cancelled, the
++  next call to ``progress`` in the background task will raise a
++  |ProgressCancelled| exception.
+ 
+   For example, your callable might look like this::
+ 
+@@ -313,6 +315,7 @@ needed.
+ .. |IterationFuture| replace:: :class:`~traits_futures.background_iteration.IterationFuture`
+ .. |submit_iteration| replace:: :func:`~traits_futures.background_iteration.submit_iteration`
+ 
++.. |ProgressCancelled| replace:: :exc:`~traits_futures.background_progress.ProgressCancelled`
+ .. |ProgressFuture| replace:: :class:`~traits_futures.background_progress.ProgressFuture`
+ .. |submit_progress| replace:: :func:`~traits_futures.background_progress.submit_progress`
+ 
+diff --git a/traits_futures/api.py b/traits_futures/api.py
+index f5ec6ea..b147f9b 100644
+--- a/traits_futures/api.py
++++ b/traits_futures/api.py
+@@ -28,6 +28,7 @@ Task submission functions
+ - :func:`~.submit_call`
+ - :func:`~.submit_iteration`
+ - :func:`~.submit_progress`
++- :exc:`~.ProgressCancelled`
+ 
+ Types of futures
+ ----------------
+@@ -75,7 +76,11 @@ from traits_futures.background_iteration import (
+     IterationFuture,
+     submit_iteration,
+ )
+-from traits_futures.background_progress import ProgressFuture, submit_progress
++from traits_futures.background_progress import (
++    ProgressCancelled,
++    ProgressFuture,
++    submit_progress,
++)
+ from traits_futures.base_future import BaseFuture
+ from traits_futures.future_states import (
+     CANCELLED,
+@@ -105,6 +110,7 @@ __all__ = [
+     "CallFuture",
+     "IterationFuture",
+     "ProgressFuture",
++    "ProgressCancelled",
+     # Future states
+     "FutureState",
+     "CANCELLED",
+diff --git a/traits_futures/background_progress.py b/traits_futures/background_progress.py
+index c79d6e6..84f5f66 100644
+--- a/traits_futures/background_progress.py
++++ b/traits_futures/background_progress.py
+@@ -32,7 +32,7 @@ from traits_futures.i_task_specification import ITaskSpecification
+ PROGRESS = "progress"
+ 
+ 
+-class _ProgressCancelled(Exception):
++class ProgressCancelled(Exception):
+     """
+     Exception raised when progress reporting is interrupted by
+     task cancellation.
+@@ -60,9 +60,16 @@ class ProgressReporter:
+         progress_info : object
+             An arbitrary object representing progress. Ideally, this
+             should be immutable and pickleable.
++
++        Raises
++        ------
++        ProgressCancelled
++            If a cancellation request for this task has already been made.
++            In this case, the exception will be raised before any progress
++            information is sent.
+         """
+         if self.cancelled():
+-            raise _ProgressCancelled("Task was cancelled")
++            raise ProgressCancelled("Task was cancelled")
+         self.send(PROGRESS, progress_info)
+ 
+ 
+@@ -85,7 +92,7 @@ class ProgressBackgroundTask:
+ 
+         try:
+             return self.callable(*self.args, **self.kwargs)
+-        except _ProgressCancelled:
++        except ProgressCancelled:
+             return None
+ 
+ 

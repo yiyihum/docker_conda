@@ -1,0 +1,140 @@
+diff --git a/examples/drawing/plot_eigenvalues.py b/examples/drawing/plot_eigenvalues.py
+index b0df67ae9..67322cfd1 100644
+--- a/examples/drawing/plot_eigenvalues.py
++++ b/examples/drawing/plot_eigenvalues.py
+@@ -14,7 +14,7 @@ m = 5000  # 5000 edges
+ G = nx.gnm_random_graph(n, m, seed=5040)  # Seed for reproducibility
+ 
+ L = nx.normalized_laplacian_matrix(G)
+-e = numpy.linalg.eigvals(L.A)
++e = numpy.linalg.eigvals(L.toarray())
+ print("Largest eigenvalue:", max(e))
+ print("Smallest eigenvalue:", min(e))
+ plt.hist(e, bins=100)  # histogram with 100 bins
+diff --git a/networkx/algorithms/flow/maxflow.py b/networkx/algorithms/flow/maxflow.py
+index 8d2fb8f03..b0098d0a0 100644
+--- a/networkx/algorithms/flow/maxflow.py
++++ b/networkx/algorithms/flow/maxflow.py
+@@ -12,14 +12,6 @@ from .utils import build_flow_dict
+ 
+ # Define the default flow function for computing maximum flow.
+ default_flow_func = preflow_push
+-# Functions that don't support cutoff for minimum cut computations.
+-flow_funcs = [
+-    boykov_kolmogorov,
+-    dinitz,
+-    edmonds_karp,
+-    preflow_push,
+-    shortest_augmenting_path,
+-]
+ 
+ __all__ = ["maximum_flow", "maximum_flow_value", "minimum_cut", "minimum_cut_value"]
+ 
+@@ -452,7 +444,7 @@ def minimum_cut(flowG, _s, _t, capacity="capacity", flow_func=None, **kwargs):
+     if not callable(flow_func):
+         raise nx.NetworkXError("flow_func has to be callable.")
+ 
+-    if kwargs.get("cutoff") is not None and flow_func in flow_funcs:
++    if kwargs.get("cutoff") is not None and flow_func is preflow_push:
+         raise nx.NetworkXError("cutoff should not be specified.")
+ 
+     R = flow_func(flowG, _s, _t, capacity=capacity, value_only=True, **kwargs)
+@@ -603,7 +595,7 @@ def minimum_cut_value(flowG, _s, _t, capacity="capacity", flow_func=None, **kwar
+     if not callable(flow_func):
+         raise nx.NetworkXError("flow_func has to be callable.")
+ 
+-    if kwargs.get("cutoff") is not None and flow_func in flow_funcs:
++    if kwargs.get("cutoff") is not None and flow_func is preflow_push:
+         raise nx.NetworkXError("cutoff should not be specified.")
+ 
+     R = flow_func(flowG, _s, _t, capacity=capacity, value_only=True, **kwargs)
+diff --git a/networkx/drawing/nx_pylab.py b/networkx/drawing/nx_pylab.py
+index 09e5ed3a9..674c28a45 100644
+--- a/networkx/drawing/nx_pylab.py
++++ b/networkx/drawing/nx_pylab.py
+@@ -650,6 +650,42 @@ def draw_networkx_edges(
+     # undirected graphs (for performance reasons) and use FancyArrowPatches
+     # for directed graphs.
+     # The `arrows` keyword can be used to override the default behavior
++    use_linecollection = not G.is_directed()
++    if arrows in (True, False):
++        use_linecollection = not arrows
++
++    # Some kwargs only apply to FancyArrowPatches. Warn users when they use
++    # non-default values for these kwargs when LineCollection is being used
++    # instead of silently ignoring the specified option
++    if use_linecollection and any(
++        [
++            arrowstyle is not None,
++            arrowsize != 10,
++            connectionstyle != "arc3",
++            min_source_margin != 0,
++            min_target_margin != 0,
++        ]
++    ):
++        import warnings
++
++        msg = (
++            "\n\nThe {0} keyword argument is not applicable when drawing edges\n"
++            "with LineCollection.\n\n"
++            "To make this warning go away, either specify `arrows=True` to\n"
++            "force FancyArrowPatches or use the default value for {0}.\n"
++            "Note that using FancyArrowPatches may be slow for large graphs.\n"
++        )
++        if arrowstyle is not None:
++            msg = msg.format("arrowstyle")
++        if arrowsize != 10:
++            msg = msg.format("arrowsize")
++        if connectionstyle != "arc3":
++            msg = msg.format("connectionstyle")
++        if min_source_margin != 0:
++            msg = msg.format("min_source_margin")
++        if min_target_margin != 0:
++            msg = msg.format("min_target_margin")
++        warnings.warn(msg, category=UserWarning, stacklevel=2)
+ 
+     if arrowstyle == None:
+         if G.is_directed():
+@@ -657,10 +693,6 @@ def draw_networkx_edges(
+         else:
+             arrowstyle = "-"
+ 
+-    use_linecollection = not G.is_directed()
+-    if arrows in (True, False):
+-        use_linecollection = not arrows
+-
+     if ax is None:
+         ax = plt.gca()
+ 
+diff --git a/networkx/readwrite/gml.py b/networkx/readwrite/gml.py
+index da5ccca58..758c0c73b 100644
+--- a/networkx/readwrite/gml.py
++++ b/networkx/readwrite/gml.py
+@@ -363,6 +363,11 @@ def parse_gml_lines(lines, label, destringizer):
+                         value = destringizer(value)
+                     except ValueError:
+                         pass
++                # Special handling for empty lists and tuples
++                if value == "()":
++                    value = tuple()
++                if value == "[]":
++                    value = list()
+                 curr_token = next(tokens)
+             elif category == Pattern.DICT_START:
+                 curr_token, value = parse_dict(curr_token)
+@@ -728,12 +733,9 @@ def generate_gml(G, stringizer=None):
+                 for key, value in value.items():
+                     yield from stringize(key, value, (), next_indent)
+                 yield indent + "]"
+-            elif (
+-                isinstance(value, (list, tuple))
+-                and key != "label"
+-                and value
+-                and not in_list
+-            ):
++            elif isinstance(value, (list, tuple)) and key != "label" and not in_list:
++                if len(value) == 0:
++                    yield indent + key + " " + f'"{value!r}"'
+                 if len(value) == 1:
+                     yield indent + key + " " + f'"{LIST_START_VALUE}"'
+                 for val in value:

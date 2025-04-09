@@ -1,0 +1,358 @@
+diff --git a/tests.json b/tests.json
+index d2214b2..233519e 100644
+--- a/tests.json
++++ b/tests.json
+@@ -330,7 +330,7 @@
+             ]
+         },
+         {
+-            "id": "File.File",
++            "id": "File",
+             "path": "tests.file",
+             "classname": "TestFile",
+             "tests": [
+@@ -355,6 +355,21 @@
+                 "test_folder_06",
+                 "test_folder_07"
+             ]
++        },
++        {
++            "id": "Worker",
++            "path": "tests.worker",
++            "classname": "TestWorker",
++            "tests": [
++                "test_worker_01",
++                "test_worker_02",
++                "test_worker_03",
++                "test_worker_04",
++                "test_worker_05",
++                "test_worker_06",
++                "test_worker_07",
++                "test_worker_08"
++            ]
+         }
+     ]
+ }
+diff --git a/tests/helper/__init__.py b/tests/helper/__init__.py
+index f23f667..71630bf 100644
+--- a/tests/helper/__init__.py
++++ b/tests/helper/__init__.py
+@@ -29,6 +29,7 @@ __all__ = [
+     "file",
+     "sqlite",
+     "table",
++    "worker",
+ 
+     "get_sqlite",
+     "set_log"
+diff --git a/tests/helper/worker.py b/tests/helper/worker.py
+new file mode 100644
+index 0000000..08cbc1e
+--- /dev/null
++++ b/tests/helper/worker.py
+@@ -0,0 +1,127 @@
++#!/usr/bin/python3
++# -*- coding: utf-8 -*-
++#
++#    Licensed under the Apache License, Version 2.0 (the "License");
++#    you may not use this file except in compliance with the License.
++#    You may obtain a copy of the License at
++#
++#        http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS,
++#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#    See the License for the specific language governing permissions and
++#    limitations under the License.
++#
++#    Copyright (C) 2017, Kai Raphahn <kai.raphahn@laburec.de>
++#
++
++from typing import List
++from dataclasses import dataclass, field
++
++import bbutil
++
++from bbutil.worker import Worker
++
++__all__ = [
++    "CallManager",
++    "Worker01",
++    "Worker02"
++]
++
++
++@dataclass
++class CallManager(object):
++
++    start: int = 0
++    stop: int = 0
++    prepare: int = 0
++    run: int = 0
++    close: int = 0
++    abort: int = 0
++
++    def count(self, name: str):
++        _value = getattr(self, name)
++        _value += 1
++        setattr(self, name, _value)
++        return
++
++    def setup(self, worker: Worker):
++        worker.set_callback(start=lambda: self.count("start"))
++        worker.set_callback(stop=lambda: self.count("stop"))
++        worker.set_callback(prepare=lambda: self.count("prepare"))
++        worker.set_callback(run=lambda: self.count("run"))
++        worker.set_callback(close=lambda: self.count("close"))
++        worker.set_callback(abort=lambda: self.count("abort"))
++        return
++
++    def info(self):
++        bbutil.log.inform("start", "{0:d}".format(self.start))
++        bbutil.log.inform("stop", "{0:d}".format(self.stop))
++        bbutil.log.inform("prepare", "{0:d}".format(self.prepare))
++        bbutil.log.inform("run", "{0:d}".format(self.run))
++        bbutil.log.inform("close", "{0:d}".format(self.close))
++        bbutil.log.inform("abort", "{0:d}".format(self.abort))
++        return
++
++
++@dataclass
++class Worker01(Worker):
++
++    exit_prepare: bool = True
++    exit_run: bool = True
++    exit_close: bool = True
++
++    def prepare(self) -> bool:
++        return self.exit_prepare
++
++    def run(self) -> bool:
++        return self.exit_run
++
++    def close(self) -> bool:
++        return self.exit_close
++
++
++@dataclass
++class Worker02(Worker):
++
++    max: int = 50000
++    iterate_list: List[int] = field(default_factory=list)
++
++    def prepare(self) -> bool:
++        _max = self.max
++        _range = range(0, _max)
++        _progress = bbutil.log.progress(_max)
++
++        for n in _range:
++            self.iterate_list.append(n)
++            _progress.inc()
++
++        bbutil.log.clear()
++        return True
++
++    def run(self) -> bool:
++        _max = len(self.iterate_list)
++        _progress = bbutil.log.progress(_max)
++
++        n = 0
++        for x in self.iterate_list:
++            self.iterate_list[n] = x + 1
++            _progress.inc()
++            n += 1
++
++        bbutil.log.clear()
++        return True
++
++    def close(self) -> bool:
++        _max = len(self.iterate_list)
++        _progress = bbutil.log.progress(_max)
++
++        n = 0
++        for x in self.iterate_list:
++            self.iterate_list[n] = x - 1
++            _progress.inc()
++            n += 1
++
++        bbutil.log.clear()
++        return True
+diff --git a/tests/worker.py b/tests/worker.py
+new file mode 100644
+index 0000000..fb6fac0
+--- /dev/null
++++ b/tests/worker.py
+@@ -0,0 +1,172 @@
++#!/usr/bin/python3
++# -*- coding: utf-8 -*-
++#
++#    Licensed under the Apache License, Version 2.0 (the "License");
++#    you may not use this file except in compliance with the License.
++#    You may obtain a copy of the License at
++#
++#        http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS,
++#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#    See the License for the specific language governing permissions and
++#    limitations under the License.
++#
++#    Copyright (C) 2017, Kai Raphahn <kai.raphahn@laburec.de>
++#
++
++import unittest
++
++import unittest.mock as mock
++
++from tests.helper import set_log
++from tests.helper.worker import CallManager, Worker01, Worker02
++
++__all__ = [
++    "TestWorker"
++]
++
++oserror = OSError("Something strange did happen!")
++mock_oserror = mock.Mock(side_effect=oserror)
++mock_remove = mock.Mock()
++
++
++class TestWorker(unittest.TestCase):
++    """Testing class for locking module."""
++
++    def setUp(self):
++        set_log()
++        return
++
++    def test_worker_01(self):
++        _worker = Worker01(id="Worker01")
++
++        _check = _worker.execute()
++        self.assertTrue(_check)
++        self.assertFalse(_worker.error)
++        return
++
++    def test_worker_02(self):
++        _calls = CallManager()
++        _worker = Worker01(id="Worker01")
++        _calls.setup(_worker)
++
++        _worker.start()
++        _worker.wait()
++
++        self.assertFalse(_worker.error)
++
++        _calls.info()
++        self.assertEqual(_calls.start, 1)
++        self.assertEqual(_calls.stop, 1)
++        self.assertEqual(_calls.prepare, 1)
++        self.assertEqual(_calls.run, 1)
++        self.assertEqual(_calls.close, 1)
++        self.assertEqual(_calls.abort, 0)
++        return
++
++    def test_worker_03(self):
++        _calls = CallManager()
++        _worker = Worker01(id="Worker01", exit_prepare=False)
++        _calls.setup(_worker)
++
++        _check = _worker.execute()
++        self.assertFalse(_check)
++        self.assertTrue(_worker.error)
++
++        _calls.info()
++        self.assertEqual(_calls.start, 1)
++        self.assertEqual(_calls.stop, 1)
++        self.assertEqual(_calls.prepare, 1)
++        self.assertEqual(_calls.run, 0)
++        self.assertEqual(_calls.close, 0)
++        self.assertEqual(_calls.abort, 0)
++        return
++
++    def test_worker_04(self):
++        _calls = CallManager()
++        _worker = Worker01(id="Worker01", exit_run=False)
++        _calls.setup(_worker)
++
++        _check = _worker.execute()
++        self.assertFalse(_check)
++        self.assertTrue(_worker.error)
++
++        _calls.info()
++        self.assertEqual(_calls.start, 1)
++        self.assertEqual(_calls.stop, 1)
++        self.assertEqual(_calls.prepare, 1)
++        self.assertEqual(_calls.run, 1)
++        self.assertEqual(_calls.close, 0)
++        self.assertEqual(_calls.abort, 0)
++        return
++
++    def test_worker_05(self):
++        _calls = CallManager()
++        _worker = Worker01(id="Worker01", exit_close=False)
++        _calls.setup(_worker)
++
++        _check = _worker.execute()
++        self.assertFalse(_check)
++        self.assertTrue(_worker.error)
++
++        _calls.info()
++        self.assertEqual(_calls.start, 1)
++        self.assertEqual(_calls.stop, 1)
++        self.assertEqual(_calls.prepare, 1)
++        self.assertEqual(_calls.run, 1)
++        self.assertEqual(_calls.close, 1)
++        self.assertEqual(_calls.abort, 0)
++        return
++
++    def test_worker_06(self):
++        _calls = CallManager()
++        _worker = Worker01(id="Worker01")
++        _calls.setup(_worker)
++
++        _worker.start()
++        _worker.wait()
++
++        self.assertFalse(_worker.error)
++
++        _calls.info()
++        self.assertEqual(_calls.start, 1)
++        self.assertEqual(_calls.stop, 1)
++        self.assertEqual(_calls.prepare, 1)
++        self.assertEqual(_calls.run, 1)
++        self.assertEqual(_calls.close, 1)
++        self.assertEqual(_calls.abort, 0)
++        return
++
++    def test_worker_07(self):
++        _calls = CallManager()
++        _worker = Worker02(id="Worker02", max=250000)
++        _calls.setup(_worker)
++
++        _worker.start()
++        _check1 = _worker.is_running
++        _worker.abort = True
++
++        _worker.wait()
++        self.assertFalse(_worker.error)
++
++        _calls.info()
++        self.assertEqual(_calls.start, 1)
++        self.assertEqual(_calls.stop, 1)
++        self.assertEqual(_calls.prepare, 1)
++        self.assertEqual(_calls.run, 0)
++        self.assertEqual(_calls.close, 0)
++        self.assertEqual(_calls.abort, 1)
++        return
++
++    def test_worker_08(self):
++        _worker = Worker02(id="Worker02", max=250000)
++
++        _worker.start()
++        _check1 = _worker.is_running
++        _worker.abort = True
++
++        _worker.wait()
++        self.assertFalse(_worker.error)
++        return

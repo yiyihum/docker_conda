@@ -1,0 +1,113 @@
+diff --git a/tests/dialects/test_dialect.py b/tests/dialects/test_dialect.py
+index 446247c3..4267a4dc 100644
+--- a/tests/dialects/test_dialect.py
++++ b/tests/dialects/test_dialect.py
+@@ -715,6 +715,7 @@ class TestDialect(Validator):
+                 "hive": "REDUCE(x, 0, (acc, x) -> acc + x, acc -> acc)",
+                 "presto": "REDUCE(x, 0, (acc, x) -> acc + x, acc -> acc)",
+                 "spark": "AGGREGATE(x, 0, (acc, x) -> acc + x, acc -> acc)",
++                "presto": "REDUCE(x, 0, (acc, x) -> acc + x, acc -> acc)",
+             },
+         )
+ 
+diff --git a/tests/dialects/test_postgres.py b/tests/dialects/test_postgres.py
+index 70a6820b..780cac0c 100644
+--- a/tests/dialects/test_postgres.py
++++ b/tests/dialects/test_postgres.py
+@@ -113,11 +113,19 @@ class TestPostgres(Validator):
+         self.validate_identity("x ~* 'y'")
+ 
+         self.validate_all(
+-            "GENERATE_SERIES(a, b, c)",
++            "GENERATE_SERIES(a, b, '  2   days  ')",
+             write={
+-                "postgres": "GENERATE_SERIES(a, b, c)",
+-                "presto": "SEQUENCE(a, b, c)",
+-                "trino": "SEQUENCE(a, b, c)",
++                "postgres": "GENERATE_SERIES(a, b, INTERVAL '2' days)",
++                "presto": "SEQUENCE(a, b, INTERVAL '2' days)",
++                "trino": "SEQUENCE(a, b, INTERVAL '2' days)",
++            },
++        )
++        self.validate_all(
++            "GENERATE_SERIES('2019-01-01'::TIMESTAMP, NOW(), '1day')",
++            write={
++                "postgres": "GENERATE_SERIES(CAST('2019-01-01' AS TIMESTAMP), CURRENT_TIMESTAMP, INTERVAL '1' day)",
++                "presto": "SEQUENCE(CAST('2019-01-01' AS TIMESTAMP), CAST(CURRENT_TIMESTAMP AS TIMESTAMP), INTERVAL '1' day)",
++                "trino": "SEQUENCE(CAST('2019-01-01' AS TIMESTAMP), CAST(CURRENT_TIMESTAMP AS TIMESTAMP), INTERVAL '1' day)",
+             },
+         )
+         self.validate_all(
+diff --git a/tests/dialects/test_presto.py b/tests/dialects/test_presto.py
+index b5350481..9c8e26e7 100644
+--- a/tests/dialects/test_presto.py
++++ b/tests/dialects/test_presto.py
+@@ -314,6 +314,11 @@ class TestPresto(Validator):
+ 
+     def test_presto(self):
+         self.validate_identity("SELECT BOOL_OR(a > 10) FROM asd AS T(a)")
++        self.validate_identity("SELECT * FROM (VALUES (1))")
++        self.validate_identity("START TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE")
++        self.validate_identity("START TRANSACTION ISOLATION LEVEL REPEATABLE READ")
++        self.validate_identity("APPROX_PERCENTILE(a, b, c, d)")
++
+         self.validate_all(
+             'SELECT a."b" FROM "foo"',
+             write={
+@@ -455,10 +460,6 @@ class TestPresto(Validator):
+                 "spark": UnsupportedError,
+             },
+         )
+-        self.validate_identity("SELECT * FROM (VALUES (1))")
+-        self.validate_identity("START TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE")
+-        self.validate_identity("START TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+-        self.validate_identity("APPROX_PERCENTILE(a, b, c, d)")
+ 
+     def test_encode_decode(self):
+         self.validate_all(
+diff --git a/tests/dialects/test_spark.py b/tests/dialects/test_spark.py
+index 02d43aaa..be74a27f 100644
+--- a/tests/dialects/test_spark.py
++++ b/tests/dialects/test_spark.py
+@@ -212,6 +212,17 @@ TBLPROPERTIES (
+         self.validate_identity("TRIM(BOTH 'SL' FROM 'SSparkSQLS')")
+         self.validate_identity("TRIM(LEADING 'SL' FROM 'SSparkSQLS')")
+         self.validate_identity("TRIM(TRAILING 'SL' FROM 'SSparkSQLS')")
++
++        self.validate_all(
++            "AGGREGATE(my_arr, 0, (acc, x) -> acc + x, s -> s * 2)",
++            write={
++                "trino": "REDUCE(my_arr, 0, (acc, x) -> acc + x, s -> s * 2)",
++                "duckdb": "REDUCE(my_arr, 0, (acc, x) -> acc + x, s -> s * 2)",
++                "hive": "REDUCE(my_arr, 0, (acc, x) -> acc + x, s -> s * 2)",
++                "presto": "REDUCE(my_arr, 0, (acc, x) -> acc + x, s -> s * 2)",
++                "spark": "AGGREGATE(my_arr, 0, (acc, x) -> acc + x, s -> s * 2)",
++            },
++        )
+         self.validate_all(
+             "TRIM('SL', 'SSparkSQLS')", write={"spark": "TRIM('SL' FROM 'SSparkSQLS')"}
+         )
+diff --git a/tests/test_expressions.py b/tests/test_expressions.py
+index f0639ed2..55e07d13 100644
+--- a/tests/test_expressions.py
++++ b/tests/test_expressions.py
+@@ -631,6 +631,19 @@ FROM foo""",
+ FROM foo""",
+         )
+ 
++    def test_to_interval(self):
++        self.assertEqual(exp.to_interval("1day").sql(), "INTERVAL '1' day")
++        self.assertEqual(exp.to_interval("  5     months").sql(), "INTERVAL '5' months")
++        with self.assertRaises(ValueError):
++            exp.to_interval("bla")
++
++        self.assertEqual(exp.to_interval(exp.Literal.string("1day")).sql(), "INTERVAL '1' day")
++        self.assertEqual(
++            exp.to_interval(exp.Literal.string("  5   months")).sql(), "INTERVAL '5' months"
++        )
++        with self.assertRaises(ValueError):
++            exp.to_interval(exp.Literal.string("bla"))
++
+     def test_to_table(self):
+         table_only = exp.to_table("table_name")
+         self.assertEqual(table_only.name, "table_name")

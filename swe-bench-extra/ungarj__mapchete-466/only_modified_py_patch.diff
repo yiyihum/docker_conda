@@ -1,0 +1,356 @@
+diff --git a/mapchete/_executor.py b/mapchete/_executor.py
+index e1f9d53..2478b0d 100644
+--- a/mapchete/_executor.py
++++ b/mapchete/_executor.py
+@@ -11,7 +11,7 @@ import warnings
+ 
+ from cached_property import cached_property
+ 
+-from mapchete.errors import JobCancelledError
++from mapchete.errors import JobCancelledError, MapcheteTaskFailed
+ from mapchete.log import set_log_level
+ from mapchete._timer import Timer
+ 
+@@ -180,21 +180,15 @@ class _ExecutorBase:
+         Release future from cluster explicitly and wrap result around FinishedFuture object.
+         """
+         if not _dask:
+-            try:
+-                self.running_futures.remove(future)
+-            except KeyError:  # pragma: no cover
+-                pass
++            self.running_futures.discard(future)
+         self.finished_futures.discard(future)
+-        fut_exception = future.exception(timeout=FUTURE_TIMEOUT)
+-        if fut_exception:  # pragma: no cover
+-            logger.error("exception caught in future %s", future)
+-            logger.exception(fut_exception)
+-            raise fut_exception
+-        result = result or future.result(timeout=FUTURE_TIMEOUT)
+-        if isinstance(result, CancelledError):  # pragma: no cover
+-            raise result
++
++        # raise exception if future errored or was cancelled
++        future = future_raise_exception(future)
++
+         # create minimal Future-like object with no references to the cluster
+         finished_future = FinishedFuture(future, result=result)
++
+         # explicitly release future
+         try:
+             future.release()
+@@ -253,7 +247,7 @@ class DaskExecutor(_ExecutorBase):
+                 "starting dask.distributed.Client with kwargs %s", self._executor_kwargs
+             )
+         self._ac_iterator = as_completed(
+-            loop=self._executor.loop, with_results=True, raise_errors=True
++            loop=self._executor.loop, with_results=True, raise_errors=False
+         )
+         self._submitted = 0
+         super().__init__(*args, **kwargs)
+@@ -608,14 +602,14 @@ class FakeFuture:
+         except Exception as e:  # pragma: no cover
+             self._result, self._exception = None, e
+ 
+-    def result(self):
++    def result(self, **kwargs):
+         """Return task result."""
+         if self._exception:
+             logger.exception(self._exception)
+             raise self._exception
+         return self._result
+ 
+-    def exception(self):
++    def exception(self, **kwargs):
+         """Raise task exception if any."""
+         return self._exception
+ 
+@@ -635,11 +629,11 @@ class SkippedFuture:
+         self._result = result
+         self.skip_info = skip_info
+ 
+-    def result(self):
++    def result(self, **kwargs):
+         """Only return initial result value."""
+         return self._result
+ 
+-    def exception(self):  # pragma: no cover
++    def exception(self, **kwargs):  # pragma: no cover
+         """Nothing to raise here."""
+         return
+ 
+@@ -665,14 +659,14 @@ class FinishedFuture:
+         except Exception as e:  # pragma: no cover
+             self._result, self._exception = None, e
+ 
+-    def result(self):
++    def result(self, **kwargs):
+         """Return task result."""
+         if self._exception:  # pragma: no cover
+             logger.exception(self._exception)
+             raise self._exception
+         return self._result
+ 
+-    def exception(self):  # pragma: no cover
++    def exception(self, **kwargs):  # pragma: no cover
+         """Raise task exception if any."""
+         return self._exception
+ 
+@@ -683,3 +677,57 @@ class FinishedFuture:
+     def __repr__(self):  # pragma: no cover
+         """Return string representation."""
+         return f"<FinishedFuture: type: {type(self._result)}, exception: {type(self._exception)})"
++
++
++def future_is_failed_or_cancelled(future):
++    """
++    Return whether future is failed or cancelled.
++
++    This is a workaround between the slightly different APIs of dask and concurrent.futures.
++    It also tries to avoid potentially expensive calls to the dask scheduler.
++    """
++    # dask futures
++    if hasattr(future, "status"):
++        return future.status in ["error", "cancelled"]
++    # concurrent.futures futures
++    else:
++        return future.exception(timeout=FUTURE_TIMEOUT) is not None
++
++
++def future_exception(future):
++    """
++    Return future exception if future errored or cancelled.
++
++    This is a workaround between the slightly different APIs of dask and concurrent.futures.
++    It also tries to avoid potentially expensive calls to the dask scheduler.
++    """
++    # dask futures
++    if hasattr(future, "status"):
++        if future.status == "cancelled":  # pragma: no cover
++            exception = future.result(timeout=FUTURE_TIMEOUT)
++        elif future.status == "error":
++            exception = future.exception(timeout=FUTURE_TIMEOUT)
++        else:  # pragma: no cover
++            exception = None
++    else:
++        # concurrent.futures futures
++        exception = future.exception(timeout=FUTURE_TIMEOUT)
++
++    if exception is None:  # pragma: no cover
++        raise TypeError("future %s does not have an exception to raise", future)
++    return exception
++
++
++def future_raise_exception(future, raise_errors=True):
++    """
++    Checks whether future contains an exception and raises it.
++    """
++    if raise_errors and future_is_failed_or_cancelled(future):
++        exception = future_exception(future)
++        future_name = (
++            future.key.rstrip("_finished") if hasattr(future, "key") else str(future)
++        )
++        raise MapcheteTaskFailed(
++            f"{future_name} raised a {repr(exception)}"
++        ).with_traceback(exception.__traceback__)
++    return future
+diff --git a/mapchete/_processing.py b/mapchete/_processing.py
+index 97e8a32..997d6ea 100644
+--- a/mapchete/_processing.py
++++ b/mapchete/_processing.py
+@@ -5,18 +5,28 @@ from contextlib import ExitStack
+ from itertools import chain
+ import logging
+ import multiprocessing
++import os
+ from shapely.geometry import mapping
+ from tilematrix._funcs import Bounds
+ from traceback import format_exc
+ from typing import Generator
+ 
+ from mapchete.config import get_process_func
+-from mapchete._executor import DaskExecutor, Executor, SkippedFuture, FinishedFuture
+-from mapchete.errors import MapcheteNodataTile
+-from mapchete._tasks import to_dask_collection, TileTaskBatch, TileTask, TaskBatch, Task
++from mapchete._executor import (
++    DaskExecutor,
++    Executor,
++    SkippedFuture,
++    FinishedFuture,
++    future_raise_exception,
++)
++from mapchete.errors import MapcheteNodataTile, MapcheteTaskFailed
++from mapchete._tasks import to_dask_collection, TileTaskBatch, TileTask, TaskBatch
+ from mapchete._timer import Timer
+ from mapchete.validate import validate_zooms
+ 
++FUTURE_TIMEOUT = float(os.environ.get("MP_FUTURE_TIMEOUT", 10))
++
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -279,16 +289,8 @@ def compute(
+                 ),
+                 1,
+             ):
+-                if raise_errors:  # pragma: no cover
+-                    if future.exception():
+-                        logger.exception(future.exception())
+-                        raise future.exception()
+-                    elif future.cancelled():
+-                        logger.debug("future %s was cancelled!", future)
+-                        # this should raise the CancelledError
+-                        future.result()
+                 logger.debug("task %s finished: %s", num_processed, future)
+-                yield future
++                yield future_raise_exception(future, raise_errors=raise_errors)
+         else:
+             for num_processed, future in enumerate(
+                 _compute_tasks(
+@@ -301,16 +303,8 @@ def compute(
+                 ),
+                 1,
+             ):
+-                if raise_errors:  # pragma: no cover
+-                    if future.exception():
+-                        logger.exception(future.exception())
+-                        raise future.exception()
+-                    elif future.cancelled():
+-                        logger.debug("future %s was cancelled!", future)
+-                        # this should raise the CancelledError
+-                        future.result()
+                 logger.debug("task %s finished: %s", num_processed, future)
+-                yield future
++                yield future_raise_exception(future)
+ 
+     logger.info("computed %s tasks in %s", num_processed, duration)
+ 
+@@ -571,7 +565,6 @@ def _compute_task_graph(
+ ):
+     # TODO optimize memory management, e.g. delete preprocessing tasks from input
+     # once the dask graph is ready.
+-    from dask.delayed import delayed
+     from distributed import as_completed
+ 
+     # materialize all tasks including dependencies
+@@ -587,7 +580,6 @@ def _compute_task_graph(
+             )
+         )
+     logger.debug("dask collection with %s tasks generated in %s", len(coll), t)
+-
+     # send to scheduler
+     with Timer() as t:
+         futures = executor._executor.compute(coll, optimize_graph=True, traverse=True)
+@@ -635,6 +627,7 @@ def _compute_tasks(
+             fkwargs=dict(append_data=True),
+             **kwargs,
+         ):
++            future = future_raise_exception(future)
+             result = future.result()
+             process.config.set_preprocessing_task_result(result.task_key, result.data)
+             yield future
+@@ -642,22 +635,21 @@ def _compute_tasks(
+     # run single tile
+     if tile:
+         logger.info("run process on single tile")
+-        yield next(
+-            executor.as_completed(
+-                func=_execute_and_write,
+-                iterable=[
+-                    TileTask(
+-                        tile=tile,
+-                        config=process.config,
+-                        skip=(
+-                            process.config.mode == "continue"
+-                            and process.config.output_reader.tiles_exist(tile)
+-                        ),
++        for future in executor.as_completed(
++            func=_execute_and_write,
++            iterable=[
++                TileTask(
++                    tile=tile,
++                    config=process.config,
++                    skip=(
++                        process.config.mode == "continue"
++                        and process.config.output_reader.tiles_exist(tile)
+                     ),
+-                ],
+-                fkwargs=dict(output_writer=process.config.output),
+-            )
+-        )
++                ),
++            ],
++            fkwargs=dict(output_writer=process.config.output),
++        ):
++            yield future_raise_exception(future)
+ 
+     else:
+         # for output drivers requiring writing data in parent process
+@@ -689,7 +681,7 @@ def _compute_tasks(
+             write_in_parent_process=write_in_parent_process,
+             **kwargs,
+         ):
+-            yield future
++            yield future_raise_exception(future)
+ 
+ 
+ def _run_multi_overviews(
+diff --git a/mapchete/_tasks.py b/mapchete/_tasks.py
+index 43f9c26..22ca296 100644
+--- a/mapchete/_tasks.py
++++ b/mapchete/_tasks.py
+@@ -232,6 +232,7 @@ class TileTask(Task):
+                 # append dependent preprocessing task results to input objects
+                 if dependencies:
+                     for task_key, task_result in dependencies.items():
++                        logger.debug("HERBERT: %s", task_key)
+                         if not task_key.startswith("tile_task"):
+                             inp_key, task_key = task_key.split(":")[0], ":".join(
+                                 task_key.split(":")[1:]
+@@ -259,9 +260,7 @@ class TileTask(Task):
+             # Log process time
+             logger.exception(e)
+             logger.error((self.tile.id, "exception in user process", e, str(duration)))
+-            new = MapcheteProcessException(format_exc())
+-            new.old = e
+-            raise new
++            raise
+ 
+         return process_data
+ 
+@@ -424,8 +423,16 @@ def to_dask_collection(batches):
+                 )
+             else:
+                 dependencies = {}
+-            tasks[task] = delayed(batch.func)(
+-                task, dependencies=dependencies, **batch.fkwargs
++            tasks[task] = delayed(
++                batch.func,
++                pure=True,
++                name=f"{task.id}",
++                traverse=len(dependencies) > 0,
++            )(
++                task,
++                dependencies=dependencies,
++                **batch.fkwargs,
++                dask_key_name=f"{task.id}_finished",
+             )
+         previous_batch = batch
+     return list(tasks.values())
+diff --git a/mapchete/errors.py b/mapchete/errors.py
+index 6576a7e..675897e 100644
+--- a/mapchete/errors.py
++++ b/mapchete/errors.py
+@@ -13,6 +13,10 @@ class MapcheteProcessException(Exception):
+     """Raised when a mapchete process execution fails."""
+ 
+ 
++class MapcheteTaskFailed(Exception):
++    """Raised when a task fails."""
++
++
+ class MapcheteProcessOutputError(ValueError):
+     """Raised when a mapchete process output is invalid."""
+ 
+

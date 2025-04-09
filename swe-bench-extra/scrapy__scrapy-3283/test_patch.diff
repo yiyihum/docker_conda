@@ -1,0 +1,99 @@
+diff --git a/tests/test_dupefilters.py b/tests/test_dupefilters.py
+index 2d1a4bfff..db69597a2 100644
+--- a/tests/test_dupefilters.py
++++ b/tests/test_dupefilters.py
+@@ -5,11 +5,60 @@ import shutil
+ 
+ from scrapy.dupefilters import RFPDupeFilter
+ from scrapy.http import Request
++from scrapy.core.scheduler import Scheduler
+ from scrapy.utils.python import to_bytes
++from scrapy.utils.job import job_dir
++from scrapy.utils.test import get_crawler
++
++
++class FromCrawlerRFPDupeFilter(RFPDupeFilter):
++
++    @classmethod
++    def from_crawler(cls, crawler):
++        debug = crawler.settings.getbool('DUPEFILTER_DEBUG')
++        df = cls(job_dir(crawler.settings), debug)
++        df.method = 'from_crawler'
++        return df
++
++
++class FromSettingsRFPDupeFilter(RFPDupeFilter):
++
++    @classmethod
++    def from_settings(cls, settings):
++        debug = settings.getbool('DUPEFILTER_DEBUG')
++        df = cls(job_dir(settings), debug)
++        df.method = 'from_settings'
++        return df
++
++
++class DirectDupeFilter(object):
++    method = 'n/a'
+ 
+ 
+ class RFPDupeFilterTest(unittest.TestCase):
+ 
++    def test_df_from_crawler_scheduler(self):
++        settings = {'DUPEFILTER_DEBUG': True,
++                    'DUPEFILTER_CLASS': __name__  + '.FromCrawlerRFPDupeFilter'}
++        crawler = get_crawler(settings_dict=settings)
++        scheduler = Scheduler.from_crawler(crawler)
++        self.assertTrue(scheduler.df.debug)
++        self.assertEqual(scheduler.df.method, 'from_crawler')
++
++    def test_df_from_settings_scheduler(self):
++        settings = {'DUPEFILTER_DEBUG': True,
++                    'DUPEFILTER_CLASS': __name__  + '.FromSettingsRFPDupeFilter'}
++        crawler = get_crawler(settings_dict=settings)
++        scheduler = Scheduler.from_crawler(crawler)
++        self.assertTrue(scheduler.df.debug)
++        self.assertEqual(scheduler.df.method, 'from_settings')
++
++    def test_df_direct_scheduler(self):
++        settings = {'DUPEFILTER_CLASS': __name__  + '.DirectDupeFilter'}
++        crawler = get_crawler(settings_dict=settings)
++        scheduler = Scheduler.from_crawler(crawler)
++        self.assertEqual(scheduler.df.method, 'n/a')
++
+     def test_filter(self):
+         dupefilter = RFPDupeFilter()
+         dupefilter.open()
+diff --git a/tests/test_http_request.py b/tests/test_http_request.py
+index fc89229c6..58326a384 100644
+--- a/tests/test_http_request.py
++++ b/tests/test_http_request.py
+@@ -406,6 +406,29 @@ class FormRequestTest(RequestTest):
+         self.assertEqual(fs[u'test2'], [u'xxx µ'])
+         self.assertEqual(fs[u'six'], [u'seven'])
+ 
++    def test_from_response_duplicate_form_key(self):
++        response = _buildresponse(
++                '<form></form>',
++                url='http://www.example.com')
++        req = self.request_class.from_response(response,
++                method='GET',
++                formdata=(('foo', 'bar'), ('foo', 'baz')))
++        self.assertEqual(urlparse(req.url).hostname, 'www.example.com')
++        self.assertEqual(urlparse(req.url).query, 'foo=bar&foo=baz')
++    
++    def test_from_response_override_duplicate_form_key(self):
++        response = _buildresponse(
++            """<form action="get.php" method="POST">
++            <input type="hidden" name="one" value="1">
++            <input type="hidden" name="two" value="3">
++            </form>""")
++        req = self.request_class.from_response(
++            response,
++            formdata=(('two', '2'), ('two', '4')))
++        fs = _qs(req)
++        self.assertEqual(fs[b'one'], [b'1'])
++        self.assertEqual(fs[b'two'], [b'2', b'4'])
++
+     def test_from_response_extra_headers(self):
+         response = _buildresponse(
+             """<form action="post.php" method="POST">

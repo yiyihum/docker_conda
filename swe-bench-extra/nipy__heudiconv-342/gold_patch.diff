@@ -1,0 +1,109 @@
+diff --git a/heudiconv/convert.py b/heudiconv/convert.py
+index c115039..7acfdf7 100644
+--- a/heudiconv/convert.py
++++ b/heudiconv/convert.py
+@@ -572,7 +572,7 @@ def save_converted_files(res, item_dicoms, bids, outtype, prefix, outname_bids,
+                 echo_number = fileinfo.get('EchoNumber', 1)
+ 
+ 
+-                supported_multiecho = ['_bold', '_epi', '_sbref', '_T1w']
++                supported_multiecho = ['_bold', '_epi', '_sbref', '_T1w', '_PDT2']
+                 # Now, decide where to insert it.
+                 # Insert it **before** the following string(s), whichever appears first.
+                 for imgtype in supported_multiecho:
+diff --git a/heudiconv/heuristics/reproin.py b/heudiconv/heuristics/reproin.py
+index 7de451d..4829941 100644
+--- a/heudiconv/heuristics/reproin.py
++++ b/heudiconv/heuristics/reproin.py
+@@ -28,10 +28,11 @@ per each session.
+ Sequence names on the scanner must follow this specification to avoid manual
+ conversion/handling:
+ 
+-  [PREFIX:]<seqtype[-label]>[_ses-<SESID>][_task-<TASKID>][_acq-<ACQLABEL>][_run-<RUNID>][_dir-<DIR>][<more BIDS>][__<custom>]
++  [PREFIX:][WIP ]<seqtype[-label]>[_ses-<SESID>][_task-<TASKID>][_acq-<ACQLABEL>][_run-<RUNID>][_dir-<DIR>][<more BIDS>][__<custom>]
+ 
+ where
+  [PREFIX:] - leading capital letters followed by : are stripped/ignored
++ [WIP ] - prefix is stripped/ignored (added by Philips for patch sequences)
+  <...> - value to be entered
+  [...] - optional -- might be nearly mandatory for some modalities (e.g.,
+          run for functional) and very optional for others
+@@ -104,6 +105,16 @@ __<custom> (optional)
+ 
+ Although we still support "-" and "+" used within SESID and TASKID, their use is
+ not recommended, thus not listed here
++
++## Scanner specifics
++
++We perform following actions regardless of the type of scanner, but applied
++generally to accommodate limitations imposed by different manufacturers/models:
++
++### Philips
++
++- We replace all ( with { and ) with } to be able e.g. to specify session {date}
++- "WIP " prefix unconditionally added by the scanner is stripped
+ """
+ 
+ import os
+@@ -426,16 +437,15 @@ def ls(study_session, seqinfo):
+ # So we just need subdir and file_suffix!
+ def infotodict(seqinfo):
+     """Heuristic evaluator for determining which runs belong where
+-    
+-    allowed template fields - follow python string module: 
+-    
++
++    allowed template fields - follow python string module:
++
+     item: index within category 
+     subject: participant id 
+     seqitem: run number during scanning
+     subindex: sub index within group
+     session: scan index for longitudinal acq
+     """
+-
+     seqinfo = fix_seqinfo(seqinfo)
+     lgr.info("Processing %d seqinfo entries", len(seqinfo))
+     and_dicom = ('dicom', 'nii.gz')
+@@ -841,6 +851,7 @@ def parse_series_spec(series_spec):
+     # https://github.com/ReproNim/reproin/issues/14
+     # where PU: prefix is added by the scanner
+     series_spec = re.sub("^[A-Z]*:", "", series_spec)
++    series_spec = re.sub("^WIP ", "", series_spec) # remove Philips WIP prefix
+ 
+     # Remove possible suffix we don't care about after __
+     series_spec = series_spec.split('__', 1)[0]
+@@ -888,7 +899,9 @@ def parse_series_spec(series_spec):
+ 
+         # sanitize values, which must not have _ and - is undesirable ATM as well
+         # TODO: BIDSv2.0 -- allows "-" so replace with it instead
+-        value = str(value).replace('_', 'X').replace('-', 'X')
++        value = str(value) \
++            .replace('_', 'X').replace('-', 'X') \
++            .replace('(', '{').replace(')', '}')  # for Philips
+ 
+         if key in ['ses', 'run', 'task', 'acq']:
+             # those we care about explicitly
+diff --git a/heudiconv/utils.py b/heudiconv/utils.py
+index 847dfaf..abea820 100644
+--- a/heudiconv/utils.py
++++ b/heudiconv/utils.py
+@@ -251,7 +251,17 @@ def treat_infofile(filename):
+         j = json.load(f)
+ 
+     j_slim = slim_down_info(j)
+-    j_pretty = json_dumps_pretty(j_slim, indent=2, sort_keys=True)
++    dumps_kw = dict(indent=2, sort_keys=True)
++    try:
++        j_pretty = json_dumps_pretty(j_slim, **dumps_kw)
++    except AssertionError as exc:
++        lgr.warning(
++            "Prettyfication of .json failed (%s).  "
++            "Original .json will be kept as is.  Please share (if you could) "
++            "that file (%s) with HeuDiConv developers"
++            % (str(exc), filename)
++        )
++        j_pretty = json.dumps(j_slim, **dumps_kw)
+ 
+     set_readonly(filename, False)
+     with open(filename, 'wt') as fp:

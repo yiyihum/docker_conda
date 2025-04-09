@@ -1,0 +1,148 @@
+diff --git a/eof/cli.py b/eof/cli.py
+index e5a2432..948c96c 100644
+--- a/eof/cli.py
++++ b/eof/cli.py
+@@ -35,7 +35,13 @@ from eof import log
+     type=click.Choice(["S1A", "S1B"]),
+     help="Optionally specify Sentinel satellite to download (default: gets both S1A and S1B)",
+ )
+-def cli(search_path, save_dir, sentinel_file, date, mission):
++@click.option(
++    "--use-scihub",
++    is_flag=True,
++    default=False,
++    help="Use SciHub as primary provider to download orbits (default: False)",
++)
++def cli(search_path, save_dir, sentinel_file, date, mission, use_scihub):
+     """Download Sentinel precise orbit files.
+ 
+     Saves files to `save-dir` (default = current directory)
+@@ -51,4 +57,5 @@ def cli(search_path, save_dir, sentinel_file, date, mission):
+         sentinel_file=sentinel_file,
+         mission=mission,
+         date=date,
++        use_scihub=use_scihub,
+     )
+diff --git a/eof/download.py b/eof/download.py
+index ab06273..b9db51e 100644
+--- a/eof/download.py
++++ b/eof/download.py
+@@ -45,7 +45,8 @@ PRECISE_ORBIT = "POEORB"
+ RESTITUTED_ORBIT = "RESORB"
+ 
+ 
+-def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir="."):
++def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir=".",
++                  use_scihub: bool = False):
+     """Downloads and saves EOF files for specific dates
+ 
+     Args:
+@@ -54,6 +55,8 @@ def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir=".
+             No input downloads both, must be same len as orbit_dts
+         sentinel_file (str): path to Sentinel-1 filename to download one .EOF for
+         save_dir (str): directory to save the EOF files into
++        use_scihub (bool): use SciHub to download orbits
++            (if False SciHUb is used only as a fallback)
+ 
+     Returns:
+         list[str]: all filenames of saved orbit files
+@@ -76,18 +79,51 @@ def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir=".
+     # First make sures all are datetimes if given string
+     orbit_dts = [parse(dt) if isinstance(dt, str) else dt for dt in orbit_dts]
+ 
+-    # Download and save all links in parallel
+-    pool = ThreadPool(processes=MAX_WORKERS)
+-    result_dt_dict = {
+-        pool.apply_async(_download_and_write, (mission, dt, save_dir)): dt
+-        for mission, dt in zip(missions, orbit_dts)
+-    }
+     filenames = []
+-    for result in result_dt_dict:
+-        cur_filenames = result.get()
+-        dt = result_dt_dict[result]
+-        logger.info("Finished {}, saved to {}".format(dt.date(), cur_filenames))
+-        filenames.extend(cur_filenames)
++
++    if not use_scihub:
++        # Download and save all links in parallel
++        pool = ThreadPool(processes=MAX_WORKERS)
++        result_dt_dict = {
++            pool.apply_async(_download_and_write, (mission, dt, save_dir)): dt
++            for mission, dt in zip(missions, orbit_dts)
++        }
++
++        for result in result_dt_dict:
++            cur_filenames = result.get()
++            if cur_filenames is None:
++                use_scihub = True
++                continue
++            dt = result_dt_dict[result]
++            logger.info("Finished {}, saved to {}".format(dt.date(), cur_filenames))
++            filenames.extend(cur_filenames)
++    
++    if use_scihub:
++        # try to search on scihub
++        from .scihubclient import ScihubGnssClient
++        client = ScihubGnssClient()
++        query = {}
++        if sentinel_file:
++            query.update(client.query_orbit_for_product(sentinel_file))
++        else:
++            for mission, dt in zip(missions, orbit_dts):
++                result = client.query_orbit(dt, dt + timedelta(days=1),
++                                            mission, product_type='AUX_POEORB')
++                if result:
++                    query.update(result)
++                else:
++                    # try with RESORB
++                    result = client.query_orbit(dt, dt + timedelta(minutes=1),
++                                                mission,
++                                                product_type='AUX_RESORB')
++                    query.update(result)
++
++        if query:
++            result = client.download_all(query)
++            filenames.extend(
++                item['path'] for item in result.downloaded.values()
++            )
++    
+     return filenames
+ 
+ 
+@@ -299,7 +335,8 @@ def find_scenes_to_download(search_path="./", save_dir="./"):
+     return orbit_dts, missions
+ 
+ 
+-def main(search_path=".", save_dir=",", sentinel_file=None, mission=None, date=None):
++def main(search_path=".", save_dir=",", sentinel_file=None, mission=None, date=None,
++         use_scihub: bool = False):
+     """Function used for entry point to download eofs"""
+ 
+     if not os.path.exists(save_dir):
+@@ -331,4 +368,5 @@ def main(search_path=".", save_dir=",", sentinel_file=None, mission=None, date=N
+         missions=missions,
+         sentinel_file=sentinel_file,
+         save_dir=save_dir,
++        use_scihub=use_scihub,
+     )
+diff --git a/setup.py b/setup.py
+index fd829be..e82e843 100644
+--- a/setup.py
++++ b/setup.py
+@@ -20,6 +20,7 @@ setuptools.setup(
+         "Programming Language :: Python :: 3.6",
+         "Programming Language :: Python :: 3.7",
+         "Programming Language :: Python :: 3.8",
++        "Programming Language :: Python :: 3.9",
+         "Programming Language :: C",
+         "License :: OSI Approved :: MIT License",
+         "Topic :: Scientific/Engineering",
+@@ -29,6 +30,7 @@ setuptools.setup(
+         "requests",
+         "click",
+         "python-dateutil",
++        "sentinelsat >= 1.0",
+     ],
+     entry_points={
+         "console_scripts": [
+

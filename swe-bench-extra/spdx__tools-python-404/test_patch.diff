@@ -1,0 +1,106 @@
+diff --git a/tests/validation/test_creation_info_validator.py b/tests/validation/test_creation_info_validator.py
+index 5de0416..8f0d661 100644
+--- a/tests/validation/test_creation_info_validator.py
++++ b/tests/validation/test_creation_info_validator.py
+@@ -27,9 +27,7 @@ def test_valid_creation_info():
+ 
+ @pytest.mark.parametrize \
+         ("creation_info_input, spdx_id, expected_message",
+-         [(creation_info_fixture(spdx_version="version-2.3"), "SPDXRef-DOCUMENT",
+-           'spdx_version must be of the form "SPDX-[major].[minor]" but is: version-2.3'),
+-          (creation_info_fixture(spdx_id="SPDXRef-doc"), "SPDXRef-doc",
++         [(creation_info_fixture(spdx_id="SPDXRef-doc"), "SPDXRef-doc",
+            'spdx_id must be "SPDXRef-DOCUMENT", but is: SPDXRef-doc'),
+           (creation_info_fixture(data_license="MIT"), "SPDXRef-DOCUMENT",
+            'data_license must be "CC0-1.0", but is: MIT'),
+diff --git a/tests/validation/test_document_validator.py b/tests/validation/test_document_validator.py
+index 637c6ad..a7f2d7a 100644
+--- a/tests/validation/test_document_validator.py
++++ b/tests/validation/test_document_validator.py
+@@ -9,17 +9,50 @@
+ #  See the License for the specific language governing permissions and
+ #  limitations under the License.
+ 
+-from typing import List
++from typing import List, Optional
+ 
++import pytest
++
++from src.model.document import Document, CreationInfo
+ from src.validation.document_validator import validate_full_spdx_document
+-from src.validation.validation_message import ValidationMessage
+-from tests.fixtures import document_fixture
++from src.validation.validation_message import ValidationMessage, ValidationContext, SpdxElementType
++from tests.fixtures import document_fixture, creation_info_fixture
+ 
+ 
+ def test_valid_document():
+     document = document_fixture()
+-    validation_messages: List[ValidationMessage] = validate_full_spdx_document(document, "2.3")
++    validation_messages: List[ValidationMessage] = validate_full_spdx_document(document)
+ 
+     assert validation_messages == []
+ 
+-# TODO: https://github.com/spdx/tools-python/issues/375
++
++@pytest.mark.parametrize("creation_info, version_input, expected_message",
++                         [(creation_info_fixture(spdx_version="SPDX-2.3"), "SPDX-2.3", None),
++                          (creation_info_fixture(spdx_version="SPDX-2.3"), None, None),
++                          (creation_info_fixture(spdx_version="SPDX-2.3"), "SPDX-2.2",
++                           "provided SPDX version SPDX-2.2 does not match the document's SPDX version SPDX-2.3"),
++                          (creation_info_fixture(spdx_version="SPDX-2.3"), "SPDX2.3",
++                           "provided SPDX version SPDX2.3 does not match the document's SPDX version SPDX-2.3"),
++                          (creation_info_fixture(spdx_version="SPDX2.3"), "SPDX-2.3",
++                           'the document\'s spdx_version must be of the form "SPDX-[major].[minor]" but is: SPDX2.3'),
++                          (creation_info_fixture(spdx_version="SPDX2.3"), None,
++                           'the document\'s spdx_version must be of the form "SPDX-[major].[minor]" but is: SPDX2.3'),
++                          (creation_info_fixture(spdx_version="SPDX2.3"), "SPDX2.3",
++                           'the document\'s spdx_version must be of the form "SPDX-[major].[minor]" but is: SPDX2.3'),
++                          ])
++def test_spdx_version_handling(creation_info: CreationInfo, version_input: str, expected_message: Optional[str]):
++    document: Document = document_fixture(creation_info=creation_info)
++    validation_messages: List[ValidationMessage] = validate_full_spdx_document(document, version_input)
++
++    context = ValidationContext(spdx_id=creation_info.spdx_id, element_type=SpdxElementType.DOCUMENT)
++    expected: List[ValidationMessage] = []
++
++    if expected_message:
++        expected.append(ValidationMessage(expected_message, context))
++        expected.append(ValidationMessage("There are issues concerning the SPDX version of the document. "
++                                          "As subsequent validation relies on the correct version, "
++                                          "the validation process has been cancelled.", context))
++
++    assert validation_messages == expected
++
++    # TODO: https://github.com/spdx/tools-python/issues/375
+diff --git a/tests/validation/test_relationship_validator.py b/tests/validation/test_relationship_validator.py
+index 7066555..1d164e2 100644
+--- a/tests/validation/test_relationship_validator.py
++++ b/tests/validation/test_relationship_validator.py
+@@ -40,7 +40,7 @@ def test_valid_relationship(related_spdx_element):
+ def test_unknown_spdx_id(spdx_element_id, related_spdx_element_id, expected_message):
+     relationship: Relationship = relationship_fixture(spdx_element_id=spdx_element_id,
+                                                       related_spdx_element_id=related_spdx_element_id)
+-    validation_messages: List[ValidationMessage] = validate_relationship(relationship, document_fixture(), "2.3")
++    validation_messages: List[ValidationMessage] = validate_relationship(relationship, document_fixture(), "SPDX-2.3")
+ 
+     expected = ValidationMessage(expected_message,
+                                  ValidationContext(element_type=SpdxElementType.RELATIONSHIP,
+@@ -51,14 +51,14 @@ def test_unknown_spdx_id(spdx_element_id, related_spdx_element_id, expected_mess
+ 
+ @pytest.mark.parametrize("relationship, expected_message",
+                          [(Relationship("SPDXRef-DOCUMENT", RelationshipType.SPECIFICATION_FOR, "SPDXRef-Package"),
+-                           "RelationshipType.SPECIFICATION_FOR is not supported for SPDX versions below 2.3"),
++                           "RelationshipType.SPECIFICATION_FOR is not supported for SPDX versions below SPDX-2.3"),
+                           (Relationship("SPDXRef-DOCUMENT", RelationshipType.REQUIREMENT_DESCRIPTION_FOR,
+                                         "SPDXRef-Package"),
+-                           "RelationshipType.REQUIREMENT_DESCRIPTION_FOR is not supported for SPDX versions below 2.3")])
++                           "RelationshipType.REQUIREMENT_DESCRIPTION_FOR is not supported for SPDX versions below SPDX-2.3")])
+ def test_v2_3_only_types(relationship, expected_message):
+     document: Document = document_fixture()
+ 
+-    validation_message: List[ValidationMessage] = validate_relationship(relationship, document, "2.2")
++    validation_message: List[ValidationMessage] = validate_relationship(relationship, document, "SPDX-2.2")
+ 
+     expected = [ValidationMessage(expected_message,
+                                   ValidationContext(element_type=SpdxElementType.RELATIONSHIP,

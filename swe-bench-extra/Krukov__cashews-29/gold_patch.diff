@@ -1,0 +1,175 @@
+diff --git a/cashews/__init__.py b/cashews/__init__.py
+index d55971e..9611fa0 100644
+--- a/cashews/__init__.py
++++ b/cashews/__init__.py
+@@ -7,7 +7,7 @@ from .decorators import (  # noqa
+     fast_condition,
+ )
+ from .formatter import default_formatter, get_template_and_func_for, get_template_for_key  # noqa
+-from .helpers import add_prefix  # noqa
++from .helpers import add_prefix, all_keys_lower  # noqa
+ from .validation import set_invalidate_further  # noqa
+ from .wrapper import Cache  # noqa
+ 
+diff --git a/cashews/backends/redis/backend.py b/cashews/backends/redis/backend.py
+index 5bdeffa..f33099c 100644
+--- a/cashews/backends/redis/backend.py
++++ b/cashews/backends/redis/backend.py
+@@ -198,8 +198,5 @@ class _Redis(Backend):
+         return await self._client.get(key)
+ 
+     def close(self):
+-        del self._client
+         self._client = None
+         self.__is_init = False
+-
+-    __del__ = close
+diff --git a/cashews/formatter.py b/cashews/formatter.py
+index fef1406..9fd9bf9 100644
+--- a/cashews/formatter.py
++++ b/cashews/formatter.py
+@@ -18,7 +18,7 @@ class _ReplaceFormatter(Formatter):
+             return self.__default(field_name), None
+ 
+     def format_field(self, value, format_spec):
+-        return format(value)
++        return format(format_value(value))
+ 
+ 
+ class _FuncFormatter(_ReplaceFormatter):
+@@ -38,9 +38,9 @@ class _FuncFormatter(_ReplaceFormatter):
+ 
+     def format_field(self, value, format_spec):
+         format_spec, args = self.parse_format_spec(format_spec)
+-        value = super().format_field(value, format_spec if format_spec not in self._functions else "")
+         if format_spec in self._functions:
+-            return str(self._functions[format_spec](value, *args))
++            value = str(self._functions[format_spec](value, *args))
++        value = super().format_field(value, format_spec if format_spec not in self._functions else "")
+         return value
+ 
+     @staticmethod
+@@ -51,6 +51,14 @@ class _FuncFormatter(_ReplaceFormatter):
+         return format_spec, args.replace(")", "").split(",")
+ 
+ 
++def format_value(value):
++    if value is None:
++        return ""
++    elif isinstance(value, bool):
++        return str(value).lower()
++    return value
++
++
+ default_formatter = _FuncFormatter(lambda name: "")
+ default_formatter._register("len", len)
+ 
+diff --git a/cashews/helpers.py b/cashews/helpers.py
+index 0c15206..c61fd99 100644
+--- a/cashews/helpers.py
++++ b/cashews/helpers.py
+@@ -19,6 +19,23 @@ def add_prefix(prefix: str):
+     return _middleware
+ 
+ 
++def all_keys_lower():
++    async def _middleware(call, *args, backend=None, cmd=None, **kwargs):
++        if cmd.lower() == "get_many":
++            return await call(*[key.lower() for key in args])
++        call_values = get_call_values(call, args, kwargs)
++        as_key = "key"
++        if cmd == "delete_match":
++            as_key = "pattern"
++        key = call_values.get(as_key)
++        if key:
++            call_values[as_key] = key.lower()
++            return await call(**call_values)
++        return await call(*args, **kwargs)
++
++    return _middleware
++
++
+ def memory_limit(min=0, max=None):
+     async def _memory_middleware(call, *args, backend=None, cmd=None, **kwargs):
+         if cmd != "set":
+diff --git a/cashews/key.py b/cashews/key.py
+index 93a65a9..b8652cc 100644
+--- a/cashews/key.py
++++ b/cashews/key.py
+@@ -71,9 +71,8 @@ def _get_cache_key(
+     """
+     kwargs = kwargs or {}
+     key_values = get_call_values(func, args, kwargs)
+-    key_values = {k: v if v is not None else "" for k, v in key_values.items()}
+     _key_template = template or get_cache_key_template(func)
+-    return template_to_pattern(_key_template, _formatter=default_formatter, **key_values).lower()
++    return template_to_pattern(_key_template, _formatter=default_formatter, **key_values)
+ 
+ 
+ def get_func_params(func):
+@@ -100,7 +99,7 @@ def get_cache_key_template(func: Callable, key: Optional[str] = None, prefix: st
+         if func_params and func_params[0] == "self":
+             name = [func.__module__, func.__qualname__]
+         params = {param_name: "{" + param_name + "}" for param_name in func_params}
+-        key = ":".join([*name, *chain(*params.items())]).lower()
++        key = ":".join([*name, *chain(*params.items())])
+     else:
+         _check_key_params(key, func_params)
+     if prefix:
+diff --git a/cashews/serialize.py b/cashews/serialize.py
+index aea1ecb..3affbb0 100644
+--- a/cashews/serialize.py
++++ b/cashews/serialize.py
+@@ -10,10 +10,6 @@ class UnSecureDataError(Exception):
+     pass
+ 
+ 
+-class none:
+-    pass
+-
+-
+ class PickleSerializerMixin:
+     _digestmods = {
+         b"sha1": hashlib.sha1,
+@@ -47,7 +43,9 @@ class PickleSerializerMixin:
+     def _process_value(self, value: Union[bytes, None, int, str], key, default=None):
+         if value is None:
+             return default
+-        if isinstance(value, int) or value.isdigit():
++        if isinstance(value, int):
++            return value
++        if value.isdigit():
+             return int(value)
+         try:
+             sign, value = value.split(b"_", 1)
+@@ -60,8 +58,6 @@ class PickleSerializerMixin:
+         value = pickle.loads(value, fix_imports=False, encoding="bytes")
+         if self._check_repr:
+             repr(value)
+-        if value is none:
+-            return None
+         return value
+ 
+     async def get_many(self, *keys):
+@@ -86,8 +82,6 @@ class PickleSerializerMixin:
+         return sign, digestmod
+ 
+     async def set(self, key: str, value, *args, **kwargs):
+-        if value is None:
+-            value = none
+         if isinstance(value, int) and not isinstance(value, bool):
+             return await super().set(key, value, *args, **kwargs)
+         value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL, fix_imports=False)
+diff --git a/cashews/validation.py b/cashews/validation.py
+index ddb63d6..0d8bf99 100644
+--- a/cashews/validation.py
++++ b/cashews/validation.py
+@@ -11,7 +11,7 @@ from .key import get_call_values, get_func_params
+ async def invalidate_func(backend: Backend, func, kwargs: Optional[Dict] = None):
+     values = {**{param: "*" for param in get_func_params(func)}, **kwargs}
+     for template in get_templates_for_func(func):
+-        del_template = template_to_pattern(template, **values).lower()
++        del_template = template_to_pattern(template, **values)
+         await backend.delete_match(del_template)
+ 
+ 

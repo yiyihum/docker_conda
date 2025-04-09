@@ -1,0 +1,177 @@
+diff --git a/mkdocs/structure/pages.py b/mkdocs/structure/pages.py
+index 8b0a642d..5b4a849b 100644
+--- a/mkdocs/structure/pages.py
++++ b/mkdocs/structure/pages.py
+@@ -1,6 +1,5 @@
+ from __future__ import annotations
+ 
+-import copy
+ import enum
+ import logging
+ import posixpath
+@@ -20,6 +19,7 @@ from mkdocs import utils
+ from mkdocs.structure import StructureItem
+ from mkdocs.structure.toc import get_toc
+ from mkdocs.utils import _removesuffix, get_build_date, get_markdown_title, meta, weak_property
++from mkdocs.utils.rendering import get_heading_text
+ 
+ if TYPE_CHECKING:
+     from xml.etree import ElementTree as etree
+@@ -555,23 +555,13 @@ class _ExtractTitleTreeprocessor(markdown.treeprocessors.Treeprocessor):
+     def run(self, root: etree.Element) -> etree.Element:
+         for el in root:
+             if el.tag == 'h1':
+-                # Drop anchorlink from the element, if present.
+-                if len(el) > 0 and el[-1].tag == 'a' and not (el[-1].tail or '').strip():
+-                    el = copy.copy(el)
+-                    del el[-1]
+-                # Extract the text only, recursively.
+-                title = ''.join(el.itertext())
+-                # Unescape per Markdown implementation details.
+-                title = markdown.extensions.toc.stashedHTML2text(
+-                    title, self.md, strip_entities=False
+-                )
+-                self.title = title.strip()
++                self.title = get_heading_text(el, self.md)
+             break
+         return root
+ 
+     def _register(self, md: markdown.Markdown) -> None:
+         self.md = md
+-        md.treeprocessors.register(self, "mkdocs_extract_title", priority=-1)  # After the end.
++        md.treeprocessors.register(self, "mkdocs_extract_title", priority=1)  # Close to the end.
+ 
+ 
+ class _AbsoluteLinksValidationValue(enum.IntEnum):
+diff --git a/mkdocs/utils/rendering.py b/mkdocs/utils/rendering.py
+new file mode 100644
+index 00000000..545e1efb
+--- /dev/null
++++ b/mkdocs/utils/rendering.py
+@@ -0,0 +1,104 @@
++from __future__ import annotations
++
++import copy
++from typing import TYPE_CHECKING, Callable
++
++import markdown
++import markdown.treeprocessors
++
++if TYPE_CHECKING:
++    from xml.etree import ElementTree as etree
++
++# TODO: This will become unnecessary after min-versions have Markdown >=3.4
++_unescape: Callable[[str], str]
++try:
++    _unescape = markdown.treeprocessors.UnescapeTreeprocessor().unescape
++except AttributeError:
++    _unescape = lambda s: s
++
++# TODO: Most of this file will become unnecessary after https://github.com/Python-Markdown/markdown/pull/1441
++
++
++def get_heading_text(el: etree.Element, md: markdown.Markdown) -> str:
++    el = copy.deepcopy(el)
++    _remove_anchorlink(el)
++    _remove_fnrefs(el)
++    _extract_alt_texts(el)
++    return _strip_tags(_render_inner_html(el, md))
++
++
++def _strip_tags(text: str) -> str:
++    """Strip HTML tags and return plain text. Note: HTML entities are unaffected."""
++    # A comment could contain a tag, so strip comments first
++    while (start := text.find('<!--')) != -1 and (end := text.find('-->', start)) != -1:
++        text = text[:start] + text[end + 3 :]
++
++    while (start := text.find('<')) != -1 and (end := text.find('>', start)) != -1:
++        text = text[:start] + text[end + 1 :]
++
++    # Collapse whitespace
++    text = ' '.join(text.split())
++    return text
++
++
++def _render_inner_html(el: etree.Element, md: markdown.Markdown) -> str:
++    # The `UnescapeTreeprocessor` runs after `toc` extension so run here.
++    text = md.serializer(el)
++    text = _unescape(text)
++
++    # Strip parent tag
++    start = text.index('>') + 1
++    end = text.rindex('<')
++    text = text[start:end].strip()
++
++    for pp in md.postprocessors:
++        text = pp.run(text)
++    return text
++
++
++def _remove_anchorlink(el: etree.Element) -> None:
++    """Drop anchorlink from the element, if present."""
++    if len(el) > 0 and el[-1].tag == 'a' and el[-1].get('class') == 'headerlink':
++        del el[-1]
++
++
++def _remove_fnrefs(root: etree.Element) -> None:
++    """Remove footnote references from the element, if any are present."""
++    for parent in root.findall('.//sup[@id]/..'):
++        _replace_elements_with_text(parent, _predicate_for_fnrefs)
++
++
++def _predicate_for_fnrefs(el: etree.Element) -> str | None:
++    if el.tag == 'sup' and el.get('id', '').startswith('fnref'):
++        return ''
++    return None
++
++
++def _extract_alt_texts(root: etree.Element) -> None:
++    """For images that have an `alt` attribute, replace them with this content."""
++    for parent in root.findall('.//img[@alt]/..'):
++        _replace_elements_with_text(parent, _predicate_for_alt_texts)
++
++
++def _predicate_for_alt_texts(el: etree.Element) -> str | None:
++    if el.tag == 'img' and (alt := el.get('alt')):
++        return alt
++    return None
++
++
++def _replace_elements_with_text(
++    parent: etree.Element, predicate: Callable[[etree.Element], str | None]
++) -> None:
++    """For each child element, if matched, replace it with the text returned from the predicate."""
++    carry_text = ""
++    for child in reversed(parent):  # Reversed for the ability to mutate during iteration.
++        # Remove matching elements but carry any `tail` text to preceding elements.
++        new_text = predicate(child)
++        if new_text is not None:
++            carry_text = new_text + (child.tail or "") + carry_text
++            parent.remove(child)
++        elif carry_text:
++            child.tail = (child.tail or "") + carry_text
++            carry_text = ""
++    if carry_text:
++        parent.text = (parent.text or "") + carry_text
+diff --git a/pyproject.toml b/pyproject.toml
+index 71bc189e..28355b73 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -36,7 +36,7 @@ dependencies = [
+     "click >=7.0",
+     "Jinja2 >=2.11.1",
+     "markupsafe >=2.0.1",
+-    "Markdown >=3.4.1",
++    "Markdown >=3.3.6",
+     "PyYAML >=5.1",
+     "watchdog >=2.0",
+     "ghp-import >=1.0",
+@@ -57,7 +57,7 @@ min-versions = [
+     "click ==7.0",
+     "Jinja2 ==2.11.1",
+     "markupsafe ==2.0.1",
+-    "Markdown ==3.4.1",
++    "Markdown ==3.3.6",
+     "PyYAML ==5.1",
+     "watchdog ==2.0",
+     "ghp-import ==1.0",

@@ -1,0 +1,252 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ee81118..40f207d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [#648](https://github.com/equinor/webviz-config/pull/648) - Allow `blob:` in `script-src` CSP in order to enable web worker usage in Dash components.
+ - [#652](https://github.com/equinor/webviz-config/pull/652) - Enabled support for LaTeX math/equations in markdown.
+ - [#653](https://github.com/equinor/webviz-config/pull/653) - Reduce time for running `webviz --help` by lazy importing top level entrypoints.
++- [#656](https://github.com/equinor/webviz-config/pull/656) - Further reduce startup time by only loading plugin entrypoints used in the application.
+ 
+ ### Added
+ - [#644](https://github.com/equinor/webviz-config/pull/644) - Added option to download tables in `DataTable` and `PivotTable`.
+diff --git a/webviz_config/_config_parser.py b/webviz_config/_config_parser.py
+index b64b6d7..c8fd588 100644
+--- a/webviz_config/_config_parser.py
++++ b/webviz_config/_config_parser.py
+@@ -9,7 +9,6 @@ import yaml
+ 
+ import webviz_config.plugins
+ from .utils import terminal_colors
+-from .utils._get_webviz_plugins import _get_webviz_plugins
+ from . import _deprecation_store as _ds
+ 
+ SPECIAL_ARGS = ["self", "app", "webviz_settings", "_call_signature"]
+@@ -211,9 +210,7 @@ class ParserError(Exception):
+ 
+ class ConfigParser:
+ 
+-    STANDARD_PLUGINS = [
+-        name for (name, _) in _get_webviz_plugins(webviz_config.plugins)
+-    ]
++    INSTALLED_PLUGINS = webviz_config.plugins.__all__
+ 
+     def __init__(self, yaml_file: pathlib.Path):
+ 
+@@ -436,13 +433,13 @@ class ConfigParser:
+                     plugin_variables = next(iter(plugin.values()))
+                     kwargs = {} if plugin_variables is None else {**plugin_variables}
+ 
+-                    if plugin_name not in ConfigParser.STANDARD_PLUGINS:
++                    if plugin_name not in ConfigParser.INSTALLED_PLUGINS:
+                         raise ParserError(
+                             f"{terminal_colors.RED}{terminal_colors.BOLD}"
+                             "You have included a plugin with "
+                             f"name `{plugin_name}` in your "
+-                            "configuration file. This is not a "
+-                            "standard plugin."
++                            "configuration file. This is not an "
++                            "installed plugin."
+                             f"{terminal_colors.END}"
+                         )
+ 
+diff --git a/webviz_config/_docs/_build_docs.py b/webviz_config/_docs/_build_docs.py
+index 6313ebd..2439d8c 100644
+--- a/webviz_config/_docs/_build_docs.py
++++ b/webviz_config/_docs/_build_docs.py
+@@ -23,7 +23,6 @@ import jinja2
+ import webviz_config.plugins
+ from webviz_config.plugins import PLUGIN_METADATA, PLUGIN_PROJECT_METADATA
+ from .._config_parser import SPECIAL_ARGS
+-from ..utils._get_webviz_plugins import _get_webviz_plugins
+ from .. import _deprecation_store as _ds
+ 
+ 
+@@ -119,17 +118,17 @@ def _extract_init_arguments_and_check_for_deprecation(
+     return (bool(deprecated_arguments), result, deprecation_check_code)
+ 
+ 
+-def _document_plugin(plugin: Tuple[str, Any]) -> PluginInfo:
+-    """Takes in a tuple (from e.g. inspect.getmembers), and returns
++def _document_plugin(plugin_name: str) -> PluginInfo:
++    """Takes in plugin name as string and returns
+     a dictionary according to the type definition PluginInfo.
+     """
+ 
+-    name, reference = plugin
++    reference = webviz_config.plugins.__getattr__(plugin_name)
+     docstring = reference.__doc__ if reference.__doc__ is not None else ""
+     docstring_parts = _split_docstring(docstring)
+     module = inspect.getmodule(reference)
+     subpackage = inspect.getmodule(module).__package__  # type: ignore
+-    dist_name = PLUGIN_METADATA[name]["dist_name"]
++    dist_name = PLUGIN_METADATA[plugin_name]["dist_name"]
+     (
+         has_deprecated_arguments,
+         arguments,
+@@ -144,7 +143,7 @@ def _document_plugin(plugin: Tuple[str, Any]) -> PluginInfo:
+         else None,
+         "data_input": docstring_parts[2] if len(docstring_parts) > 2 else None,
+         "description": docstring_parts[0] if docstring != "" else None,
+-        "name": name,
++        "name": plugin_name,
+         "package_doc": import_module(subpackage).__doc__,  # type: ignore
+         "dist_name": dist_name,
+         "dist_version": PLUGIN_PROJECT_METADATA[dist_name]["dist_version"],
+@@ -165,8 +164,8 @@ def get_plugin_documentation() -> defaultdict:
+ 
+     plugin_doc = [
+         _document_plugin(plugin)
+-        for plugin in _get_webviz_plugins(webviz_config.plugins)
+-        if not plugin[0].startswith("Example")
++        for plugin in webviz_config.plugins.__all__
++        if not plugin.startswith("Example")
+     ]
+ 
+     # Sort the plugins by package:
+diff --git a/webviz_config/_docs/_create_schema.py b/webviz_config/_docs/_create_schema.py
+index 07e4fe8..3257145 100644
+--- a/webviz_config/_docs/_create_schema.py
++++ b/webviz_config/_docs/_create_schema.py
+@@ -186,7 +186,8 @@ def create_schema() -> dict:
+                     "type": "object",
+                     "properties": {
+                         plugin_doc["name"]: {
+-                            "description": plugin_doc["description"],
++                            "description": plugin_doc["description"]
++                            or " PLUGIN MISSING DESCRIPTION ",
+                             "type": "object",
+                             "properties": {
+                                 **{
+diff --git a/webviz_config/plugins/__init__.py b/webviz_config/plugins/__init__.py
+index 89333bc..9ad9c47 100644
+--- a/webviz_config/plugins/__init__.py
++++ b/webviz_config/plugins/__init__.py
+@@ -2,11 +2,24 @@
+ the utility itself.
+ """
+ 
++import abc
+ from importlib.metadata import distributions
+ 
+ from ._utils import load_webviz_plugins_with_metadata, PluginProjectMetaData
+ 
+ 
+-PLUGIN_METADATA, PLUGIN_PROJECT_METADATA = load_webviz_plugins_with_metadata(
+-    distributions(), globals()
+-)
++(
++    PLUGIN_METADATA,
++    PLUGIN_PROJECT_METADATA,
++    plugin_entrypoints,
++) = load_webviz_plugins_with_metadata(distributions())
++
++__all__ = list(plugin_entrypoints.keys())
++
++
++def __getattr__(name: str) -> abc.ABC:
++    """Lazy load plugins, i.e. only import/load when a given plugin is requested."""
++
++    if name in __all__:
++        return plugin_entrypoints[name].load()
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+diff --git a/webviz_config/plugins/_utils.py b/webviz_config/plugins/_utils.py
+index 53971fb..58723b3 100644
+--- a/webviz_config/plugins/_utils.py
++++ b/webviz_config/plugins/_utils.py
+@@ -1,8 +1,8 @@
+ import re
+ import warnings
+-from typing import Any, Dict, Iterable, Optional, Tuple, TypedDict
++from typing import Dict, Iterable, Optional, Tuple, TypedDict
+ 
+-from importlib.metadata import requires, version, PackageNotFoundError
++from importlib.metadata import requires, version, PackageNotFoundError, EntryPoint
+ 
+ 
+ class PluginProjectMetaData(TypedDict):
+@@ -51,29 +51,24 @@ def _plugin_dist_dependencies(plugin_dist_name: str) -> Dict[str, str]:
+ 
+ 
+ def load_webviz_plugins_with_metadata(
+-    distributions: Iterable, loaded_plugins: Dict[str, Any]
+-) -> Tuple[Dict[str, dict], Dict[str, PluginProjectMetaData]]:
+-    """Loads the given distributions, finds entry points corresponding to webviz-config
+-    plugins, and put them into the mutable input dictionary loaded_plugins
+-    (key is plugin name string, value is reference to plugin class).
++    distributions: Iterable,
++) -> Tuple[Dict[str, dict], Dict[str, PluginProjectMetaData], Dict[str, EntryPoint]]:
++    """Finds entry points corresponding to webviz-config plugins,
++    and returns them as a dictionary (key is plugin name string,
++    value is reference to entrypoint).
++
+     Also returns a dictionary of plugin metadata.
+     """
+ 
+     plugin_project_metadata: Dict[str, PluginProjectMetaData] = {}
+     plugin_metadata: Dict[str, dict] = {}
++    plugin_entrypoints: Dict[str, EntryPoint] = {}
+ 
+     for dist in distributions:
+         for entry_point in dist.entry_points:
+             if entry_point.group == "webviz_config_plugins":
+-
+                 dist_name = dist.metadata["name"]
+ 
+-                project_urls = {
+-                    value.split(",")[0]: value.split(",")[1].strip()
+-                    for (key, value) in dist.metadata.items()
+-                    if key == "Project-URL"
+-                }
+-
+                 if (
+                     entry_point.name in plugin_metadata
+                     and dist_name not in plugin_project_metadata
+@@ -86,6 +81,12 @@ def load_webviz_plugins_with_metadata(
+                     )
+ 
+                 if dist_name not in plugin_project_metadata:
++                    project_urls = {
++                        value.split(",")[0]: value.split(",")[1].strip()
++                        for (key, value) in dist.metadata.items()
++                        if key == "Project-URL"
++                    }
++
+                     plugin_project_metadata[dist_name] = PluginProjectMetaData(
+                         {
+                             "dist_version": dist.version,
+@@ -101,6 +102,6 @@ def load_webviz_plugins_with_metadata(
+                     "dist_name": dist.metadata["name"],
+                 }
+ 
+-                loaded_plugins[entry_point.name] = entry_point.load()
++                plugin_entrypoints[entry_point.name] = entry_point
+ 
+-    return (plugin_metadata, plugin_project_metadata)
++    return (plugin_metadata, plugin_project_metadata, plugin_entrypoints)
+diff --git a/webviz_config/utils/_get_webviz_plugins.py b/webviz_config/utils/_get_webviz_plugins.py
+deleted file mode 100644
+index ab1efbb..0000000
+--- a/webviz_config/utils/_get_webviz_plugins.py
++++ /dev/null
+@@ -1,20 +0,0 @@
+-import types
+-import typing
+-import inspect
+-
+-from .._plugin_abc import WebvizPluginABC
+-
+-
+-def _get_webviz_plugins(module: types.ModuleType) -> list:
+-    """Returns a list of all Webviz plugins
+-    in the module given as input.
+-    """
+-
+-    def _is_webviz_plugin(obj: typing.Any) -> bool:
+-        return (
+-            inspect.isclass(obj)
+-            and issubclass(obj, WebvizPluginABC)
+-            and obj is not WebvizPluginABC
+-        )
+-
+-    return inspect.getmembers(module, _is_webviz_plugin)

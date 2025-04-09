@@ -1,0 +1,143 @@
+diff --git a/sqlglot/dialects/tsql.py b/sqlglot/dialects/tsql.py
+index aefe625b..a555f5c4 100644
+--- a/sqlglot/dialects/tsql.py
++++ b/sqlglot/dialects/tsql.py
+@@ -730,6 +730,17 @@ class TSQL(Dialect):
+             exp.VolatileProperty: exp.Properties.Location.UNSUPPORTED,
+         }
+ 
++        def lateral_op(self, expression: exp.Lateral) -> str:
++            cross_apply = expression.args.get("cross_apply")
++            if cross_apply is True:
++                return "CROSS APPLY"
++            if cross_apply is False:
++                return "OUTER APPLY"
++
++            # TODO: perhaps we can check if the parent is a Join and transpile it appropriately
++            self.unsupported("LATERAL clause is not supported.")
++            return "LATERAL"
++
+         def timefromparts_sql(self, expression: exp.TimeFromParts) -> str:
+             nano = expression.args.get("nano")
+             if nano is not None:
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 56580dcf..9609c332 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1925,7 +1925,13 @@ class Join(Expression):
+ 
+ 
+ class Lateral(UDTF):
+-    arg_types = {"this": True, "view": False, "outer": False, "alias": False}
++    arg_types = {
++        "this": True,
++        "view": False,
++        "outer": False,
++        "alias": False,
++        "cross_apply": False,  # True -> CROSS APPLY, False -> OUTER APPLY
++    }
+ 
+ 
+ class MatchRecognize(Expression):
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index c9adb835..98337fc6 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -1686,7 +1686,8 @@ class Generator:
+         if not on_sql and using:
+             on_sql = csv(*(self.sql(column) for column in using))
+ 
+-        this_sql = self.sql(expression, "this")
++        this = expression.this
++        this_sql = self.sql(this)
+ 
+         if on_sql:
+             on_sql = self.indent(on_sql, skip_first=True)
+@@ -1696,6 +1697,9 @@ class Generator:
+             else:
+                 on_sql = f"{space}ON {on_sql}"
+         elif not op_sql:
++            if isinstance(this, exp.Lateral) and this.args.get("cross_apply") is not None:
++                return f" {this_sql}"
++
+             return f", {this_sql}"
+ 
+         op_sql = f"{op_sql} JOIN" if op_sql else "JOIN"
+@@ -1706,6 +1710,19 @@ class Generator:
+         args = f"({args})" if len(args.split(",")) > 1 else args
+         return f"{args} {arrow_sep} {self.sql(expression, 'this')}"
+ 
++    def lateral_op(self, expression: exp.Lateral) -> str:
++        cross_apply = expression.args.get("cross_apply")
++
++        # https://www.mssqltips.com/sqlservertip/1958/sql-server-cross-apply-and-outer-apply/
++        if cross_apply is True:
++            op = "INNER JOIN "
++        elif cross_apply is False:
++            op = "LEFT JOIN "
++        else:
++            op = ""
++
++        return f"{op}LATERAL"
++
+     def lateral_sql(self, expression: exp.Lateral) -> str:
+         this = self.sql(expression, "this")
+ 
+@@ -1719,7 +1736,7 @@ class Generator:
+ 
+         alias = self.sql(expression, "alias")
+         alias = f" AS {alias}" if alias else ""
+-        return f"LATERAL {this}{alias}"
++        return f"{self.lateral_op(expression)} {this}{alias}"
+ 
+     def limit_sql(self, expression: exp.Limit, top: bool = False) -> str:
+         this = self.sql(expression, "this")
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 89577cd5..40a71da5 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -2493,13 +2493,14 @@ class Parser(metaclass=_Parser):
+         )
+ 
+     def _parse_lateral(self) -> t.Optional[exp.Lateral]:
+-        outer_apply = self._match_pair(TokenType.OUTER, TokenType.APPLY)
+         cross_apply = self._match_pair(TokenType.CROSS, TokenType.APPLY)
++        if not cross_apply and self._match_pair(TokenType.OUTER, TokenType.APPLY):
++            cross_apply = False
+ 
+-        if outer_apply or cross_apply:
++        if cross_apply is not None:
+             this = self._parse_select(table=True)
+             view = None
+-            outer = not cross_apply
++            outer = None
+         elif self._match(TokenType.LATERAL):
+             this = self._parse_select(table=True)
+             view = self._match(TokenType.VIEW)
+@@ -2532,7 +2533,14 @@ class Parser(metaclass=_Parser):
+         else:
+             table_alias = self._parse_table_alias()
+ 
+-        return self.expression(exp.Lateral, this=this, view=view, outer=outer, alias=table_alias)
++        return self.expression(
++            exp.Lateral,
++            this=this,
++            view=view,
++            outer=outer,
++            alias=table_alias,
++            cross_apply=cross_apply,
++        )
+ 
+     def _parse_join_parts(
+         self,
+@@ -2566,9 +2574,6 @@ class Parser(metaclass=_Parser):
+         if not skip_join_token and not join and not outer_apply and not cross_apply:
+             return None
+ 
+-        if outer_apply:
+-            side = Token(TokenType.LEFT, "LEFT")
+-
+         kwargs: t.Dict[str, t.Any] = {"this": self._parse_table(parse_bracket=parse_bracket)}
+ 
+         if method:
+

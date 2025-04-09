@@ -1,0 +1,193 @@
+diff --git a/AUTHORS.rst b/AUTHORS.rst
+index b34e861..b0fa74b 100644
+--- a/AUTHORS.rst
++++ b/AUTHORS.rst
+@@ -9,3 +9,4 @@ Contributors
+ ============
+ 
+ * Anthony Sottile - https://github.com/asottile
++* Łukasz Skarżyński - https://github.com/skarzi
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 49ecc2c..3df7df3 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -87,3 +87,5 @@ latest
+ ------
+ 
+ * Upgrade Grimp to 1.2.2.
++* Add SetField
++* Use a SetField for ignore_imports options
+diff --git a/src/importlinter/contracts/forbidden.py b/src/importlinter/contracts/forbidden.py
+index 89a10de..6badb2b 100644
+--- a/src/importlinter/contracts/forbidden.py
++++ b/src/importlinter/contracts/forbidden.py
+@@ -14,8 +14,8 @@ class ForbiddenContract(Contract):
+ 
+         - source_modules:    A list of Modules that should not import the forbidden modules.
+         - forbidden_modules: A list of Modules that should not be imported by the source modules.
+-        - ignore_imports:    A list of DirectImports. These imports will be ignored: if the import
+-                             would cause a contract to be broken, adding it to the list will cause
++        - ignore_imports:    A set of DirectImports. These imports will be ignored: if the import
++                             would cause a contract to be broken, adding it to the set will cause
+                              the contract be kept instead. (Optional.)
+     """
+ 
+@@ -23,7 +23,7 @@ class ForbiddenContract(Contract):
+ 
+     source_modules = fields.ListField(subfield=fields.ModuleField())
+     forbidden_modules = fields.ListField(subfield=fields.ModuleField())
+-    ignore_imports = fields.ListField(subfield=fields.DirectImportField(), required=False)
++    ignore_imports = fields.SetField(subfield=fields.DirectImportField(), required=False)
+ 
+     def check(self, graph: ImportGraph) -> ContractCheck:
+         is_kept = True
+diff --git a/src/importlinter/contracts/independence.py b/src/importlinter/contracts/independence.py
+index 71a7ff7..14f206e 100644
+--- a/src/importlinter/contracts/independence.py
++++ b/src/importlinter/contracts/independence.py
+@@ -16,15 +16,15 @@ class IndependenceContract(Contract):
+     Configuration options:
+ 
+         - modules:        A list of Modules that should be independent from each other.
+-        - ignore_imports: A list of DirectImports. These imports will be ignored: if the import
+-                          would cause a contract to be broken, adding it to the list will cause
++        - ignore_imports: A set of DirectImports. These imports will be ignored: if the import
++                          would cause a contract to be broken, adding it to the set will cause
+                           the contract be kept instead. (Optional.)
+     """
+ 
+     type_name = "independence"
+ 
+     modules = fields.ListField(subfield=fields.ModuleField())
+-    ignore_imports = fields.ListField(subfield=fields.DirectImportField(), required=False)
++    ignore_imports = fields.SetField(subfield=fields.DirectImportField(), required=False)
+ 
+     def check(self, graph: ImportGraph) -> ContractCheck:
+         is_kept = True
+diff --git a/src/importlinter/contracts/layers.py b/src/importlinter/contracts/layers.py
+index 6aa43b5..cf15223 100644
+--- a/src/importlinter/contracts/layers.py
++++ b/src/importlinter/contracts/layers.py
+@@ -42,8 +42,8 @@ class LayersContract(Contract):
+         - layers:         An ordered list of layers. Each layer is the name of a module relative
+                           to its parent package. The order is from higher to lower level layers.
+         - containers:     A list of the parent Modules of the layers (optional).
+-        - ignore_imports: A list of DirectImports. These imports will be ignored: if the import
+-                          would cause a contract to be broken, adding it to the list will cause
++        - ignore_imports: A set of DirectImports. These imports will be ignored: if the import
++                          would cause a contract to be broken, adding it to the set will cause
+                           the contract be kept instead. (Optional.)
+     """
+ 
+@@ -51,7 +51,7 @@ class LayersContract(Contract):
+ 
+     layers = fields.ListField(subfield=LayerField())
+     containers = fields.ListField(subfield=fields.StringField(), required=False)
+-    ignore_imports = fields.ListField(subfield=fields.DirectImportField(), required=False)
++    ignore_imports = fields.SetField(subfield=fields.DirectImportField(), required=False)
+ 
+     def check(self, graph: ImportGraph) -> ContractCheck:
+         is_kept = True
+diff --git a/src/importlinter/domain/fields.py b/src/importlinter/domain/fields.py
+index 7809113..e226ec9 100644
+--- a/src/importlinter/domain/fields.py
++++ b/src/importlinter/domain/fields.py
+@@ -1,16 +1,18 @@
+ import abc
+ import re
+-from typing import Any, List, Union
++from typing import Generic, Iterable, List, Set, TypeVar, Union
+ 
+ from importlinter.domain.imports import DirectImport, Module
+ 
++FieldValue = TypeVar("FieldValue")
++
+ 
+ class ValidationError(Exception):
+     def __init__(self, message: str) -> None:
+         self.message = message
+ 
+ 
+-class Field(abc.ABC):
++class Field(Generic[FieldValue], abc.ABC):
+     """
+     Base class for containers for some data on a Contract.
+ 
+@@ -21,7 +23,7 @@ class Field(abc.ABC):
+         self.required = required
+ 
+     @abc.abstractmethod
+-    def parse(self, raw_data: Union[str, List[str]]) -> Any:
++    def parse(self, raw_data: Union[str, List[str]]) -> FieldValue:
+         """
+         Given some raw data supplied by a user, return some clean data.
+ 
+@@ -42,16 +44,13 @@ class StringField(Field):
+         return str(raw_data)
+ 
+ 
+-class ListField(Field):
++class BaseMultipleValueField(Field):
+     """
+-    A field for multiple values of any type.
++    An abstract field for multiple values of any type.
+ 
+     Arguments:
+-        - subfield: An instance of a single-value Field. Each item in the list will be the return
+-                    value of this subfield.
+-    Usage:
+-
+-        field = ListField(subfield=AnotherField())
++        - subfield: An instance of a single-value Field. Each item in the iterable will be
++                    the return value of this subfield.
+ 
+     """
+ 
+@@ -59,7 +58,8 @@ class ListField(Field):
+         super().__init__(*args, **kwargs)
+         self.subfield = subfield
+ 
+-    def parse(self, raw_data: Union[str, List]) -> List[Any]:
++    @abc.abstractmethod
++    def parse(self, raw_data: Union[str, List]) -> Iterable[FieldValue]:
+         if isinstance(raw_data, tuple):
+             raw_data = list(raw_data)
+         if not isinstance(raw_data, list):
+@@ -70,6 +70,37 @@ class ListField(Field):
+         return clean_list
+ 
+ 
++class ListField(BaseMultipleValueField):
++    """
++    A field for multiple values of any type.
++
++    Fields values are returned in list sorted by parsing order.
++
++    Usage:
++
++        field = ListField(subfield=AnotherField())
++    """
++
++    def parse(self, raw_data: Union[str, List]) -> List[FieldValue]:
++        return list(super().parse(raw_data))
++
++
++class SetField(BaseMultipleValueField):
++    """
++    A field for multiple, unique values of any type.
++
++    Fields values are returned inordered in set.
++
++    Usage:
++
++        field = SetField(subfield=AnotherField())
++
++    """
++
++    def parse(self, raw_data: Union[str, List]) -> Set[FieldValue]:
++        return set(super().parse(raw_data))
++
++
+ class ModuleField(Field):
+     """
+     A field for Modules.

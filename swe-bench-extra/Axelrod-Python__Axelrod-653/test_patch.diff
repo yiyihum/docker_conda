@@ -1,0 +1,172 @@
+diff --git a/axelrod/tests/integration/test_matches.py b/axelrod/tests/integration/test_matches.py
+index b6241145..d0018132 100644
+--- a/axelrod/tests/integration/test_matches.py
++++ b/axelrod/tests/integration/test_matches.py
+@@ -11,6 +11,10 @@ C, D = axelrod.Actions.C, axelrod.Actions.D
+ deterministic_strategies = [s for s in axelrod.ordinary_strategies
+                             if not s().classifier['stochastic']]  # Well behaved strategies
+ 
++stochastic_strategies = [s for s in axelrod.ordinary_strategies
++                         if s().classifier['stochastic']]
++
++
+ class TestMatchOutcomes(unittest.TestCase):
+ 
+     @given(strategies=strategy_lists(strategies=deterministic_strategies,
+@@ -23,3 +27,19 @@ class TestMatchOutcomes(unittest.TestCase):
+         matches = [axelrod.Match(players, turns) for _ in range(3)]
+         self.assertEqual(matches[0].play(), matches[1].play())
+         self.assertEqual(matches[1].play(), matches[2].play())
++
++    @given(strategies=strategy_lists(strategies=stochastic_strategies,
++                                     min_size=2, max_size=2),
++           turns=integers(min_value=1, max_value=20),
++           seed=integers(min_value=0, max_value=4294967295))
++    def test_outcome_repeats_stochastic(self, strategies, turns, seed):
++        """a test to check that if a seed is set stochastic strategies give the
++        same result"""
++        results = []
++        for _ in range(3):
++            axelrod.seed(seed)
++            players = [s() for s in strategies]
++            results.append(axelrod.Match(players, turns).play())
++
++        self.assertEqual(results[0], results[1])
++        self.assertEqual(results[1], results[2])
+diff --git a/axelrod/tests/integration/test_tournament.py b/axelrod/tests/integration/test_tournament.py
+index 7358c073..e90e2384 100644
+--- a/axelrod/tests/integration/test_tournament.py
++++ b/axelrod/tests/integration/test_tournament.py
+@@ -1,6 +1,7 @@
+ import unittest
+ import axelrod
+ import tempfile
++import filecmp
+ 
+ from axelrod.strategy_transformers import FinalTransformer
+ 
+@@ -60,6 +61,39 @@ class TestTournament(unittest.TestCase):
+         actual_outcome = sorted(zip(self.player_names, scores))
+         self.assertEqual(actual_outcome, self.expected_outcome)
+ 
++    def test_repeat_tournament_deterministic(self):
++        """A test to check that tournament gives same results."""
++        deterministic_players = [s() for s in axelrod.ordinary_strategies
++                                 if not s().classifier['stochastic']]
++        files = []
++        for _ in range(2):
++            tournament = axelrod.Tournament(name='test',
++                                            players=deterministic_players,
++                                            game=self.game, turns=2,
++                                            repetitions=2)
++            files.append(tempfile.NamedTemporaryFile())
++            tournament.play(progress_bar=False, filename=files[-1].name,
++                            build_results=False)
++        self.assertTrue(filecmp.cmp(files[0].name, files[1].name))
++
++    def test_repeat_tournament_stochastic(self):
++        """
++        A test to check that tournament gives same results when setting seed.
++        """
++        files = []
++        for _ in range(2):
++            axelrod.seed(0)
++            stochastic_players = [s() for s in axelrod.ordinary_strategies
++                                  if s().classifier['stochastic']]
++            tournament = axelrod.Tournament(name='test',
++                                            players=stochastic_players,
++                                            game=self.game, turns=2,
++                                            repetitions=2)
++            files.append(tempfile.NamedTemporaryFile())
++            tournament.play(progress_bar=False, filename=files[-1].name,
++                            build_results=False)
++        self.assertTrue(filecmp.cmp(files[0].name, files[1].name))
++
+ 
+ class TestNoisyTournament(unittest.TestCase):
+     def test_noisy_tournament(self):
+diff --git a/axelrod/tests/unit/test_punisher.py b/axelrod/tests/unit/test_punisher.py
+index 29451c37..7aabf295 100644
+--- a/axelrod/tests/unit/test_punisher.py
++++ b/axelrod/tests/unit/test_punisher.py
+@@ -116,3 +116,4 @@ class TestInversePunisher(TestPlayer):
+         self.assertEqual(P1.history, [])
+         self.assertEqual(P1.grudged, False)
+         self.assertEqual(P1.grudge_memory, 0)
++        
+\ No newline at end of file
+diff --git a/axelrod/tests/unit/test_random_.py b/axelrod/tests/unit/test_random_.py
+index 16046617..5ce4a483 100644
+--- a/axelrod/tests/unit/test_random_.py
++++ b/axelrod/tests/unit/test_random_.py
+@@ -1,9 +1,10 @@
+ """Test for the random strategy."""
+ 
++import numpy
+ import random
+ import unittest
+ 
+-from axelrod import random_choice, Actions
++from axelrod import random_choice, seed, Actions
+ 
+ C, D = Actions.C, Actions.D
+ 
+@@ -16,3 +17,17 @@ class TestRandom_(unittest.TestCase):
+         self.assertEqual(random_choice(), C)
+         random.seed(2)
+         self.assertEqual(random_choice(), D)
++
++    def test_set_seed(self):
++        """Test that numpy and stdlib random seed is set by axelrod seed"""
++
++        numpy_random_numbers = []
++        stdlib_random_numbers = []
++        for _ in range(2):
++            seed(0)
++            numpy_random_numbers.append(numpy.random.random())
++            stdlib_random_numbers.append(random.random())
++
++        self.assertEqual(numpy_random_numbers[0], numpy_random_numbers[1])
++        self.assertEqual(stdlib_random_numbers[0], stdlib_random_numbers[1])
++
+diff --git a/axelrod/tests/unit/test_titfortat.py b/axelrod/tests/unit/test_titfortat.py
+index 33c606ae..6d39a52d 100644
+--- a/axelrod/tests/unit/test_titfortat.py
++++ b/axelrod/tests/unit/test_titfortat.py
+@@ -432,8 +432,35 @@ class TestContriteTitForTat(TestPlayer):
+         self.assertEqual(opponent.history, [C, D, D, D])
+         self.assertFalse(ctft.contrite)
+ 
++             
+     def test_reset_cleans_all(self):
+         p = self.player()
+         p.contrite = True
+         p.reset()
+         self.assertFalse(p.contrite)
++
++class TestSlowTitForTwoTats(TestPlayer):
++
++    name = "Slow Tit For Two Tats"
++    player = axelrod.SlowTitForTwoTats
++    expected_classifier = {
++        'memory_depth': 2,
++        'stochastic': False,
++        'makes_use_of': set(),
++        'inspects_source': False,
++        'manipulates_source': False,
++        'manipulates_state': False
++    }
++
++    def test_strategy(self):
++        """Starts by cooperating."""
++        self.first_play_test(C)
++
++    def test_effect_of_strategy(self):
++        """If opponent plays the same move twice, repeats last action of opponent history."""
++        self.responses_test([C]*2, [C, C], [C])
++        self.responses_test([C]*3, [C, D, C], [C])
++        self.responses_test([C]*3, [C, D, D], [D])
++
++       
++  
+\ No newline at end of file

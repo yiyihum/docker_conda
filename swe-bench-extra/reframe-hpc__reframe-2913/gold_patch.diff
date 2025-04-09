@@ -1,0 +1,111 @@
+diff --git a/docs/manpage.rst b/docs/manpage.rst
+index 2320c26f..9de42be8 100644
+--- a/docs/manpage.rst
++++ b/docs/manpage.rst
+@@ -545,6 +545,24 @@ Options controlling ReFrame execution
+    .. versionchanged:: 4.1
+       Options that can be specified multiple times are now combined between execution modes and the command line.
+ 
++.. option:: -P, --parameterize=[TEST.]VAR=VAL0,VAL1,...
++
++   Parameterize a test on an existing variable.
++
++   This option will create a new test with a parameter named ``$VAR`` with the values given in the comma-separated list ``VAL0,VAL1,...``.
++   The values will be converted based on the type of the target variable ``VAR``.
++   The ``TEST.`` prefix will only parameterize the variable ``VAR`` of test ``TEST``.
++
++   The :option:`-P` can be specified multiple times in order to parameterize multiple variables.
++
++   .. note::
++
++      Conversely to the :option:`-S` option that can set a variable in an arbitrarily nested fixture,
++      the :option:`-P` option can only parameterize the leaf test:
++      it cannot be used to parameterize a fixture of the test.
++
++   .. versionadded:: 4.3
++
+ .. option:: --repeat=N
+ 
+    Repeat the selected tests ``N`` times.
+diff --git a/reframe/core/meta.py b/reframe/core/meta.py
+index 95c35e7b..9654a531 100644
+--- a/reframe/core/meta.py
++++ b/reframe/core/meta.py
+@@ -936,20 +936,18 @@ def make_test(name, bases, body, methods=None, module=None, **kwargs):
+     namespace = RegressionTestMeta.__prepare__(name, bases, **kwargs)
+     methods = methods or []
+ 
+-    # Add methods to the body
++    # Update the namespace with the body elements
++    #
++    # NOTE: We do not use `update()` here so as to force the `__setitem__`
++    # logic
++    for k, v in body.items():
++        namespace[k] = v
++
++    # Add methods to the namespace
+     for m in methods:
+-        body[m.__name__] = m
+-
+-    # We update the namespace with the body of the class and we explicitly
+-    # call reset on each namespace key to trigger the functionality of
+-    # `__setitem__()` as if the body elements were actually being typed in the
+-    # class definition
+-    namespace.update(body)
+-    for k in list(namespace.keys()):
+-        namespace.reset(k)
++        namespace[m.__name__] = m
+ 
+     cls = RegressionTestMeta(name, bases, namespace, **kwargs)
+-
+     if not module:
+         # Set the test's module to be that of our callers
+         caller = inspect.currentframe().f_back
+diff --git a/reframe/frontend/cli.py b/reframe/frontend/cli.py
+index 55dc6fb7..b3ea5af7 100644
+--- a/reframe/frontend/cli.py
++++ b/reframe/frontend/cli.py
+@@ -30,7 +30,8 @@ import reframe.utility.osext as osext
+ import reframe.utility.typecheck as typ
+ 
+ from reframe.frontend.testgenerators import (distribute_tests,
+-                                             getallnodes, repeat_tests)
++                                             getallnodes, repeat_tests,
++                                             parameterize_tests)
+ from reframe.frontend.executors.policies import (SerialExecutionPolicy,
+                                                  AsynchronousExecutionPolicy)
+ from reframe.frontend.executors import Runner, generate_testcases
+@@ -436,6 +437,10 @@ def main():
+     run_options.add_argument(
+         '--mode', action='store', help='Execution mode to use'
+     )
++    run_options.add_argument(
++        '-P', '--parameterize', action='append', metavar='VAR:VAL0,VAL1,...',
++        default=[], help='Parameterize a test on a set of variables'
++    )
+     run_options.add_argument(
+         '--repeat', action='store', metavar='N',
+         help='Repeat selected tests N times'
+@@ -1096,6 +1101,22 @@ def main():
+                 f'{len(testcases)} remaining'
+             )
+ 
++        if options.parameterize:
++            # Prepare parameters
++            params = {}
++            for param_spec in options.parameterize:
++                try:
++                    var, values_spec = param_spec.split('=')
++                except ValueError:
++                    raise errors.CommandLineError(
++                        f'invalid parameter spec: {param_spec}'
++                    ) from None
++                else:
++                    params[var] = values_spec.split(',')
++
++            testcases_all = parameterize_tests(testcases, params)
++            testcases = testcases_all
++
+         if options.repeat is not None:
+             try:
+                 num_repeats = int(options.repeat)

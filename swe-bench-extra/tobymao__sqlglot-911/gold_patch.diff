@@ -1,0 +1,109 @@
+diff --git a/sqlglot/dialects/clickhouse.py b/sqlglot/dialects/clickhouse.py
+index 3ef467b1..04d46d28 100644
+--- a/sqlglot/dialects/clickhouse.py
++++ b/sqlglot/dialects/clickhouse.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import typing as t
++
+ from sqlglot import exp, generator, parser, tokens
+ from sqlglot.dialects.dialect import Dialect, inline_array_sql, var_map_sql
+ from sqlglot.parser import parse_var_map
+@@ -22,6 +24,7 @@ class ClickHouse(Dialect):
+         KEYWORDS = {
+             **tokens.Tokenizer.KEYWORDS,
+             "ASOF": TokenType.ASOF,
++            "GLOBAL": TokenType.GLOBAL,
+             "DATETIME64": TokenType.DATETIME,
+             "FINAL": TokenType.FINAL,
+             "FLOAT32": TokenType.FLOAT,
+@@ -42,12 +45,27 @@ class ClickHouse(Dialect):
+             "QUANTILEIF": lambda params, args: exp.QuantileIf(parameters=params, expressions=args),
+         }
+ 
++        RANGE_PARSERS = {
++            **parser.Parser.RANGE_PARSERS,
++            TokenType.GLOBAL: lambda self, this: self._match(TokenType.IN)
++            and self._parse_in(this, is_global=True),
++        }
++
+         JOIN_KINDS = {*parser.Parser.JOIN_KINDS, TokenType.ANY, TokenType.ASOF}  # type: ignore
+ 
+         TABLE_ALIAS_TOKENS = {*parser.Parser.TABLE_ALIAS_TOKENS} - {TokenType.ANY}  # type: ignore
+ 
+-        def _parse_table(self, schema=False):
+-            this = super()._parse_table(schema)
++        def _parse_in(
++            self, this: t.Optional[exp.Expression], is_global: bool = False
++        ) -> exp.Expression:
++            this = super()._parse_in(this)
++            this.set("is_global", is_global)
++            return this
++
++        def _parse_table(
++            self, schema: bool = False, alias_tokens: t.Optional[t.Collection[TokenType]] = None
++        ) -> t.Optional[exp.Expression]:
++            this = super()._parse_table(schema=schema, alias_tokens=alias_tokens)
+ 
+             if self._match(TokenType.FINAL):
+                 this = self.expression(exp.Final, this=this)
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 2167c675..c78387d8 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -2449,6 +2449,7 @@ class In(Predicate):
+         "query": False,
+         "unnest": False,
+         "field": False,
++        "is_global": False,
+     }
+ 
+ 
+@@ -3002,8 +3003,10 @@ class StrToTime(Func):
+     arg_types = {"this": True, "format": True}
+ 
+ 
++# Spark allows unix_timestamp()
++# https://spark.apache.org/docs/3.1.3/api/python/reference/api/pyspark.sql.functions.unix_timestamp.html
+ class StrToUnix(Func):
+-    arg_types = {"this": True, "format": True}
++    arg_types = {"this": False, "format": False}
+ 
+ 
+ class NumberToStr(Func):
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 21ab41eb..c690ec09 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -1141,6 +1141,8 @@ class Generator:
+         query = expression.args.get("query")
+         unnest = expression.args.get("unnest")
+         field = expression.args.get("field")
++        is_global = " GLOBAL" if expression.args.get("is_global") else ""
++
+         if query:
+             in_sql = self.wrap(query)
+         elif unnest:
+@@ -1149,7 +1151,8 @@ class Generator:
+             in_sql = self.sql(field)
+         else:
+             in_sql = f"({self.expressions(expression, flat=True)})"
+-        return f"{self.sql(expression, 'this')} IN {in_sql}"
++
++        return f"{self.sql(expression, 'this')}{is_global} IN {in_sql}"
+ 
+     def in_unnest_op(self, unnest: exp.Unnest) -> str:
+         return f"(SELECT {self.sql(unnest)})"
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index e211ff78..32989920 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -182,6 +182,7 @@ class TokenType(AutoName):
+     FUNCTION = auto()
+     FROM = auto()
+     GENERATED = auto()
++    GLOBAL = auto()
+     GROUP_BY = auto()
+     GROUPING_SETS = auto()
+     HAVING = auto()

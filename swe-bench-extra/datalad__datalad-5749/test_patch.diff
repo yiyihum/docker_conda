@@ -1,0 +1,136 @@
+diff --git a/datalad/core/distributed/tests/test_clone.py b/datalad/core/distributed/tests/test_clone.py
+index 7c7bd2f55..30c30ebbf 100644
+--- a/datalad/core/distributed/tests/test_clone.py
++++ b/datalad/core/distributed/tests/test_clone.py
+@@ -1564,3 +1564,85 @@ def test_clone_recorded_subds_reset(path):
+     eq_(ds_b.subdatasets()[0]["gitshasum"],
+         sub_repo.get_hexsha(
+             sub_repo.get_corresponding_branch(branch) or branch))
++
++
++@with_tempfile
++@with_tempfile
++def test_clone_url_mapping(src_path, dest_path):
++    src = create(src_path)
++    dest = Dataset(dest_path)
++    # check that the impossible doesn't work
++    assert_raises(IncompleteResultsError, clone, 'rambo', dest_path)
++    # rather than adding test URL mapping here, consider
++    # test_url_mapping_specs(), it is cheaper there
++  
++    # anticipate windows test paths and escape them
++    escaped_subst = (r',rambo,%s' % src_path).replace('\\', '\\\\')
++    for specs in (
++            # we can clone with a simple substitution
++            {'datalad.clone.url-substitute.mike': escaped_subst},
++            # a prior match to a dysfunctional URL doesn't impact success
++            {
++                'datalad.clone.url-substitute.no': ',rambo,picknick',
++                'datalad.clone.url-substitute.mike': escaped_subst,
++            }):
++        try:
++            with patch.dict(dest.config._merged_store, specs):
++                clone('rambo', dest_path)
++        finally:
++            dest.remove(check=False)
++
++    # check submodule config impact
++    dest.create()
++    with patch.dict(dest.config._merged_store,
++                    {'datalad.clone.url-substitute.mike': escaped_subst}):
++        dest.clone('rambo', 'subds')
++    submod_rec = dest.repo.get_submodules()[0]
++    # we record the original-original URL
++    eq_(submod_rec['gitmodule_datalad-url'], 'rambo')
++    # and put the effective one as the primary URL
++    eq_(submod_rec['gitmodule_url'], src_path)
++
++
++_nomatch_map = {
++    'datalad.clone.url-substitute.nomatch': (
++        ',nomatch,NULL',
++    )
++}
++_windows_map = {
++    'datalad.clone.url-substitute.win': (
++        r',C:\\Users\\datalad\\from,D:\\to',
++    )
++}
++
++
++def test_url_mapping_specs():
++    from datalad.core.distributed.clone import _map_urls
++    cfg = ConfigManager()
++    for m, i, o in (
++            # path redirect on windows
++            (_windows_map,
++             r'C:\Users\datalad\from',
++             r'D:\to'),
++            # test standard github mapping, no pathc needed
++            ({},
++             'https://github.com/datalad/testrepo_gh/sub _1',
++             'https://github.com/datalad/testrepo_gh-sub__1'),
++            # and on deep subdataset too
++            ({},
++             'https://github.com/datalad/testrepo_gh/sub _1/d/sub_-  1',
++             'https://github.com/datalad/testrepo_gh-sub__1-d-sub_-_1'),
++            # test that the presence of another mapping spec doesn't ruin
++            # the outcome
++            (_nomatch_map,
++             'https://github.com/datalad/testrepo_gh/sub _1',
++             'https://github.com/datalad/testrepo_gh-sub__1'),
++            # verify OSF mapping, but see
++            # https://github.com/datalad/datalad/issues/5769 for future
++            # implications
++            ({},
++             'https://osf.io/q8xnk/',
++             'osf://q8xnk'),
++            ):
++        with patch.dict(cfg._merged_store, m):
++            eq_(_map_urls(cfg, [i]), [o])
+diff --git a/datalad/distribution/tests/test_install.py b/datalad/distribution/tests/test_install.py
+index a86addfb8..769682e2a 100644
+--- a/datalad/distribution/tests/test_install.py
++++ b/datalad/distribution/tests/test_install.py
+@@ -919,3 +919,41 @@ def test_relpath_semantics(path):
+         sub = install(
+             dataset='super', source='subsrc', path=op.join('super', 'sub'))
+         eq_(sub.path, op.join(super.path, 'sub'))
++
++
++def _create_test_install_recursive_github(path):  # pragma: no cover
++    # to be ran once to populate a hierarchy of test datasets on github
++    # Making it a full round-trip would require github credentials on CI etc
++    ds = create(opj(path, "testrepo  gh"))
++    # making them with spaces and - to ensure that we consistently use the mapping
++    # for create and for get/clone/install
++    ds.create("sub _1")
++    ds.create("sub _1/d/sub_-  1")
++    import datalad.distribution.create_sibling_github  # to bind API
++    ds.create_sibling_github(
++        "testrepo  gh",
++        github_organization='datalad',
++        recursive=True,
++        # yarik forgot to push first, "replace" is not working in non-interactive IIRC
++        # existing='reconfigure'
++    )
++    return ds.push(recursive=True, to='github')
++
++
++@skip_if_no_network
++@with_tempfile(mkdir=True)
++def test_install_recursive_github(path):
++    # test recursive installation of a hierarchy of datasets created on github
++    # using datalad create-sibling-github.  Following invocation was used to poplate it
++    #
++    # out = _create_test_install_recursive_github(path)
++
++    # "testrepo  gh" was mapped by our sanitization in create_sibling_github to testrepo_gh, thus
++    for i, url in enumerate([
++        'https://github.com/datalad/testrepo_gh',
++        # optionally made available to please paranoids, but with all takes too long (22sec)
++        #'https://github.com/datalad/testrepo_gh.git',
++        #'git@github.com:datalad/testrepo_gh.git',
++    ]):
++        ds = install(source=url, path=opj(path, "clone%i" % i), recursive=True)
++        eq_(len(ds.subdatasets(recursive=True, fulfilled=True)), 2)

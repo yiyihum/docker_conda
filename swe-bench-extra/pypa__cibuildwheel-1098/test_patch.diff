@@ -1,0 +1,133 @@
+diff --git a/unit_test/main_tests/conftest.py b/unit_test/main_tests/conftest.py
+index 25732187..c90fb555 100644
+--- a/unit_test/main_tests/conftest.py
++++ b/unit_test/main_tests/conftest.py
+@@ -12,7 +12,13 @@
+ 
+ 
+ class ArgsInterceptor:
++    def __init__(self):
++        self.call_count = 0
++        self.args = None
++        self.kwargs = None
++
+     def __call__(self, *args, **kwargs):
++        self.call_count += 1
+         self.args = args
+         self.kwargs = kwargs
+ 
+@@ -75,16 +81,14 @@ def platform(request, monkeypatch):
+ 
+ 
+ @pytest.fixture
+-def intercepted_build_args(platform, monkeypatch):
++def intercepted_build_args(monkeypatch):
+     intercepted = ArgsInterceptor()
+ 
+-    if platform == "linux":
+-        monkeypatch.setattr(linux, "build", intercepted)
+-    elif platform == "macos":
+-        monkeypatch.setattr(macos, "build", intercepted)
+-    elif platform == "windows":
+-        monkeypatch.setattr(windows, "build", intercepted)
+-    else:
+-        raise ValueError(f"unknown platform value: {platform}")
++    monkeypatch.setattr(linux, "build", intercepted)
++    monkeypatch.setattr(macos, "build", intercepted)
++    monkeypatch.setattr(windows, "build", intercepted)
++
++    yield intercepted
+ 
+-    return intercepted
++    # check that intercepted_build_args only ever had one set of args
++    assert intercepted.call_count <= 1
+diff --git a/unit_test/main_tests/main_platform_test.py b/unit_test/main_tests/main_platform_test.py
+index 96fd4412..9136802c 100644
+--- a/unit_test/main_tests/main_platform_test.py
++++ b/unit_test/main_tests/main_platform_test.py
+@@ -192,3 +192,73 @@ def test_archs_platform_all(platform, intercepted_build_args, monkeypatch):
+             Architecture.arm64,
+             Architecture.universal2,
+         }
++
++
++@pytest.mark.parametrize(
++    "only,plat",
++    (
++        ("cp311-manylinux_x86_64", "linux"),
++        ("cp310-win_amd64", "windows"),
++        ("cp311-macosx_x86_64", "macos"),
++    ),
++)
++def test_only_argument(intercepted_build_args, monkeypatch, only, plat):
++    monkeypatch.setenv("CIBW_BUILD", "unused")
++    monkeypatch.setenv("CIBW_SKIP", "unused")
++    monkeypatch.setattr(sys, "argv", sys.argv + ["--only", only])
++
++    main()
++
++    options = intercepted_build_args.args[0]
++    assert options.globals.build_selector.build_config == only
++    assert options.globals.build_selector.skip_config == ""
++    assert options.platform == plat
++    assert options.globals.architectures == Architecture.all_archs(plat)
++
++
++@pytest.mark.parametrize("only", ("cp311-manylxinux_x86_64", "some_linux_thing"))
++def test_only_failed(monkeypatch, only):
++    monkeypatch.setattr(sys, "argv", sys.argv + ["--only", only])
++
++    with pytest.raises(SystemExit):
++        main()
++
++
++def test_only_no_platform(monkeypatch):
++    monkeypatch.setattr(
++        sys, "argv", sys.argv + ["--only", "cp311-manylinux_x86_64", "--platform", "macos"]
++    )
++
++    with pytest.raises(SystemExit):
++        main()
++
++
++def test_only_no_archs(monkeypatch):
++    monkeypatch.setattr(
++        sys, "argv", sys.argv + ["--only", "cp311-manylinux_x86_64", "--archs", "x86_64"]
++    )
++
++    with pytest.raises(SystemExit):
++        main()
++
++
++@pytest.mark.parametrize(
++    "envvar_name,envvar_value",
++    (
++        ("CIBW_BUILD", "cp310-*"),
++        ("CIBW_SKIP", "cp311-*"),
++        ("CIBW_ARCHS", "auto32"),
++        ("CIBW_PLATFORM", "macos"),
++    ),
++)
++def test_only_overrides_env_vars(monkeypatch, intercepted_build_args, envvar_name, envvar_value):
++    monkeypatch.setattr(sys, "argv", sys.argv + ["--only", "cp311-manylinux_x86_64"])
++    monkeypatch.setenv(envvar_name, envvar_value)
++
++    main()
++
++    options = intercepted_build_args.args[0]
++    assert options.globals.build_selector.build_config == "cp311-manylinux_x86_64"
++    assert options.globals.build_selector.skip_config == ""
++    assert options.platform == "linux"
++    assert options.globals.architectures == Architecture.all_archs("linux")
+diff --git a/unit_test/utils.py b/unit_test/utils.py
+index 0cd2fefb..bf44382a 100644
+--- a/unit_test/utils.py
++++ b/unit_test/utils.py
+@@ -10,6 +10,7 @@ def get_default_command_line_arguments() -> CommandLineArguments:
+         platform="auto",
+         allow_empty=False,
+         archs=None,
++        only=None,
+         config_file="",
+         output_dir=Path("wheelhouse"),
+         package_dir=Path("."),

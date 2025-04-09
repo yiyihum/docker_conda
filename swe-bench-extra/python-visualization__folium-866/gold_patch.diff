@@ -1,0 +1,147 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index fee3bfb2..f845af64 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,6 +1,8 @@
+ 0.6.0
+ ~~~~~
+ 
++- `Popup` accepts new arguments `show` (render open on page load) and `sticky` (popups
++  only close when explicitly clicked) (jwhendy #778)
+ - Added leaflet-search plugin (ghandic #759)
+ - Improved Vector Layers docs, notebooks, and optional arguments (ocefpaf #731)
+ - Implemented `export=False/True` option to the Draw plugin layer for saving
+@@ -24,6 +26,7 @@ Bug Fixes
+ - Fixed numpy array bug (#749) in _flatten
+ - Unify `get_bounds` routine to avoid wrong responses
+ - If Path option `fill_color` is present it will override `fill=False`
++- Fix disappearing layer control when using FastMarkerCluster (conengmo #866)
+ 
+ 0.5.0
+ ~~~~~
+diff --git a/folium/__init__.py b/folium/__init__.py
+index 2574ff8e..e03ff878 100644
+--- a/folium/__init__.py
++++ b/folium/__init__.py
+@@ -23,6 +23,11 @@ from folium.map import (
+ 
+ from folium.vector_layers import Circle, CircleMarker, PolyLine, Polygon, Rectangle  # noqa
+ 
++import branca
++if tuple(int(x) for x in branca.__version__.split('.')) < (0, 3, 0):
++    raise ImportError('branca version 0.3.0 or higher is required. '
++                      'Update branca with e.g. `pip install branca --upgrade`.')
++
+ __version__ = get_versions()['version']
+ del get_versions
+ 
+diff --git a/folium/map.py b/folium/map.py
+index 4680510c..c2fb7261 100644
+--- a/folium/map.py
++++ b/folium/map.py
+@@ -276,23 +276,30 @@ class Popup(Element):
+         True if the popup is a template that needs to the rendered first.
+     max_width: int, default 300
+         The maximal width of the popup.
++    show: bool, default False
++        True renders the popup open on page load.
++    sticky: bool, default False
++        True prevents map and other popup clicks from closing.
+     """
+     _template = Template(u"""
+-            var {{this.get_name()}} = L.popup({maxWidth: '{{this.max_width}}'});
++            var {{this.get_name()}} = L.popup({maxWidth: '{{this.max_width}}'
++            {% if this.show or this.sticky %}, autoClose: false{% endif %}
++            {% if this.sticky %}, closeOnClick: false{% endif %}});
+ 
+             {% for name, element in this.html._children.items() %}
+                 var {{name}} = $('{{element.render(**kwargs).replace('\\n',' ')}}')[0];
+                 {{this.get_name()}}.setContent({{name}});
+             {% endfor %}
+ 
+-            {{this._parent.get_name()}}.bindPopup({{this.get_name()}});
++            {{this._parent.get_name()}}.bindPopup({{this.get_name()}})
++            {% if this.show %}.openPopup(){% endif %};
+ 
+             {% for name, element in this.script._children.items() %}
+                 {{element.render()}}
+             {% endfor %}
+         """)  # noqa
+ 
+-    def __init__(self, html=None, parse_html=False, max_width=300):
++    def __init__(self, html=None, parse_html=False, max_width=300, show=False, sticky=False):
+         super(Popup, self).__init__()
+         self._name = 'Popup'
+         self.header = Element()
+@@ -311,6 +318,8 @@ class Popup(Element):
+             self.html.add_child(Html(text_type(html), script=script))
+ 
+         self.max_width = max_width
++        self.show = show
++        self.sticky = sticky
+ 
+     def render(self, **kwargs):
+         """Renders the HTML representation of the element."""
+diff --git a/folium/plugins/fast_marker_cluster.py b/folium/plugins/fast_marker_cluster.py
+index b42cd281..d4a8f756 100644
+--- a/folium/plugins/fast_marker_cluster.py
++++ b/folium/plugins/fast_marker_cluster.py
+@@ -41,11 +41,11 @@ class FastMarkerCluster(MarkerCluster):
+     """
+     _template = Template(u"""
+             {% macro script(this, kwargs) %}
+-            {{this._callback}}
+ 
+-            (function(){
+-                var data = {{this._data}};
+-                var map = {{this._parent.get_name()}};
++            var {{ this.get_name() }} = (function(){
++                {{this._callback}}
++
++                var data = {{ this._data }};
+                 var cluster = L.markerClusterGroup();
+ 
+                 for (var i = 0; i < data.length; i++) {
+@@ -54,7 +54,8 @@ class FastMarkerCluster(MarkerCluster):
+                     marker.addTo(cluster);
+                 }
+ 
+-                cluster.addTo(map);
++                cluster.addTo({{ this._parent.get_name() }});
++                return cluster;
+             })();
+             {% endmacro %}""")
+ 
+@@ -66,15 +67,12 @@ class FastMarkerCluster(MarkerCluster):
+         self._data = _validate_coordinates(data)
+ 
+         if callback is None:
+-            self._callback = ('var callback;\n' +
+-                              'callback = function (row) {\n' +
+-                              '\tvar icon, marker;\n' +
+-                              '\t// Returns a L.marker object\n' +
+-                              '\ticon = L.AwesomeMarkers.icon();\n' +
+-                              '\tmarker = L.marker(new L.LatLng(row[0], ' +
+-                              'row[1]));\n' +
+-                              '\tmarker.setIcon(icon);\n' +
+-                              '\treturn marker;\n' +
+-                              '};')
++            self._callback = """
++                var callback = function (row) {
++                    var icon = L.AwesomeMarkers.icon();
++                    var marker = L.marker(new L.LatLng(row[0], row[1]));
++                    marker.setIcon(icon);
++                    return marker;
++                };"""
+         else:
+             self._callback = 'var callback = {};'.format(callback)
+diff --git a/requirements.txt b/requirements.txt
+index f2c4eb37..69e1a836 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,4 @@
+-branca
++branca>=0.3.0
+ jinja2
+ numpy
+ requests

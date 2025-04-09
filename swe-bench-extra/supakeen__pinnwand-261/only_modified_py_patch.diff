@@ -1,0 +1,82 @@
+diff --git a/src/pinnwand/defensive.py b/src/pinnwand/defensive.py
+index 0b64d53..4a5ebd5 100644
+--- a/src/pinnwand/defensive.py
++++ b/src/pinnwand/defensive.py
+@@ -1,6 +1,5 @@
+-import ipaddress
+ import re
+-from typing import Dict, Union
++from typing import Dict
+ from functools import wraps
+ 
+ import token_bucket
+@@ -13,18 +12,10 @@ from pinnwand.configuration import Configuration, ConfigurationProvider
+ log = logger.get_logger(__name__)
+ 
+ 
+-ratelimit_area: Dict[
+-    str,
+-    Dict[
+-        Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
+-        token_bucket.Limiter,
+-    ],
+-] = {}
++ratelimit_area: Dict[str, token_bucket.Limiter] = {}
+ 
+ 
+-def should_be_ratelimited(
+-    request: HTTPServerRequest, area: str = "global"
+-) -> bool:
++def should_be_ratelimited(ip_address: str, area: str = "global") -> bool:
+     """Test if a requesting IP is ratelimited for a certain area. Areas are
+     different functionalities of the website, for example 'view' or 'input' to
+     differentiate between creating new pastes (low volume) or high volume
+@@ -38,20 +29,17 @@ def should_be_ratelimited(
+     configuration: Configuration = ConfigurationProvider.get_config()
+ 
+     if area not in ratelimit_area:
+-        ratelimit_area[area] = {}
+-
+-    # TODO handle valueerror as validationerror?
+-    address = ipaddress.ip_address(str(request.remote_ip))
+-
+-    if address not in ratelimit_area[area]:
+-        ratelimit_area[area][address] = token_bucket.Limiter(
++        ratelimit_area[area] = token_bucket.Limiter(
+             configuration.ratelimit[area]["refill"],
+             configuration.ratelimit[area]["capacity"],
+             token_bucket.MemoryStorage(),
+         )
+ 
+-    if not ratelimit_area[area][address].consume(1):
+-        log.warning("%s hit rate limit for %r", address, area)
++    if not ratelimit_area[area].consume(
++        ip_address.encode("utf-8"),
++        configuration.ratelimit[area]["consume"],
++    ):
++        log.warning("%s hit rate limit for %r", ip_address, area)
+         return True
+ 
+     return False
+@@ -63,7 +51,7 @@ def ratelimit(area: str):
+     def wrapper(func):
+         @wraps(func)
+         def inner(request_handler: RequestHandler, *args, **kwargs):
+-            if should_be_ratelimited(request_handler.request, area):
++            if should_be_ratelimited(request_handler.request.remote_ip, area):
+                 raise error.RatelimitError()
+             return func(request_handler, *args, **kwargs)
+ 
+diff --git a/src/pinnwand/handler/api_curl.py b/src/pinnwand/handler/api_curl.py
+index 1fca553..1cf569e 100644
+--- a/src/pinnwand/handler/api_curl.py
++++ b/src/pinnwand/handler/api_curl.py
+@@ -31,7 +31,6 @@ class Create(tornado.web.RequestHandler):
+ 
+     @defensive.ratelimit(area="create")
+     def post(self) -> None:
+-
+         configuration: Configuration = ConfigurationProvider.get_config()
+         lexer = self.get_body_argument("lexer", "text")
+         raw = self.get_body_argument("raw", "", strip=False)
+

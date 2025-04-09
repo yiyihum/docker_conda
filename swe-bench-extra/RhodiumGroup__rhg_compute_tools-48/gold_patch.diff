@@ -1,0 +1,167 @@
+diff --git a/HISTORY.rst b/HISTORY.rst
+index c3f2eb7..053b986 100644
+--- a/HISTORY.rst
++++ b/HISTORY.rst
+@@ -4,6 +4,32 @@ History
+ 
+ .. current developments
+ 
++v0.2.0
++------
++
++* Add CLI tools (:issue:`37`). See ``rctools gcs repdirstruc --help`` to start
++* Add new function ``rhg_compute_tools.gcs.replicate_directory_structure_on_gcs`` to copy directory trees into GCS
++* Fixes to docstrings and metadata (:issue:`43`) (:issue:`45`)
++
++
++v0.1.8
++------
++
++* Deployment fixes
++
++v0.1.7
++------
++
++* Design tools: use RHG & CIL colors & styles
++* Plotting helpers: generate cmaps with consistent colors & norms, and apply a colorbar to geopandas plots with nonlinear norms
++* Autoscaling fix for kubecluster: switch to dask_kubernetes.KubeCluster to allow use of recent bug fixes
++
++
++v0.1.6
++------
++
++* Add ``rhg_compute_tools.gcs.cp_gcs`` and ``rhg_compute_tools.gcs.sync_gcs`` utilities
++
+ v0.1.5
+ ------
+ 
+diff --git a/requirements.txt b/requirements.txt
+index d19ea9f..9e968c3 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,3 +2,4 @@ google-cloud-storage==1.16.1
+ dask-kubernetes==0.8.0
+ matplotlib==3.0.3
+ numpy>=1.14
++click
+diff --git a/requirements_dev.txt b/requirements_dev.txt
+index 903cbb1..0bf806b 100644
+--- a/requirements_dev.txt
++++ b/requirements_dev.txt
+@@ -8,4 +8,5 @@ Sphinx==1.7.4
+ pyyaml>=4.2b1
+ pytest-cov==2.5.1
+ pytest-runner==4.2
++pytest-mock
+ twine==1.13.0
+diff --git a/rhg_compute_tools/cli.py b/rhg_compute_tools/cli.py
+new file mode 100644
+index 0000000..9aacdee
+--- /dev/null
++++ b/rhg_compute_tools/cli.py
+@@ -0,0 +1,36 @@
++import click
++from rhg_compute_tools.gcs import replicate_directory_structure_on_gcs
++
++
++@click.group(
++    context_settings={'help_option_names': ['-h', '--help']}
++)
++def rctools_cli():
++    """Rhodium Compute Tools"""
++    pass
++
++
++@rctools_cli.group()
++def gcs():
++    """Tools for interacting with Google Cloud Storage
++    """
++    pass
++
++
++@gcs.command()
++@click.argument('src', type=click.Path(exists=True))
++@click.argument('dst', type=click.Path())
++@click.option('-c', '--credentials', type=click.Path(exists=True),
++              envvar='GOOGLE_APPLICATION_CREDENTIALS',
++              help='Optional path to GCS credentials file.')
++def repdirstruc(src, dst, credentials):
++    """Replicate directory structure onto GCS bucket.
++
++    SRC is path to a local directory. Directories within will be replicated.
++    DST is gs://[bucket] and optional path to replicate SRC into.
++
++    If --credentials or -c is not explicitly given, checks the
++    GOOGLE_APPLICATIONS_CREDENTIALS environment variable for path to a GCS
++    credentials file.
++    """
++    replicate_directory_structure_on_gcs(src, dst, credentials)
+diff --git a/rhg_compute_tools/gcs.py b/rhg_compute_tools/gcs.py
+index 93c1ac6..cfe89b8 100644
+--- a/rhg_compute_tools/gcs.py
++++ b/rhg_compute_tools/gcs.py
+@@ -47,13 +47,12 @@ def _get_path_types(src, dest):
+     return src_gs, dest_gs, dest_gcs
+ 
+ 
+-def replicate_directory_structure_on_gcs(src, dst, storage_client):
+-    '''
++def replicate_directory_structure_on_gcs(src, dst, client_or_creds):
++    """
+     Replicate a local directory structure on google cloud storage
+-    
++
+     Parameters
+     ----------
+-    
+     src : str
+         Path to the root directory on the source machine. The directory
+         structure within this directory will be reproduced within `dst`,
+@@ -61,9 +60,15 @@ def replicate_directory_structure_on_gcs(src, dst, storage_client):
+     dst : str
+         A url for the root directory of the destination, starting with
+         `gs://[bucket_name]/`, e.g. `gs://my_bucket/path/to/my/data`
+-    storage_client : object
+-        An authenticated :py:class:`google.cloud.storage.client.Client` object
+-    '''
++    client_or_creds : google.cloud.storage.client.Client or str
++        An authenticated :py:class:`google.cloud.storage.client.Client` object,
++        or a str path to storage credentials authentication file.
++    """
++    if isinstance(client_or_creds, str):
++        credentials = service_account.Credentials.from_service_account_file(
++            client_or_creds
++        )
++        client_or_creds = storage.Client(credentials=credentials)
+ 
+     if dst.startswith('gs://'):
+         dst = dst[5:]
+@@ -71,11 +76,11 @@ def replicate_directory_structure_on_gcs(src, dst, storage_client):
+         dst = dst[6:]
+     else:
+         raise ValueError('dst must begin with `gs://` or `gcs://`')
+-    
++
+     bucket_name = dst.split('/')[0]
+     blob_path = '/'.join(dst.split('/')[1:])
+-    
+-    bucket = storage_client.get_bucket(bucket_name)
++
++    bucket = client_or_creds.get_bucket(bucket_name)
+ 
+     for d, dirnames, files in os.walk(src):
+         dest_path = os.path.join(blob_path, os.path.relpath(d, src))
+diff --git a/setup.py b/setup.py
+index 1cdca31..2c039e2 100644
+--- a/setup.py
++++ b/setup.py
+@@ -60,4 +60,9 @@ setup(
+     test_suite='tests',
+     tests_require=test_requirements,
+     setup_requires=setup_requirements,
++    entry_points={
++        'console_scripts': [
++            'rctools = rhg_compute_tools.cli:rctools_cli',
++        ]
++    },
+ )

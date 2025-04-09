@@ -1,0 +1,196 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ee662c9..9212725 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 3.1.31 Jan 13, 2020
++
++Added `sam-coverage-depth.py`.
++
+ ## 3.1.30 Jan 13, 2020
+ 
+ Added `--minGenomeLength` to `make-protein-database.py`.
+diff --git a/bin/sam-coverage-depth.py b/bin/sam-coverage-depth.py
+new file mode 100755
+index 0000000..7516f61
+--- /dev/null
++++ b/bin/sam-coverage-depth.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python
++
++from __future__ import print_function
++
++import sys
++import argparse
++from collections import Counter
++from numpy import std
++
++from dark.filter import (
++    addFASTAFilteringCommandLineOptions, parseFASTAFilteringCommandLineOptions)
++from dark.reads import Reads
++from dark.sam import samfile, SAMFilter, samReferences, UnknownReference
++from dark.utils import pct
++
++
++def baseCountsToStr(counts):
++    """
++    Convert base counts to a string.
++
++    @param counts: A C{Counter} instance.
++    @return: A C{str} representation of nucleotide counts.
++    """
++    return ' '.join([
++        ('%s:%d' % (base, counts[base])) for base in sorted(counts)])
++
++
++parser = argparse.ArgumentParser(
++    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++    description=('Print SAM/BAM file coverage statistics by offset. '
++                 'Output lines show the offset.'))
++
++addFASTAFilteringCommandLineOptions(parser)
++SAMFilter.addFilteringOptions(parser, samfileIsPositional=True)
++
++parser.add_argument(
++    '--noOffsets', default=False, action='store_true',
++    help='Do not print per-offset details of base counts.')
++
++parser.add_argument(
++    '--noStats', default=False, action='store_true',
++    help='Do not print final average and standard deviation statistics.')
++
++args = parser.parse_args()
++
++if args.noOffsets and args.noStats:
++    print('You have used both --noOffsets and --noStats, so there is no '
++          'output!', file=sys.stderr)
++    sys.exit(1)
++
++# We don't have a file of reads, we just want a read filter that we
++# can use to filter the SAM file query sequences.
++reads = parseFASTAFilteringCommandLineOptions(args, Reads())
++samFilter = SAMFilter.parseFilteringOptions(args, reads.filterRead)
++
++printOffsets = not args.noOffsets
++printStats = not args.noStats
++
++if samFilter.referenceIds and len(samFilter.referenceIds) > 1:
++    print('Only one reference id can be given. To calculate coverage for more '
++          'than one reference, run this script multiple times.',
++          file=sys.stderr)
++    sys.exit(1)
++
++try:
++    referenceLengths = samFilter.referenceLengths()
++except UnknownReference:
++    referenceId = samFilter.referenceIds.pop()
++    referenceIds = samReferences(args.samfile)
++    print('Reference %r does not appear in SAM file %s. Known '
++          'references are: %s.' % (
++              referenceId, args.samfile, ', '.join(sorted(referenceIds))),
++          file=sys.stderr)
++    sys.exit(1)
++
++if printStats:
++    counts = []
++
++with samfile(args.samfile) as sam:
++
++    if samFilter.referenceIds:
++        # No need to check if the given reference id is in referenceLengths
++        # because the samFilter.referenceLengths call above catched that.
++        referenceId = samFilter.referenceIds.pop()
++    else:
++        if len(referenceLengths) == 1:
++            referenceId = list(referenceLengths)[0]
++        else:
++            print('SAM file %r contains %d references (%s). Only one '
++                  'reference id can be analyzed at a time. Please use '
++                  '--referenceId to specify the one you want examined.' % (
++                      args.samfile, len(referenceLengths),
++                      ', '.join(sorted(referenceLengths))), file=sys.stderr)
++            sys.exit(1)
++
++    for column in sam.pileup(reference=referenceId):
++        bases = Counter()
++        for read in column.pileups:
++            if (not read.is_del and not read.is_refskip and
++                    samFilter.filterAlignment(read.alignment)):
++                base = read.alignment.query_sequence[read.query_position]
++                bases[base] += 1
++
++        baseCount = sum(bases.values())
++
++        if printStats:
++            counts.append(baseCount)
++
++        if printOffsets:
++            print('%d: %d %s' % (column.reference_pos + 1, baseCount,
++                                 baseCountsToStr(bases)))
++
++if printStats:
++    referenceLength = referenceLengths[referenceId]
++    print('Reference id: %s' % referenceId)
++    print('Reference length: %d' % referenceLength)
++    print('Bases covered: %s' % pct(len(counts), referenceLength))
++    print('Min coverage depth: %d' % (
++        0 if len(counts) < referenceLength else min(counts)))
++    print('Max coverage depth: %d' % max(counts))
++    print('Mean coverage depth: %.3f' % (sum(counts) / referenceLength))
++    print('Coverage depth s.d.: %.3f' % std(counts))
+diff --git a/dark/__init__.py b/dark/__init__.py
+index 324a302..da9777a 100644
+--- a/dark/__init__.py
++++ b/dark/__init__.py
+@@ -7,4 +7,4 @@ if sys.version_info < (2, 7):
+ # will not be found by the version() function in ../setup.py
+ #
+ # Remember to update ../CHANGELOG.md describing what's new in each version.
+-__version__ = '3.1.30'
++__version__ = '3.1.31'
+diff --git a/dark/sam.py b/dark/sam.py
+index b668b4f..07a5e08 100644
+--- a/dark/sam.py
++++ b/dark/sam.py
+@@ -334,13 +334,10 @@ class SAMFilter(object):
+             SAM/BAM file is read.
+         @return: A C{SAMFilter} instance.
+         """
+-        referenceIds = (set(chain.from_iterable(args.referenceId))
+-                        if args.referenceId else None)
+-
+         return cls(
+             args.samfile,
+             filterRead=filterRead,
+-            referenceIds=referenceIds,
++            referenceIds=set(args.referenceId) if args.referenceId else None,
+             storeQueryIds=storeQueryIds,
+             dropUnmapped=args.dropUnmapped,
+             dropSecondary=args.dropSecondary,
+diff --git a/dark/utils.py b/dark/utils.py
+index 0059330..1ffa57f 100644
+--- a/dark/utils.py
++++ b/dark/utils.py
+@@ -259,6 +259,22 @@ def countPrint(mesg, count, len1, len2=None):
+                         count, len2, percentage(count, len2)))
+ 
+ 
++def pct(a, b):
++    """
++    Format a string showing two integers and what percentage the first
++    is of the second.
++
++    @param a: An C{int}, the numerator.
++    @param b: An C{int}, the denominator.
++    """
++    assert 0 <= a <= b
++    if b:
++        return ('%d/%d (%.3f%%)' %
++                (a, b, (a / b if b else 0.0) * 100.0))
++    else:
++        return '0/0 (0.000%)'
++
++
+ @contextmanager
+ def cd(newdir):
+     """

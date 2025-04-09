@@ -1,0 +1,79 @@
+diff --git a/sqllineage/combiners.py b/sqllineage/combiners.py
+index a652340..2887748 100644
+--- a/sqllineage/combiners.py
++++ b/sqllineage/combiners.py
+@@ -1,7 +1,9 @@
+ from functools import reduce
+-from operator import add
++from operator import add, or_
++from typing import Set
+ 
+ from sqllineage.core import LineageResult
++from sqllineage.models import Table
+ 
+ 
+ class LineageCombiner:
+@@ -30,10 +32,22 @@ class DefaultLineageCombiner(LineageCombiner):
+                         if table_old in st_tables:
+                             st_tables.remove(table_old)
+                             st_tables.add(table_new)
++            elif lineage_result.with_:
++                combined_result.read |= lineage_result.read - lineage_result.with_
++                combined_result.write |= lineage_result.write
+             else:
+                 combined_result.read |= lineage_result.read
+                 combined_result.write |= lineage_result.write
+         tmp_tables = combined_result.read.intersection(combined_result.write)
++        self_depend_tables = reduce(
++            or_,
++            (
++                lineage_result.read.intersection(lineage_result.write)
++                for lineage_result in args
++            ),
++            set(),
++        )  # type: Set[Table]
++        tmp_tables -= self_depend_tables
+         combined_result.read -= tmp_tables
+         combined_result.write -= tmp_tables
+         return combined_result
+diff --git a/sqllineage/core.py b/sqllineage/core.py
+index 47d3265..3657362 100644
+--- a/sqllineage/core.py
++++ b/sqllineage/core.py
+@@ -27,12 +27,10 @@ TEMP_TABLE_TOKENS = ("WITH",)
+ class LineageResult:
+     """Statement(s) Level Lineage Result."""
+ 
+-    __slots__ = ["read", "write", "rename", "drop"]
++    __slots__ = ["read", "write", "rename", "drop", "with_"]
+     if TYPE_CHECKING:
+-        read = None  # type: Set[Table]
+-        write = None  # type: Set[Table]
+-        rename = None  # type: Set[Tuple[Table, Table]]
+-        drop = None  # type: Set[Table]
++        read = write = drop = with_ = set()  # type: Set[Table]
++        rename = set()  # type: Set[Tuple[Table, Table]]
+ 
+     def __init__(self) -> None:
+         for attr in self.__slots__:
+@@ -54,6 +52,9 @@ class LineageResult:
+             for attr in self.__slots__
+         )
+ 
++    def __repr__(self):
++        return str(self)
++
+ 
+ class LineageAnalyzer:
+     """SQL Statement Level Lineage Analyzer."""
+@@ -160,8 +161,7 @@ class LineageAnalyzer:
+                 else:
+                     if not isinstance(sub_token, Identifier):
+                         raise SQLLineageException("An Identifier is expected")
+-                    self._lineage_result.read.add(Table.create(sub_token))
+-                    self._lineage_result.write.add(Table.create(sub_token))
++                    self._lineage_result.with_.add(Table.create(sub_token))
+                     self._extract_from_DML(sub_token)
+                     temp_table_token_flag = False
+ 
+

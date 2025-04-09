@@ -1,0 +1,177 @@
+diff --git a/rio_cogeo/profiles.py b/rio_cogeo/profiles.py
+index 8fb1bae..9a91747 100644
+--- a/rio_cogeo/profiles.py
++++ b/rio_cogeo/profiles.py
+@@ -1,5 +1,7 @@
+ """rio_cogeo.profiles: CloudOptimized profiles."""
+ 
++import warnings
++
+ from rasterio.profiles import Profile
+ 
+ 
+@@ -85,6 +87,58 @@ class PACKBITSProfile(Profile):
+     }
+ 
+ 
++class LZMAProfile(Profile):
++    """Tiled, pixel-interleaved, LZMA-compressed GTiff."""
++
++    defaults = {
++        "driver": "GTiff",
++        "interleave": "pixel",
++        "tiled": True,
++        "blockxsize": 512,
++        "blockysize": 512,
++        "compress": "LZMA",
++    }
++
++
++class LERCProfile(Profile):
++    """Tiled, pixel-interleaved, LERC-compressed GTiff."""
++
++    defaults = {
++        "driver": "GTiff",
++        "interleave": "pixel",
++        "tiled": True,
++        "blockxsize": 512,
++        "blockysize": 512,
++        "compress": "LERC",
++    }
++
++
++class LERCDEFLATEProfile(Profile):
++    """Tiled, pixel-interleaved, LERC_DEFLATE-compressed GTiff."""
++
++    defaults = {
++        "driver": "GTiff",
++        "interleave": "pixel",
++        "tiled": True,
++        "blockxsize": 512,
++        "blockysize": 512,
++        "compress": "LERC_DEFLATE",
++    }
++
++
++class LERCZSTDProfile(Profile):
++    """Tiled, pixel-interleaved, LERC_ZSTD-compressed GTiff."""
++
++    defaults = {
++        "driver": "GTiff",
++        "interleave": "pixel",
++        "tiled": True,
++        "blockxsize": 512,
++        "blockysize": 512,
++        "compress": "LERC_ZSTD",
++    }
++
++
+ class RAWProfile(Profile):
+     """Tiled, pixel-interleaved, no-compressed GTiff."""
+ 
+@@ -110,6 +164,10 @@ class COGProfiles(dict):
+                 "lzw": LZWProfile(),
+                 "deflate": DEFLATEProfile(),
+                 "packbits": PACKBITSProfile(),
++                "lzma": LZMAProfile(),
++                "lerc": LERCProfile(),
++                "lerc_deflate": LERCDEFLATEProfile(),
++                "lerc_zstd": LERCZSTDProfile(),
+                 "raw": RAWProfile(),
+             }
+         )
+@@ -119,6 +177,12 @@ class COGProfiles(dict):
+         if key not in (self.keys()):
+             raise KeyError("{} is not a valid COG profile name".format(key))
+ 
++        if key in ["zstd", "webp", "lerc", "lerc_deflate", "lerc_zstd"]:
++            warnings.warn(
++                "Non-standard compression schema: {}. The output COG might not be fully"
++                " supported by software not build against latest libtiff.".format(key)
++            )
++
+         return self[key].copy()
+ 
+ 
+diff --git a/rio_cogeo/scripts/cli.py b/rio_cogeo/scripts/cli.py
+index 75c1034..9f244fb 100644
+--- a/rio_cogeo/scripts/cli.py
++++ b/rio_cogeo/scripts/cli.py
+@@ -17,7 +17,7 @@ IN_MEMORY_THRESHOLD = int(os.environ.get("IN_MEMORY_THRESHOLD", 10980 * 10980))
+ 
+ 
+ class BdxParamType(click.ParamType):
+-    """Band inddex type."""
++    """Band index type."""
+ 
+     name = "bidx"
+ 
+@@ -36,7 +36,7 @@ class BdxParamType(click.ParamType):
+ 
+ 
+ class NodataParamType(click.ParamType):
+-    """Nodata inddex type."""
++    """Nodata type."""
+ 
+     name = "nodata"
+ 
+@@ -53,6 +53,22 @@ class NodataParamType(click.ParamType):
+             raise click.ClickException("{} is not a valid nodata value.".format(value))
+ 
+ 
++class ThreadsParamType(click.ParamType):
++    """num_threads index type."""
++
++    name = "threads"
++
++    def convert(self, value, param, ctx):
++        """Validate and parse thread number."""
++        try:
++            if value.lower() == "all_cpus":
++                return "ALL_CPUS"
++            else:
++                return int(value)
++        except (TypeError, ValueError):
++            raise click.ClickException("{} is not a valid thread value.".format(value))
++
++
+ @click.group(short_help="Create and Validate COGEO")
+ @click.version_option(version=cogeo_version, message="%(version)s")
+ def cogeo():
+@@ -131,7 +147,12 @@ def cogeo():
+     help="Force processing raster in memory / not in memory (default: process in memory "
+     "if smaller than {:.0f} million pixels)".format(IN_MEMORY_THRESHOLD // 1e6),
+ )
+-@click.option("--threads", type=int, default=8)
++@click.option(
++    "--threads",
++    type=ThreadsParamType(),
++    default="ALL_CPUS",
++    help="Number of worker threads for multi-threaded compression (default: ALL_CPUS)",
++)
+ @options.creation_options
+ @click.option(
+     "--quiet", "-q", help="Remove progressbar and other non-error output.", is_flag=True
+@@ -168,7 +189,7 @@ def create(
+         output_profile.update(creation_options)
+ 
+     config = dict(
+-        NUM_THREADS=threads,
++        GDAL_NUM_THREADS=threads,
+         GDAL_TIFF_INTERNAL_MASK=os.environ.get("GDAL_TIFF_INTERNAL_MASK", True),
+         GDAL_TIFF_OVR_BLOCKSIZE=str(overview_blocksize),
+     )
+diff --git a/setup.py b/setup.py
+index 59bd20d..b65831a 100644
+--- a/setup.py
++++ b/setup.py
+@@ -29,7 +29,7 @@ if sys.version_info >= (3, 6):
+ 
+ setup(
+     name="rio-cogeo",
+-    version="1.1.2",
++    version="1.1.3",
+     description=u"CloudOptimized GeoTIFF (COGEO) creation plugin for rasterio",
+     long_description=readme,
+     long_description_content_type="text/markdown",
+

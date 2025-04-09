@@ -1,0 +1,273 @@
+diff --git a/ChangeLog b/ChangeLog
+index 546ffca7e..b715a4a20 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,5 +1,55 @@
+ ======================================================================
+ 
++Originator: Chris Fischer 
++Date: 8-2-2021
++Tag: cime6.0.4
++Answer Changes: None
++Tests: scripts_regression_tests
++Dependencies:
++
++Brief Summary:
++    - Fix replay archive.
++    - Prepend the casename to mpas component restart file search in st_archive.
++    - Fix e3sm archiving.
++    - Check the size of read only xml files.
++    - Ensure Cmake is available for wait_for_tests.
++    - Fix the failure of ensemble consistency tests for PGI/NVHPC compiler on Casper.
++    - Fix type in centos7-linux definition.
++    - jenkins_generic_job: no reason for this magic config setting here.
++
++User interface changes: 
++
++PR summary: git log --oneline --first-parent [previous_tag]..master
++c6f489356 Merge pull request #4053 from jasonb5/fix_replay_archive
++dbaa9b2d2 Merge pull request #4057 from ESMCI/jonbob/fix_mpas_archive_naming
++1ee229961 Merge pull request #4055 from jasonb5/fix_e3sm_archiving
++705640271 Merge pull request #4056 from jedwards4b/jedwards/checksize_of_xml
++231c8e783 Merge pull request #4052 from ESMCI/jgfouca/fix_cmake_avail_for_wft
++4961a210a Merge pull request #4048 from sjsprecious/fix_ect_failure
++d72fc45f1 fix typo in centos7-linux definition
++49342dca5 Merge pull request #4046 from ESMCI/jgfouca/remove_dumb_config
++
++
++Modified files: git diff --name-status [previous_tag]
++M       config/cesm/machines/Depends.nvhpc-gpu
++M       config/cesm/machines/Depends.pgi-gpu
++M       config/cesm/machines/config_compilers.xml
++M       config/cesm/machines/config_machines.xml
++M       scripts/Tools/jenkins_generic_job
++M       scripts/lib/CIME/XML/generic_xml.py
++M       scripts/lib/CIME/case/case.py
++M       scripts/lib/CIME/case/case_st_archive.py
++M       scripts/lib/CIME/provenance.py
++M       scripts/lib/CIME/tests/test_case.py
++M       scripts/lib/CIME/tests/test_provenance.py
++M       scripts/lib/CIME/wait_for_tests.py
++M       scripts/tests/scripts_regression_tests.py
++
++
++======================================================================
++
++======================================================================
++
+ Originator: Bill Sacks
+ Date: 7-15-2021
+ Tag: cime6.0.3
+diff --git a/scripts/lib/CIME/build.py b/scripts/lib/CIME/build.py
+index d1b78e9e4..10841e553 100644
+--- a/scripts/lib/CIME/build.py
++++ b/scripts/lib/CIME/build.py
+@@ -6,7 +6,7 @@ from CIME.XML.standard_module_setup  import *
+ from CIME.utils                 import get_model, analyze_build_log, \
+     stringify_bool, run_and_log_case_status, get_timestamp, run_sub_or_cmd, \
+     run_cmd, get_batch_script_for_job, gzip_existing_file, safe_copy, \
+-    check_for_python, get_logging_options, import_from_file
++    is_python_executable, get_logging_options, import_from_file
+ from CIME.provenance            import save_build_provenance as save_build_provenance_sub
+ from CIME.locked_files          import lock_file, unlock_file
+ from CIME.XML.files             import Files
+@@ -516,7 +516,7 @@ def _build_model_thread(config_dir, compclass, compname, caseroot, libroot, bldr
+     if get_model() != "ufs":
+         compile_cmd = "SMP={} {}".format(stringify_bool(smp), compile_cmd)
+ 
+-    if check_for_python(cmd):
++    if is_python_executable(cmd):
+         logging_options = get_logging_options()
+         if logging_options != "":
+             compile_cmd = compile_cmd + logging_options
+diff --git a/scripts/lib/CIME/case/case_setup.py b/scripts/lib/CIME/case/case_setup.py
+index f2d0e5cdf..d40c83777 100644
+--- a/scripts/lib/CIME/case/case_setup.py
++++ b/scripts/lib/CIME/case/case_setup.py
+@@ -3,16 +3,18 @@ Library for case.setup.
+ case_setup is a member of class Case from file case.py
+ """
+ 
++import errno
++
+ from CIME.XML.standard_module_setup import *
+ 
+ from CIME.XML.machines      import Machines
+ from CIME.BuildTools.configure import configure
+-from CIME.utils             import get_cime_root, run_and_log_case_status, get_model, get_batch_script_for_job, safe_copy
++from CIME.utils             import run_and_log_case_status, get_model, \
++    get_batch_script_for_job, safe_copy, file_contains_python_function, import_from_file
+ from CIME.utils             import batch_jobid
+ from CIME.utils             import transform_vars
+ from CIME.test_status       import *
+ from CIME.locked_files      import unlock_file, lock_file
+-import errno
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -50,24 +52,60 @@ def _build_usernl_files(case, model, comp):
+             ninst = case.get_value("NINST")
+         elif ninst == 1:
+             ninst = case.get_value("NINST_{}".format(model))
+-        nlfile = "user_nl_{}".format(comp)
+-        model_nl = os.path.join(model_dir, nlfile)
+-        if ninst > 1:
+-            for inst_counter in range(1, ninst+1):
+-                inst_nlfile = "{}_{:04d}".format(nlfile, inst_counter)
+-                if not os.path.exists(inst_nlfile):
+-                    # If there is a user_nl_foo in the case directory, copy it
+-                    # to user_nl_foo_INST; otherwise, copy the original
+-                    # user_nl_foo from model_dir
+-                    if os.path.exists(nlfile):
+-                        safe_copy(nlfile, inst_nlfile)
+-                    elif os.path.exists(model_nl):
+-                        safe_copy(model_nl, inst_nlfile)
+-        else:
+-            # ninst = 1
+-            if not os.path.exists(nlfile):
+-                if os.path.exists(model_nl):
+-                    safe_copy(model_nl, nlfile)
++        default_nlfile = "user_nl_{}".format(comp)
++        model_nl = os.path.join(model_dir, default_nlfile)
++        user_nl_list = _get_user_nl_list(case, default_nlfile, model_dir)
++        # Note that, even if there are multiple elements of user_nl_list (i.e., we are
++        # creating multiple user_nl files for this component with different names), all of
++        # them will start out as copies of the single user_nl_comp file in the model's
++        # source tree.
++        for nlfile in user_nl_list:
++            if ninst > 1:
++                for inst_counter in range(1, ninst+1):
++                    inst_nlfile = "{}_{:04d}".format(nlfile, inst_counter)
++                    if not os.path.exists(inst_nlfile):
++                        # If there is a user_nl_foo in the case directory, copy it
++                        # to user_nl_foo_INST; otherwise, copy the original
++                        # user_nl_foo from model_dir
++                        if os.path.exists(nlfile):
++                            safe_copy(nlfile, inst_nlfile)
++                        elif os.path.exists(model_nl):
++                            safe_copy(model_nl, inst_nlfile)
++            else:
++                # ninst = 1
++                if not os.path.exists(nlfile):
++                    if os.path.exists(model_nl):
++                        safe_copy(model_nl, nlfile)
++
++###############################################################################
++def _get_user_nl_list(case, default_nlfile, model_dir):
++    """Get a list of user_nl files needed by this component
++
++    Typically, each component has a single user_nl file: user_nl_comp. However, some
++    components use multiple user_nl files. These components can define a function in
++    cime_config/buildnml named get_user_nl_list, which returns a list of user_nl files
++    that need to be staged in the case directory. For example, in a run where CISM is
++    modeling both Antarctica and Greenland, its get_user_nl_list function will return
++    ['user_nl_cism', 'user_nl_cism_ais', 'user_nl_cism_gris'].
++
++    If that function is NOT defined in the component's buildnml, then we return the given
++    default_nlfile.
++
++    """
++    # Check if buildnml is present in the expected location, and if so, whether it
++    # contains the function "get_user_nl_list"; if so, we'll import the module and call
++    # that function; if not, we'll fall back on the default value.
++    buildnml_path = os.path.join(model_dir, "buildnml")
++    has_function = False
++    if (os.path.isfile(buildnml_path) and
++        file_contains_python_function(buildnml_path, "get_user_nl_list")):
++        has_function = True
++
++    if has_function:
++        comp_buildnml = import_from_file("comp_buildnml", buildnml_path)
++        return comp_buildnml.get_user_nl_list(case)
++    else:
++        return [default_nlfile]
+ 
+ ###############################################################################
+ def _case_setup_impl(case, caseroot, clean=False, test_mode=False, reset=False, keep=None):
+diff --git a/scripts/lib/CIME/nmlgen.py b/scripts/lib/CIME/nmlgen.py
+index 58cd182fd..a4891cf15 100644
+--- a/scripts/lib/CIME/nmlgen.py
++++ b/scripts/lib/CIME/nmlgen.py
+@@ -106,10 +106,15 @@ class NamelistGenerator(object):
+                       skip_default_for_groups=None):
+         """Return array of names of all definition nodes
+ 
++        infiles should be a list of file paths, each one giving namelist settings that
++        take precedence over the default values. Often there will be only one file in this
++        list. If there are multiple files, earlier files take precedence over later files.
++
+         If skip_default_for_groups is provided, it should be a list of namelist group
+         names; the add_default call will not be done for any variables in these
+         groups. This is often paired with later conditional calls to
+         add_defaults_for_group.
++
+         """
+         if skip_default_for_groups is None:
+             skip_default_for_groups = []
+diff --git a/scripts/lib/CIME/utils.py b/scripts/lib/CIME/utils.py
+index c77f9f044..b88bbfcd1 100644
+--- a/scripts/lib/CIME/utils.py
++++ b/scripts/lib/CIME/utils.py
+@@ -396,18 +396,31 @@ def _convert_to_fd(filearg, from_dir, mode="a"):
+ 
+ _hack=object()
+ 
+-def check_for_python(filepath, funcname=None):
+-    is_python = is_python_executable(filepath)
+-    has_function = True
+-    if funcname is not None:
+-        has_function = False
+-        with open(filepath, 'r') as fd:
+-            for line in fd.readlines():
+-                if re.search(r"^def\s+{}\(".format(funcname), line) or re.search(r"^from.+import.+\s{}".format(funcname), line):
+-                    has_function = True
+-                    break
++def _line_defines_python_function(line, funcname):
++    """Returns True if the given line defines the function 'funcname' as a top-level definition
++
++    ("top-level definition" means: not something like a class method; i.e., the def should
++    be at the start of the line, not indented)
++
++    """
++    if (re.search(r"^def\s+{}\s*\(".format(funcname), line) or
++        re.search(r"^from\s.+\simport.*\s{}(?:,|\s|$)".format(funcname), line)):
++        return True
++    return False
++
++def file_contains_python_function(filepath, funcname):
++    """Checks whether the given file contains a top-level definition of the function 'funcname'
++
++    Returns a boolean value (True if the file contains this function definition, False otherwise)
++    """
++    has_function = False
++    with open(filepath, 'r') as fd:
++        for line in fd.readlines():
++            if (_line_defines_python_function(line, funcname)):
++                has_function = True
++                break
+ 
+-    return is_python and has_function
++    return has_function
+ 
+ def run_sub_or_cmd(cmd, cmdargs, subname, subargs, logfile=None, case=None,
+                    from_dir=None, timeout=None):
+@@ -417,15 +430,10 @@ def run_sub_or_cmd(cmd, cmdargs, subname, subargs, logfile=None, case=None,
+ 
+     Raises exception on failure.
+     """
+-    do_run_cmd = True
+-
+-    # Before attempting to load the script make sure it contains the subroutine
+-    # we are expecting
+-    with open(cmd, 'r') as fd:
+-        for line in fd.readlines():
+-            if re.search(r"^def {}\(".format(subname), line):
+-                do_run_cmd = False
+-                break
++    if file_contains_python_function(cmd, subname):
++        do_run_cmd = False
++    else:
++        do_run_cmd = True
+ 
+     if not do_run_cmd:
+         try:

@@ -1,0 +1,188 @@
+diff --git a/ops/testing.py b/ops/testing.py
+index 0d782a6..5d509cb 100644
+--- a/ops/testing.py
++++ b/ops/testing.py
+@@ -246,6 +246,7 @@ class Harness(Generic[CharmType]):
+         self._unit_name: str = f"{self._meta.name}/0"
+         self._hooks_enabled: bool = True
+         self._relation_id_counter: int = 0
++        self._action_id_counter: int = 0
+         config_ = self._get_config(config)
+         self._backend = _TestingModelBackend(self._unit_name, self._meta, config_)
+         self._model = model.Model(self._meta, self._backend)
+@@ -1883,7 +1884,8 @@ class Harness(Generic[CharmType]):
+         action_under_test = _RunningAction(action_name, ActionOutput([], {}), params)
+         handler = getattr(self.charm.on, f"{action_name.replace('-', '_')}_action")
+         self._backend._running_action = action_under_test
+-        handler.emit()
++        self._action_id_counter += 1
++        handler.emit(str(self._action_id_counter))
+         self._backend._running_action = None
+         if action_under_test.failure_message is not None:
+             raise ActionFailed(
+diff --git a/test/test_charm.py b/test/test_charm.py
+index ac14784..627d2d5 100644
+--- a/test/test_charm.py
++++ b/test/test_charm.py
+@@ -463,7 +463,7 @@ start:
+             def _on_foo_bar_action(self, event: ops.ActionEvent):
+                 self.seen_action_params = event.params
+                 event.log('test-log')
+-                event.set_results({'res': 'val with spaces'})
++                event.set_results({'res': 'val with spaces', 'id': event.id})
+                 event.fail('test-fail')
+ 
+             def _on_start_action(self, event: ops.ActionEvent):
+@@ -477,12 +477,13 @@ start:
+         self.assertIn('foo_bar_action', events)
+         self.assertIn('start_action', events)
+ 
+-        charm.on.foo_bar_action.emit()
++        action_id = "1234"
++        charm.on.foo_bar_action.emit(id=action_id)
+         self.assertEqual(charm.seen_action_params, {"foo-name": "name", "silent": True})
+         self.assertEqual(fake_script_calls(self), [
+             ['action-get', '--format=json'],
+             ['action-log', "test-log"],
+-            ['action-set', "res=val with spaces"],
++            ['action-set', "res=val with spaces", f"id={action_id}"],
+             ['action-fail', "test-fail"],
+         ])
+ 
+@@ -511,7 +512,7 @@ start:
+             charm.res = bad_res
+ 
+             with self.assertRaises(ValueError):
+-                charm.on.foo_bar_action.emit()
++                charm.on.foo_bar_action.emit(id='1')
+ 
+     def _test_action_event_defer_fails(self, cmd_type: str):
+ 
+@@ -532,7 +533,7 @@ start:
+         charm = MyCharm(framework)
+ 
+         with self.assertRaises(RuntimeError):
+-            charm.on.start_action.emit()
++            charm.on.start_action.emit(id='2')
+ 
+     def test_action_event_defer_fails(self):
+         self._test_action_event_defer_fails('action')
+diff --git a/test/test_framework.py b/test/test_framework.py
+index e7c7a20..7a2a778 100644
+--- a/test/test_framework.py
++++ b/test/test_framework.py
+@@ -1813,7 +1813,7 @@ class DebugHookTests(BaseTestCase):
+ 
+         with patch('sys.stderr', new_callable=io.StringIO):
+             with patch('pdb.runcall') as mock:
+-                publisher.foobar_action.emit()
++                publisher.foobar_action.emit(id='1')
+ 
+         self.assertEqual(mock.call_count, 1)
+         self.assertFalse(observer.called)
+@@ -1833,7 +1833,7 @@ class DebugHookTests(BaseTestCase):
+ 
+         with patch('sys.stderr', new_callable=io.StringIO):
+             with patch('pdb.runcall') as mock:
+-                publisher.foobar_action.emit()
++                publisher.foobar_action.emit(id='2')
+ 
+         self.assertEqual(mock.call_count, 1)
+         self.assertFalse(observer.called)
+diff --git a/test/test_main.py b/test/test_main.py
+index 7c18495..3c9d5ec 100644
+--- a/test/test_main.py
++++ b/test/test_main.py
+@@ -586,11 +586,13 @@ class _TestMain(abc.ABC):
+              'departing_unit': 'remote/42'},
+         ), (
+             EventSpec(ops.ActionEvent, 'start_action',
+-                      env_var='JUJU_ACTION_NAME'),
++                      env_var='JUJU_ACTION_NAME',
++                      set_in_env={'JUJU_ACTION_UUID': '1'}),
+             {},
+         ), (
+             EventSpec(ops.ActionEvent, 'foo_bar_action',
+-                      env_var='JUJU_ACTION_NAME'),
++                      env_var='JUJU_ACTION_NAME',
++                      set_in_env={'JUJU_ACTION_UUID': '2'}),
+             {},
+         ), (
+             EventSpec(ops.PebbleReadyEvent, 'test_pebble_ready',
+@@ -726,19 +728,20 @@ class _TestMain(abc.ABC):
+         fake_script(typing.cast(unittest.TestCase, self), 'action-get', "echo '{}'")
+ 
+         test_cases = [(
+-            EventSpec(ops.ActionEvent, 'log_critical_action', env_var='JUJU_ACTION_NAME'),
++            EventSpec(ops.ActionEvent, 'log_critical_action', env_var='JUJU_ACTION_NAME',
++                      set_in_env={'JUJU_ACTION_UUID': '1'}),
+             ['juju-log', '--log-level', 'CRITICAL', '--', 'super critical'],
+         ), (
+             EventSpec(ops.ActionEvent, 'log_error_action',
+-                      env_var='JUJU_ACTION_NAME'),
++                      env_var='JUJU_ACTION_NAME', set_in_env={'JUJU_ACTION_UUID': '2'}),
+             ['juju-log', '--log-level', 'ERROR', '--', 'grave error'],
+         ), (
+             EventSpec(ops.ActionEvent, 'log_warning_action',
+-                      env_var='JUJU_ACTION_NAME'),
++                      env_var='JUJU_ACTION_NAME', set_in_env={'JUJU_ACTION_UUID': '3'}),
+             ['juju-log', '--log-level', 'WARNING', '--', 'wise warning'],
+         ), (
+             EventSpec(ops.ActionEvent, 'log_info_action',
+-                      env_var='JUJU_ACTION_NAME'),
++                      env_var='JUJU_ACTION_NAME', set_in_env={'JUJU_ACTION_UUID': '4'}),
+             ['juju-log', '--log-level', 'INFO', '--', 'useful info'],
+         )]
+ 
+@@ -779,7 +782,8 @@ class _TestMain(abc.ABC):
+         state = self._simulate_event(EventSpec(
+             ops.ActionEvent, 'get_model_name_action',
+             env_var='JUJU_ACTION_NAME',
+-            model_name='test-model-name'))
++            model_name='test-model-name',
++            set_in_env={'JUJU_ACTION_UUID': '1'}))
+         assert isinstance(state, ops.BoundStoredState)
+         self.assertEqual(state._on_get_model_name_action, ['test-model-name'])
+ 
+@@ -791,7 +795,8 @@ class _TestMain(abc.ABC):
+                     """echo '{"status": "unknown", "message": ""}'""")
+         state = self._simulate_event(EventSpec(
+             ops.ActionEvent, 'get_status_action',
+-            env_var='JUJU_ACTION_NAME'))
++            env_var='JUJU_ACTION_NAME',
++            set_in_env={'JUJU_ACTION_UUID': '1'}))
+         assert isinstance(state, ops.BoundStoredState)
+         self.assertEqual(state.status_name, 'unknown')
+         self.assertEqual(state.status_message, '')
+@@ -801,7 +806,8 @@ class _TestMain(abc.ABC):
+             """echo '{"status": "blocked", "message": "help meeee"}'""")
+         state = self._simulate_event(EventSpec(
+             ops.ActionEvent, 'get_status_action',
+-            env_var='JUJU_ACTION_NAME'))
++            env_var='JUJU_ACTION_NAME',
++            set_in_env={'JUJU_ACTION_UUID': '1'}))
+         assert isinstance(state, ops.BoundStoredState)
+         self.assertEqual(state.status_name, 'blocked')
+         self.assertEqual(state.status_message, 'help meeee')
+@@ -1169,7 +1175,8 @@ class TestMainWithDispatch(_TestMainWithDispatch, unittest.TestCase):
+         with self.assertRaises(subprocess.CalledProcessError):
+             self._simulate_event(EventSpec(
+                 ops.ActionEvent, 'keyerror_action',
+-                env_var='JUJU_ACTION_NAME'))
++                env_var='JUJU_ACTION_NAME',
++                set_in_env={'JUJU_ACTION_UUID': '1'}))
+         self.stderr.seek(0)
+         stderr = self.stderr.read()
+         self.assertIn('KeyError', stderr)
+diff --git a/test/test_testing.py b/test/test_testing.py
+index e937265..a2d0cfd 100644
+--- a/test/test_testing.py
++++ b/test/test_testing.py
+@@ -5445,6 +5445,7 @@ class TestActions(unittest.TestCase):
+             def _on_simple_action(self, event: ops.ActionEvent):
+                 """An action that doesn't generate logs, have any results, or fail."""
+                 self.simple_was_called = True
++                assert isinstance(event.id, str)
+ 
+             def _on_fail_action(self, event: ops.ActionEvent):
+                 event.fail("this will be ignored")

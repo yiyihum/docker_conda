@@ -1,0 +1,153 @@
+diff --git a/README.rst b/README.rst
+index 04e66ab..d424ec5 100644
+--- a/README.rst
++++ b/README.rst
+@@ -7,6 +7,11 @@ streams (also known as EventSource, after the name of the Javascript interface
+ inside browsers).  The SSEClient class accepts a url on init, and is then an
+ iterator over messages coming from the server.
+ 
++Maintenance
++-----------
++
++I (btubbs) haven't been using this library in my own work for years, so I put limited time into maintaining it.  I will check in on pull requests and issues once per month.  If you are interested in providing more active support for the library, please reach out.
++
+ Installation
+ ------------
+ 
+diff --git a/setup.py b/setup.py
+index 217f8e2..eb5d8d4 100644
+--- a/setup.py
++++ b/setup.py
+@@ -13,7 +13,7 @@ pytest_runner = ['pytest_runner>=2.1'] if needs_pytest else []
+ 
+ setup(
+     name='sseclient',
+-    version='0.0.26',
++    version='0.0.27',
+     author='Brent Tubbs',
+     author_email='brent.tubbs@gmail.com',
+     py_modules=['sseclient'],
+diff --git a/sseclient.py b/sseclient.py
+index d2193e2..3bacccf 100644
+--- a/sseclient.py
++++ b/sseclient.py
+@@ -14,7 +14,7 @@ import six
+ 
+ import requests
+ 
+-__version__ = '0.0.26'
++__version__ = '0.0.27'
+ 
+ # Technically, we should support streams that mix line endings.  This regex,
+ # however, assumes that a system will provide consistent line endings.
+@@ -55,8 +55,8 @@ class SSEClient(object):
+         requester = self.session or requests
+         self.resp = requester.get(self.url, stream=True, **self.requests_kwargs)
+         self.resp_iterator = self.iter_content()
+-        self.decoder = codecs.getincrementaldecoder(
+-            self.resp.encoding)(errors='replace')
++        encoding = self.resp.encoding or self.resp.apparent_encoding
++        self.decoder = codecs.getincrementaldecoder(encoding)(errors='replace')
+ 
+         # TODO: Ensure we're handling redirects.  Might also stick the 'origin'
+         # attribute on Events like the Javascript spec requires.
+@@ -67,12 +67,13 @@ class SSEClient(object):
+             while True:
+                 if hasattr(self.resp.raw, '_fp') and \
+                         hasattr(self.resp.raw._fp, 'fp') and \
+-                        hasattr(self.resp.raw._fp.fp, 'read1'):
++                        hasattr(self.resp.raw._fp.fp, 'read1') and \
++                        not self.resp.raw.chunked:
+                     chunk = self.resp.raw._fp.fp.read1(self.chunk_size)
+                 else:
+-                    # _fp is not available, this means that we cannot use short
+-                    # reads and this will block until the full chunk size is
+-                    # actually read
++                    # _fp is not available or we are using chunked encoding
++                    # this means that we cannot use short reads and this will
++                    # block until the full chunk size is actually read
+                     chunk = self.resp.raw.read(self.chunk_size)
+                 if not chunk:
+                     break
+@@ -87,40 +88,47 @@ class SSEClient(object):
+         return self
+ 
+     def __next__(self):
+-        while not self._event_complete():
+-            try:
+-                next_chunk = next(self.resp_iterator)
+-                if not next_chunk:
+-                    raise EOFError()
+-                self.buf += self.decoder.decode(next_chunk)
+-
+-            except (StopIteration, requests.RequestException, EOFError, six.moves.http_client.IncompleteRead) as e:
+-                print(e)
+-                time.sleep(self.retry / 1000.0)
+-                self._connect()
+-
+-                # The SSE spec only supports resuming from a whole message, so
+-                # if we have half a message we should throw it out.
+-                head, sep, tail = self.buf.rpartition('\n')
+-                self.buf = head + sep
+-                continue
+-
+-        # Split the complete event (up to the end_of_field) into event_string,
+-        # and retain anything after the current complete event in self.buf
+-        # for next time.
+-        (event_string, self.buf) = re.split(end_of_field, self.buf, maxsplit=1)
+-        msg = Event.parse(event_string)
+-
+-        # If the server requests a specific retry delay, we need to honor it.
+-        if msg.retry:
+-            self.retry = msg.retry
+-
+-        # last_id should only be set if included in the message.  It's not
+-        # forgotten if a message omits it.
+-        if msg.id:
+-            self.last_id = msg.id
+-
+-        return msg
++        while True: #loop until event emitted
++            while not self._event_complete():
++                try:
++                    next_chunk = next(self.resp_iterator)
++                    if not next_chunk:
++                        raise EOFError()
++                    self.buf += self.decoder.decode(next_chunk)
++
++                except (StopIteration, requests.RequestException, EOFError, six.moves.http_client.IncompleteRead) as e:
++                    print(e)
++                    time.sleep(self.retry / 1000.0)
++                    self._connect()
++
++                    # The SSE spec only supports resuming from a whole message, so
++                    # if we have half a message we should throw it out.
++                    head, sep, tail = self.buf.rpartition('\n')
++                    self.buf = head + sep
++                    continue
++
++            # Split the complete event (up to the end_of_field) into event_string,
++            # and retain anything after the current complete event in self.buf
++            # for next time.
++            (event_string, self.buf) = re.split(end_of_field, self.buf, maxsplit=1)
++            msg = Event.parse(event_string)
++
++            # If the server requests a specific retry delay, we need to honor it.
++            if msg.retry:
++                self.retry = msg.retry
++
++            # last_id should only be set if included in the message.  It's not
++            # forgotten if a message omits it.
++            if msg.id:
++                self.last_id = msg.id
++
++            #Set the last event ID string of the event source to the value of the last event ID buffer.
++            msg.lastEventId =self.last_id
++
++            # if data in event, emit and return
++            if msg.data !='':
++                return msg
++       
+ 
+     if six.PY2:
+         next = __next__

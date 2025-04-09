@@ -1,0 +1,191 @@
+diff --git a/stix2/base.py b/stix2/base.py
+index a283902..4248075 100644
+--- a/stix2/base.py
++++ b/stix2/base.py
+@@ -388,14 +388,12 @@ class _Observable(_STIXBase):
+                         temp_deep_copy = copy.deepcopy(dict(kwargs[key]))
+                         _recursive_stix_to_dict(temp_deep_copy)
+                         streamlined_obj_vals.append(temp_deep_copy)
+-                    elif isinstance(kwargs[key], list) and isinstance(kwargs[key][0], _STIXBase):
+-                        for obj in kwargs[key]:
+-                            temp_deep_copy = copy.deepcopy(dict(obj))
+-                            _recursive_stix_to_dict(temp_deep_copy)
+-                            streamlined_obj_vals.append(temp_deep_copy)
++                    elif isinstance(kwargs[key], list):
++                        temp_deep_copy = copy.deepcopy(kwargs[key])
++                        _recursive_stix_list_to_dict(temp_deep_copy)
++                        streamlined_obj_vals.append(temp_deep_copy)
+                     else:
+                         streamlined_obj_vals.append(kwargs[key])
+-
+             if streamlined_obj_vals:
+                 data = canonicalize(streamlined_obj_vals, utf8=False)
+ 
+@@ -448,5 +446,20 @@ def _recursive_stix_to_dict(input_dict):
+ 
+             # There may stil be nested _STIXBase objects
+             _recursive_stix_to_dict(input_dict[key])
++        elif isinstance(input_dict[key], list):
++            _recursive_stix_list_to_dict(input_dict[key])
+         else:
+-            return
++            pass
++
++
++def _recursive_stix_list_to_dict(input_list):
++    for i in range(len(input_list)):
++        if isinstance(input_list[i], _STIXBase):
++            input_list[i] = dict(input_list[i])
++        elif isinstance(input_list[i], dict):
++            pass
++        elif isinstance(input_list[i], list):
++            _recursive_stix_list_to_dict(input_list[i])
++        else:
++            continue
++        _recursive_stix_to_dict(input_list[i])
+diff --git a/stix2/pattern_visitor.py b/stix2/pattern_visitor.py
+index b2d7a53..6ac3e98 100644
+--- a/stix2/pattern_visitor.py
++++ b/stix2/pattern_visitor.py
+@@ -1,16 +1,12 @@
+ import importlib
+ import inspect
+ 
+-from antlr4 import CommonTokenStream, InputStream
+-from antlr4.tree.Trees import Trees
+-import six
+ from stix2patterns.exceptions import ParseException
+-from stix2patterns.grammars.STIXPatternLexer import STIXPatternLexer
+ from stix2patterns.grammars.STIXPatternParser import (
+     STIXPatternParser, TerminalNode,
+ )
+ from stix2patterns.grammars.STIXPatternVisitor import STIXPatternVisitor
+-from stix2patterns.validator import STIXPatternErrorListener
++from stix2patterns.v20.pattern import Pattern
+ 
+ from .patterns import *
+ from .patterns import _BooleanExpression
+@@ -328,41 +324,9 @@ class STIXPatternVisitorForSTIX2(STIXPatternVisitor):
+ 
+ def create_pattern_object(pattern, module_suffix="", module_name=""):
+     """
+-    Validates a pattern against the STIX Pattern grammar.  Error messages are
+-    returned in a list.  The test passed if the returned list is empty.
++    Create a STIX pattern AST from a pattern string.
+     """
+ 
+-    start = ''
+-    if isinstance(pattern, six.string_types):
+-        start = pattern[:2]
+-        pattern = InputStream(pattern)
+-
+-    if not start:
+-        start = pattern.readline()[:2]
+-        pattern.seek(0)
+-
+-    parseErrListener = STIXPatternErrorListener()
+-
+-    lexer = STIXPatternLexer(pattern)
+-    # it always adds a console listener by default... remove it.
+-    lexer.removeErrorListeners()
+-
+-    stream = CommonTokenStream(lexer)
+-
+-    parser = STIXPatternParser(stream)
+-
+-    parser.buildParseTrees = True
+-    # it always adds a console listener by default... remove it.
+-    parser.removeErrorListeners()
+-    parser.addErrorListener(parseErrListener)
+-
+-    # To improve error messages, replace "<INVALID>" in the literal
+-    # names with symbolic names.  This is a hack, but seemed like
+-    # the simplest workaround.
+-    for i, lit_name in enumerate(parser.literalNames):
+-        if lit_name == u"<INVALID>":
+-            parser.literalNames[i] = parser.symbolicNames[i]
+-
+-    tree = parser.pattern()
++    pattern_obj = Pattern(pattern)
+     builder = STIXPatternVisitorForSTIX2(module_suffix, module_name)
+-    return builder.visit(tree)
++    return pattern_obj.visit(builder)
+diff --git a/stix2/v21/observables.py b/stix2/v21/observables.py
+index 1703263..ed560a6 100644
+--- a/stix2/v21/observables.py
++++ b/stix2/v21/observables.py
+@@ -7,13 +7,10 @@ Observable and do not have a ``_type`` attribute.
+ 
+ from collections import OrderedDict
+ import itertools
+-import warnings
+ 
+ from ..base import _Extension, _Observable, _STIXBase
+ from ..custom import _custom_extension_builder, _custom_observable_builder
+-from ..exceptions import (
+-    AtLeastOnePropertyError, DependentPropertiesError, STIXDeprecationWarning,
+-)
++from ..exceptions import AtLeastOnePropertyError, DependentPropertiesError
+ from ..properties import (
+     BinaryProperty, BooleanProperty, DictionaryProperty,
+     EmbeddedObjectProperty, EnumProperty, ExtensionsProperty, FloatProperty,
+@@ -122,14 +119,6 @@ class DomainName(_Observable):
+     ])
+     _id_contributing_properties = ["value"]
+ 
+-    def _check_object_constraints(self):
+-        if self.get('resolves_to_refs'):
+-            warnings.warn(
+-                "The 'resolves_to_refs' property of domain-name is deprecated in "
+-                "STIX 2.1. Use the 'resolves-to' relationship type instead",
+-                STIXDeprecationWarning,
+-            )
+-
+ 
+ class EmailAddress(_Observable):
+     # TODO: Add link
+@@ -421,21 +410,6 @@ class IPv4Address(_Observable):
+     ])
+     _id_contributing_properties = ["value"]
+ 
+-    def _check_object_constraints(self):
+-        if self.get('resolves_to_refs'):
+-            warnings.warn(
+-                "The 'resolves_to_refs' property of ipv4-addr is deprecated in "
+-                "STIX 2.1. Use the 'resolves-to' relationship type instead",
+-                STIXDeprecationWarning,
+-            )
+-
+-        if self.get('belongs_to_refs'):
+-            warnings.warn(
+-                "The 'belongs_to_refs' property of ipv4-addr is deprecated in "
+-                "STIX 2.1. Use the 'belongs-to' relationship type instead",
+-                STIXDeprecationWarning,
+-            )
+-
+ 
+ class IPv6Address(_Observable):
+     # TODO: Add link
+@@ -458,21 +432,6 @@ class IPv6Address(_Observable):
+     ])
+     _id_contributing_properties = ["value"]
+ 
+-    def _check_object_constraints(self):
+-        if self.get('resolves_to_refs'):
+-            warnings.warn(
+-                "The 'resolves_to_refs' property of ipv6-addr is deprecated in "
+-                "STIX 2.1. Use the 'resolves-to' relationship type instead",
+-                STIXDeprecationWarning,
+-            )
+-
+-        if self.get('belongs_to_refs'):
+-            warnings.warn(
+-                "The 'belongs_to_refs' property of ipv6-addr is deprecated in "
+-                "STIX 2.1. Use the 'belongs-to' relationship type instead",
+-                STIXDeprecationWarning,
+-            )
+-
+ 
+ class MACAddress(_Observable):
+     # TODO: Add link
+

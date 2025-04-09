@@ -1,0 +1,146 @@
+diff --git a/changelog.md b/changelog.md
+index 97c850a5..26bbe12a 100644
+--- a/changelog.md
++++ b/changelog.md
+@@ -4,11 +4,12 @@
+ 
+ ### Devices
+ 
++- Sensor: add `always_callback` option
+ - ClimateMode: Refactor climate modes in operation_mode and controller_mode, also fixes a bug for binary operation modes where the mode would be set to AWAY no matter what value was sent to the bus.
+ 
+ ### Internals
+ 
+-- StateUpdater: Only request one GA at a time.
++- StateUpdater: Only request 3 GAs at a time.
+ 
+ ## 0.15.1 bugfix for binary sensors
+ 
+diff --git a/docs/sensor.md b/docs/sensor.md
+index c741e111..22ae2581 100644
+--- a/docs/sensor.md
++++ b/docs/sensor.md
+@@ -15,6 +15,7 @@ Sensors are monitoring temperature, air humidity, pressure etc. from KNX bus.
+     sensor = Sensor(
+         xknx=xknx,
+         name='DiningRoom.Temperature.Sensor',
++        always_callback=False,
+         group_address_state='6/2/1',
+         sync_state=True,
+         value_type='temperature'
+@@ -25,6 +26,7 @@ Sensors are monitoring temperature, air humidity, pressure etc. from KNX bus.
+ 
+ * `xknx` is the XKNX object.
+ * `name` is the name of the object.
++* `always_callback` defines if a callback/update should always be triggered no matter if the previous and the new state are identical.
+ * `group_address_state` is the KNX group address of the sensor device.
+ * `sync_state` defines if the value should be actively read from the bus. If `False` no GroupValueRead telegrams will be sent to its group address. Defaults to `True`
+ * `value_type` controls how the value should be rendered in a human readable representation. The attribut may have may have the values `percent`, `temperature`, `illuminance`, `speed_ms` or `current`.
+diff --git a/home-assistant-plugin/custom_components/xknx/factory.py b/home-assistant-plugin/custom_components/xknx/factory.py
+index de552ff2..005d24d5 100644
+--- a/home-assistant-plugin/custom_components/xknx/factory.py
++++ b/home-assistant-plugin/custom_components/xknx/factory.py
+@@ -214,6 +214,7 @@ def _create_sensor(knx_module: XKNX, config: ConfigType) -> XknxSensor:
+         name=config[CONF_NAME],
+         group_address_state=config[SensorSchema.CONF_STATE_ADDRESS],
+         sync_state=config[SensorSchema.CONF_SYNC_STATE],
++        always_callback=config[SensorSchema.CONF_ALWAYS_CALLBACK],
+         value_type=config[CONF_TYPE],
+     )
+ 
+diff --git a/home-assistant-plugin/custom_components/xknx/schema.py b/home-assistant-plugin/custom_components/xknx/schema.py
+index 9c628bed..d97a532a 100644
+--- a/home-assistant-plugin/custom_components/xknx/schema.py
++++ b/home-assistant-plugin/custom_components/xknx/schema.py
+@@ -306,6 +306,7 @@ class NotifySchema:
+ class SensorSchema:
+     """Voluptuous schema for KNX sensors."""
+ 
++    CONF_ALWAYS_CALLBACK = "always_callback"
+     CONF_STATE_ADDRESS = CONF_STATE_ADDRESS
+     CONF_SYNC_STATE = CONF_SYNC_STATE
+     DEFAULT_NAME = "KNX Sensor"
+@@ -318,6 +319,7 @@ class SensorSchema:
+                 cv.boolean,
+                 cv.string,
+             ),
++            vol.Optional(CONF_ALWAYS_CALLBACK, default=False): cv.boolean,
+             vol.Required(CONF_STATE_ADDRESS): cv.string,
+             vol.Required(CONF_TYPE): vol.Any(int, float, str),
+         }
+diff --git a/xknx/core/state_updater.py b/xknx/core/state_updater.py
+index 268730df..db7df306 100644
+--- a/xknx/core/state_updater.py
++++ b/xknx/core/state_updater.py
+@@ -14,12 +14,12 @@ logger = logging.getLogger("xknx.state_updater")
+ class StateUpdater:
+     """Class for keeping the states of RemoteValues up to date."""
+ 
+-    def __init__(self, xknx):
++    def __init__(self, xknx, parallel_reads: int = 3):
+         """Initialize StateUpdater class."""
+         self.xknx = xknx
+         self.started = False
+         self._workers = {}
+-        self._one_by_one = asyncio.Lock()
++        self._semaphore = asyncio.Semaphore(value=parallel_reads)
+ 
+     def register_remote_value(self, remote_value: RemoteValue, tracker_options=True):
+         """Register a RemoteValue to initialize its state and/or track for expiration."""
+@@ -77,7 +77,7 @@ class StateUpdater:
+ 
+         async def read_state_mutex():
+             """Schedule to read the state from the KNX bus - one at a time."""
+-            async with self._one_by_one:
++            async with self._semaphore:
+                 # wait until there is nothing else to send to the bus
+                 await self.xknx.telegram_queue.outgoing_queue.join()
+                 logger.debug(
+diff --git a/xknx/devices/sensor.py b/xknx/devices/sensor.py
+index 1ac1471e..de62ec95 100644
+--- a/xknx/devices/sensor.py
++++ b/xknx/devices/sensor.py
+@@ -19,14 +19,15 @@ class Sensor(Device):
+         xknx,
+         name,
+         group_address_state=None,
+-        sync_state=True,
+-        value_type=None,
++        sync_state: bool = True,
++        always_callback: bool = False,
++        value_type: str = None,
+         device_updated_cb=None,
+     ):
+         """Initialize Sensor class."""
+         # pylint: disable=too-many-arguments
+         super().__init__(xknx, name, device_updated_cb)
+-
++        self.always_callback = always_callback
+         self.sensor_value = RemoteValueSensor(
+             xknx,
+             group_address_state=group_address_state,
+@@ -45,6 +46,7 @@ class Sensor(Device):
+         """Initialize object from configuration structure."""
+         group_address_state = config.get("group_address_state")
+         sync_state = config.get("sync_state", True)
++        always_callback = config.get("always_callback", False)
+         value_type = config.get("value_type")
+ 
+         return cls(
+@@ -52,11 +54,16 @@ class Sensor(Device):
+             name,
+             group_address_state=group_address_state,
+             sync_state=sync_state,
++            always_callback=always_callback,
+             value_type=value_type,
+         )
+ 
+     async def process_group_write(self, telegram):
+         """Process incoming and outgoing GROUP WRITE telegram."""
++        await self.sensor_value.process(telegram, always_callback=self.always_callback)
++
++    async def process_group_response(self, telegram):
++        """Process incoming GroupValueResponse telegrams."""
+         await self.sensor_value.process(telegram)
+ 
+     def unit_of_measurement(self):

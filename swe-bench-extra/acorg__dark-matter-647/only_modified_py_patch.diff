@@ -1,0 +1,134 @@
+diff --git a/dark/__init__.py b/dark/__init__.py
+index e37701e..a768585 100644
+--- a/dark/__init__.py
++++ b/dark/__init__.py
+@@ -7,4 +7,4 @@ if sys.version_info < (2, 7):
+ # will not be found by the version() function in ../setup.py
+ #
+ # Remember to update ../CHANGELOG.md describing what's new in each version.
+-__version__ = '3.0.49'
++__version__ = '3.0.50'
+diff --git a/dark/diamond/conversion.py b/dark/diamond/conversion.py
+index 29c2694..42c2a8d 100644
+--- a/dark/diamond/conversion.py
++++ b/dark/diamond/conversion.py
+@@ -4,6 +4,7 @@ import six
+ import bz2
+ from json import dumps, loads
+ from operator import itemgetter
++from collections import Counter
+ 
+ from Bio.File import as_handle
+ 
+@@ -13,6 +14,85 @@ from dark.alignments import Alignment, ReadAlignments
+ from dark.diamond.hsp import normalizeHSP
+ 
+ 
++# The keys in the following are DIAMOND format 6 field names. The values
++# are one-argument functions that take a string and return an appropriately
++# converted field value.
++#
++# The following fields are taken from the DIAMOND manual v0.9.22 2018-05-11.
++# Fields whose name doesn't appear here will be left as strings.
++DIAMOND_FIELD_CONVERTER = {
++    'bitscore': float,
++    'evalue': float,
++    'frame': int,
++    'gapopen': int,
++    'gaps': int,
++    'identicalCount': lambda nident: None if nident is None else int(nident),
++    'length': int,
++    'mismatch': int,
++    'nident': int,
++    'pident': float,
++    'positive': int,
++    'positiveCount': lambda pos: None if pos is None else int(pos),
++    'ppos': float,
++    'qcovhsp': float,
++    'qend': int,
++    'qframe': int,
++    'qlen': int,
++    'qstart': int,
++    'score': float,
++    'send': int,
++    'slen': int,
++    'sstart': int,
++}
++
++
++def diamondTabularFormatToDicts(filename, fieldNames):
++    """
++    Read DIAMOND tabular (--outfmt 6) output and convert lines to dictionaries.
++
++    @param filename: Either a C{str} file name or an open file pointer.
++    @param fieldNames: A C{list} or C{tuple} of C{str} DIAMOND field names.
++        Run 'diamond -help' to see the full list.
++    @raise ValueError: If a line of C{filename} does not have the expected
++        number of TAB-separated fields (i.e., len(fieldNames)). Or if
++        C{fieldNames} is empty or contains duplicates.
++    @return: A generator that yields C{dict}s with keys that are the DIAMOND
++        field names and values as converted by DIAMOND_FIELD_CONVERTER.
++    """
++    nFields = len(fieldNames)
++    if not nFields:
++        raise ValueError('fieldNames cannot be empty.')
++
++    c = Counter(fieldNames)
++    if c.most_common(1)[0][1] > 1:
++        raise ValueError(
++            'fieldNames contains duplicated names: %s.' %
++            (', '.join(sorted(x[0] for x in c.most_common() if x[1] > 1))))
++
++    def identity(x):
++        return x
++
++    convertFunc = DIAMOND_FIELD_CONVERTER.get
++
++    with as_handle(filename) as fp:
++        for count, line in enumerate(fp, start=1):
++            result = {}
++            line = line[:-1]
++            values = line.split('\t')
++            if len(values) != nFields:
++                raise ValueError(
++                    'Line %d of %s had %d field values (expected %d). '
++                    'Line was %r.' %
++                    (count,
++                     (filename if isinstance(filename, six.string_types)
++                      else 'input'),
++                     len(values), nFields, line))
++            for fieldName, value in zip(fieldNames, values):
++                value = convertFunc(fieldName, identity)(value)
++                result[fieldName] = value
++            yield result
++
++
+ class DiamondTabularFormatReader(object):
+     """
+     Provide a method that yields parsed tabular records from a file. Store and
+diff --git a/dark/reads.py b/dark/reads.py
+index b2a4bcc..18171d0 100644
+--- a/dark/reads.py
++++ b/dark/reads.py
+@@ -766,7 +766,7 @@ class ReadFilter(object):
+         only return those that have length <= 100, so your result may have
+         less than 20 reads. The former version extracts reads of the
+         desired length and then takes 20 reads at random from that set, so
+-        you'll always get 20 raeds in your result, assuming there are at
++        you'll always get 20 reads in your result, assuming there are at
+         least that many reads satisfying the length filter.
+     @param trueLength: The C{int} number of reads in this C{Reads} instance.
+         Under normal circumstances it will not be necessary to pass this
+diff --git a/setup.py b/setup.py
+index fef9e17..bc089e7 100644
+--- a/setup.py
++++ b/setup.py
+@@ -35,6 +35,7 @@ scripts = [
+     'bin/compare-sequences.py',
+     'bin/convert-blast-xml-to-json.py',
+     'bin/convert-diamond-to-json.py',
++    'bin/convert-diamond-to-sam.py',
+     'bin/convert-sam-to-fastq.sh',
+     'bin/dark-matter-version.py',
+     'bin/dna-to-aa.py',
+

@@ -1,0 +1,170 @@
+diff --git a/.gitignore b/.gitignore
+index 86f00e0..b2bbf4d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -62,6 +62,7 @@ htmlcov/
+ nosetests.xml
+ coverage.xml
+ *,cover
++.pytest_cache/
+ 
+ # Translations
+ *.mo
+diff --git a/aospy/data_loader.py b/aospy/data_loader.py
+index 4bf057b..3962eb9 100644
+--- a/aospy/data_loader.py
++++ b/aospy/data_loader.py
+@@ -6,7 +6,12 @@ import warnings
+ import numpy as np
+ import xarray as xr
+ 
+-from .internal_names import ETA_STR, GRID_ATTRS, TIME_STR, TIME_BOUNDS_STR
++from .internal_names import (
++    ETA_STR,
++    GRID_ATTRS,
++    TIME_STR,
++    TIME_BOUNDS_STR,
++)
+ from .utils import times, io
+ 
+ 
+@@ -63,8 +68,8 @@ def grid_attrs_to_aospy_names(data):
+         Data returned with coordinates consistent with aospy
+         conventions
+     """
++    dims_and_vars = set(data.variables).union(set(data.dims))
+     for name_int, names_ext in GRID_ATTRS.items():
+-        dims_and_vars = set(data.variables).union(set(data.dims))
+         data_coord_name = set(names_ext).intersection(dims_and_vars)
+         if data_coord_name:
+             data = data.rename({data_coord_name.pop(): name_int})
+@@ -174,7 +179,7 @@ def _prep_time_data(ds):
+     Dataset, int, int
+         The processed Dataset and minimum and maximum years in the loaded data
+     """
+-    ds = times.ensure_time_as_dim(ds)
++    ds = times.ensure_time_as_index(ds)
+     ds, min_year, max_year = times.numpy_datetime_workaround_encode_cf(ds)
+     if TIME_BOUNDS_STR in ds:
+         ds = times.ensure_time_avg_has_cf_metadata(ds)
+@@ -275,6 +280,7 @@ class DataLoader(object):
+             coords=self.coords, start_date=start_date, end_date=end_date,
+             time_offset=time_offset, **DataAttrs
+         )
++
+         ds, min_year, max_year = _prep_time_data(ds)
+         ds = set_grid_attrs_as_coords(ds)
+         da = _sel_var(ds, var, self.upcast_float32)
+diff --git a/aospy/utils/times.py b/aospy/utils/times.py
+index 688417f..08b0c89 100644
+--- a/aospy/utils/times.py
++++ b/aospy/utils/times.py
+@@ -540,13 +540,14 @@ def assert_matching_time_coord(arr1, arr2):
+         raise ValueError(message.format(arr1[TIME_STR], arr2[TIME_STR]))
+ 
+ 
+-def ensure_time_as_dim(ds):
+-    """Ensures that time is an indexable dimension on relevant quantites
++def ensure_time_as_index(ds):
++    """Ensures that time is an indexed coordinate on relevant quantites.
+ 
+-    In xarray, scalar coordinates cannot be indexed.  We rely
+-    on indexing in the time dimension throughout the code; therefore
+-    we need this helper method to (if needed) convert a scalar time coordinate
+-    to a dimension.
++    Sometimes when the data we load from disk has only one timestep, the
++    indexing of time-defined quantities in the resulting xarray.Dataset gets
++    messed up, in that the time bounds array and data variables don't get
++    indexed by time, even though they should.  Therefore, we need this helper
++    function to (possibly) correct this.
+ 
+     Note that this must be applied before CF-conventions are decoded; otherwise
+     it casts ``np.datetime64[ns]`` as ``int`` values.
+@@ -559,38 +560,14 @@ def ensure_time_as_dim(ds):
+     Returns
+     -------
+     Dataset
+-    """
+-    if TIME_STR not in ds.dims:
+-        time = convert_scalar_to_indexable_coord(ds[TIME_STR])
+-        ds = ds.set_coords(TIME_STR)
+-        for name in ds.variables:
+-            if ((name not in GRID_ATTRS_NO_TIMES) and
+-               (name != TIME_STR)):
+-                da = ds[name]
+-                da, _ = xr.broadcast(da, time)
+-                da[TIME_STR] = time
+-                ds[name] = da
+-    return ds
+-
+ 
+-def convert_scalar_to_indexable_coord(scalar_da):
+-    """Convert a scalar coordinate to an indexable one.
+-
+-    In xarray, scalar coordinates cannot be indexed. This converts
+-    a scalar coordinate-containing ``DataArray`` to one that can
+-    be indexed using ``da.sel`` and ``da.isel``.
+-
+-    Parameters
+-    ----------
+-    scalar_da : DataArray
+-        Must contain a scalar coordinate
+-
+-    Returns
+-    -------
+-    DataArray
+     """
+-    data = [scalar_da.values.item()]
+-    da = xr.DataArray(data, coords=[data], dims=[scalar_da.name],
+-                      name=scalar_da.name)
+-    da.attrs = scalar_da.attrs
+-    return da
++    time_indexed_coords = {TIME_WEIGHTS_STR, TIME_BOUNDS_STR}
++    time_indexed_vars = set(ds.data_vars).union(time_indexed_coords)
++    time_indexed_vars = time_indexed_vars.intersection(ds.variables)
++    for name in time_indexed_vars:
++        if TIME_STR not in ds[name].indexes:
++            da = ds[name].expand_dims(TIME_STR)
++            da[TIME_STR] = ds[TIME_STR]
++            ds[name] = da
++    return ds
+diff --git a/docs/whats-new.rst b/docs/whats-new.rst
+index 7996ff6..6ce763e 100644
+--- a/docs/whats-new.rst
++++ b/docs/whats-new.rst
+@@ -25,6 +25,10 @@ Breaking Changes
+   object, pass it directly the parameters that previously would have
+   been passed to ``CalcInterface`` (fixes :issue:`249` via
+   :pull:`250`).  By `Spencer Hill <https://github.com/spencerahill>`_.
++- Deprecate ``utils.times.convert_scalar_to_indexable_coord``, since
++  as of xarray version 0.10.3 release, the functionality is no longer
++  necessary (fixes :issue:`268` via :pull:`269`.  By `Spencer Hill
++  <https://github.com/spencerahill>`_.
+ 
+ Documentation
+ ~~~~~~~~~~~~~
+@@ -110,8 +114,9 @@ Dependencies
+ 
+ - ``aospy`` now requires a minimum version of ``distributed`` of
+   1.17.1 (fixes :issue:`210` via :pull:`211`).
+-- ``aospy`` now requires a minimum version of ``xarray`` of 0.10.0.
+-  See discussion in :issue:`199` and :pull:`240` for more details.
++- ``aospy`` now requires a minimum version of ``xarray`` of 0.10.3.
++  See discussion in :issue:`199`, :pull:`240`, :issue:`268`, and
++  :pull:`269` for more details.
+ 
+ .. _whats-new.0.2:
+ 
+diff --git a/setup.py b/setup.py
+index b237c6e..bb659f5 100644
+--- a/setup.py
++++ b/setup.py
+@@ -33,7 +33,7 @@ setuptools.setup(
+                       'toolz >= 0.7.2',
+                       'dask >= 0.14',
+                       'distributed >= 1.17.1',
+-                      'xarray >= 0.10.0',
++                      'xarray >= 0.10.3',
+                       'cloudpickle >= 0.2.1'],
+     tests_require=['pytest >= 2.7.1',
+                    'pytest-catchlog >= 1.0'],

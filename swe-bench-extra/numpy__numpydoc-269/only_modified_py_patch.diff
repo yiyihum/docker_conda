@@ -1,0 +1,106 @@
+diff --git a/numpydoc/docscrape.py b/numpydoc/docscrape.py
+index ad0d99c..807e9bc 100644
+--- a/numpydoc/docscrape.py
++++ b/numpydoc/docscrape.py
+@@ -566,23 +566,6 @@ class FunctionDoc(NumpyDocString):
+             doc = inspect.getdoc(func) or ''
+         NumpyDocString.__init__(self, doc, config)
+ 
+-        if not self['Signature'] and func is not None:
+-            func, func_name = self.get_func()
+-            try:
+-                try:
+-                    signature = str(inspect.signature(func))
+-                except (AttributeError, ValueError):
+-                    # try to read signature, backward compat for older Python
+-                    if sys.version_info[0] >= 3:
+-                        argspec = inspect.getfullargspec(func)
+-                    else:
+-                        argspec = inspect.getargspec(func)
+-                    signature = inspect.formatargspec(*argspec)
+-                signature = '%s%s' % (func_name, signature)
+-            except TypeError:
+-                signature = '%s()' % func_name
+-            self['Signature'] = signature
+-
+     def get_func(self):
+         func_name = getattr(self._f, '__name__', self.__class__.__name__)
+         if inspect.isclass(self._f):
+diff --git a/numpydoc/numpydoc.py b/numpydoc/numpydoc.py
+index 652eedc..93cd975 100644
+--- a/numpydoc/numpydoc.py
++++ b/numpydoc/numpydoc.py
+@@ -28,6 +28,7 @@ from docutils.nodes import citation, Text, section, comment, reference
+ import sphinx
+ from sphinx.addnodes import pending_xref, desc_content
+ from sphinx.util import logging
++from sphinx.errors import ExtensionError
+ 
+ if sphinx.__version__ < '1.6.5':
+     raise RuntimeError("Sphinx 1.6.5 or newer is required")
+@@ -203,12 +204,25 @@ def mangle_signature(app, what, name, obj, options, sig, retann):
+     if not hasattr(obj, '__doc__'):
+         return
+     doc = get_doc_object(obj, config={'show_class_members': False})
+-    sig = doc['Signature'] or getattr(obj, '__text_signature__', None)
++    sig = (doc['Signature']
++           or _clean_text_signature(getattr(obj, '__text_signature__', None)))
+     if sig:
+         sig = re.sub("^[^(]*", "", sig)
+         return sig, ''
+ 
+ 
++def _clean_text_signature(sig):
++    if sig is None:
++        return None
++    start_pattern = re.compile(r"^[^(]*\(")
++    start, end = start_pattern.search(sig).span()
++    start_sig = sig[start:end]
++    sig = sig[end:-1]
++    sig = re.sub(r'^\$(self|module|type)(,\s|$)','' , sig, count=1)
++    sig = re.sub(r'(^|(?<=,\s))/,\s\*', '*', sig, count=1)
++    return start_sig + sig + ')'
++
++
+ def setup(app, get_doc_object_=get_doc_object):
+     if not hasattr(app, 'add_config_value'):
+         return  # probably called by nose, better bail out
+@@ -218,7 +232,13 @@ def setup(app, get_doc_object_=get_doc_object):
+ 
+     app.setup_extension('sphinx.ext.autosummary')
+ 
+-    app.connect('builder-inited', update_config)
++    # Once we bump our Sphinx requirement higher (1.7 or 1.8?)
++    # we can just connect to config-inited
++    try:
++        app.connect('config-inited', update_config)
++    except ExtensionError:
++        app.connect('builder-inited', update_config)
++
+     app.connect('autodoc-process-docstring', mangle_docstrings)
+     app.connect('autodoc-process-signature', mangle_signature)
+     app.connect('doctree-read', relabel_references)
+@@ -244,17 +264,19 @@ def setup(app, get_doc_object_=get_doc_object):
+     return metadata
+ 
+ 
+-def update_config(app):
++def update_config(app, config=None):
+     """Update the configuration with default values."""
++    if config is None:  # needed for testing and old Sphinx
++        config = app.config
+     # Do not simply overwrite the `app.config.numpydoc_xref_aliases`
+     # otherwise the next sphinx-build will compare the incoming values (without
+     # our additions) to the old values (with our additions) and trigger
+     # a full rebuild!
+-    numpydoc_xref_aliases_complete = deepcopy(app.config.numpydoc_xref_aliases)
++    numpydoc_xref_aliases_complete = deepcopy(config.numpydoc_xref_aliases)
+     for key, value in DEFAULT_LINKS.items():
+         if key not in numpydoc_xref_aliases_complete:
+             numpydoc_xref_aliases_complete[key] = value
+-    app.config.numpydoc_xref_aliases_complete = numpydoc_xref_aliases_complete
++    config.numpydoc_xref_aliases_complete = numpydoc_xref_aliases_complete
+ 
+ 
+ # ------------------------------------------------------------------------------
+

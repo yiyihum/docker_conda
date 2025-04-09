@@ -1,0 +1,117 @@
+diff --git a/sygnal/apnspushkin.py b/sygnal/apnspushkin.py
+index c7abf26..c4d495b 100644
+--- a/sygnal/apnspushkin.py
++++ b/sygnal/apnspushkin.py
+@@ -283,10 +283,22 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
+         with self.sygnal.tracer.start_span(
+             "apns_dispatch", tags=span_tags, child_of=context.opentracing_span
+         ) as span_parent:
++            # Before we build the payload, check that the default_payload is not
++            # malformed and reject the pushkey if it is
++
++            default_payload = {}
++
++            if device.data:
++                default_payload = device.data.get("default_payload", {})
++                if not isinstance(default_payload, dict):
++                    log.error(
++                        "default_payload is malformed, this value must be a dict."
++                    )
++                    return [device.pushkey]
+ 
+             if n.event_id and not n.type:
+                 payload: Optional[Dict[str, Any]] = self._get_payload_event_id_only(
+-                    n, device
++                    n, default_payload
+                 )
+             else:
+                 payload = self._get_payload_full(n, device, log)
+@@ -336,7 +348,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
+             raise NotificationDispatchException("Retried too many times.")
+ 
+     def _get_payload_event_id_only(
+-        self, n: Notification, device: Device
++        self, n: Notification, default_payload: Dict[str, Any]
+     ) -> Dict[str, Any]:
+         """
+         Constructs a payload for a notification where we know only the event ID.
+@@ -350,8 +362,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
+         """
+         payload = {}
+ 
+-        if device.data:
+-            payload.update(device.data.get("default_payload", {}))
++        payload.update(default_payload)
+ 
+         if n.room_id:
+             payload["room_id"] = n.room_id
+diff --git a/sygnal/gcmpushkin.py b/sygnal/gcmpushkin.py
+index e895489..ca68d68 100644
+--- a/sygnal/gcmpushkin.py
++++ b/sygnal/gcmpushkin.py
+@@ -18,7 +18,7 @@ import json
+ import logging
+ import time
+ from io import BytesIO
+-from typing import TYPE_CHECKING, Any, AnyStr, Dict, List, Tuple
++from typing import TYPE_CHECKING, Any, AnyStr, Dict, List, Optional, Tuple
+ 
+ from opentracing import Span, logs, tags
+ from prometheus_client import Counter, Gauge, Histogram
+@@ -347,16 +347,21 @@ class GcmPushkin(ConcurrencyLimitedPushkin):
+         with self.sygnal.tracer.start_span(
+             "gcm_dispatch", tags=span_tags, child_of=context.opentracing_span
+         ) as span_parent:
++            # TODO: Implement collapse_key to queue only one message per room.
++            failed: List[str] = []
++
+             data = GcmPushkin._build_data(n, device)
++
++            # Reject pushkey if default_payload is misconfigured
++            if data is None:
++                failed.append(device.pushkey)
++
+             headers = {
+                 "User-Agent": ["sygnal"],
+                 "Content-Type": ["application/json"],
+                 "Authorization": ["key=%s" % (self.api_key,)],
+             }
+ 
+-            # TODO: Implement collapse_key to queue only one message per room.
+-            failed: List[str] = []
+-
+             body = self.base_request_body.copy()
+             body["data"] = data
+             body["priority"] = "normal" if n.prio == "low" else "high"
+@@ -409,7 +414,7 @@ class GcmPushkin(ConcurrencyLimitedPushkin):
+             return failed
+ 
+     @staticmethod
+-    def _build_data(n: Notification, device: Device) -> Dict[str, Any]:
++    def _build_data(n: Notification, device: Device) -> Optional[Dict[str, Any]]:
+         """
+         Build the payload data to be sent.
+         Args:
+@@ -418,12 +423,19 @@ class GcmPushkin(ConcurrencyLimitedPushkin):
+             will be sent.
+ 
+         Returns:
+-            JSON-compatible dict
++            JSON-compatible dict or None if the default_payload is misconfigured
+         """
+         data = {}
+ 
+         if device.data:
+-            data.update(device.data.get("default_payload", {}))
++            default_payload = device.data.get("default_payload", {})
++            if isinstance(default_payload, dict):
++                data.update(default_payload)
++            else:
++                logger.error(
++                    "default_payload was misconfigured, this value must be a dict."
++                )
++                return None
+ 
+         for attr in [
+             "event_id",
+

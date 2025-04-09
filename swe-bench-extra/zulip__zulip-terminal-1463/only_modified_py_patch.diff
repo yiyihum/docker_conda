@@ -1,0 +1,100 @@
+diff --git a/zulipterminal/api_types.py b/zulipterminal/api_types.py
+index 119770e..b341993 100644
+--- a/zulipterminal/api_types.py
++++ b/zulipterminal/api_types.py
+@@ -34,6 +34,14 @@ MAX_TOPIC_NAME_LENGTH: Final = 60
+ MAX_MESSAGE_LENGTH: Final = 10000
+ 
+ 
++###############################################################################
++# These values are in the register response from ZFL 164
++# Before this feature level, they had the listed default (fixed) values
++
++PRESENCE_OFFLINE_THRESHOLD_SECS: Final = 140
++PRESENCE_PING_INTERVAL_SECS: Final = 60
++
++
+ ###############################################################################
+ # Core message types (used in Composition and Message below)
+ 
+diff --git a/zulipterminal/model.py b/zulipterminal/model.py
+index af0b846..72215c8 100644
+--- a/zulipterminal/model.py
++++ b/zulipterminal/model.py
+@@ -34,6 +34,8 @@ from zulipterminal.api_types import (
+     MAX_MESSAGE_LENGTH,
+     MAX_STREAM_NAME_LENGTH,
+     MAX_TOPIC_NAME_LENGTH,
++    PRESENCE_OFFLINE_THRESHOLD_SECS,
++    PRESENCE_PING_INTERVAL_SECS,
+     TYPING_STARTED_EXPIRY_PERIOD,
+     TYPING_STARTED_WAIT_PERIOD,
+     TYPING_STOPPED_WAIT_PERIOD,
+@@ -81,9 +83,6 @@ from zulipterminal.platform_code import notify
+ from zulipterminal.ui_tools.utils import create_msg_box_list
+ 
+ 
+-OFFLINE_THRESHOLD_SECS = 140
+-
+-
+ class ServerConnectionFailure(Exception):
+     pass
+ 
+@@ -172,6 +171,8 @@ class Model:
+         self.server_version = self.initial_data["zulip_version"]
+         self.server_feature_level: int = self.initial_data.get("zulip_feature_level", 0)
+ 
++        self._store_server_presence_intervals()
++
+         self.user_dict: Dict[str, MinimalUserData] = {}
+         self.user_id_email_dict: Dict[int, str] = {}
+         self._all_users_by_id: Dict[int, RealmUser] = {}
+@@ -445,7 +446,7 @@ class Model:
+                     view = self.controller.view
+                     view.users_view.update_user_list(user_list=self.users)
+                     view.middle_column.update_message_list_status_markers()
+-            time.sleep(60)
++            time.sleep(self.server_presence_ping_interval_secs)
+ 
+     @asynch
+     def toggle_message_reaction(
+@@ -814,6 +815,18 @@ class Model:
+             TYPING_STARTED_EXPIRY_PERIOD,
+         )
+ 
++    def _store_server_presence_intervals(self) -> None:
++        """
++        In ZFL 164, these values were added to the register response.
++        Uses default values if not received.
++        """
++        self.server_presence_offline_threshold_secs = self.initial_data.get(
++            "server_presence_offline_threshold_seconds", PRESENCE_OFFLINE_THRESHOLD_SECS
++        )
++        self.server_presence_ping_interval_secs = self.initial_data.get(
++            "server_presence_ping_interval_seconds", PRESENCE_PING_INTERVAL_SECS
++        )
++
+     @staticmethod
+     def modernize_message_response(message: Message) -> Message:
+         """
+@@ -1202,7 +1215,7 @@ class Model:
+                 *
+                 * Out of the ClientPresence objects found in `presence`, we
+                 * consider only those with a timestamp newer than
+-                * OFFLINE_THRESHOLD_SECS; then of
++                * self.server_presence_offline_threshold_secs; then of
+                 * those, return the one that has the greatest UserStatus, where
+                 * `active` > `idle` > `offline`.
+                 *
+@@ -1216,7 +1229,9 @@ class Model:
+                     timestamp = client[1]["timestamp"]
+                     if client_name == "aggregated":
+                         continue
+-                    elif (time.time() - timestamp) < OFFLINE_THRESHOLD_SECS:
++                    elif (
++                        time.time() - timestamp
++                    ) < self.server_presence_offline_threshold_secs:
+                         if status == "active":
+                             aggregate_status = "active"
+                         if status == "idle" and aggregate_status != "active":
+

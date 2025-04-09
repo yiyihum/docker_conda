@@ -1,0 +1,85 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c584b9c..0e66ae1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,7 +6,8 @@
+ * Add ``async with`` support to ``BaseCache``.
+ * Remove deprecated ``loop`` parameters.
+ * Remove deprecated ``cache`` parameter from ``create()``.
+-* Use ``str()`` in ``_build_key()`` to ensure consistency of enum keys between different Python versions (if using enum keys, upgrading to 0.12 may invalidate existing caches due to key values changing).
++* Use ``base._ensure_key()`` in ``_build_key()`` to ensure consistency of enum
++keys between different Python versions. [#633](https://github.com/aio-libs/aiocache/issues/633) -- Padraic Shafer
+ * Improved support for ``build_key(key, namespace)`` [#569](https://github.com/aio-libs/aiocache/issues/569) - Padraic Shafer
+     * `BaseCache.build_key` uses `namespace` argument if provided,
+     otherwise it uses `self.namespace`.
+diff --git a/aiocache/backends/redis.py b/aiocache/backends/redis.py
+index d569ec2..407efec 100644
+--- a/aiocache/backends/redis.py
++++ b/aiocache/backends/redis.py
+@@ -4,7 +4,7 @@ import warnings
+ import redis.asyncio as redis
+ from redis.exceptions import ResponseError as IncrbyException
+ 
+-from aiocache.base import BaseCache
++from aiocache.base import BaseCache, _ensure_key
+ from aiocache.serializers import JsonSerializer
+ 
+ 
+@@ -219,11 +219,12 @@ class RedisCache(RedisBackend):
+         return options
+ 
+     def _build_key(self, key, namespace=None):
+-        # TODO(PY311): Remove str()
+         if namespace is not None:
+-            return "{}{}{}".format(namespace, ":" if namespace else "", str(key))
++            return "{}{}{}".format(
++                namespace, ":" if namespace else "", _ensure_key(key))
+         if self.namespace is not None:
+-            return "{}{}{}".format(self.namespace, ":" if self.namespace else "", str(key))
++            return "{}{}{}".format(
++                self.namespace, ":" if self.namespace else "", _ensure_key(key))
+         return key
+ 
+     def __repr__(self):  # pragma: no cover
+diff --git a/aiocache/base.py b/aiocache/base.py
+index bc4df81..54e9d18 100644
+--- a/aiocache/base.py
++++ b/aiocache/base.py
+@@ -3,6 +3,7 @@ import functools
+ import logging
+ import os
+ import time
++from enum import Enum
+ from types import TracebackType
+ from typing import Callable, Optional, Set, Type
+ 
+@@ -498,14 +499,10 @@ class BaseCache:
+         pass
+ 
+     def _build_key(self, key, namespace=None):
+-        # TODO(PY311): Remove str() calls.
+-        # str() is needed to ensure consistent results when using enums between
+-        # Python 3.11+ and older releases due to changed __format__() method:
+-        # https://docs.python.org/3/whatsnew/3.11.html#enum
+         if namespace is not None:
+-            return "{}{}".format(namespace, str(key))
++            return "{}{}".format(namespace, _ensure_key(key))
+         if self.namespace is not None:
+-            return "{}{}".format(self.namespace, str(key))
++            return "{}{}".format(self.namespace, _ensure_key(key))
+         return key
+ 
+     def _get_ttl(self, ttl):
+@@ -553,5 +550,12 @@ class _Conn:
+         return _do_inject_conn
+ 
+ 
++def _ensure_key(key):
++    if isinstance(key, Enum):
++        return key.value
++    else:
++        return key
++
++
+ for cmd in API.CMDS:
+     setattr(_Conn, cmd.__name__, _Conn._inject_conn(cmd.__name__))

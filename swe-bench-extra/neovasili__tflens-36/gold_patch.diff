@@ -1,0 +1,156 @@
+diff --git a/README.md b/README.md
+index b4b09a0..5676c16 100644
+--- a/README.md
++++ b/README.md
+@@ -80,6 +80,8 @@ optional arguments:
+         Applies a regular expression to the name field in order to filter the resources list to output
+   -t FILTER_TYPE, --filter-type FILTER_TYPE
+         Applies a regular expression to the type field in order to filter the resources list to output
++  -p FILTER_PROVIDER, --filter-provider FILTER_PROVIDER
++        Applies a regular expression to the provider field in order to filter the resources list to output
+ ```
+ 
+ ### Examples
+diff --git a/tflens/__main__.py b/tflens/__main__.py
+index f7f87a2..fe1ca3d 100644
+--- a/tflens/__main__.py
++++ b/tflens/__main__.py
+@@ -59,6 +59,14 @@ parser.add_argument('-t', '--filter-type',
+     filter the resources list to output",
+   default="")
+ 
++parser.add_argument('-p', '--filter-provider',
++  type=str,
++  action="store",
++  dest="filter_provider",
++  help="Applies a regular expression to the provider field in order to \
++    filter the resources list to output",
++  default="")
++
+ args = parser.parse_args()
+ 
+ ARGS_REMOTE = args.remote
+@@ -67,6 +75,7 @@ ARGS_OUTPUT = args.output
+ ARGS_FILTER_MODULE = args.filter_module
+ ARGS_FILTER_NAME = args.filter_name
+ ARGS_FILTER_TYPE = args.filter_type
++ARGS_FILTER_PROVIDER = args.filter_provider
+ 
+ if not ARGS_FILE_LOCATION:
+   ARGS_FILE_LOCATION = "{}/terraform.tfstate".format(Path().absolute())
+@@ -81,6 +90,7 @@ def main():
+     file_location=ARGS_FILE_LOCATION,
+     name_filter_expression=ARGS_FILTER_NAME,
+     type_filter_expression=ARGS_FILTER_TYPE,
++    provider_filter_expression=ARGS_FILTER_PROVIDER,
+     module_filter_expression=ARGS_FILTER_MODULE
+   )
+ 
+diff --git a/tflens/controller/tfstate.py b/tflens/controller/tfstate.py
+index 478c492..0f4c7a5 100644
+--- a/tflens/controller/tfstate.py
++++ b/tflens/controller/tfstate.py
+@@ -16,6 +16,7 @@ class TfStateController():
+     tfstate_content: dict,
+     name_filter_expression: str=None,
+     type_filter_expression: str=None,
++    provider_filter_expression: str=None,
+     module_filter_expression: str=None
+   ):
+     self.__tfstate = TfState(
+@@ -24,6 +25,7 @@ class TfStateController():
+     self.__resources = TfStateFilterHelper(
+       name_filter_expression=name_filter_expression,
+       type_filter_expression=type_filter_expression,
++      provider_filter_expression=provider_filter_expression,
+       module_filter_expression=module_filter_expression,
+       resources=self.__tfstate.get_resources()
+     ).apply_filter()
+@@ -56,6 +58,7 @@ class LocalTfStateController(TfStateController):
+     file_location: str,
+     module_filter_expression: str=None,
+     type_filter_expression: str=None,
++    provider_filter_expression: str=None,
+     name_filter_expression: str=None
+   ):
+     self.__local_tfstate_service = LocalTfStateService(
+@@ -66,6 +69,7 @@ class LocalTfStateController(TfStateController):
+       tfstate_content=self.__local_tfstate_service.read_content(),
+       name_filter_expression=name_filter_expression,
+       type_filter_expression=type_filter_expression,
++      provider_filter_expression=provider_filter_expression,
+       module_filter_expression=module_filter_expression
+     )
+ 
+@@ -76,6 +80,7 @@ class RemoteS3TfStateController(TfStateController):
+     file_location: str,
+     module_filter_expression: str=None,
+     type_filter_expression: str=None,
++    provider_filter_expression: str=None,
+     name_filter_expression: str=None
+   ):
+     self.__remote_s3_tfstate_service = RemoteS3TfStateService(
+@@ -86,5 +91,6 @@ class RemoteS3TfStateController(TfStateController):
+       tfstate_content=self.__remote_s3_tfstate_service.read_content(),
+       name_filter_expression=name_filter_expression,
+       type_filter_expression=type_filter_expression,
++      provider_filter_expression=provider_filter_expression,
+       module_filter_expression=module_filter_expression
+     )
+diff --git a/tflens/helper/filter.py b/tflens/helper/filter.py
+index f6ce147..ee86ff3 100644
+--- a/tflens/helper/filter.py
++++ b/tflens/helper/filter.py
+@@ -35,17 +35,27 @@ class TypeFilterHelper(FilterHelper):
+       object_attribute_value=resource.get_type()
+     )
+ 
++class ProviderFilterHelper(FilterHelper):
++
++  def __init__(self, filter_expression: str, resource: TfStateResource):
++    super().__init__(
++      filter_expression=filter_expression,
++      object_attribute_value=resource.get_type()
++    )
++
+ class TfStateFilterHelper():
+ 
+   def __init__(
+     self,
+     name_filter_expression: str=None,
+     type_filter_expression: str=None,
++    provider_filter_expression: str=None,
+     module_filter_expression: str=None,
+     resources: list=None
+   ):
+     self.__name_filter_expression = name_filter_expression
+     self.__type_filter_expression = type_filter_expression
++    self.__provider_filter_expression = provider_filter_expression
+     self.__module_filter_expression = module_filter_expression
+     self.__resources = resources
+ 
+@@ -56,6 +66,7 @@ class TfStateFilterHelper():
+       pass_name_filter = True
+       pass_module_filter = True
+       pass_type_filter = True
++      pass_provider_filter = True
+ 
+       if self.__name_filter_expression:
+         filter_helper = NameFilterHelper(filter_expression=self.__name_filter_expression, resource=resource)
+@@ -65,11 +76,15 @@ class TfStateFilterHelper():
+         filter_helper = TypeFilterHelper(filter_expression=self.__type_filter_expression, resource=resource)
+         pass_type_filter = filter_helper.check_filter()
+ 
++      if self.__provider_filter_expression:
++        filter_helper = ProviderFilterHelper(filter_expression=self.__provider_filter_expression, resource=resource)
++        pass_provider_filter = filter_helper.check_filter()
++
+       if self.__module_filter_expression:
+         filter_helper = ModuleFilterHelper(filter_expression=self.__module_filter_expression, resource=resource)
+         pass_module_filter = filter_helper.check_filter()
+ 
+-      if pass_module_filter and pass_name_filter and pass_type_filter:
++      if pass_module_filter and pass_name_filter and pass_type_filter and pass_provider_filter:
+         filtered_list.append(resource)
+ 
+     return filtered_list

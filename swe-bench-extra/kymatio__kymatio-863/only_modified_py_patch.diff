@@ -1,0 +1,259 @@
+diff --git a/kymatio/scattering1d/filter_bank.py b/kymatio/scattering1d/filter_bank.py
+index 003cfba..090e48d 100644
+--- a/kymatio/scattering1d/filter_bank.py
++++ b/kymatio/scattering1d/filter_bank.py
+@@ -287,7 +287,7 @@ def compute_params_filterbank(sigma_min, Q, alpha, r_psi=math.sqrt(0.5)):
+     ----------
+     sigma_min : float
+         This acts as a lower bound on the frequential widths of the band-pass
+-        filters. The low-pass filter may be wider (if T < 2**J_scattering), making
++        filters. The low-pass filter may be wider (if T < _N_padded), making
+         invariants over shorter time scales than longest band-pass filter.
+     Q : int
+         number of wavelets per octave.
+@@ -337,7 +337,7 @@ def compute_params_filterbank(sigma_min, Q, alpha, r_psi=math.sqrt(0.5)):
+     return xis, sigmas, js
+ 
+ 
+-def scattering_filter_factory(J_support, J_scattering, Q, T, r_psi=math.sqrt(0.5),
++def scattering_filter_factory(N, J, Q, T, r_psi=math.sqrt(0.5),
+                               max_subsampling=None, sigma0=0.1, alpha=5., **kwargs):
+     """
+     Builds in Fourier the Morlet filters used for the scattering transform.
+@@ -354,11 +354,6 @@ def scattering_filter_factory(J_support, J_scattering, Q, T, r_psi=math.sqrt(0.5
+ 
+     Parameters
+     ----------
+-    J_support : int
+-        2**J_support is the desired support size of the filters
+-    J_scattering : int
+-        parameter for the scattering transform (2**J_scattering
+-        corresponds to maximal temporal support of any filter)
+     Q : tuple
+         number of wavelets per octave at the first and second order 
+         Q = (Q1, Q2). Q1 and Q2 are both int >= 1.
+@@ -374,9 +369,8 @@ def scattering_filter_factory(J_support, J_scattering, Q, T, r_psi=math.sqrt(0.5
+         to save computation time if it is not required. Defaults to None, in
+         which case this value is dynamically adjusted depending on the filters.
+     sigma0 : float, optional
+-        parameter controlling the frequential width of the
+-        low-pass filter at J_scattering=0; at a an absolute J_scattering, it
+-        is equal to sigma0 / 2**J_scattering. Defaults to 1e-1
++        parameter controlling the frequential width of the low-pass filter at
++        j=0; at a an absolute J, it is equal to sigma0 / 2**J. Defaults to 0.1
+     alpha : float, optional
+         tolerance factor for the aliasing after subsampling.
+         The larger alpha, the more conservative the value of maximal
+@@ -416,7 +410,7 @@ def scattering_filter_factory(J_support, J_scattering, Q, T, r_psi=math.sqrt(0.5
+     https://tel.archives-ouvertes.fr/tel-01559667
+     """
+     # compute the spectral parameters of the filters
+-    sigma_min = sigma0 / math.pow(2, J_scattering)
++    sigma_min = sigma0 / math.pow(2, J)
+     Q1, Q2 = Q
+     xi1s, sigma1s, j1s = compute_params_filterbank(sigma_min, Q1, alpha, r_psi)
+     xi2s, sigma2s, j2s = compute_params_filterbank(sigma_min, Q2, alpha, r_psi)
+@@ -435,8 +429,7 @@ def scattering_filter_factory(J_support, J_scattering, Q, T, r_psi=math.sqrt(0.5
+         # compute the current value for the max_subsampling,
+         # which depends on the input it can accept.
+         if max_subsampling is None:
+-            possible_subsamplings_after_order1 = [
+-                j1 for j1 in j1s if j2 > j1]
++            possible_subsamplings_after_order1 = [j1 for j1 in j1s if j2 > j1]
+             if len(possible_subsamplings_after_order1) > 0:
+                 max_sub_psi2 = max(possible_subsamplings_after_order1)
+             else:
+@@ -444,7 +437,6 @@ def scattering_filter_factory(J_support, J_scattering, Q, T, r_psi=math.sqrt(0.5
+         else:
+             max_sub_psi2 = max_subsampling
+         # We first compute the filter without subsampling
+-        N = 2**J_support
+ 
+         psi_levels = [morlet_1d(N, xi2, sigma2)]
+         # compute the filter after subsampling at all other subsamplings
+@@ -457,7 +449,6 @@ def scattering_filter_factory(J_support, J_scattering, Q, T, r_psi=math.sqrt(0.5
+     # for the 1st order filters, the input is not subsampled so we
+     # can only compute them with N=2**J_support
+     for (xi1, sigma1, j1) in zip(xi1s, sigma1s, j1s):
+-        N = 2**J_support
+         psi_levels = [morlet_1d(N, xi1, sigma1)]
+         psi1_f.append({'levels': psi_levels, 'xi': xi1, 'sigma': sigma1, 'j': j1})
+ 
+diff --git a/kymatio/scattering1d/frontend/base_frontend.py b/kymatio/scattering1d/frontend/base_frontend.py
+index 436cd40..a20059d 100644
+--- a/kymatio/scattering1d/frontend/base_frontend.py
++++ b/kymatio/scattering1d/frontend/base_frontend.py
+@@ -1,8 +1,8 @@
+ from ...frontend.base_frontend import ScatteringBase
+ import math
+ import numbers
+-
+ import numpy as np
++from warnings import warn
+ 
+ from ..filter_bank import compute_temporal_support, gauss_1d, scattering_filter_factory
+ from ..utils import (compute_border_indices, compute_padding,
+@@ -52,46 +52,48 @@ class ScatteringBase1D(ScatteringBase):
+         else:
+             raise ValueError("Q must be an integer or a tuple")
+ 
+-        # check the shape
++        # check input length
+         if isinstance(self.shape, numbers.Integral):
+-            self.N = self.shape
++            self.shape = (self.shape,)
+         elif isinstance(self.shape, tuple):
+-            self.N = self.shape[0]
+             if len(self.shape) > 1:
+                 raise ValueError("If shape is specified as a tuple, it must "
+                                  "have exactly one element")
+         else:
+             raise ValueError("shape must be an integer or a 1-tuple")
++        N_input = self.shape[0]
+ 
+         # check T or set default
+         if self.T is None:
+             self.T = 2**(self.J)
+-        elif self.T > self.N:
++        elif self.T > N_input:
+             raise ValueError("The temporal support T of the low-pass filter "
+                              "cannot exceed input length (got {} > {})".format(
+-                                 self.T, self.N))
++                                 self.T, N_input))
+         self.log2_T = math.floor(math.log2(self.T))
+ 
+         # Compute the minimum support to pad (ideally)
+-        phi_f = gauss_1d(self.N, self.sigma0/self.T)
++        phi_f = gauss_1d(N_input, self.sigma0/self.T)
+         min_to_pad = 3 * compute_temporal_support(
+             phi_f.reshape(1, -1), criterion_amplitude=1e-3)
+ 
+         # to avoid padding more than N - 1 on the left and on the right,
+         # since otherwise torch sends nans
+-        J_max_support = int(np.floor(np.log2(3 * self.N - 2)))
+-        self.J_pad = min(int(np.ceil(np.log2(self.N + 2 * min_to_pad))),
+-                         J_max_support)
++        J_max_support = int(np.floor(np.log2(3 * N_input - 2)))
++        J_pad = min(int(np.ceil(np.log2(N_input + 2 * min_to_pad))),
++                    J_max_support)
++        self._N_padded = 2**J_pad
++
+         # compute the padding quantities:
+-        self.pad_left, self.pad_right = compute_padding(self.J_pad, self.N)
++        self.pad_left, self.pad_right = compute_padding(self._N_padded, N_input)
+         # compute start and end indices
+         self.ind_start, self.ind_end = compute_border_indices(
+-            self.log2_T, self.J, self.pad_left, self.pad_left + self.N)
++            self.log2_T, self.J, self.pad_left, self.pad_left + N_input)
+ 
+     def create_filters(self):
+         # Create the filters
+         self.phi_f, self.psi1_f, self.psi2_f = scattering_filter_factory(
+-            self.J_pad, self.J, self.Q, self.T,
++            self._N_padded, self.J, self.Q, self.T,
+             r_psi=self.r_psi, sigma0=self.sigma0, alpha=self.alpha)
+ 
+     def meta(self):
+@@ -147,6 +149,20 @@ class ScatteringBase1D(ScatteringBase):
+                 'Input tensor x should have at least one axis, got {}'.format(
+                     len(x.shape)))
+ 
++    @property
++    def J_pad(self):
++        warn("The attribute J_pad is deprecated and will be removed in v0.4. "
++        "Measure len(self.phi_f[0]) for the padded length (previously 2**J_pad) "
++        "or access shape[0] for the unpadded length (previously N).", DeprecationWarning)
++        return int(np.log2(self._N_padded))
++
++    @property
++    def N(self):
++        warn("The attribute N is deprecated and will be removed in v0.4. "
++        "Measure len(self.phi_f[0]) for the padded length (previously 2**J_pad) "
++        "or access shape[0] for the unpadded length (previously N).", DeprecationWarning)
++        return int(self.shape[0])
++
+     _doc_shape = 'N'
+ 
+     _doc_instantiation_shape = {True: 'S = Scattering1D(J, N, Q)',
+@@ -158,9 +174,7 @@ class ScatteringBase1D(ScatteringBase):
+         """
+ 
+     _doc_attrs_shape = \
+-    r"""J_pad : int
+-            The logarithm of the padded length of the signals.
+-        pad_left : int
++    r"""pad_left : int
+             The amount of padding to the left of the signal.
+         pad_right : int
+             The amount of padding to the right of the signal.
+diff --git a/kymatio/scattering1d/utils.py b/kymatio/scattering1d/utils.py
+index 6261436..6bddf3e 100644
+--- a/kymatio/scattering1d/utils.py
++++ b/kymatio/scattering1d/utils.py
+@@ -39,33 +39,32 @@ def compute_border_indices(log2_T, J, i0, i1):
+         ind_end[j] = (ind_end[j - 1] // 2) + (ind_end[j - 1] % 2)
+     return ind_start, ind_end
+ 
+-def compute_padding(J_pad, N):
++def compute_padding(N, N_input):
+     """
+     Computes the padding to be added on the left and on the right
+     of the signal.
+ 
+-    It should hold that 2**J_pad >= N
++    It should hold that N >= N_input
+ 
+     Parameters
+     ----------
+-    J_pad : int
+-        2**J_pad is the support of the padded signal
+     N : int
+-        original signal support size
++        support of the padded signal
++    N_input : int
++        support of the unpadded signal
+ 
+     Returns
+     -------
+     pad_left: amount to pad on the left ("beginning" of the support)
+     pad_right: amount to pad on the right ("end" of the support)
+     """
+-    N_pad = 2**J_pad
+-    if N_pad < N:
++    if N < N_input:
+         raise ValueError('Padding support should be larger than the original' +
+                          'signal size!')
+-    to_add = 2**J_pad - N
++    to_add = N - N_input
+     pad_left = to_add // 2
+     pad_right = to_add - pad_left
+-    if max(pad_left, pad_right) >= N:
++    if max(pad_left, pad_right) >= N_input:
+         raise ValueError('Too large padding value, will lead to NaN errors')
+     return pad_left, pad_right
+ 
+@@ -95,9 +94,8 @@ def precompute_size_scattering(J, Q, T, max_order, r_psi, sigma0, alpha):
+         Should be >0 and <1. Controls the redundancy of the filters
+         (the larger r_psi, the larger the overlap between adjacent wavelets).
+     sigma0 : float
+-        parameter controlling the frequential width of the
+-        low-pass filter at J_scattering=0; at a an absolute J_scattering, it
+-        is equal to sigma0 / 2**J_scattering.
++        parameter controlling the frequential width of the low-pass filter at
++        j=0; at a an absolute J, it is equal to sigma0 / 2**J.
+     alpha : float, optional
+         tolerance factor for the aliasing after subsampling.
+         The larger alpha, the more conservative the value of maximal
+@@ -150,9 +148,8 @@ def compute_meta_scattering(J, Q, T, max_order, r_psi, sigma0, alpha):
+         Should be >0 and <1. Controls the redundancy of the filters
+         (the larger r_psi, the larger the overlap between adjacent wavelets).
+     sigma0 : float
+-        parameter controlling the frequential width of the
+-        low-pass filter at J_scattering=0; at a an absolute J_scattering, it
+-        is equal to sigma0 / 2**J_scattering.
++        parameter controlling the frequential width of the low-pass filter at
++        j=0; at a an absolute J, it is equal to sigma0 / 2**J.
+     alpha : float, optional
+         tolerance factor for the aliasing after subsampling.
+         The larger alpha, the more conservative the value of maximal
+

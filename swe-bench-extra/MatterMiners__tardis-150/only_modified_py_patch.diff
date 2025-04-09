@@ -1,0 +1,151 @@
+diff --git a/tardis/adapters/sites/slurm.py b/tardis/adapters/sites/slurm.py
+index a3a8fb5..9431ca6 100644
+--- a/tardis/adapters/sites/slurm.py
++++ b/tardis/adapters/sites/slurm.py
+@@ -11,6 +11,7 @@ from ...utilities.attributedict import convert_to_attribute_dict
+ from ...utilities.executors.shellexecutor import ShellExecutor
+ from ...utilities.asynccachemap import AsyncCacheMap
+ from ...utilities.utils import htcondor_csv_parser
++from ...utilities.utils import slurm_cmd_option_formatter
+ 
+ from asyncio import TimeoutError
+ from contextlib import contextmanager
+@@ -63,6 +64,10 @@ class SlurmAdapter(SiteAdapter):
+             )
+             self._startup_command = self._configuration.StartupCommand
+ 
++        self._sbatch_cmdline_option_string = slurm_cmd_option_formatter(
++            self.sbatch_cmdline_options
++        )
++
+         self._executor = getattr(self._configuration, "executor", ShellExecutor())
+ 
+         self._slurm_status = AsyncCacheMap(
+@@ -107,15 +112,13 @@ class SlurmAdapter(SiteAdapter):
+     async def deploy_resource(
+         self, resource_attributes: AttributeDict
+     ) -> AttributeDict:
++
+         request_command = (
+-            f"sbatch -p {self.machine_type_configuration.Partition} "
+-            f"-N 1 -n {self.machine_meta_data.Cores} "
+-            f"--mem={self.machine_meta_data.Memory}gb "
+-            f"-t {self.machine_type_configuration.Walltime} "
+-            f"--export=SLURM_Walltime="
+-            f"{self.machine_type_configuration.Walltime} "
++            "sbatch "
++            f"{self._sbatch_cmdline_option_string} "
+             f"{self._startup_command}"
+         )
++
+         result = await self._executor.run_command(request_command)
+         logger.debug(f"{self.site_name} sbatch returned {result}")
+         pattern = re.compile(r"^Submitted batch job (\d*)", flags=re.MULTILINE)
+@@ -165,6 +168,27 @@ class SlurmAdapter(SiteAdapter):
+             {"JobId": resource_attributes.remote_resource_uuid}, **resource_attributes
+         )
+ 
++    @property
++    def sbatch_cmdline_options(self):
++        sbatch_options = self.machine_type_configuration.get(
++            "SubmitOptions", AttributeDict()
++        )
++
++        return AttributeDict(
++            short=AttributeDict(
++                **sbatch_options.get("short", AttributeDict()),
++                p=self.machine_type_configuration.Partition,
++                N=1,
++                n=self.machine_meta_data.Cores,
++                t=self.machine_type_configuration.Walltime,
++            ),
++            long=AttributeDict(
++                **sbatch_options.get("long", AttributeDict()),
++                mem=f"{self.machine_meta_data.Memory}gb",
++                export=f"SLURM_Walltime={self.machine_type_configuration.Walltime}",
++            ),
++        )
++
+     async def stop_resource(self, resource_attributes: AttributeDict):
+         logger.debug("Slurm jobs cannot be stopped gracefully. Terminating instead.")
+         return await self.terminate_resource(resource_attributes)
+diff --git a/tardis/utilities/utils.py b/tardis/utilities/utils.py
+index 0525ff2..f17512e 100644
+--- a/tardis/utilities/utils.py
++++ b/tardis/utilities/utils.py
+@@ -1,12 +1,17 @@
++from .attributedict import AttributeDict
+ from .executors.shellexecutor import ShellExecutor
+ from ..exceptions.executorexceptions import CommandExecutionFailure
++from ..interfaces.executor import Executor
+ 
+ from io import StringIO
++from typing import List, Tuple
+ 
+ import csv
+ 
+ 
+-async def async_run_command(cmd, shell_executor=ShellExecutor()):
++async def async_run_command(
++    cmd: str, shell_executor: Executor = ShellExecutor()
++) -> str:
+     try:
+         response = await shell_executor.run_command(cmd)
+     except CommandExecutionFailure as ef:
+@@ -22,16 +27,25 @@ async def async_run_command(cmd, shell_executor=ShellExecutor()):
+         return response.stdout
+ 
+ 
+-def htcondor_cmd_option_formatter(options):
++def cmd_option_formatter(options: AttributeDict, prefix: str, separator: str) -> str:
+     options = (
+-        f"-{name} {value}" if value is not None else f"-{name}"
++        f"{prefix}{name}{separator}{value}" if value is not None else f"{prefix}{name}"
+         for name, value in options.items()
+     )
+ 
+     return " ".join(options)
+ 
+ 
+-def htcondor_csv_parser(htcondor_input, fieldnames, delimiter="\t", replacements=None):
++def htcondor_cmd_option_formatter(options: AttributeDict) -> str:
++    return cmd_option_formatter(options, prefix="-", separator=" ")
++
++
++def htcondor_csv_parser(
++    htcondor_input: str,
++    fieldnames: [List, Tuple],
++    delimiter: str = "\t",
++    replacements: dict = None,
++):
+     replacements = replacements or {}
+     with StringIO(htcondor_input) as csv_input:
+         cvs_reader = csv.DictReader(
+@@ -42,3 +56,26 @@ def htcondor_csv_parser(htcondor_input, fieldnames, delimiter="\t", replacements
+                 key: value if value not in replacements.keys() else replacements[value]
+                 for key, value in row.items()
+             }
++
++
++def slurm_cmd_option_formatter(options: AttributeDict) -> str:
++    option_prefix = dict(short="-", long="--")
++    option_separator = dict(short=" ", long="=")
++
++    option_string = ""
++
++    for option_type in ("short", "long"):
++        try:
++            tmp_option_string = cmd_option_formatter(
++                getattr(options, option_type),
++                prefix=option_prefix[option_type],
++                separator=option_separator[option_type],
++            )
++        except AttributeError:
++            pass
++        else:
++            if option_string:  # add additional space between short and long options
++                option_string += " "
++            option_string += tmp_option_string
++
++    return option_string
+

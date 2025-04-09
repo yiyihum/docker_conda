@@ -1,0 +1,139 @@
+diff --git a/tests/unit/contracts/test_forbidden.py b/tests/unit/contracts/test_forbidden.py
+index 684d8eb..e69dc93 100644
+--- a/tests/unit/contracts/test_forbidden.py
++++ b/tests/unit/contracts/test_forbidden.py
+@@ -125,6 +125,19 @@ class TestForbiddenContract:
+         ):
+             contract.check(graph=graph)
+ 
++    def test_ignore_imports_tolerates_duplicates(self):
++        graph = self._build_graph()
++        contract = self._build_contract(
++            forbidden_modules=("mypackage.blue", "mypackage.yellow"),
++            ignore_imports=(
++                "mypackage.three -> mypackage.green",
++                "mypackage.utils -> mypackage.purple",
++                "mypackage.three -> mypackage.green",
++            ),
++            include_external_packages=False,
++        )
++        assert contract.check(graph=graph)
++
+     def _build_graph(self):
+         graph = ImportGraph()
+         for module in (
+@@ -171,7 +184,9 @@ class TestForbiddenContract:
+         )
+         return graph
+ 
+-    def _build_contract(self, forbidden_modules, include_external_packages=False):
++    def _build_contract(
++        self, forbidden_modules, ignore_imports=None, include_external_packages=False
++    ):
+         session_options = {"root_packages": ["mypackage"]}
+         if include_external_packages:
+             session_options["include_external_packages"] = "True"
+@@ -182,6 +197,7 @@ class TestForbiddenContract:
+             contract_options={
+                 "source_modules": ("mypackage.one", "mypackage.two", "mypackage.three"),
+                 "forbidden_modules": forbidden_modules,
++                "ignore_imports": ignore_imports or [],
+             },
+         )
+ 
+diff --git a/tests/unit/contracts/test_independence.py b/tests/unit/contracts/test_independence.py
+index fefc36d..db3ba26 100644
+--- a/tests/unit/contracts/test_independence.py
++++ b/tests/unit/contracts/test_independence.py
+@@ -392,3 +392,30 @@ def test_missing_module():
+ 
+     with pytest.raises(ValueError, match=("Module 'mypackage.bar' does not exist.")):
+         contract.check(graph=graph)
++
++
++def test_ignore_imports_tolerates_duplicates():
++    graph = ImportGraph()
++    graph.add_module("mypackage")
++    graph.add_import(
++        importer="mypackage.a", imported="mypackage.b", line_number=1, line_contents="-"
++    )
++    graph.add_import(
++        importer="mypackage.a", imported="mypackage.c", line_number=2, line_contents="-"
++    )
++    contract = IndependenceContract(
++        name="Independence contract",
++        session_options={"root_packages": ["mypackage"]},
++        contract_options={
++            "modules": ("mypackage.a", "mypackage.b"),
++            "ignore_imports": [
++                "mypackage.a -> mypackage.b",
++                "mypackage.a -> mypackage.c",
++                "mypackage.a -> mypackage.b",
++            ],
++        },
++    )
++
++    contract_check = contract.check(graph=graph)
++
++    assert contract_check.kept
+diff --git a/tests/unit/contracts/test_layers.py b/tests/unit/contracts/test_layers.py
+index 36b1086..82231c4 100644
+--- a/tests/unit/contracts/test_layers.py
++++ b/tests/unit/contracts/test_layers.py
+@@ -765,6 +765,20 @@ class TestIgnoreImports:
+         with pytest.raises(MissingImport):
+             contract.check(graph=graph)
+ 
++    def test_ignore_imports_tolerates_duplicates(self):
++        contract = self._build_contract(
++            ignore_imports=[
++                "mypackage.low.black -> mypackage.medium.orange",
++                "mypackage.utils.foo -> mypackage.utils.bar",
++                "mypackage.low.black -> mypackage.medium.orange",
++            ]
++        )
++        graph = self._build_graph()
++
++        contract_check = contract.check(graph=graph)
++
++        assert contract_check.kept
++
+     def _build_graph(self):
+         graph = ImportGraph()
+         for module in (
+diff --git a/tests/unit/domain/test_fields.py b/tests/unit/domain/test_fields.py
+index 851404a..76883f0 100644
+--- a/tests/unit/domain/test_fields.py
++++ b/tests/unit/domain/test_fields.py
+@@ -7,6 +7,7 @@ from importlinter.domain.fields import (
+     Field,
+     ListField,
+     ModuleField,
++    SetField,
+     StringField,
+     ValidationError,
+ )
+@@ -83,9 +84,23 @@ class TestDirectImportField(BaseFieldTest):
+     "raw_data, expected_value",
+     (
+         (["mypackage.foo", "mypackage.bar"], [Module("mypackage.foo"), Module("mypackage.bar")]),
++        (["mypackage.foo", "mypackage.foo"], [Module("mypackage.foo"), Module("mypackage.foo")]),
+         ("singlevalue", [Module("singlevalue")]),
+     ),
+ )
+ class TestListField(BaseFieldTest):
+     field_class = ListField
+     field_kwargs = dict(subfield=ModuleField())
++
++
++@pytest.mark.parametrize(
++    "raw_data, expected_value",
++    (
++        (["mypackage.foo", "mypackage.bar"], {Module("mypackage.foo"), Module("mypackage.bar")}),
++        (["mypackage.foo", "mypackage.foo"], {Module("mypackage.foo")}),
++        ("singlevalue", {Module("singlevalue")}),
++    ),
++)
++class TestSetField(BaseFieldTest):
++    field_class = SetField
++    field_kwargs = dict(subfield=ModuleField())

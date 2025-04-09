@@ -1,0 +1,149 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5cc55decb..fe30a9778 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ - Fixed zero division error https://github.com/Textualize/textual/issues/2673
+ - Fix `scroll_to_center` when there were nested layers out of view (Compositor full_map not populated fully) https://github.com/Textualize/textual/pull/2684
++- Issues with `switch_screen` not updating the results callback appropriately https://github.com/Textualize/textual/issues/2650
+ 
+ ### Added
+ 
+@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ - `SuggestFromList` class to let widgets get completions from a fixed set of options https://github.com/Textualize/textual/pull/2604
+ - `Input` has a new component class `input--suggestion` https://github.com/Textualize/textual/pull/2604
+ - Added `Widget.remove_children` https://github.com/Textualize/textual/pull/2657
++- Added `Validator` framework and validation for `Input` https://github.com/Textualize/textual/pull/2600
+ 
+ ### Changed
+ 
+@@ -35,6 +37,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ - `Tree` and `DirectoryTree` Messages no longer accept a `tree` parameter, using `self.node.tree` instead. https://github.com/Textualize/textual/issues/2529
+ - Keybinding <kbd>right</kbd> in `Input` is also used to accept a suggestion if the cursor is at the end of the input https://github.com/Textualize/textual/pull/2604
+ - `Input.__init__` now accepts a `suggester` attribute for completion suggestions https://github.com/Textualize/textual/pull/2604
++- Using `switch_screen` to switch to the currently active screen is now a no-op https://github.com/Textualize/textual/pull/2692
+ 
+ ### Removed
+ 
+diff --git a/src/textual/_compositor.py b/src/textual/_compositor.py
+index caf6d1e6e..bd2c75395 100644
+--- a/src/textual/_compositor.py
++++ b/src/textual/_compositor.py
+@@ -361,6 +361,11 @@ class Compositor:
+ 
+         new_widgets = map.keys()
+ 
++        # Newly visible widgets
++        shown_widgets = new_widgets - old_widgets
++        # Newly hidden widgets
++        hidden_widgets = self.widgets - widgets
++
+         # Replace map and widgets
+         self._full_map = map
+         self.widgets = widgets
+@@ -389,10 +394,7 @@ class Compositor:
+             for widget, (region, *_) in changes
+             if (widget in common_widgets and old_map[widget].region[2:] != region[2:])
+         }
+-        # Newly visible widgets
+-        shown_widgets = new_widgets - old_widgets
+-        # Newly hidden widgets
+-        hidden_widgets = self.widgets - widgets
++
+         return ReflowResult(
+             hidden=hidden_widgets,
+             shown=shown_widgets,
+diff --git a/src/textual/app.py b/src/textual/app.py
+index 879edbad5..e9300f8c8 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -1611,15 +1611,19 @@ class App(Generic[ReturnType], DOMNode):
+             raise TypeError(
+                 f"switch_screen requires a Screen instance or str; not {screen!r}"
+             )
+-        if self.screen is not screen:
+-            previous_screen = self._replace_screen(self._screen_stack.pop())
+-            previous_screen._pop_result_callback()
+-            next_screen, await_mount = self._get_screen(screen)
+-            self._screen_stack.append(next_screen)
+-            self.screen.post_message(events.ScreenResume())
+-            self.log.system(f"{self.screen} is current (SWITCHED)")
+-            return await_mount
+-        return AwaitMount(self.screen, [])
++
++        next_screen, await_mount = self._get_screen(screen)
++        if screen is self.screen or next_screen is self.screen:
++            self.log.system(f"Screen {screen} is already current.")
++            return AwaitMount(self.screen, [])
++
++        previous_screen = self._replace_screen(self._screen_stack.pop())
++        previous_screen._pop_result_callback()
++        self._screen_stack.append(next_screen)
++        self.screen.post_message(events.ScreenResume())
++        self.screen._push_result_callback(self.screen, None)
++        self.log.system(f"{self.screen} is current (SWITCHED)")
++        return await_mount
+ 
+     def install_screen(self, screen: Screen, name: str) -> None:
+         """Install a screen.
+diff --git a/src/textual/css/_style_properties.py b/src/textual/css/_style_properties.py
+index 45ba9c423..a45813bfa 100644
+--- a/src/textual/css/_style_properties.py
++++ b/src/textual/css/_style_properties.py
+@@ -90,7 +90,7 @@ class GenericProperty(Generic[PropertyGetType, PropertySetType]):
+         # Raise StyleValueError here
+         return cast(PropertyGetType, value)
+ 
+-    def __set_name__(self, owner: Styles, name: str) -> None:
++    def __set_name__(self, owner: StylesBase, name: str) -> None:
+         self.name = name
+ 
+     def __get__(
+@@ -138,7 +138,7 @@ class ScalarProperty:
+         self.allow_auto = allow_auto
+         super().__init__()
+ 
+-    def __set_name__(self, owner: Styles, name: str) -> None:
++    def __set_name__(self, owner: StylesBase, name: str) -> None:
+         self.name = name
+ 
+     def __get__(
+@@ -227,7 +227,7 @@ class ScalarListProperty:
+         self.percent_unit = percent_unit
+         self.refresh_children = refresh_children
+ 
+-    def __set_name__(self, owner: Styles, name: str) -> None:
++    def __set_name__(self, owner: StylesBase, name: str) -> None:
+         self.name = name
+ 
+     def __get__(
+@@ -294,7 +294,7 @@ class BoxProperty:
+             obj.get_rule(self.name) or ("", self._default_color),
+         )
+ 
+-    def __set__(self, obj: Styles, border: tuple[EdgeType, str | Color] | None):
++    def __set__(self, obj: StylesBase, border: tuple[EdgeType, str | Color] | None):
+         """Set the box property.
+ 
+         Args:
+@@ -928,7 +928,7 @@ class ColorProperty:
+ class StyleFlagsProperty:
+     """Descriptor for getting and set style flag properties (e.g. ``bold italic underline``)."""
+ 
+-    def __set_name__(self, owner: Styles, name: str) -> None:
++    def __set_name__(self, owner: StylesBase, name: str) -> None:
+         self.name = name
+ 
+     def __get__(
+@@ -1008,7 +1008,9 @@ class TransitionsProperty:
+         """
+         return cast("dict[str, Transition]", obj.get_rule("transitions", {}))
+ 
+-    def __set__(self, obj: Styles, transitions: dict[str, Transition] | None) -> None:
++    def __set__(
++        self, obj: StylesBase, transitions: dict[str, Transition] | None
++    ) -> None:
+         _rich_traceback_omit = True
+         if transitions is None:
+             obj.clear_rule("transitions")

@@ -1,0 +1,759 @@
+diff --git a/docs/examples/validators_root.py b/docs/examples/validators_root.py
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/validators_root.py
+@@ -0,0 +1,41 @@
++from pydantic import BaseModel, ValidationError, root_validator
++
++class UserModel(BaseModel):
++    username: str
++    password1: str
++    password2: str
++
++    @root_validator(pre=True)
++    def check_card_number_omitted(cls, values):
++        assert 'card_number' not in values, 'card_number should not be included'
++        return values
++
++    @root_validator
++    def check_passwords_match(cls, values):
++        pw1, pw2 = values.get('password1'), values.get('password2')
++        if pw1 is not None and pw2 is not None and pw1 != pw2:
++            raise ValueError('passwords do not match')
++        return values
++
++print(UserModel(username='scolvin', password1='zxcvbn', password2='zxcvbn'))
++#> UserModel username='scolvin' password1='zxcvbn' password2='zxcvbn'
++
++try:
++    UserModel(username='scolvin', password1='zxcvbn', password2='zxcvbn2')
++except ValidationError as e:
++    print(e)
++"""
++1 validation error for UserModel
++__root__
++  passwords do not match (type=value_error)
++"""
++
++try:
++    UserModel(username='scolvin', password1='zxcvbn', password2='zxcvbn', card_number='1234')
++except ValidationError as e:
++    print(e)
++"""
++1 validation error for UserModel
++__root__
++  card_number should not be included (type=assertion_error)
++"""
+diff --git a/docs/examples/validators_simple.py b/docs/examples/validators_simple.py
+--- a/docs/examples/validators_simple.py
++++ b/docs/examples/validators_simple.py
+@@ -1,6 +1,5 @@
+ from pydantic import BaseModel, ValidationError, validator
+ 
+-
+ class UserModel(BaseModel):
+     name: str
+     username: str
+@@ -24,16 +23,15 @@ def username_alphanumeric(cls, v):
+         assert v.isalpha(), 'must be alphanumeric'
+         return v
+ 
+-
+ print(UserModel(name='samuel colvin', username='scolvin', password1='zxcvbn', password2='zxcvbn'))
+-# > UserModel name='Samuel Colvin' password1='zxcvbn' password2='zxcvbn'
++#> UserModel name='Samuel Colvin' username='scolvin' password1='zxcvbn' password2='zxcvbn'
+ 
+ try:
+     UserModel(name='samuel', username='scolvin', password1='zxcvbn', password2='zxcvbn2')
+ except ValidationError as e:
+     print(e)
+ """
+-2 validation errors
++2 validation errors for UserModel
+ name
+   must contain a space (type=value_error)
+ password2
+diff --git a/pydantic/__init__.py b/pydantic/__init__.py
+--- a/pydantic/__init__.py
++++ b/pydantic/__init__.py
+@@ -1,6 +1,6 @@
+ # flake8: noqa
+ from . import dataclasses
+-from .class_validators import validator
++from .class_validators import root_validator, validator
+ from .env_settings import BaseSettings
+ from .error_wrappers import ValidationError
+ from .errors import *
+diff --git a/pydantic/class_validators.py b/pydantic/class_validators.py
+--- a/pydantic/class_validators.py
++++ b/pydantic/class_validators.py
+@@ -4,24 +4,24 @@
+ from inspect import Signature, signature
+ from itertools import chain
+ from types import FunctionType
+-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Type
++from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
+ 
+ from .errors import ConfigError
+ from .typing import AnyCallable
+ from .utils import in_ipython
+ 
+-if TYPE_CHECKING:  # pragma: no cover
+-    from .main import BaseConfig
+-    from .fields import Field
+-    from .types import ModelOrDc
+-
+-    ValidatorCallable = Callable[[Optional[ModelOrDc], Any, Dict[str, Any], Field, Type[BaseConfig]], Any]
+-
+ 
+ class Validator:
+     __slots__ = 'func', 'pre', 'each_item', 'always', 'check_fields'
+ 
+-    def __init__(self, func: AnyCallable, pre: bool, each_item: bool, always: bool, check_fields: bool):
++    def __init__(
++        self,
++        func: AnyCallable,
++        pre: bool = False,
++        each_item: bool = False,
++        always: bool = False,
++        check_fields: bool = False,
++    ):
+         self.func = func
+         self.pre = pre
+         self.each_item = each_item
+@@ -29,7 +29,19 @@ def __init__(self, func: AnyCallable, pre: bool, each_item: bool, always: bool,
+         self.check_fields = check_fields
+ 
+ 
++if TYPE_CHECKING:  # pragma: no cover
++    from .main import BaseConfig
++    from .fields import Field
++    from .types import ModelOrDc
++
++    ValidatorCallable = Callable[[Optional[ModelOrDc], Any, Dict[str, Any], Field, Type[BaseConfig]], Any]
++    ValidatorsList = List[ValidatorCallable]
++    ValidatorListDict = Dict[str, List[Validator]]
++
+ _FUNCS: Set[str] = set()
++ROOT_KEY = '__root__'
++VALIDATOR_CONFIG_KEY = '__validator_config__'
++ROOT_VALIDATOR_CONFIG_KEY = '__root_validator_config__'
+ 
+ 
+ def validator(
+@@ -66,39 +78,62 @@ def validator(
+         each_item = not whole
+ 
+     def dec(f: AnyCallable) -> classmethod:
+-        # avoid validators with duplicated names since without this validators can be overwritten silently
+-        # which generally isn't the intended behaviour, don't run in ipython - see #312
+-        if not in_ipython():  # pragma: no branch
+-            ref = f.__module__ + '.' + f.__qualname__
+-            if ref in _FUNCS:
+-                raise ConfigError(f'duplicate validator function "{ref}"')
+-            _FUNCS.add(ref)
++        _check_validator_name(f)
+         f_cls = classmethod(f)
+-        f_cls.__validator_config = (  # type: ignore
+-            fields,
+-            Validator(func=f, pre=pre, each_item=each_item, always=always, check_fields=check_fields),
++        setattr(
++            f_cls,
++            VALIDATOR_CONFIG_KEY,
++            (fields, Validator(func=f, pre=pre, each_item=each_item, always=always, check_fields=check_fields)),
+         )
+         return f_cls
+ 
+     return dec
+ 
+ 
+-ValidatorListDict = Dict[str, List[Validator]]
++def root_validator(
++    _func: Optional[AnyCallable] = None, *, pre: bool = False
++) -> Union[classmethod, Callable[[AnyCallable], classmethod]]:
++    if _func:
++        _check_validator_name(_func)
++        f_cls = classmethod(_func)
++        setattr(f_cls, ROOT_VALIDATOR_CONFIG_KEY, Validator(func=_func, pre=pre))
++        return f_cls
++
++    def dec(f: AnyCallable) -> classmethod:
++        _check_validator_name(f)
++        f_cls = classmethod(f)
++        setattr(f_cls, ROOT_VALIDATOR_CONFIG_KEY, Validator(func=f, pre=pre))
++        return f_cls
++
++    return dec
++
++
++def _check_validator_name(f: AnyCallable) -> None:
++    """
++    avoid validators with duplicated names since without this, validators can be overwritten silently
++    which generally isn't the intended behaviour, don't run in ipython - see #312
++    """
++    if not in_ipython():  # pragma: no branch
++        ref = f.__module__ + '.' + f.__qualname__
++        if ref in _FUNCS:
++            raise ConfigError(f'duplicate validator function "{ref}"')
++        _FUNCS.add(ref)
+ 
+ 
+ class ValidatorGroup:
+-    def __init__(self, validators: ValidatorListDict) -> None:
++    def __init__(self, validators: 'ValidatorListDict') -> None:
+         self.validators = validators
+         self.used_validators = {'*'}
+ 
+     def get_validators(self, name: str) -> Optional[Dict[str, Validator]]:
+         self.used_validators.add(name)
+-        specific_validators = self.validators.get(name)
+-        wildcard_validators = self.validators.get('*')
+-        if specific_validators or wildcard_validators:
+-            validators = (specific_validators or []) + (wildcard_validators or [])
++        validators = self.validators.get(name, [])
++        if name != ROOT_KEY:
++            validators += self.validators.get('*', [])
++        if validators:
+             return {v.func.__name__: v for v in validators}
+-        return None
++        else:
++            return None
+ 
+     def check_for_unused(self) -> None:
+         unused_validators = set(
+@@ -120,7 +155,7 @@ def check_for_unused(self) -> None:
+ def extract_validators(namespace: Dict[str, Any]) -> Dict[str, List[Validator]]:
+     validators: Dict[str, List[Validator]] = {}
+     for var_name, value in namespace.items():
+-        validator_config = getattr(value, '__validator_config', None)
++        validator_config = getattr(value, VALIDATOR_CONFIG_KEY, None)
+         if validator_config:
+             fields, v = validator_config
+             for field in fields:
+@@ -131,7 +166,30 @@ def extract_validators(namespace: Dict[str, Any]) -> Dict[str, List[Validator]]:
+     return validators
+ 
+ 
+-def inherit_validators(base_validators: ValidatorListDict, validators: ValidatorListDict) -> ValidatorListDict:
++def extract_root_validators(namespace: Dict[str, Any]) -> Tuple[List[AnyCallable], List[AnyCallable]]:
++    pre_validators: List[AnyCallable] = []
++    post_validators: List[AnyCallable] = []
++    for name, value in namespace.items():
++        validator_config: Optional[Validator] = getattr(value, ROOT_VALIDATOR_CONFIG_KEY, None)
++        if validator_config:
++            sig = signature(validator_config.func)
++            args = list(sig.parameters.keys())
++            if args[0] == 'self':
++                raise ConfigError(
++                    f'Invalid signature for root validator {name}: {sig}, "self" not permitted as first argument, '
++                    f'should be: (cls, values).'
++                )
++            if len(args) != 2:
++                raise ConfigError(f'Invalid signature for root validator {name}: {sig}, should be: (cls, values).')
++            # check function signature
++            if validator_config.pre:
++                pre_validators.append(validator_config.func)
++            else:
++                post_validators.append(validator_config.func)
++    return pre_validators, post_validators
++
++
++def inherit_validators(base_validators: 'ValidatorListDict', validators: 'ValidatorListDict') -> 'ValidatorListDict':
+     for field, field_validators in base_validators.items():
+         if field not in validators:
+             validators[field] = []
+@@ -165,6 +223,10 @@ def make_generic_validator(validator: AnyCallable) -> 'ValidatorCallable':
+         return wraps(validator)(_generic_validator_basic(validator, sig, set(args)))
+ 
+ 
++def prep_validators(v_funcs: Iterable[AnyCallable]) -> 'ValidatorsList':
++    return [make_generic_validator(f) for f in v_funcs if f]
++
++
+ all_kwargs = {'values', 'field', 'config'}
+ 
+ 
+@@ -235,6 +297,10 @@ def _generic_validator_basic(validator: AnyCallable, sig: Signature, args: Set[s
+         return lambda cls, v, values, field, config: validator(v, values=values, field=field, config=config)
+ 
+ 
+-def gather_validators(type_: 'ModelOrDc') -> Dict[str, classmethod]:
++def gather_all_validators(type_: 'ModelOrDc') -> Dict[str, classmethod]:
+     all_attributes = ChainMap(*[cls.__dict__ for cls in type_.__mro__])
+-    return {k: v for k, v in all_attributes.items() if hasattr(v, '__validator_config')}
++    return {
++        k: v
++        for k, v in all_attributes.items()
++        if hasattr(v, VALIDATOR_CONFIG_KEY) or hasattr(v, ROOT_VALIDATOR_CONFIG_KEY)
++    }
+diff --git a/pydantic/dataclasses.py b/pydantic/dataclasses.py
+--- a/pydantic/dataclasses.py
++++ b/pydantic/dataclasses.py
+@@ -1,7 +1,7 @@
+ import dataclasses
+ from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, Optional, Type, Union
+ 
+-from .class_validators import gather_validators
++from .class_validators import gather_all_validators
+ from .error_wrappers import ValidationError
+ from .errors import DataclassTypeError
+ from .fields import Required
+@@ -67,7 +67,9 @@ def _process_class(
+     def _pydantic_post_init(self: 'DataclassType', *initvars: Any) -> None:
+         if post_init_original is not None:
+             post_init_original(self, *initvars)
+-        d = validate_model(self.__pydantic_model__, self.__dict__, cls=self.__class__)[0]
++        d, _, validation_error = validate_model(self.__pydantic_model__, self.__dict__, cls=self.__class__)
++        if validation_error:
++            raise validation_error
+         object.__setattr__(self, '__dict__', d)
+         object.__setattr__(self, '__initialised__', True)
+         if post_init_post_parse is not None:
+@@ -81,7 +83,7 @@ def _pydantic_post_init(self: 'DataclassType', *initvars: Any) -> None:
+         for field in dataclasses.fields(cls)
+     }
+ 
+-    validators = gather_validators(cls)
++    validators = gather_all_validators(cls)
+     cls.__pydantic_model__ = create_model(
+         cls.__name__, __config__=config, __module__=_cls.__module__, __validators__=validators, **fields
+     )
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -4,7 +4,6 @@
+     Dict,
+     FrozenSet,
+     Generator,
+-    Iterable,
+     Iterator,
+     List,
+     Mapping,
+@@ -19,11 +18,11 @@
+ )
+ 
+ from . import errors as errors_
+-from .class_validators import Validator, make_generic_validator
++from .class_validators import Validator, make_generic_validator, prep_validators
+ from .error_wrappers import ErrorWrapper
+ from .errors import NoneIsNotAllowedError
+ from .types import Json, JsonWrapper
+-from .typing import AnyCallable, AnyType, Callable, ForwardRef, display_as_type, is_literal_type, literal_values
++from .typing import AnyType, Callable, ForwardRef, display_as_type, is_literal_type, literal_values
+ from .utils import lenient_issubclass, sequence_like
+ from .validators import constant_validator, dict_validator, find_validators, validate_json
+ 
+@@ -36,13 +35,12 @@
+ NoneType = type(None)
+ 
+ if TYPE_CHECKING:  # pragma: no cover
+-    from .class_validators import ValidatorCallable  # noqa: F401
++    from .class_validators import ValidatorsList  # noqa: F401
+     from .error_wrappers import ErrorList
+     from .main import BaseConfig, BaseModel  # noqa: F401
+     from .schema import Schema  # noqa: F401
+     from .types import ModelOrDc  # noqa: F401
+ 
+-    ValidatorsList = List[ValidatorCallable]
+     ValidateReturn = Tuple[Optional[Any], Optional[ErrorList]]
+     LocStr = Union[Tuple[Union[int, str], ...], str]
+ 
+@@ -238,7 +236,7 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+             if get_validators:
+                 self.class_validators.update(
+                     {
+-                        f'list_{i}': Validator(validator, each_item=False, pre=True, always=True, check_fields=False)
++                        f'list_{i}': Validator(validator, pre=True, always=True)
+                         for i, validator in enumerate(get_validators())
+                     }
+                 )
+@@ -285,7 +283,7 @@ def _populate_validators(self) -> None:
+                 *(get_validators() if get_validators else list(find_validators(self.type_, self.model_config))),
+                 *[v.func for v in class_validators_ if v.each_item and not v.pre],
+             )
+-            self.validators = self._prep_vals(v_funcs)
++            self.validators = prep_validators(v_funcs)
+ 
+         # Add const validator
+         self.pre_validators = []
+@@ -294,8 +292,8 @@ def _populate_validators(self) -> None:
+             self.pre_validators = [make_generic_validator(constant_validator)]
+ 
+         if class_validators_:
+-            self.pre_validators += self._prep_vals(v.func for v in class_validators_ if not v.each_item and v.pre)
+-            self.post_validators = self._prep_vals(v.func for v in class_validators_ if not v.each_item and not v.pre)
++            self.pre_validators += prep_validators(v.func for v in class_validators_ if not v.each_item and v.pre)
++            self.post_validators = prep_validators(v.func for v in class_validators_ if not v.each_item and not v.pre)
+ 
+         if self.parse_json:
+             self.pre_validators.append(make_generic_validator(validate_json))
+@@ -303,10 +301,6 @@ def _populate_validators(self) -> None:
+         self.pre_validators = self.pre_validators or None
+         self.post_validators = self.post_validators or None
+ 
+-    @staticmethod
+-    def _prep_vals(v_funcs: Iterable[AnyCallable]) -> 'ValidatorsList':
+-        return [make_generic_validator(f) for f in v_funcs if f]
+-
+     def validate(
+         self, v: Any, values: Dict[str, Any], *, loc: 'LocStr', cls: Optional['ModelOrDc'] = None
+     ) -> 'ValidateReturn':
+diff --git a/pydantic/generics.py b/pydantic/generics.py
+--- a/pydantic/generics.py
++++ b/pydantic/generics.py
+@@ -1,7 +1,7 @@
+ from typing import Any, ClassVar, Dict, Generic, Tuple, Type, TypeVar, Union, get_type_hints
+ 
+-from pydantic.class_validators import gather_validators
+-from pydantic.main import BaseModel, create_model
++from .class_validators import gather_all_validators
++from .main import BaseModel, create_model
+ 
+ _generic_types_cache: Dict[Tuple[Type[Any], Union[Any, Tuple[Any, ...]]], Type[BaseModel]] = {}
+ GenericModelT = TypeVar('GenericModelT', bound='GenericModel')
+@@ -41,7 +41,7 @@ def __class_getitem__(  # type: ignore
+         }
+ 
+         model_name = concrete_name(cls, params)
+-        validators = gather_validators(cls)
++        validators = gather_all_validators(cls)
+         fields: Dict[str, Tuple[Type[Any], Any]] = {
+             k: (v, cls.__fields__[k].default) for k, v in concrete_type_hints.items() if k in cls.__fields__
+         }
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -7,9 +7,9 @@
+ from functools import partial
+ from pathlib import Path
+ from types import FunctionType
+-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Type, TypeVar, Union, cast, no_type_check
++from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, cast, no_type_check
+ 
+-from .class_validators import ValidatorGroup, extract_validators, inherit_validators
++from .class_validators import ROOT_KEY, ValidatorGroup, extract_root_validators, extract_validators, inherit_validators
+ from .error_wrappers import ErrorWrapper, ValidationError
+ from .errors import ConfigError, DictError, ExtraError, MissingError
+ from .fields import SHAPE_MAPPING, Field
+@@ -64,6 +64,7 @@ class BaseConfig:
+     error_msg_templates: Dict[str, str] = {}
+     arbitrary_types_allowed = False
+     orm_mode: bool = False
++    getter_dict: Type[GetterDict] = GetterDict
+     alias_generator: Optional[Callable[[str], str]] = None
+     keep_untouched: Tuple[type, ...] = ()
+     schema_extra: Dict[str, Any] = {}
+@@ -108,13 +109,13 @@ def set_extra(config: Type[BaseConfig], cls_name: str) -> None:
+ def is_valid_field(name: str) -> bool:
+     if not name.startswith('_'):
+         return True
+-    return '__root__' == name
++    return ROOT_KEY == name
+ 
+ 
+ def validate_custom_root_type(fields: Dict[str, Field]) -> None:
+     if len(fields) > 1:
+         raise ValueError('__root__ cannot be mixed with other fields')
+-    if fields['__root__'].shape == SHAPE_MAPPING:
++    if fields[ROOT_KEY].shape == SHAPE_MAPPING:
+         raise TypeError('custom root type cannot allow mapping')
+ 
+ 
+@@ -127,11 +128,14 @@ def __new__(mcs, name, bases, namespace):
+         fields: Dict[str, Field] = {}
+         config = BaseConfig
+         validators: 'ValidatorListDict' = {}
++        pre_root_validators, post_root_validators = [], []
+         for base in reversed(bases):
+             if issubclass(base, BaseModel) and base != BaseModel:
+                 fields.update(deepcopy(base.__fields__))
+                 config = inherit_config(base.__config__, config)
+                 validators = inherit_validators(base.__validators__, validators)
++                pre_root_validators += base.__pre_root_validators__
++                post_root_validators += base.__post_root_validators__
+ 
+         config = inherit_config(namespace.get('Config'), config)
+         validators = inherit_validators(extract_validators(namespace), validators)
+@@ -190,7 +194,7 @@ def __new__(mcs, name, bases, namespace):
+                         )
+                     fields[var_name] = inferred
+ 
+-        _custom_root_type = '__root__' in fields
++        _custom_root_type = ROOT_KEY in fields
+         if _custom_root_type:
+             validate_custom_root_type(fields)
+         vg.check_for_unused()
+@@ -198,10 +202,13 @@ def __new__(mcs, name, bases, namespace):
+             json_encoder = partial(custom_pydantic_encoder, config.json_encoders)
+         else:
+             json_encoder = pydantic_encoder
++        pre_rv_new, post_rv_new = extract_root_validators(namespace)
+         new_namespace = {
+             '__config__': config,
+             '__fields__': fields,
+             '__validators__': vg.validators,
++            '__pre_root_validators__': pre_root_validators + pre_rv_new,
++            '__post_root_validators__': post_root_validators + post_rv_new,
+             '_schema_cache': {},
+             '_json_encoder': staticmethod(json_encoder),
+             '_custom_root_type': _custom_root_type,
+@@ -215,6 +222,8 @@ class BaseModel(metaclass=MetaModel):
+         # populated by the metaclass, defined here to help IDEs only
+         __fields__: Dict[str, Field] = {}
+         __validators__: Dict[str, AnyCallable] = {}
++        __pre_root_validators__: List[AnyCallable]
++        __post_root_validators__: List[AnyCallable]
+         __config__: Type[BaseConfig] = BaseConfig
+         __root__: Any = None
+         _json_encoder: Callable[[Any], Any] = lambda x: x
+@@ -229,7 +238,9 @@ def __init__(__pydantic_self__, **data: Any) -> None:
+         if TYPE_CHECKING:  # pragma: no cover
+             __pydantic_self__.__dict__: Dict[str, Any] = {}
+             __pydantic_self__.__fields_set__: 'SetStr' = set()
+-        values, fields_set, _ = validate_model(__pydantic_self__, data)
++        values, fields_set, validation_error = validate_model(__pydantic_self__.__class__, data)
++        if validation_error:
++            raise validation_error
+         object.__setattr__(__pydantic_self__, '__dict__', values)
+         object.__setattr__(__pydantic_self__, '__fields_set__', fields_set)
+ 
+@@ -308,20 +319,20 @@ def json(
+         encoder = cast(Callable[[Any], Any], encoder or self._json_encoder)
+         data = self.dict(include=include, exclude=exclude, by_alias=by_alias, skip_defaults=skip_defaults)
+         if self._custom_root_type:
+-            data = data['__root__']
++            data = data[ROOT_KEY]
+         return self.__config__.json_dumps(data, default=encoder, **dumps_kwargs)
+ 
+     @classmethod
+     def parse_obj(cls: Type['Model'], obj: Any) -> 'Model':
+         if not isinstance(obj, dict):
+             if cls._custom_root_type:
+-                obj = {'__root__': obj}
++                obj = {ROOT_KEY: obj}
+             else:
+                 try:
+                     obj = dict(obj)
+                 except (TypeError, ValueError) as e:
+                     exc = TypeError(f'{cls.__name__} expected dict not {type(obj).__name__}')
+-                    raise ValidationError([ErrorWrapper(exc, loc='__obj__')], cls) from e
++                    raise ValidationError([ErrorWrapper(exc, loc=ROOT_KEY)], cls) from e
+         return cls(**obj)
+ 
+     @classmethod
+@@ -344,7 +355,7 @@ def parse_raw(
+                 json_loads=cls.__config__.json_loads,
+             )
+         except (ValueError, TypeError, UnicodeDecodeError) as e:
+-            raise ValidationError([ErrorWrapper(e, loc='__obj__')], cls)
++            raise ValidationError([ErrorWrapper(e, loc=ROOT_KEY)], cls)
+         return cls.parse_obj(obj)
+ 
+     @classmethod
+@@ -366,7 +377,9 @@ def from_orm(cls: Type['Model'], obj: Any) -> 'Model':
+             raise ConfigError('You must have the config attribute orm_mode=True to use from_orm')
+         obj = cls._decompose_class(obj)
+         m = cls.__new__(cls)
+-        values, fields_set, _ = validate_model(m, obj)
++        values, fields_set, validation_error = validate_model(cls, obj)
++        if validation_error:
++            raise validation_error
+         object.__setattr__(m, '__dict__', values)
+         object.__setattr__(m, '__fields_set__', fields_set)
+         return m
+@@ -467,7 +480,7 @@ def validate(cls: Type['Model'], value: Any) -> 'Model':
+ 
+     @classmethod
+     def _decompose_class(cls: Type['Model'], obj: Any) -> GetterDict:
+-        return GetterDict(obj)
++        return cls.__config__.getter_dict(obj)
+ 
+     @classmethod
+     @no_type_check
+@@ -681,7 +694,7 @@ def create_model(
+ 
+ 
+ def validate_model(  # noqa: C901 (ignore complexity)
+-    model: Union[BaseModel, Type[BaseModel]], input_data: 'DictStrAny', raise_exc: bool = True, cls: 'ModelOrDc' = None
++    model: Type[BaseModel], input_data: 'DictStrAny', cls: 'ModelOrDc' = None
+ ) -> Tuple['DictStrAny', 'SetStr', Optional[ValidationError]]:
+     """
+     validate data against a model.
+@@ -694,7 +707,13 @@ def validate_model(  # noqa: C901 (ignore complexity)
+     fields_set = set()
+     config = model.__config__
+     check_extra = config.extra is not Extra.ignore
+-    cls_ = cls or model.__class__
++    cls_ = cls or model
++
++    for validator in model.__pre_root_validators__:
++        try:
++            input_data = validator(cls_, input_data)
++        except (ValueError, TypeError, AssertionError) as exc:
++            return {}, set(), ValidationError([ErrorWrapper(exc, loc=ROOT_KEY)], cls_)
+ 
+     for name, field in model.__fields__.items():
+         if type(field.type_) == ForwardRef:
+@@ -728,7 +747,7 @@ def validate_model(  # noqa: C901 (ignore complexity)
+             if check_extra:
+                 names_used.add(field.name if using_name else field.alias)
+ 
+-        v_, errors_ = field.validate(value, values, loc=field.alias, cls=cls_)  # type: ignore
++        v_, errors_ = field.validate(value, values, loc=field.alias, cls=cls_)
+         if isinstance(errors_, ErrorWrapper):
+             errors.append(errors_)
+         elif isinstance(errors_, list):
+@@ -737,7 +756,10 @@ def validate_model(  # noqa: C901 (ignore complexity)
+             values[name] = v_
+ 
+     if check_extra:
+-        extra = input_data.keys() - names_used
++        if isinstance(input_data, GetterDict):
++            extra = input_data.extra_keys() - names_used
++        else:
++            extra = input_data.keys() - names_used
+         if extra:
+             fields_set |= extra
+             if config.extra is Extra.allow:
+@@ -747,15 +769,14 @@ def validate_model(  # noqa: C901 (ignore complexity)
+                 for f in sorted(extra):
+                     errors.append(ErrorWrapper(ExtraError(), loc=f))
+ 
+-    err = None
+-    if errors:
+-        model_type = model if isinstance(model, type) else type(model)
+-        err = ValidationError(errors, model_type)
+-
+-    if not raise_exc:
+-        return values, fields_set, err
+-
+-    if err:
+-        raise err
++    for validator in model.__post_root_validators__:
++        try:
++            values = validator(cls_, values)
++        except (ValueError, TypeError, AssertionError) as exc:
++            errors.append(ErrorWrapper(exc, loc=ROOT_KEY))
++            break
+ 
+-    return values, fields_set, None
++    if errors:
++        return values, fields_set, ValidationError(errors, cls_)
++    else:
++        return values, fields_set, None
+diff --git a/pydantic/schema.py b/pydantic/schema.py
+--- a/pydantic/schema.py
++++ b/pydantic/schema.py
+@@ -11,6 +11,7 @@
+ 
+ from pydantic.color import Color
+ 
++from .class_validators import ROOT_KEY
+ from .fields import SHAPE_LIST, SHAPE_MAPPING, SHAPE_SET, SHAPE_SINGLETON, SHAPE_TUPLE, Field
+ from .json import pydantic_encoder
+ from .networks import AnyUrl, EmailStr, IPvAnyAddress, IPvAnyInterface, IPvAnyNetwork, NameEmail
+@@ -586,8 +587,8 @@ def model_type_schema(
+             properties[k] = f_schema
+             if f.required:
+                 required.append(k)
+-    if '__root__' in properties:
+-        out_schema = properties['__root__']
++    if ROOT_KEY in properties:
++        out_schema = properties[ROOT_KEY]
+         out_schema['title'] = model.__config__.title or model.__name__
+     else:
+         out_schema = {'type': 'object', 'properties': properties}
+diff --git a/pydantic/types.py b/pydantic/types.py
+--- a/pydantic/types.py
++++ b/pydantic/types.py
+@@ -26,11 +26,6 @@
+     strict_str_validator,
+ )
+ 
+-try:
+-    import email_validator
+-except ImportError:
+-    email_validator = None
+-
+ __all__ = [
+     'NoneStr',
+     'NoneBytes',
+diff --git a/pydantic/utils.py b/pydantic/utils.py
+--- a/pydantic/utils.py
++++ b/pydantic/utils.py
+@@ -1,8 +1,8 @@
+ import inspect
+ from importlib import import_module
+-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Type, Union, no_type_check
++from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple, Type, Union, no_type_check
+ 
+-from .typing import AnyType
++from .typing import AnyType, display_as_type
+ 
+ try:
+     from typing_extensions import Literal
+@@ -93,6 +93,8 @@ def almost_equal_floats(value_1: float, value_2: float, *, delta: float = 1e-8)
+ class GetterDict:
+     """
+     Hack to make object's smell just enough like dicts for validate_model.
++
++    We can't inherit from Mapping[str, Any] because it upsets cython so we have to implement all methods ourselves.
+     """
+ 
+     __slots__ = ('_obj',)
+@@ -100,15 +102,52 @@ class GetterDict:
+     def __init__(self, obj: Any):
+         self._obj = obj
+ 
+-    def get(self, item: Any, default: Any) -> Any:
+-        return getattr(self._obj, item, default)
++    def __getitem__(self, key: str) -> Any:
++        try:
++            return getattr(self._obj, key)
++        except AttributeError as e:
++            raise KeyError(key) from e
++
++    def get(self, key: Any, default: Any = None) -> Any:
++        return getattr(self._obj, key, default)
+ 
+-    def keys(self) -> Set[Any]:
++    def extra_keys(self) -> Set[Any]:
+         """
+         We don't want to get any other attributes of obj if the model didn't explicitly ask for them
+         """
+         return set()
+ 
++    def keys(self) -> List[Any]:
++        """
++        Keys of the pseudo dictionary, uses a list not set so order information can be maintained like python
++        dictionaries.
++        """
++        return list(self)
++
++    def values(self) -> List[Any]:
++        return [self[k] for k in self]
++
++    def items(self) -> Iterator[Tuple[str, Any]]:
++        for k in self:
++            yield k, self.get(k)
++
++    def __iter__(self) -> Iterator[str]:
++        for name in dir(self._obj):
++            if not name.startswith('_'):
++                yield name
++
++    def __len__(self) -> int:
++        return sum(1 for _ in self)
++
++    def __contains__(self, item: Any) -> bool:
++        return item in self.keys()
++
++    def __eq__(self, other: Any) -> bool:
++        return dict(self) == dict(other.items())  # type: ignore
++
++    def __repr__(self) -> str:
++        return f'<GetterDict({display_as_type(self._obj)}) {dict(self)}>'  # type: ignore
++
+ 
+ class ValueItems:
+     """

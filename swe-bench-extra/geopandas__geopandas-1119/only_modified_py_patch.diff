@@ -1,0 +1,235 @@
+diff --git a/geopandas/geoseries.py b/geopandas/geoseries.py
+index 1fc67bd..5782406 100644
+--- a/geopandas/geoseries.py
++++ b/geopandas/geoseries.py
+@@ -18,7 +18,8 @@ from geopandas.plotting import plot_series
+ from .array import GeometryDtype, from_shapely
+ from .base import is_geometry_type
+ 
+-_PYPROJ2 = LooseVersion(pyproj.__version__) >= LooseVersion("2.1.0")
++
++_PYPROJ_VERSION = LooseVersion(pyproj.__version__)
+ 
+ 
+ _SERIES_WARNING_MSG = """\
+@@ -389,22 +390,38 @@ class GeoSeries(GeoPandasBase, Series):
+         """
+         from fiona.crs import from_epsg
+ 
++        if crs is None and epsg is None:
++            raise TypeError("Must set either crs or epsg for output.")
++
+         if self.crs is None:
+             raise ValueError(
+                 "Cannot transform naive geometries.  "
+                 "Please set a crs on the object first."
+             )
++
+         if crs is None:
+             try:
+                 crs = from_epsg(epsg)
+-            except TypeError:
+-                raise TypeError("Must set either crs or epsg for output.")
+-        proj_in = pyproj.Proj(self.crs, preserve_units=True)
+-        proj_out = pyproj.Proj(crs, preserve_units=True)
+-        if _PYPROJ2:
+-            transformer = pyproj.Transformer.from_proj(proj_in, proj_out)
++            except (TypeError, ValueError):
++                raise ValueError("Invalid epsg: {}".format(epsg))
++
++        # skip transformation if the input CRS and output CRS are the exact same
++        if _PYPROJ_VERSION >= LooseVersion("2.1.2") and pyproj.CRS.from_user_input(
++            self.crs
++        ).is_exact_same(pyproj.CRS.from_user_input(crs)):
++            return self
++
++        if _PYPROJ_VERSION >= LooseVersion("2.2.0"):
++            # if availale, use always_xy=True to preserve GIS axis order
++            transformer = pyproj.Transformer.from_crs(self.crs, crs, always_xy=True)
++            project = transformer.transform
++        elif _PYPROJ_VERSION >= LooseVersion("2.1.0"):
++            # use transformer for repeated transformations
++            transformer = pyproj.Transformer.from_crs(self.crs, crs)
+             project = transformer.transform
+         else:
++            proj_in = pyproj.Proj(self.crs, preserve_units=True)
++            proj_out = pyproj.Proj(crs, preserve_units=True)
+             project = partial(pyproj.transform, proj_in, proj_out)
+         result = self.apply(lambda geom: transform(project, geom))
+         result.__class__ = GeoSeries
+diff --git a/geopandas/plotting.py b/geopandas/plotting.py
+index 517c647..1d7b194 100644
+--- a/geopandas/plotting.py
++++ b/geopandas/plotting.py
+@@ -91,17 +91,24 @@ def plot_polygon_collection(
+         )
+     from matplotlib.collections import PatchCollection
+ 
+-    geoms, values = _flatten_multi_geoms(geoms, values)
+-    if None in values:
+-        values = None
++    geoms, multiindex = _flatten_multi_geoms(geoms, range(len(geoms)))
++    if values is not None:
++        values = np.take(values, multiindex)
+ 
+     # PatchCollection does not accept some kwargs.
+     if "markersize" in kwargs:
+         del kwargs["markersize"]
+-
+-    # color=None overwrites specified facecolor/edgecolor with default color
+     if color is not None:
+         kwargs["color"] = color
++        if pd.api.types.is_list_like(color):
++            kwargs["color"] = np.take(color, multiindex)
++        else:
++            kwargs["color"] = color
++    else:
++        for att in ["facecolor", "edgecolor"]:
++            if att in kwargs:
++                if pd.api.types.is_list_like(kwargs[att]):
++                    kwargs[att] = np.take(kwargs[att], multiindex)
+ 
+     collection = PatchCollection([PolygonPatch(poly) for poly in geoms], **kwargs)
+ 
+@@ -145,9 +152,9 @@ def plot_linestring_collection(
+     """
+     from matplotlib.collections import LineCollection
+ 
+-    geoms, values = _flatten_multi_geoms(geoms, values)
+-    if None in values:
+-        values = None
++    geoms, multiindex = _flatten_multi_geoms(geoms, range(len(geoms)))
++    if values is not None:
++        values = np.take(values, multiindex)
+ 
+     # LineCollection does not accept some kwargs.
+     if "markersize" in kwargs:
+@@ -155,7 +162,10 @@ def plot_linestring_collection(
+ 
+     # color=None gives black instead of default color cycle
+     if color is not None:
+-        kwargs["color"] = color
++        if pd.api.types.is_list_like(color):
++            kwargs["color"] = np.take(color, multiindex)
++        else:
++            kwargs["color"] = color
+ 
+     segments = [np.array(linestring)[:, :2] for linestring in geoms]
+     collection = LineCollection(segments, **kwargs)
+@@ -206,9 +216,10 @@ def plot_point_collection(
+     if values is not None and color is not None:
+         raise ValueError("Can only specify one of 'values' and 'color' kwargs")
+ 
+-    geoms, values = _flatten_multi_geoms(geoms, values)
+-    if None in values:
+-        values = None
++    geoms, multiindex = _flatten_multi_geoms(geoms, range(len(geoms)))
++    if values is not None:
++        values = np.take(values, multiindex)
++
+     x = [p.x for p in geoms]
+     y = [p.y for p in geoms]
+ 
+@@ -218,9 +229,14 @@ def plot_point_collection(
+     if markersize is not None:
+         kwargs["s"] = markersize
+ 
++    if color is not None:
++        if pd.api.types.is_list_like(color):
++            color = np.take(color, multiindex)
++
+     collection = ax.scatter(
+         x, y, color=color, vmin=vmin, vmax=vmax, cmap=cmap, marker=marker, **kwargs
+     )
++
+     return collection
+ 
+ 
+@@ -314,6 +330,7 @@ def plot_series(s, cmap=None, color=None, ax=None, figsize=None, **style_kwds):
+         facecolor = style_kwds.pop("facecolor", None)
+         if color is not None:
+             facecolor = color
++
+         values_ = values[poly_idx] if cmap else None
+         plot_polygon_collection(
+             ax, polys, values_, facecolor=facecolor, cmap=cmap, **style_kwds
+diff --git a/geopandas/tools/sjoin.py b/geopandas/tools/sjoin.py
+index 3421431..52290a9 100644
+--- a/geopandas/tools/sjoin.py
++++ b/geopandas/tools/sjoin.py
+@@ -32,8 +32,6 @@ def sjoin(
+         Suffix to apply to overlapping column names (right GeoDataFrame).
+ 
+     """
+-    import rtree
+-
+     if not isinstance(left_df, GeoDataFrame):
+         raise ValueError(
+             "'left_df' should be GeoDataFrame, got {}".format(type(left_df))
+@@ -76,6 +74,17 @@ def sjoin(
+             " joined".format(index_left, index_right)
+         )
+ 
++    # Attempt to re-use spatial indexes, otherwise generate the spatial index
++    # for the longer dataframe
++    if right_df._sindex_generated or (
++        not left_df._sindex_generated and right_df.shape[0] > left_df.shape[0]
++    ):
++        tree_idx = right_df.sindex
++        tree_idx_right = True
++    else:
++        tree_idx = left_df.sindex
++        tree_idx_right = False
++
+     # the rtree spatial index only allows limited (numeric) index types, but an
+     # index in geopandas may be any arbitrary dtype. so reset both indices now
+     # and store references to the original indices, to be reaffixed later.
+@@ -90,22 +99,32 @@ def sjoin(
+     if op == "within":
+         # within implemented as the inverse of contains; swap names
+         left_df, right_df = right_df, left_df
++        tree_idx_right = not tree_idx_right
++
++    r_idx = np.empty((0, 0))
++    l_idx = np.empty((0, 0))
++    # get rtree spatial index
++    if tree_idx_right:
++        idxmatch = left_df.geometry.apply(lambda x: x.bounds).apply(
++            lambda x: list(tree_idx.intersection(x))
++        )
++        idxmatch = idxmatch[idxmatch.apply(len) > 0]
++        # indexes of overlapping boundaries
++        if idxmatch.shape[0] > 0:
++            r_idx = np.concatenate(idxmatch.values)
++            l_idx = np.concatenate([[i] * len(v) for i, v in idxmatch.iteritems()])
++    else:
++        # tree_idx_df == 'left'
++        idxmatch = right_df.geometry.apply(lambda x: x.bounds).apply(
++            lambda x: list(tree_idx.intersection(x))
++        )
++        idxmatch = idxmatch[idxmatch.apply(len) > 0]
++        if idxmatch.shape[0] > 0:
++            # indexes of overlapping boundaries
++            l_idx = np.concatenate(idxmatch.values)
++            r_idx = np.concatenate([[i] * len(v) for i, v in idxmatch.iteritems()])
+ 
+-    # insert the bounds in the rtree spatial index
+-    right_df_bounds = right_df.geometry.apply(lambda x: x.bounds)
+-    stream = ((i, b, None) for i, b in enumerate(right_df_bounds))
+-    tree_idx = rtree.index.Index(stream)
+-
+-    idxmatch = left_df.geometry.apply(lambda x: x.bounds).apply(
+-        lambda x: list(tree_idx.intersection(x))
+-    )
+-    idxmatch = idxmatch[idxmatch.apply(len) > 0]
+-
+-    if idxmatch.shape[0] > 0:
+-        # if output from join has overlapping geometries
+-        r_idx = np.concatenate(idxmatch.values)
+-        l_idx = np.concatenate([[i] * len(v) for i, v in idxmatch.iteritems()])
+-
++    if len(r_idx) > 0 and len(l_idx) > 0:
+         # Vectorize predicate operations
+         def find_intersects(a1, a2):
+             return a1.intersects(a2)
+

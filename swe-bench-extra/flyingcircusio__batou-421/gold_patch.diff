@@ -1,0 +1,143 @@
+diff --git a/.readthedocs.yaml b/.readthedocs.yaml
+index 5fb909f8..aae9ffef 100644
+--- a/.readthedocs.yaml
++++ b/.readthedocs.yaml
+@@ -16,7 +16,7 @@ build:
+ 
+ # Build documentation in the "docs/" directory with Sphinx
+ sphinx:
+-  configuration: docs/sourcse/conf.py
++  configuration: doc/source/conf.py
+   # You can configure Sphinx to use a different builder, for instance use the dirhtml builder for simpler URLs
+   # builder: "dirhtml"
+   # Fail on all warnings to avoid broken references
+diff --git a/src/batou/main.py b/src/batou/main.py
+index 2b8c7449..f1066e98 100644
+--- a/src/batou/main.py
++++ b/src/batou/main.py
+@@ -166,6 +166,18 @@ def main(args: Optional[list] = None) -> None:
+     )
+     p.set_defaults(func=batou.secrets.manage.remove_user)
+ 
++    p = sp.add_parser(
++        "reencrypt",
++        help="Re-encrypt all secret files with the current members.",
++    )
++    p.set_defaults(func=p.print_usage)
++    p.add_argument(
++        "--environments",
++        default="",
++        help="The environments to update. Update all if not specified.",
++    )
++    p.set_defaults(func=batou.secrets.manage.reencrypt)
++
+     # migrate
+     migrate = subparsers.add_parser(
+         "migrate",
+diff --git a/src/batou/secrets/__init__.py b/src/batou/secrets/__init__.py
+index 1f745832..bc5ffae5 100644
+--- a/src/batou/secrets/__init__.py
++++ b/src/batou/secrets/__init__.py
+@@ -372,7 +372,7 @@ class ConfigFileSecretProvider(SecretProvider):
+         raise NotImplementedError("_get_file() not implemented.")
+ 
+     def write_file(self, file: EncryptedFile, content: bytes):
+-        recipients = self._get_recipients()
++        recipients = self._get_recipients_for_encryption()
+         if not recipients:
+             raise ValueError(
+                 "No recipients found for environment. "
+@@ -385,6 +385,14 @@ class ConfigFileSecretProvider(SecretProvider):
+         with self.config_file:
+             self.write_config(content)
+ 
++    def _get_recipients(self) -> List[str]:
++        recipients = self.config.get("batou", "members")
++        if recipients.value is None:
++            return []
++        recipients = re.split(r"(\n|,)+", recipients.value)
++        recipients = [r.strip() for r in recipients if r.strip()]
++        return recipients
++
+ 
+ class GPGSecretProvider(ConfigFileSecretProvider):
+     def __init__(self, environment: "Environment"):
+@@ -421,13 +429,8 @@ class GPGSecretProvider(ConfigFileSecretProvider):
+             writeable,
+         )
+ 
+-    def _get_recipients(self) -> List[str]:
+-        recipients = self.config.get("batou", "members")
+-        if recipients.value is None:
+-            return []
+-        recipients = re.split(r"(\n|,)+", recipients.value)
+-        recipients = [r.strip() for r in recipients if r.strip()]
+-        return recipients
++    def _get_recipients_for_encryption(self) -> List[str]:
++        return self._get_recipients()
+ 
+     def write_config(self, content: bytes):
+         config = ConfigUpdater().read_string(content.decode("utf-8"))
+@@ -562,12 +565,8 @@ class AGESecretProvider(ConfigFileSecretProvider):
+             writeable,
+         )
+ 
+-    def _get_recipients(self) -> List[str]:
+-        recipients = self.config.get("batou", "members")
+-        if recipients.value is None:
+-            return []
+-        recipients = re.split(r"(\n|,)+", recipients.value)
+-        recipients = [r.strip() for r in recipients if r.strip()]
++    def _get_recipients_for_encryption(self) -> List[str]:
++        recipients = self._get_recipients()
+         return process_age_recipients(
+             recipients,
+             pathlib.Path(self.environment.base_dir)
+diff --git a/src/batou/secrets/manage.py b/src/batou/secrets/manage.py
+index e5300f91..f518126b 100644
+--- a/src/batou/secrets/manage.py
++++ b/src/batou/secrets/manage.py
+@@ -3,7 +3,7 @@ import sys
+ from configupdater import ConfigUpdater
+ 
+ from batou import AgeCallError, GPGCallError
+-from batou.environment import Environment
++from batou.environment import Environment, UnknownEnvironmentError
+ 
+ 
+ def summary():
+@@ -44,10 +44,6 @@ def add_user(keyid, environments, **kw):
+             environment.secret_provider.write_config(
+                 str(config).encode("utf-8")
+             )
+-    if not environments_:
+-        raise UnknownEnvironmentError(
+-            [e.strip() for e in environments.split(",")]
+-        )
+ 
+ 
+ def remove_user(keyid, environments, **kw):
+@@ -69,7 +65,19 @@ def remove_user(keyid, environments, **kw):
+             environment.secret_provider.write_config(
+                 str(config).encode("utf-8")
+             )
+-    if not environments:
+-        raise UnknownEnvironmentError(
+-            [e.strip() for e in environments.split(",")]
+-        )
++
++
++def reencrypt(environments, **kw):
++    """Re-encrypt all secrets in given environments.
++
++    If environments is not given, all secrets are re-encrypted.
++
++    """
++    environments_ = Environment.filter(environments)
++    for environment in environments_:
++        environment.load_secrets()
++        with environment.secret_provider.edit():
++            config = environment.secret_provider.config
++            environment.secret_provider.write_config(
++                str(config).encode("utf-8")
++            )

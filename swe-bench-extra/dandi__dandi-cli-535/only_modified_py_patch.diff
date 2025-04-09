@@ -1,0 +1,126 @@
+diff --git a/dandi/cli/cmd_ls.py b/dandi/cli/cmd_ls.py
+index d104076b..bd02daef 100644
+--- a/dandi/cli/cmd_ls.py
++++ b/dandi/cli/cmd_ls.py
+@@ -40,6 +40,11 @@ from ..utils import is_url
+     default=6,  # TODO: come up with smart auto-scaling etc
+     show_default=True,
+ )
++@click.option(
++    "--metadata",
++    type=click.Choice(["api", "all", "assets"]),
++    default="api",
++)
+ @click.option(
+     "--schema",
+     help="Convert metadata to new schema version",
+@@ -47,11 +52,12 @@ from ..utils import is_url
+ )
+ @click.argument("paths", nargs=-1, type=click.Path(exists=False, dir_okay=True))
+ @map_to_click_exceptions
+-def ls(paths, schema, fields=None, format="auto", recursive=False, jobs=6):
++def ls(paths, schema, metadata, fields=None, format="auto", recursive=False, jobs=6):
+     """List .nwb files and dandisets metadata."""
+     # TODO: more logical ordering in case of fields = None
+     from .formatter import JSONFormatter, PYOUTFormatter, YAMLFormatter
+     from ..consts import metadata_all_fields
++    from ..dandiapi import DandiAPIClient
+ 
+     # TODO: avoid
+     from ..support.pyout import PYOUT_SHORT_NAMES_rev
+@@ -98,6 +104,7 @@ def ls(paths, schema, fields=None, format="auto", recursive=False, jobs=6):
+ 
+                 with navigate_url(path) as (client, dandiset, assets):
+                     if dandiset:
++                        dandiset_id = dandiset.get("dandiset", {}).get("identifier")
+                         rec = {
+                             "path": dandiset.pop("dandiset", {}).get(
+                                 "identifier", "ERR#%s" % id(dandiset)
+@@ -107,8 +114,23 @@ def ls(paths, schema, fields=None, format="auto", recursive=False, jobs=6):
+                         # rec.update(dandiset.get('metadata', {}))
+                         rec.update(dandiset)
+                         yield rec
++                    else:
++                        dandiset_id = None
+                     if recursive and assets:
+-                        yield from assets
++                        if isinstance(client, DandiAPIClient) and metadata in (
++                            "all",
++                            "assets",
++                        ):
++                            for a in assets:
++                                if "metadata" not in a:
++                                    a["metadata"] = client.get_asset(
++                                        dandiset_id,
++                                        dandiset["version"],
++                                        a["asset_id"],
++                                    )
++                                yield a
++                        else:
++                            yield from assets
+             else:
+                 # For now we support only individual files
+                 yield path
+diff --git a/dandi/dandiarchive.py b/dandi/dandiarchive.py
+index 3729a092..81c0f6b8 100644
+--- a/dandi/dandiarchive.py
++++ b/dandi/dandiarchive.py
+@@ -51,7 +51,7 @@ def navigate_url(url):
+             asset_id["version"] = r["most_recent_version"]["version"]
+         args = (asset_id["dandiset_id"], asset_id["version"])
+         kwargs["include_metadata"] = True
+-        if asset_id.get("location"):
++        if asset_id.get("location") or asset_id.get("asset_id"):
+             with client.session():
+                 dandiset = client.get_dandiset(*args)
+                 if asset_type == "folder":
+@@ -59,8 +59,11 @@ def navigate_url(url):
+                         *args, path=asset_id["location"]
+                     )
+                 elif asset_type == "item":
+-                    asset = client.get_asset_bypath(*args, asset_id["location"])
+-                    assets = [asset] if asset is not None else []
++                    if "location" in asset_id:
++                        asset = client.get_asset_bypath(*args, asset_id["location"])
++                        assets = [asset] if asset is not None else []
++                    else:
++                        assets = [client.get_asset(*args, asset_id["asset_id"])]
+                 else:
+                     raise NotImplementedError(
+                         f"Do not know how to handle asset type {asset_type} with location"
+@@ -183,6 +186,16 @@ class _dandi_url_parser:
+             {"server_type": "api"},
+             "https://<server>[/api]/dandisets/<dandiset id>[/versions[/<version>]]",
+         ),
++        (
++            re.compile(
++                rf"{server_grp}(?P<asset_type>dandiset)s/{dandiset_id_grp}"
++                r"/versions/(?P<version>[.0-9]{5,}|draft)"
++                r"/assets/(?P<asset_id>[^/]+)(/(download/?)?)?"
++            ),
++            {"server_type": "api"},
++            "https://<server>[/api]/dandisets/<dandiset id>/versions/<version>"
++            "/assets/<asset id>[/download]",
++        ),
+         # But for drafts files navigator it is a bit different beast and there
+         # could be no versions, only draft
+         # https://deploy-preview-341--gui-dandiarchive-org.netlify.app/#/dandiset/000027/draft/files?_id=5f176583f63d62e1dbd06943&_modelType=folder
+@@ -353,6 +366,7 @@ class _dandi_url_parser:
+         dandiset_id = groups.get("dandiset_id")
+         version = groups.get("version")
+         location = groups.get("location")
++        asset_key = groups.get("asset_id")
+         if location:
+             location = urlunquote(location)
+             # ATM carries leading '/' which IMHO is not needed/misguiding somewhat, so
+@@ -371,6 +385,9 @@ class _dandi_url_parser:
+             else:
+                 asset_type = "item"
+             asset_ids["location"] = location
++        elif asset_key:
++            asset_type = "item"
++            asset_ids["asset_id"] = asset_key
+         # TODO: remove whenever API supports "draft" and this type of url
+         if groups.get("id"):
+             assert version == "draft"
+

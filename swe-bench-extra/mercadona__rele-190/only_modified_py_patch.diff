@@ -1,0 +1,81 @@
+diff --git a/rele/client.py b/rele/client.py
+index 8ba1be1..bcb3af5 100644
+--- a/rele/client.py
++++ b/rele/client.py
+@@ -167,6 +167,9 @@ class Publisher:
+             if raise_exception:
+                 raise e
+         else:
++            run_middleware_hook("post_publish_success", topic)
++
++            # DEPRECATED
+             run_middleware_hook("post_publish", topic)
+ 
+         return future
+diff --git a/rele/middleware.py b/rele/middleware.py
+index 84fb8da..dceb84d 100644
+--- a/rele/middleware.py
++++ b/rele/middleware.py
+@@ -1,4 +1,5 @@
+ import importlib
++import warnings
+ 
+ _middlewares = []
+ 
+@@ -24,7 +25,20 @@ def run_middleware_hook(hook_name, *args, **kwargs):
+         getattr(middleware, hook_name)(*args, **kwargs)
+ 
+ 
+-class BaseMiddleware:
++class WarnDeprecatedHooks(type):
++    def __new__(cls, *args, **kwargs):
++        x = super().__new__(cls, *args, **kwargs)
++        if hasattr(x, "post_publish"):
++            warnings.warn(
++                "The post_publish hook in the middleware is deprecated "
++                "and will be removed in future versions. Please substitute it with "
++                "the post_publish_success hook instead.",
++                DeprecationWarning,
++            )
++        return x
++
++
++class BaseMiddleware(metaclass=WarnDeprecatedHooks):
+     """Base class for middleware.  The default implementations
+     for all hooks are no-ops and subclasses may implement whatever
+     subset of hooks they like.
+@@ -43,6 +57,11 @@ class BaseMiddleware:
+         """
+ 
+     def post_publish(self, topic):
++        """DEPRECATED: Called after Publisher sends message.
++        :param topic:
++        """
++
++    def post_publish_success(self, topic):
+         """Called after Publisher sends message.
+         :param topic:
+         """
+diff --git a/rele/publishing.py b/rele/publishing.py
+index e2bf1d4..3368548 100644
+--- a/rele/publishing.py
++++ b/rele/publishing.py
+@@ -1,3 +1,5 @@
++from rele import config, discover
++
+ from .client import Publisher
+ 
+ _publisher = None
+@@ -41,5 +43,10 @@ def publish(topic, data, **kwargs):
+     :return: None
+     """
+     if not _publisher:
+-        raise ValueError("init_global_publisher must be called first.")
++        settings, _ = discover.sub_modules()
++        if not hasattr(settings, "RELE"):
++            raise ValueError("Config setup not called and settings module not found.")
++
++        config.setup(settings.RELE)
++
+     _publisher.publish(topic, data, **kwargs)
+

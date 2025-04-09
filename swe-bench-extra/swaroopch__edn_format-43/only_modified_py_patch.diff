@@ -1,0 +1,147 @@
+diff --git a/edn_format/edn_lex.py b/edn_format/edn_lex.py
+index ac0a3af..fc2026e 100644
+--- a/edn_format/edn_lex.py
++++ b/edn_format/edn_lex.py
+@@ -102,7 +102,8 @@ tokens = ('WHITESPACE',
+           'MAP_START',
+           'SET_START',
+           'MAP_OR_SET_END',
+-          'TAG')
++          'TAG',
++          'DISCARD_TAG')
+ 
+ PARTS = {}
+ PARTS["non_nums"] = r"\w.*+!\-_?$%&=:#<>@"
+@@ -138,7 +139,7 @@ KEYWORD = (":"
+            "[{all}]+"
+            ")").format(**PARTS)
+ TAG = (r"\#"
+-       r"\w"
++       r"[a-zA-Z]"  # https://github.com/edn-format/edn/issues/30#issuecomment-8540641
+        "("
+        "[{all}]*"
+        r"\/"
+@@ -147,6 +148,8 @@ TAG = (r"\#"
+        "[{all}]*"
+        ")").format(**PARTS)
+ 
++DISCARD_TAG = r"\#\_"
++
+ t_VECTOR_START = r'\['
+ t_VECTOR_END = r'\]'
+ t_LIST_START = r'\('
+@@ -228,9 +231,10 @@ def t_COMMENT(t):
+     pass  # ignore
+ 
+ 
+-def t_DISCARD(t):
+-    r'\#_\S+\b'
+-    pass  # ignore
++@ply.lex.TOKEN(DISCARD_TAG)
++def t_DISCARD_TAG(t):
++    t.value = t.value[1:]
++    return t
+ 
+ 
+ @ply.lex.TOKEN(TAG)
+diff --git a/edn_format/edn_parse.py b/edn_format/edn_parse.py
+index c2be09d..329584e 100644
+--- a/edn_format/edn_parse.py
++++ b/edn_format/edn_parse.py
+@@ -56,41 +56,21 @@ def p_term_leaf(p):
+     p[0] = p[1]
+ 
+ 
+-def p_empty_vector(p):
+-    """vector : VECTOR_START VECTOR_END"""
+-    p[0] = ImmutableList([])
+-
+-
+ def p_vector(p):
+     """vector : VECTOR_START expressions VECTOR_END"""
+     p[0] = ImmutableList(p[2])
+ 
+ 
+-def p_empty_list(p):
+-    """list : LIST_START LIST_END"""
+-    p[0] = tuple()
+-
+-
+ def p_list(p):
+     """list : LIST_START expressions LIST_END"""
+     p[0] = tuple(p[2])
+ 
+ 
+-def p_empty_set(p):
+-    """set : SET_START MAP_OR_SET_END"""
+-    p[0] = frozenset()
+-
+-
+ def p_set(p):
+     """set : SET_START expressions MAP_OR_SET_END"""
+     p[0] = frozenset(p[2])
+ 
+ 
+-def p_empty_map(p):
+-    """map : MAP_START MAP_OR_SET_END"""
+-    p[0] = ImmutableDict({})
+-
+-
+ def p_map(p):
+     """map : MAP_START expressions MAP_OR_SET_END"""
+     terms = p[2]
+@@ -100,14 +80,20 @@ def p_map(p):
+     p[0] = ImmutableDict(dict([terms[i:i + 2] for i in range(0, len(terms), 2)]))
+ 
+ 
+-def p_expressions_expressions_expression(p):
+-    """expressions : expressions expression"""
+-    p[0] = p[1] + [p[2]]
++def p_discarded_expressions(p):
++    """discarded_expressions : DISCARD_TAG expression discarded_expressions
++                             |"""
++    p[0] = []
++
+ 
++def p_expressions_expression_expressions(p):
++    """expressions : expression expressions"""
++    p[0] = [p[1]] + p[2]
+ 
+-def p_expressions_expression(p):
+-    """expressions : expression"""
+-    p[0] = [p[1]]
++
++def p_expressions_empty(p):
++    """expressions : discarded_expressions"""
++    p[0] = []
+ 
+ 
+ def p_expression(p):
+@@ -119,6 +105,11 @@ def p_expression(p):
+     p[0] = p[1]
+ 
+ 
++def p_expression_discard_expression_expression(p):
++    """expression : DISCARD_TAG expression expression"""
++    p[0] = p[3]
++
++
+ def p_expression_tagged_element(p):
+     """expression : TAG expression"""
+     tag = p[1]
+@@ -144,9 +135,13 @@ def p_expression_tagged_element(p):
+     p[0] = output
+ 
+ 
++def eof():
++    raise EDNDecodeError('EOF Reached')
++
++
+ def p_error(p):
+     if p is None:
+-        raise EDNDecodeError('EOF Reached')
++        eof()
+     else:
+         raise EDNDecodeError(p)
+ 
+

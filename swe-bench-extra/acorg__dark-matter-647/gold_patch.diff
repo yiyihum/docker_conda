@@ -1,0 +1,297 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2ce0779..3931a9b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,8 @@
++## 3.0.50 Nov 23, 2018
++
++Added `bin/convert-diamond-to-sam.py` script to convert DIAMOND output
++format 6 to SAM.
++
+ ## 3.0.49 Nov 22, 2018
+ 
+ Added `btop2cigar` to `dark.btop` to convert BTOP strings to CIGAR strings.
+diff --git a/bin/convert-diamond-to-sam.py b/bin/convert-diamond-to-sam.py
+new file mode 100755
+index 0000000..38e3365
+--- /dev/null
++++ b/bin/convert-diamond-to-sam.py
+@@ -0,0 +1,145 @@
++#!/usr/bin/env python
++
++# See https://samtools.github.io/hts-specs/SAMv1.pdf for the SAM file
++# format specification.
++
++from __future__ import print_function, division
++
++import sys
++import argparse
++from os.path import basename
++from tempfile import TemporaryFile
++from functools import partial
++
++from dark import __version__ as VERSION
++from dark.btop import btop2cigar
++from dark.diamond.conversion import diamondTabularFormatToDicts
++from dark.reads import DNARead
++
++FIELDS = 'bitscore btop qframe qqual qseq qseqid slen sstart stitle'
++
++parser = argparse.ArgumentParser(
++    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
++    description=('Convert DIAMOND tabular format to SAM. The DIAMOND '
++                 'invocation *must* include --outfmt 6 %s' % FIELDS))
++
++parser.add_argument(
++    '--printFields', default=False, action='store_true',
++    help=('Print the field names in the order that they must be given to '
++          'diamond --outfmt 6 to produce correct input for this script, '
++          'then exit.'))
++
++parser.add_argument(
++    '--mappingQuality', type=int, default=255,
++    help=('The mapping quality to use for MAPQ (field 5). The default (255) '
++          'indicates that mapping quality information is not available.'))
++
++parser.add_argument(
++    '--ram', action='store_true', default=False,
++    help=('Do not use a temporary file to hold the non-header SAM output. '
++          'This will run faster but use more memory since all non-header SAM '
++          'output will be stored in RAM and only written out when the full '
++          'header can be determined.'))
++
++parser.add_argument(
++    '--keepDescriptions', action='store_true', default=False,
++    help=('Do not discard text after the first space in query or subject '
++          'sequence ids. Note that. Note that this violates the SAM '
++          'specification, but since SAM files are TAB-separated there '
++          'is probably only a small chance this will cause any problems '
++          'downstream.'))
++
++args = parser.parse_args()
++
++if args.printFields:
++    print(FIELDS)
++    sys.exit(0)
++
++idOnly = not args.keepDescriptions
++mappingQuality = args.mappingQuality
++ram = args.ram
++
++if 0 > mappingQuality > 255:
++    raise ValueError('Mapping quality must be between 0 and 255 (inclusive)')
++
++referenceLengths = {}
++
++if ram:
++    nonHeaderLines = []
++    emit = nonHeaderLines.append
++else:
++    tf = TemporaryFile(mode='w+t', encoding='utf-8')
++    emit = partial(print, file=tf)
++
++for match in diamondTabularFormatToDicts(sys.stdin, FIELDS.split()):
++    qseqid = match['qseqid'].split()[0] if idOnly else match['qseqid']
++    stitle = match['stitle'].split()[0] if idOnly else match['stitle']
++
++    referenceLengths[stitle] = match['slen']
++
++    # If the query frame is less than zero, the match was with a reverse
++    # complemented translation of the query. Put the reverse compliment
++    # into the SAM output, which seems to be standard / accepted practice
++    # based on my web searches. See e.g., https://www.biostars.org/p/131891/
++    # for what Bowtie2 does and for some comments on this issue for SAM/BAM
++    # files in general.
++    if match['qframe'] > 0:
++        flag = 0
++        qseq = match['qseq']
++        qqual = match['qqual'] or '*'
++    else:
++        flag = 16
++        qseq = DNARead('id', match['qseq']).reverseComplement().sequence
++        qqual = match['qqual'][::-1] if match['qqual'] else '*'
++
++    emit('\t'.join(map(str, [
++        # 1. QNAME
++        qseqid,
++        # 2. FLAG
++        flag,
++        # 3. RNAME
++        stitle,
++        # 4. POS
++        match['sstart'],
++        # 5. MAPQ
++        mappingQuality,
++        # 6. CIGAR
++        btop2cigar(match['btop']),
++        # 7. RNEXT
++        '*',
++        # 8. PNEXT
++        0,
++        # 9. TLEN
++        0,
++        # 10. SEQ
++        qseq,
++        # 11. QUAL
++        qqual,
++        # 12. Alignment score
++        'AS:i:%d' % int(match['bitscore'])])))
++
++
++progName = basename(sys.argv[0])
++
++# Print SAM headers.
++print('\n'.join(
++    [
++        '@PG\tID:DIAMOND\tPN:DIAMOND',
++        '@PG\tID:%s\tPN:%s (version %s)\tCL:%s %s\tPP:DIAMOND' %
++        (progName, progName, VERSION, progName, ' '.join(sys.argv[1:])),
++        '@CO\t%s is from the dark-matter package '
++        '(https://github.com/acorg/dark-matter/)' % progName,
++    ] +
++    [
++        '@SQ\tSN:%s\tLN:%d' % (name, referenceLengths[name])
++        for name in sorted(referenceLengths)
++    ]))
++
++# Print non-header lines.
++if ram:
++    print('\n'.join(nonHeaderLines))
++else:
++    tf.seek(0)
++    for line in tf:
++        print(line, end='')
++    tf.close()
+diff --git a/dark/__init__.py b/dark/__init__.py
+index e37701e..a768585 100644
+--- a/dark/__init__.py
++++ b/dark/__init__.py
+@@ -7,4 +7,4 @@ if sys.version_info < (2, 7):
+ # will not be found by the version() function in ../setup.py
+ #
+ # Remember to update ../CHANGELOG.md describing what's new in each version.
+-__version__ = '3.0.49'
++__version__ = '3.0.50'
+diff --git a/dark/diamond/conversion.py b/dark/diamond/conversion.py
+index 29c2694..42c2a8d 100644
+--- a/dark/diamond/conversion.py
++++ b/dark/diamond/conversion.py
+@@ -4,6 +4,7 @@ import six
+ import bz2
+ from json import dumps, loads
+ from operator import itemgetter
++from collections import Counter
+ 
+ from Bio.File import as_handle
+ 
+@@ -13,6 +14,85 @@ from dark.alignments import Alignment, ReadAlignments
+ from dark.diamond.hsp import normalizeHSP
+ 
+ 
++# The keys in the following are DIAMOND format 6 field names. The values
++# are one-argument functions that take a string and return an appropriately
++# converted field value.
++#
++# The following fields are taken from the DIAMOND manual v0.9.22 2018-05-11.
++# Fields whose name doesn't appear here will be left as strings.
++DIAMOND_FIELD_CONVERTER = {
++    'bitscore': float,
++    'evalue': float,
++    'frame': int,
++    'gapopen': int,
++    'gaps': int,
++    'identicalCount': lambda nident: None if nident is None else int(nident),
++    'length': int,
++    'mismatch': int,
++    'nident': int,
++    'pident': float,
++    'positive': int,
++    'positiveCount': lambda pos: None if pos is None else int(pos),
++    'ppos': float,
++    'qcovhsp': float,
++    'qend': int,
++    'qframe': int,
++    'qlen': int,
++    'qstart': int,
++    'score': float,
++    'send': int,
++    'slen': int,
++    'sstart': int,
++}
++
++
++def diamondTabularFormatToDicts(filename, fieldNames):
++    """
++    Read DIAMOND tabular (--outfmt 6) output and convert lines to dictionaries.
++
++    @param filename: Either a C{str} file name or an open file pointer.
++    @param fieldNames: A C{list} or C{tuple} of C{str} DIAMOND field names.
++        Run 'diamond -help' to see the full list.
++    @raise ValueError: If a line of C{filename} does not have the expected
++        number of TAB-separated fields (i.e., len(fieldNames)). Or if
++        C{fieldNames} is empty or contains duplicates.
++    @return: A generator that yields C{dict}s with keys that are the DIAMOND
++        field names and values as converted by DIAMOND_FIELD_CONVERTER.
++    """
++    nFields = len(fieldNames)
++    if not nFields:
++        raise ValueError('fieldNames cannot be empty.')
++
++    c = Counter(fieldNames)
++    if c.most_common(1)[0][1] > 1:
++        raise ValueError(
++            'fieldNames contains duplicated names: %s.' %
++            (', '.join(sorted(x[0] for x in c.most_common() if x[1] > 1))))
++
++    def identity(x):
++        return x
++
++    convertFunc = DIAMOND_FIELD_CONVERTER.get
++
++    with as_handle(filename) as fp:
++        for count, line in enumerate(fp, start=1):
++            result = {}
++            line = line[:-1]
++            values = line.split('\t')
++            if len(values) != nFields:
++                raise ValueError(
++                    'Line %d of %s had %d field values (expected %d). '
++                    'Line was %r.' %
++                    (count,
++                     (filename if isinstance(filename, six.string_types)
++                      else 'input'),
++                     len(values), nFields, line))
++            for fieldName, value in zip(fieldNames, values):
++                value = convertFunc(fieldName, identity)(value)
++                result[fieldName] = value
++            yield result
++
++
+ class DiamondTabularFormatReader(object):
+     """
+     Provide a method that yields parsed tabular records from a file. Store and
+diff --git a/dark/reads.py b/dark/reads.py
+index b2a4bcc..18171d0 100644
+--- a/dark/reads.py
++++ b/dark/reads.py
+@@ -766,7 +766,7 @@ class ReadFilter(object):
+         only return those that have length <= 100, so your result may have
+         less than 20 reads. The former version extracts reads of the
+         desired length and then takes 20 reads at random from that set, so
+-        you'll always get 20 raeds in your result, assuming there are at
++        you'll always get 20 reads in your result, assuming there are at
+         least that many reads satisfying the length filter.
+     @param trueLength: The C{int} number of reads in this C{Reads} instance.
+         Under normal circumstances it will not be necessary to pass this
+diff --git a/setup.py b/setup.py
+index fef9e17..bc089e7 100644
+--- a/setup.py
++++ b/setup.py
+@@ -35,6 +35,7 @@ scripts = [
+     'bin/compare-sequences.py',
+     'bin/convert-blast-xml-to-json.py',
+     'bin/convert-diamond-to-json.py',
++    'bin/convert-diamond-to-sam.py',
+     'bin/convert-sam-to-fastq.sh',
+     'bin/dark-matter-version.py',
+     'bin/dna-to-aa.py',

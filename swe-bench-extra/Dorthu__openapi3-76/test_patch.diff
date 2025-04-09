@@ -1,0 +1,141 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5a10c1b..b4e83cf 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -178,3 +178,11 @@ def schema_without_properties():
+     Provides a spec that includes a schema with no properties defined
+     """
+     yield _get_parsed_yaml("schema-without-properties.yaml")
++
++
++@pytest.fixture
++def rfc_6901():
++    """
++    Provides a spec that includes RFC 6901 escape codes in ref paths
++    """
++    yield _get_parsed_yaml("rfc_6901.yaml")
+diff --git a/tests/fixtures/rfc_6901.yaml b/tests/fixtures/rfc_6901.yaml
+new file mode 100644
+index 0000000..3b85030
+--- /dev/null
++++ b/tests/fixtures/rfc_6901.yaml
+@@ -0,0 +1,79 @@
++# this schema has refs whose paths include the escaped `~` and `/` characters
++# (escaped as ~0 and ~1 respectively).  This also purposefully includes the ~01
++# escape sequence to ensure parsing ends in `~1` and not `/`
++openapi: "3.1.0"
++info:
++  version: 1.0.0
++  title: RFC 6901 Test
++paths:
++  /ref-test:
++    parameters:
++      - $ref: '#/paths/~1parameters-holder/parameters/1'
++    get:
++      operationId: refTestGet
++      responses:
++        '200':
++          description: Test
++          content:
++            application/json:
++              schema:
++                description: |
++                  References all other fields in components/schemas to ensure all references
++                  are tested.
++                type: object
++                properties:
++                  one:
++                    $ref: '#/components/schemas/test~1one'
++                  two:
++                    $ref: '#/components/schemas/test~0two'
++                  three:
++                    $ref: '#/components/schemas/test~01three'
++                  four:
++                    $ref: '#/components/schemas/01/properties/example'
++  /parameters-holder:
++    parameters:
++      - name: example
++        in: query
++        schema:
++          type: int
++      - name: example2
++        in: query
++        schema:
++          type: int
++    get:
++      operationId: parametersHolderGet
++      responses:
++        '200':
++          description: Placeholder
++          content:
++            application/json:
++              schema:
++                type: object
++components:
++  schemas:
++    test/one:
++      description: |
++        Tests that refs can reference paths with a `/` character; this should be
++        escaped as `#/components/schemas/test~1one`
++      type: string
++    test~two:
++      description: |
++        Tests that refs can reference paths with a `~` character; this should be
++        escaped as `#/components/schemas/test~0two`
++      type: int
++    test~1three:
++      description: |
++        Tests that refs can reference paths with a ~1 sequence in them; this should
++        be escaped as `#/components/schemas/test~01three`
++      type: array
++      items:
++        type: string
++    '01':
++      description: |
++        Tests that paths parsed using integer-like segments are handled correctly.
++        This will be referenced as `#/components/schemas/0/properties/example`
++      type: object
++      properties:
++        example:
++          type: string
++          example: it worked
+diff --git a/tests/ref_test.py b/tests/ref_test.py
+index f7999be..3a15f5f 100644
+--- a/tests/ref_test.py
++++ b/tests/ref_test.py
+@@ -84,7 +84,7 @@ def test_ref_allof_handling(with_ref_allof):
+     spec = OpenAPI(with_ref_allof)
+     referenced_schema = spec.components.schemas['Example']
+ 
+-    # this should have only one property; the allOf from 
++    # this should have only one property; the allOf from
+     # paths['/allof-example']get.responses['200'].content['application/json'].schema
+     # should not modify the component
+     assert len(referenced_schema.properties) == 1, \
+@@ -92,3 +92,26 @@ def test_ref_allof_handling(with_ref_allof):
+                    len(referenced_schema.properties),
+                    ", ".join(referenced_schema.properties.keys()),
+             )
++
++def test_ref_6901_refs(rfc_6901):
++    """
++    Tests that RFC 6901 escape codes, such as ~0 and ~1, are pared correctly
++    """
++    spec = OpenAPI(rfc_6901, validate=True)
++    assert len(spec.errors()) == 0, spec.errors()
++
++    # spec parsed, make sure our refs got the right values
++    path = spec.paths['/ref-test']
++    response = path.get.responses['200'].content['application/json'].schema
++
++    assert response.properties['one'].type == 'string'
++    assert response.properties['two'].type == 'int'
++    assert response.properties['three'].type == 'array'
++
++    # ensure the integer path components parsed as expected too
++    assert response.properties['four'].type == 'string'
++    assert response.properties['four'].example == 'it worked'
++
++    # ensure integer path parsing does work as expected
++    assert len(path.parameters) == 1
++    assert path.parameters[0].name == 'example2'

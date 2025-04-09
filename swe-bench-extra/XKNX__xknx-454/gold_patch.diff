@@ -1,0 +1,183 @@
+diff --git a/.github/pull_request_template.md b/.github/pull_request_template.md
+index f470c332..29b7fbe0 100644
+--- a/.github/pull_request_template.md
++++ b/.github/pull_request_template.md
+@@ -2,33 +2,33 @@
+   You are awesome! Thanks for contributing to our project!
+   Please, DO NOT DELETE ANY TEXT from this template!.
+ -->
+-
++## Description
+ <!--
+ Please include a summary of the change and which issue is fixed.
+ Please also include relevant motivation and context.
+ List any dependencies that are required for this change.
+ -->
+-## Description
+-
+ 
+ 
+ Fixes # (issue)
+ 
++## Type of change
+ <!--
+ Please tick the applicable options.
+ NOTE: Ticking multiple options most likely indicates
+ that your change is to big and it is suggested to split it into several smaller PRs.
+ -->
+-## Type of change
+ 
+ - [ ] Bug fix (non-breaking change which fixes an issue)
+ - [ ] New feature (non-breaking change which adds functionality)
+ - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+ - [ ] This change requires a documentation update
+ 
+-# Checklist:
++## Checklist:
+ 
+ - [ ] I have performed a self-review of my own code
+-- [ ] I have made corresponding changes to the documentation
+-- [ ] My changes generate no new warnings
+-- [ ] I have added tests that prove my fix is effective or that my feature works
++- [ ] The documentation has been adjusted accordingly
++- [ ] The changes generate no new warnings
++- [ ] Tests have been added that prove the fix is effective or that the feature works
++- [ ] The changes are documented in the changelog
++- [ ] The Homeassistant plugin has been adjusted in case of new config options
+diff --git a/home-assistant-plugin/custom_components/xknx/const.py b/home-assistant-plugin/custom_components/xknx/const.py
+index 8bb99529..b5bdd447 100644
+--- a/home-assistant-plugin/custom_components/xknx/const.py
++++ b/home-assistant-plugin/custom_components/xknx/const.py
+@@ -18,6 +18,7 @@ DOMAIN = "xknx"
+ 
+ CONF_STATE_ADDRESS = "state_address"
+ CONF_SYNC_STATE = "sync_state"
++CONF_RESET_AFTER = "reset_after"
+ 
+ 
+ class ColorTempModes(Enum):
+diff --git a/home-assistant-plugin/custom_components/xknx/factory.py b/home-assistant-plugin/custom_components/xknx/factory.py
+index 157565c4..9e721817 100644
+--- a/home-assistant-plugin/custom_components/xknx/factory.py
++++ b/home-assistant-plugin/custom_components/xknx/factory.py
+@@ -202,6 +202,7 @@ def _create_switch(knx_module: XKNX, config: ConfigType) -> XknxSwitch:
+         name=config[CONF_NAME],
+         group_address=config[CONF_ADDRESS],
+         group_address_state=config.get(SwitchSchema.CONF_STATE_ADDRESS),
++        reset_after=config.get(SwitchSchema.CONF_RESET_AFTER),
+     )
+ 
+ 
+diff --git a/home-assistant-plugin/custom_components/xknx/schema.py b/home-assistant-plugin/custom_components/xknx/schema.py
+index a224d9cb..89a6fac7 100644
+--- a/home-assistant-plugin/custom_components/xknx/schema.py
++++ b/home-assistant-plugin/custom_components/xknx/schema.py
+@@ -15,6 +15,7 @@ from homeassistant.const import (
+ import homeassistant.helpers.config_validation as cv
+ 
+ from .const import (
++    CONF_RESET_AFTER,
+     CONF_STATE_ADDRESS,
+     CONF_SYNC_STATE,
+     OPERATION_MODES,
+@@ -86,7 +87,7 @@ class BinarySensorSchema:
+     CONF_SYNC_STATE = CONF_SYNC_STATE
+     CONF_IGNORE_INTERNAL_STATE = "ignore_internal_state"
+     CONF_CONTEXT_TIMEOUT = "context_timeout"
+-    CONF_RESET_AFTER = "reset_after"
++    CONF_RESET_AFTER = CONF_RESET_AFTER
+ 
+     DEFAULT_NAME = "KNX Binary Sensor"
+ 
+@@ -253,6 +254,7 @@ class SwitchSchema:
+     """Voluptuous schema for KNX switches."""
+ 
+     CONF_STATE_ADDRESS = CONF_STATE_ADDRESS
++    CONF_RESET_AFTER = CONF_RESET_AFTER
+ 
+     DEFAULT_NAME = "KNX Switch"
+     SCHEMA = vol.Schema(
+@@ -260,6 +262,7 @@ class SwitchSchema:
+             vol.Required(CONF_ADDRESS): cv.string,
+             vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+             vol.Optional(CONF_STATE_ADDRESS): cv.string,
++            vol.Optional(CONF_RESET_AFTER): cv.positive_float,
+         }
+     )
+ 
+diff --git a/xknx/devices/switch.py b/xknx/devices/switch.py
+index 670eb569..0a9dab20 100644
+--- a/xknx/devices/switch.py
++++ b/xknx/devices/switch.py
+@@ -6,6 +6,7 @@ It provides functionality for
+ * switching 'on' and 'off'.
+ * reading the current state from KNX bus.
+ """
++import asyncio
+ import logging
+ 
+ from xknx.remote_value import RemoteValueSwitch
+@@ -22,6 +23,7 @@ class Switch(Device):
+         self,
+         xknx,
+         name,
++        reset_after=None,
+         group_address=None,
+         group_address_state=None,
+         device_updated_cb=None,
+@@ -30,6 +32,10 @@ class Switch(Device):
+         # pylint: disable=too-many-arguments
+         super().__init__(xknx, name, device_updated_cb)
+ 
++        self.reset_after = reset_after
++        self._reset_task = None
++        self.state = False
++
+         self.switch = RemoteValueSwitch(
+             xknx,
+             group_address,
+@@ -42,6 +48,11 @@ class Switch(Device):
+         """Iterate the devices RemoteValue classes."""
+         yield self.switch
+ 
++    def __del__(self):
++        """Destructor. Cleaning up if this was not done before."""
++        if self._reset_task:
++            self._reset_task.cancel()
++
+     @classmethod
+     def from_config(cls, xknx, name, config):
+         """Initialize object from configuration structure."""
+@@ -55,12 +66,6 @@ class Switch(Device):
+             group_address_state=group_address_state,
+         )
+ 
+-    @property
+-    def state(self):
+-        """Return the current switch state of the device."""
+-        # None will return False
+-        return bool(self.switch.value)
+-
+     async def set_on(self):
+         """Switch on switch."""
+         await self.switch.on()
+@@ -82,7 +87,18 @@ class Switch(Device):
+ 
+     async def process_group_write(self, telegram):
+         """Process incoming and outgoing GROUP WRITE telegram."""
+-        await self.switch.process(telegram)
++        if await self.switch.process(telegram):
++            self.state = self.switch.value
++            if self.reset_after is not None and self.state:
++                if self._reset_task:
++                    self._reset_task.cancel()
++                self._reset_task = asyncio.create_task(
++                    self._reset_state(self.reset_after)
++                )
++
++    async def _reset_state(self, wait_seconds: float):
++        await asyncio.sleep(wait_seconds)
++        await self.set_off()
+ 
+     def __str__(self):
+         """Return object as readable string."""

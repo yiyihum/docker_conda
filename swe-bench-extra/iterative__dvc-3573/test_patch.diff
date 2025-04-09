@@ -1,0 +1,298 @@
+diff --git a/tests/func/params/__init__.py b/tests/func/params/__init__.py
+new file mode 100644
+diff --git a/tests/func/params/test_diff.py b/tests/func/params/test_diff.py
+new file mode 100644
+--- /dev/null
++++ b/tests/func/params/test_diff.py
+@@ -0,0 +1,87 @@
++def test_diff_no_params(tmp_dir, scm, dvc):
++    assert dvc.params.diff() == {}
++
++
++def test_diff_no_changes(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo: bar")
++    dvc.run(params=["foo"])
++    scm.add(["params.yaml", "Dvcfile"])
++    scm.commit("bar")
++    assert dvc.params.diff() == {}
++
++
++def test_diff(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo: bar")
++    dvc.run(params=["foo"])
++    scm.add(["params.yaml", "Dvcfile"])
++    scm.commit("bar")
++
++    tmp_dir.scm_gen("params.yaml", "foo: baz", commit="baz")
++    tmp_dir.scm_gen("params.yaml", "foo: qux", commit="qux")
++
++    assert dvc.params.diff(a_rev="HEAD~2") == {
++        "params.yaml": {"foo": {"old": "bar", "new": "qux"}}
++    }
++
++
++def test_diff_new(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo: bar")
++    dvc.run(params=["foo"])
++
++    assert dvc.params.diff() == {
++        "params.yaml": {"foo": {"old": None, "new": "bar"}}
++    }
++
++
++def test_diff_deleted(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo: bar")
++    dvc.run(params=["foo"])
++    scm.add(["params.yaml", "Dvcfile"])
++    scm.commit("bar")
++
++    (tmp_dir / "Dvcfile").unlink()
++
++    assert dvc.params.diff() == {
++        "params.yaml": {"foo": {"old": "bar", "new": None}}
++    }
++
++
++def test_diff_deleted_config(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo: bar")
++    dvc.run(params=["foo"])
++    scm.add(["params.yaml", "Dvcfile"])
++    scm.commit("bar")
++
++    (tmp_dir / "params.yaml").unlink()
++
++    assert dvc.params.diff() == {
++        "params.yaml": {"foo": {"old": "bar", "new": None}}
++    }
++
++
++def test_diff_list(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo:\n- bar\n- baz")
++    dvc.run(params=["foo"])
++    scm.add(["params.yaml", "Dvcfile"])
++    scm.commit("foo")
++
++    tmp_dir.gen("params.yaml", "foo:\n- bar\n- baz\n- qux")
++
++    assert dvc.params.diff() == {
++        "params.yaml": {
++            "foo": {"old": "['bar', 'baz']", "new": "['bar', 'baz', 'qux']"}
++        }
++    }
++
++
++def test_diff_dict(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo:\n  bar: baz")
++    dvc.run(params=["foo"])
++    scm.add(["params.yaml", "Dvcfile"])
++    scm.commit("foo")
++
++    tmp_dir.gen("params.yaml", "foo:\n  bar: qux")
++
++    assert dvc.params.diff() == {
++        "params.yaml": {"foo.bar": {"old": "baz", "new": "qux"}}
++    }
+diff --git a/tests/func/params/test_show.py b/tests/func/params/test_show.py
+new file mode 100644
+--- /dev/null
++++ b/tests/func/params/test_show.py
+@@ -0,0 +1,35 @@
++import pytest
++
++from dvc.repo.params.show import NoParamsError
++
++
++def test_show_empty(dvc):
++    with pytest.raises(NoParamsError):
++        dvc.params.show()
++
++
++def test_show(tmp_dir, dvc):
++    tmp_dir.gen("params.yaml", "foo: bar")
++    dvc.run(params=["foo"])
++    assert dvc.params.show() == {"": {"params.yaml": {"foo": "bar"}}}
++
++
++def test_show_list(tmp_dir, dvc):
++    tmp_dir.gen("params.yaml", "foo:\n- bar\n- baz\n")
++    dvc.run(params=["foo"])
++    assert dvc.params.show() == {"": {"params.yaml": {"foo": ["bar", "baz"]}}}
++
++
++def test_show_branch(tmp_dir, scm, dvc):
++    tmp_dir.gen("params.yaml", "foo: bar")
++    dvc.run(params=["foo"])
++    scm.add(["params.yaml", "Dvcfile"])
++    scm.commit("init")
++
++    with tmp_dir.branch("branch", new=True):
++        tmp_dir.scm_gen("params.yaml", "foo: baz", commit="branch")
++
++    assert dvc.params.show(revs=["branch"]) == {
++        "working tree": {"params.yaml": {"foo": "bar"}},
++        "branch": {"params.yaml": {"foo": "baz"}},
++    }
+diff --git a/tests/unit/command/test_params.py b/tests/unit/command/test_params.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/command/test_params.py
+@@ -0,0 +1,85 @@
++import logging
++
++from dvc.cli import parse_args
++from dvc.command.params import CmdParamsDiff, _show_diff
++
++
++def test_params_diff(dvc, mocker):
++    cli_args = parse_args(
++        ["params", "diff", "HEAD~10", "HEAD~1", "--show-json"]
++    )
++    assert cli_args.func == CmdParamsDiff
++
++    cmd = cli_args.func(cli_args)
++    m = mocker.patch("dvc.repo.params.diff.diff", return_value={})
++
++    assert cmd.run() == 0
++
++    m.assert_called_once_with(
++        cmd.repo, a_rev="HEAD~10", b_rev="HEAD~1",
++    )
++
++
++def test_params_diff_changed():
++    assert _show_diff({"params.yaml": {"a.b.c": {"old": 1, "new": 2}}}) == (
++        "   Path       Param   Old   New\n" "params.yaml   a.b.c   1     2  "
++    )
++
++
++def test_params_diff_list():
++    assert _show_diff(
++        {"params.yaml": {"a.b.c": {"old": 1, "new": [2, 3]}}}
++    ) == (
++        "   Path       Param   Old    New  \n"
++        "params.yaml   a.b.c   1     [2, 3]"
++    )
++
++
++def test_params_diff_unchanged():
++    assert _show_diff(
++        {"params.yaml": {"a.b.d": {"old": "old", "new": "new"}}}
++    ) == (
++        "   Path       Param   Old   New\n" "params.yaml   a.b.d   old   new"
++    )
++
++
++def test_params_diff_no_changes():
++    assert _show_diff({}) == ""
++
++
++def test_params_diff_new():
++    assert _show_diff(
++        {"params.yaml": {"a.b.d": {"old": None, "new": "new"}}}
++    ) == (
++        "   Path       Param   Old    New\n" "params.yaml   a.b.d   None   new"
++    )
++
++
++def test_params_diff_deleted():
++    assert _show_diff(
++        {"params.yaml": {"a.b.d": {"old": "old", "new": None}}}
++    ) == (
++        "   Path       Param   Old   New \n" "params.yaml   a.b.d   old   None"
++    )
++
++
++def test_params_diff_prec():
++    assert _show_diff(
++        {"params.yaml": {"train.lr": {"old": 0.0042, "new": 0.0043}}}
++    ) == (
++        "   Path        Param      Old      New  \n"
++        "params.yaml   train.lr   0.0042   0.0043"
++    )
++
++
++def test_params_diff_show_json(dvc, mocker, caplog):
++    cli_args = parse_args(
++        ["params", "diff", "HEAD~10", "HEAD~1", "--show-json"]
++    )
++    cmd = cli_args.func(cli_args)
++    mocker.patch(
++        "dvc.repo.params.diff.diff", return_value={"params.yaml": {"a": "b"}}
++    )
++    with caplog.at_level(logging.INFO, logger="dvc"):
++        assert cmd.run() == 0
++        assert '{"params.yaml": {"a": "b"}}\n' in caplog.text
+diff --git a/tests/unit/dependency/test_params.py b/tests/unit/dependency/test_params.py
+--- a/tests/unit/dependency/test_params.py
++++ b/tests/unit/dependency/test_params.py
+@@ -57,27 +57,34 @@ def test_dumpd_without_info(dvc):
+     }
+ 
+ 
+-def test_get_info_nonexistent_file(dvc):
++def test_read_params_nonexistent_file(dvc):
+     dep = DependencyPARAMS(Stage(dvc), None, ["foo"])
+-    assert dep._get_info() == {}
++    assert dep.read_params() == {}
+ 
+ 
+-def test_get_info_unsupported_format(tmp_dir, dvc):
++def test_read_params_unsupported_format(tmp_dir, dvc):
+     tmp_dir.gen("params.yaml", b"\0\1\2\3\4\5\6\7")
+     dep = DependencyPARAMS(Stage(dvc), None, ["foo"])
+     with pytest.raises(BadParamFileError):
+-        dep._get_info()
++        dep.read_params()
+ 
+ 
+-def test_get_info_nested(tmp_dir, dvc):
++def test_read_params_nested(tmp_dir, dvc):
+     tmp_dir.gen(
+         "params.yaml", yaml.dump({"some": {"path": {"foo": ["val1", "val2"]}}})
+     )
+     dep = DependencyPARAMS(Stage(dvc), None, ["some.path.foo"])
+-    assert dep._get_info() == {"some.path.foo": ["val1", "val2"]}
++    assert dep.read_params() == {"some.path.foo": ["val1", "val2"]}
+ 
+ 
+-def test_save_info_missing_params(dvc):
++def test_save_info_missing_config(dvc):
++    dep = DependencyPARAMS(Stage(dvc), None, ["foo"])
++    with pytest.raises(MissingParamsError):
++        dep.save_info()
++
++
++def test_save_info_missing_param(tmp_dir, dvc):
++    tmp_dir.gen("params.yaml", "bar: baz")
+     dep = DependencyPARAMS(Stage(dvc), None, ["foo"])
+     with pytest.raises(MissingParamsError):
+         dep.save_info()
+diff --git a/tests/unit/remote/test_local.py b/tests/unit/remote/test_local.py
+--- a/tests/unit/remote/test_local.py
++++ b/tests/unit/remote/test_local.py
+@@ -8,12 +8,12 @@
+ from dvc.remote.local import RemoteLOCAL
+ 
+ 
+-def test_status_download_optimization(mocker):
++def test_status_download_optimization(mocker, dvc):
+     """When comparing the status to pull a remote cache,
+         And the desired files to fetch are already on the local cache,
+         Don't check the existence of the desired files on the remote cache
+     """
+-    remote = RemoteLOCAL(None, {})
++    remote = RemoteLOCAL(dvc, {})
+ 
+     infos = NamedCache()
+     infos.add("local", "acbd18db4cc2f85cedef654fccc4a4d8", "foo")
+@@ -32,8 +32,8 @@ def test_status_download_optimization(mocker):
+ 
+ 
+ @pytest.mark.parametrize("link_name", ["hardlink", "symlink"])
+-def test_is_protected(tmp_dir, link_name):
+-    remote = RemoteLOCAL(None, {})
++def test_is_protected(tmp_dir, dvc, link_name):
++    remote = RemoteLOCAL(dvc, {})
+     link_method = getattr(remote, link_name)
+ 
+     (tmp_dir / "foo").write_text("foo")

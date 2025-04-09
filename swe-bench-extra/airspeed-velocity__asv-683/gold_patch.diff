@@ -1,0 +1,277 @@
+diff --git a/asv/benchmark.py b/asv/benchmark.py
+index 20cf86f..8f6932f 100644
+--- a/asv/benchmark.py
++++ b/asv/benchmark.py
+@@ -470,10 +470,12 @@ class TimeBenchmark(Benchmark):
+         samples = [s/number for s in samples]
+         return {'samples': samples, 'number': number}
+ 
+-    def benchmark_timing(self, timer, repeat, warmup_time, number=0):
++    def benchmark_timing(self, timer, repeat, warmup_time, number=0,
++                         min_timeit_count=2):
+         sample_time = self.sample_time
+ 
+         start_time = time.time()
++        timeit_count = 0
+ 
+         if repeat == 0:
+             # automatic number of samples: 10 is large enough to
+@@ -483,6 +485,8 @@ class TimeBenchmark(Benchmark):
+ 
+             def too_slow(timing):
+                 # stop taking samples if limits exceeded
++                if timeit_count < min_timeit_count:
++                    return False
+                 if default_number:
+                     t = 1.3*sample_time
+                     max_time = start_time + min(warmup_time + repeat * t,
+@@ -508,6 +512,7 @@ class TimeBenchmark(Benchmark):
+                 timing = timer.timeit(number)
+                 wall_time = time.time() - start
+                 actual_timing = max(wall_time, timing)
++                min_timeit_count += 1
+ 
+                 if actual_timing >= sample_time:
+                     if time.time() > start_time + warmup_time:
+@@ -526,8 +531,10 @@ class TimeBenchmark(Benchmark):
+             while True:
+                 self._redo_setup_next = False
+                 timing = timer.timeit(number)
++                min_timeit_count += 1
+                 if time.time() >= start_time + warmup_time:
+                     break
++
+             if too_slow(timing):
+                 return [timing], number
+ 
+@@ -535,6 +542,7 @@ class TimeBenchmark(Benchmark):
+         samples = []
+         for j in range(repeat):
+             timing = timer.timeit(number)
++            min_timeit_count += 1
+             samples.append(timing)
+ 
+             if too_slow(timing):
+diff --git a/asv/benchmarks.py b/asv/benchmarks.py
+index 8dacfbb..0dfb0ee 100644
+--- a/asv/benchmarks.py
++++ b/asv/benchmarks.py
+@@ -81,8 +81,6 @@ def run_benchmark(benchmark, root, env, show_stderr=False,
+         - `samples`: List of lists of sampled raw data points, if benchmark produces
+           those and was successful.
+ 
+-        - `number`: Repeact count associated with each sample.
+-
+         - `stats`: List of results of statistical analysis of data.
+ 
+         - `profile`: If `profile` is `True` and run was at least partially successful, 
+@@ -126,8 +124,8 @@ def run_benchmark(benchmark, root, env, show_stderr=False,
+             if (selected_idx is not None and benchmark['params']
+                     and param_idx not in selected_idx):
+                 # Use NaN to mark the result as skipped
+-                bench_results.append(dict(samples=None, number=None,
+-                                          result=float('nan'), stats=None))
++                bench_results.append(dict(samples=None, result=float('nan'),
++                                          stats=None))
+                 bench_profiles.append(None)
+                 continue
+             success, data, profile_data, err, out, errcode = \
+@@ -139,14 +137,13 @@ def run_benchmark(benchmark, root, env, show_stderr=False,
+             total_count += 1
+             if success:
+                 if isinstance(data, dict) and 'samples' in data:
+-                    value, stats = statistics.compute_stats(data['samples'])
++                    value, stats = statistics.compute_stats(data['samples'],
++                                                            data['number'])
+                     result_data = dict(samples=data['samples'],
+-                                       number=data['number'],
+                                        result=value,
+                                        stats=stats)
+                 else:
+                     result_data = dict(samples=None,
+-                                       number=None,
+                                        result=data,
+                                        stats=None)
+ 
+@@ -155,7 +152,7 @@ def run_benchmark(benchmark, root, env, show_stderr=False,
+                     bench_profiles.append(profile_data)
+             else:
+                 failure_count += 1
+-                bench_results.append(dict(samples=None, number=None, result=None, stats=None))
++                bench_results.append(dict(samples=None, result=None, stats=None))
+                 bench_profiles.append(None)
+                 if data is not None:
+                     bad_output = data
+@@ -181,7 +178,7 @@ def run_benchmark(benchmark, root, env, show_stderr=False,
+                 result['stderr'] += err
+ 
+         # Produce result
+-        for key in ['samples', 'number', 'result', 'stats']:
++        for key in ['samples', 'result', 'stats']:
+             result[key] = [x[key] for x in bench_results]
+ 
+         if benchmark['params']:
+diff --git a/asv/commands/run.py b/asv/commands/run.py
+index 69b73d2..dec7ab8 100644
+--- a/asv/commands/run.py
++++ b/asv/commands/run.py
+@@ -307,7 +307,6 @@ class Run(Command):
+                         for benchmark_name, d in six.iteritems(results):
+                             if not record_samples:
+                                 d['samples'] = None
+-                                d['number'] = None
+ 
+                             benchmark_version = benchmarks[benchmark_name]['version']
+                             result.add_result(benchmark_name, d, benchmark_version)
+diff --git a/asv/results.py b/asv/results.py
+index 8513b71..f7a4c70 100644
+--- a/asv/results.py
++++ b/asv/results.py
+@@ -213,7 +213,6 @@ class Results(object):
+         self._date = date
+         self._results = {}
+         self._samples = {}
+-        self._number = {}
+         self._stats = {}
+         self._benchmark_params = {}
+         self._profiles = {}
+@@ -345,17 +344,11 @@ class Results(object):
+         samples : {None, list}
+             Raw result samples. If the benchmark is parameterized,
+             return a list of values.
+-        number : int
+-            Associated repeat count
+ 
+         """
+-        samples = _compatible_results(self._samples[key],
+-                                      self._benchmark_params[key],
+-                                      params)
+-        number = _compatible_results(self._number[key],
+-                                     self._benchmark_params[key],
+-                                     params)
+-        return samples, number
++        return _compatible_results(self._samples[key],
++                                   self._benchmark_params[key],
++                                   params)
+ 
+     def get_result_params(self, key):
+         """
+@@ -370,7 +363,6 @@ class Results(object):
+         del self._results[key]
+         del self._benchmark_params[key]
+         del self._samples[key]
+-        del self._number[key]
+         del self._stats[key]
+ 
+         # Remove profiles (may be missing)
+@@ -398,7 +390,6 @@ class Results(object):
+         """
+         self._results[benchmark_name] = result['result']
+         self._samples[benchmark_name] = result['samples']
+-        self._number[benchmark_name] = result['number']
+         self._stats[benchmark_name] = result['stats']
+         self._benchmark_params[benchmark_name] = result['params']
+         self._started_at[benchmark_name] = util.datetime_to_js_timestamp(result['started_at'])
+@@ -455,8 +446,6 @@ class Results(object):
+             value = {'result': self._results[key]}
+             if self._samples[key] and any(x is not None for x in self._samples[key]):
+                 value['samples'] = self._samples[key]
+-            if self._number[key] and any(x is not None for x in self._number[key]):
+-                value['number'] = self._number[key]
+             if self._stats[key] and any(x is not None for x in self._stats[key]):
+                 value['stats'] = self._stats[key]
+             if self._benchmark_params[key]:
+@@ -528,14 +517,13 @@ class Results(object):
+ 
+             obj._results = {}
+             obj._samples = {}
+-            obj._number = {}
+             obj._stats = {}
+             obj._benchmark_params = {}
+ 
+             for key, value in six.iteritems(d['results']):
+                 # Backward compatibility
+                 if not isinstance(value, dict):
+-                    value = {'result': [value], 'samples': None, 'number': None,
++                    value = {'result': [value], 'samples': None,
+                              'stats': None, 'params': []}
+ 
+                 if not isinstance(value['result'], list):
+@@ -545,14 +533,12 @@ class Results(object):
+                     value['stats'] = [value['stats']]
+ 
+                 value.setdefault('samples', None)
+-                value.setdefault('number', None)
+                 value.setdefault('stats', None)
+                 value.setdefault('params', [])
+ 
+                 # Assign results
+                 obj._results[key] = value['result']
+                 obj._samples[key] = value['samples']
+-                obj._number[key] = value['number']
+                 obj._stats[key] = value['stats']
+                 obj._benchmark_params[key] = value['params']
+ 
+@@ -580,7 +566,7 @@ class Results(object):
+         Add any existing old results that aren't overridden by the
+         current results.
+         """
+-        for dict_name in ('_samples', '_number', '_stats',
++        for dict_name in ('_samples', '_stats',
+                           '_benchmark_params', '_profiles', '_started_at',
+                           '_ended_at', '_benchmark_version'):
+             old_dict = getattr(old, dict_name)
+diff --git a/asv/statistics.py b/asv/statistics.py
+index 3ef9e06..f05989e 100644
+--- a/asv/statistics.py
++++ b/asv/statistics.py
+@@ -11,7 +11,7 @@ import math
+ from .util import inf, nan
+ 
+ 
+-def compute_stats(samples):
++def compute_stats(samples, number):
+     """
+     Statistical analysis of measured samples.
+ 
+@@ -19,6 +19,8 @@ def compute_stats(samples):
+     ----------
+     samples : list of float
+         List of total times (y) of benchmarks.
++    number : int
++        Repeat number for each sample.
+ 
+     Returns
+     -------
+@@ -72,7 +74,8 @@ def compute_stats(samples):
+              'max': max(Y),
+              'mean': mean,
+              'std': std,
+-             'n': len(Y)}
++             'repeat': len(Y),
++             'number': number}
+ 
+     return result, stats
+ 
+diff --git a/docs/source/dev.rst b/docs/source/dev.rst
+index 31fea20..7afae00 100644
+--- a/docs/source/dev.rst
++++ b/docs/source/dev.rst
+@@ -145,15 +145,11 @@ A benchmark suite directory has the following layout.  The
+ 
+           This key is omitted if there are no samples recorded.
+ 
+-        - ``number``: contains the repeat count(s) associated with the
+-          measured samples. Same format as for ``result``.
+-
+-          This key is omitted if there are no samples recorded.
+-
+         - ``stats``: dictionary containing results of statistical
+           analysis. Contains keys ``ci_99`` (confidence interval
+           estimate for the result), ``q_25``, ``q_75`` (percentiles),
+-          ``min``, ``max``, ``mean``, ``std``, and ``n``.
++          ``min``, ``max``, ``mean``, ``std``, ``repeat``, and
++          ``number``.
+ 
+           This key is omitted if there is no statistical analysis.
+ 

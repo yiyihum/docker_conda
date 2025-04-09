@@ -1,0 +1,135 @@
+diff --git a/testing/conftest.py b/testing/conftest.py
+index c881042..d29b5dd 100644
+--- a/testing/conftest.py
++++ b/testing/conftest.py
+@@ -3,10 +3,10 @@ from __future__ import annotations
+ import os
+ from pathlib import Path
+ from typing import Any
+-from typing import Generator
+ 
+ import pytest
+ 
++import setuptools_scm.utils
+ from .wd_wrapper import WorkDir
+ 
+ 
+@@ -39,13 +39,25 @@ def pytest_addoption(parser: Any) -> None:
+     )
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def debug_mode() -> Generator[None, None, None]:
+-    from setuptools_scm import utils
++class DebugMode:
++    def __init__(self, monkeypatch: pytest.MonkeyPatch):
++        self.__monkeypatch = monkeypatch
++        self.__module = setuptools_scm.utils
++
++    __monkeypatch: pytest.MonkeyPatch
++
++    def enable(self) -> None:
++        self.__monkeypatch.setattr(self.__module, "DEBUG", True)
+ 
+-    utils.DEBUG = True
+-    yield
+-    utils.DEBUG = False
++    def disable(self) -> None:
++        self.__monkeypatch.setattr(self.__module, "DEBUG", False)
++
++
++@pytest.fixture(autouse=True)
++def debug_mode(monkeypatch: pytest.MonkeyPatch) -> DebugMode:
++    debug_mode = DebugMode(monkeypatch)
++    debug_mode.enable()
++    return debug_mode
+ 
+ 
+ @pytest.fixture
+diff --git a/testing/test_cli.py b/testing/test_cli.py
+new file mode 100644
+index 0000000..0198111
+--- /dev/null
++++ b/testing/test_cli.py
+@@ -0,0 +1,50 @@
++from __future__ import annotations
++
++import io
++from contextlib import redirect_stdout
++
++import pytest
++
++from .conftest import DebugMode
++from .test_git import wd as wd_fixture  # NOQA evil fixture reuse
++from .wd_wrapper import WorkDir
++from setuptools_scm._cli import main
++
++
++PYPROJECT_TOML = "pyproject.toml"
++PYPROJECT_SIMPLE = "[tool.setuptools_scm]"
++PYPROJECT_ROOT = '[tool.setuptools_scm]\nroot=".."'
++
++
++def get_output(args: list[str]) -> str:
++
++    with redirect_stdout(io.StringIO()) as out:
++        main(args)
++    return out.getvalue()
++
++
++def test_cli_find_pyproject(
++    wd: WorkDir, monkeypatch: pytest.MonkeyPatch, debug_mode: DebugMode
++) -> None:
++    debug_mode.disable()
++    wd.commit_testfile()
++    wd.write(PYPROJECT_TOML, PYPROJECT_SIMPLE)
++    monkeypatch.chdir(wd.cwd)
++
++    out = get_output([])
++    assert out.startswith("0.1.dev1+")
++
++    with pytest.raises(SystemExit, match="no version found for"):
++        get_output(["--root=.."])
++
++    wd.write(PYPROJECT_TOML, PYPROJECT_ROOT)
++    with pytest.raises(SystemExit, match="no version found for"):
++        print(get_output(["-c", PYPROJECT_TOML]))
++
++    with pytest.raises(SystemExit, match="no version found for"):
++
++        get_output(["-c", PYPROJECT_TOML, "--root=.."])
++
++    with pytest.warns(UserWarning, match="root .. is overridden by the cli arg ."):
++        out = get_output(["-c", PYPROJECT_TOML, "--root=."])
++    assert out.startswith("0.1.dev1+")
+diff --git a/testing/test_git.py b/testing/test_git.py
+index cb54f61..6663527 100644
+--- a/testing/test_git.py
++++ b/testing/test_git.py
+@@ -15,6 +15,7 @@ from unittest.mock import patch
+ 
+ import pytest
+ 
++from .conftest import DebugMode
+ from .wd_wrapper import WorkDir
+ from setuptools_scm import Configuration
+ from setuptools_scm import format_version
+@@ -31,14 +32,16 @@ pytestmark = pytest.mark.skipif(
+ )
+ 
+ 
+-@pytest.fixture
+-def wd(wd: WorkDir, monkeypatch: pytest.MonkeyPatch) -> WorkDir:
++@pytest.fixture(name="wd")
++def wd(wd: WorkDir, monkeypatch: pytest.MonkeyPatch, debug_mode: DebugMode) -> WorkDir:
++    debug_mode.disable()
+     monkeypatch.delenv("HOME", raising=False)
+     wd("git init")
+     wd("git config user.email test@example.com")
+     wd('git config user.name "a test"')
+     wd.add_command = "git add ."
+     wd.commit_command = "git commit -m test-{reason}"
++    debug_mode.enable()
+     return wd
+ 
+ 

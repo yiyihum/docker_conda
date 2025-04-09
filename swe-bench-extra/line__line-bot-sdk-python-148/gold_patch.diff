@@ -1,0 +1,194 @@
+diff --git a/examples/flask-kitchensink/app.py b/examples/flask-kitchensink/app.py
+index 08a41a8..63dc012 100644
+--- a/examples/flask-kitchensink/app.py
++++ b/examples/flask-kitchensink/app.py
+@@ -40,6 +40,7 @@ from linebot.models import (
+     StickerMessage, StickerSendMessage, LocationMessage, LocationSendMessage,
+     ImageMessage, VideoMessage, AudioMessage, FileMessage,
+     UnfollowEvent, FollowEvent, JoinEvent, LeaveEvent, BeaconEvent,
++    MemberJoinedEvent, MemberLeftEvent,
+     FlexSendMessage, BubbleContainer, ImageComponent, BoxComponent,
+     TextComponent, SpacerComponent, IconComponent, ButtonComponent,
+     SeparatorComponent, QuickReply, QuickReplyButton,
+@@ -436,6 +437,20 @@ def handle_beacon(event):
+                 event.beacon.hwid, event.beacon.dm)))
+ 
+ 
++@handler.add(MemberJoinedEvent)
++def handle_member_joined(event):
++    line_bot_api.reply_message(
++        event.reply_token,
++        TextSendMessage(
++            text='Got memberJoined event. event={}'.format(
++                event)))
++
++
++@handler.add(MemberLeftEvent)
++def handle_member_left(event):
++    app.logger.info("Got memberLeft event")
++
++
+ @app.route('/static/<path:path>')
+ def send_static_content(path):
+     return send_from_directory('static', path)
+diff --git a/linebot/models/__init__.py b/linebot/models/__init__.py
+index 819a993..f8894ea 100644
+--- a/linebot/models/__init__.py
++++ b/linebot/models/__init__.py
+@@ -45,6 +45,8 @@ from .events import (  # noqa
+     LeaveEvent,
+     PostbackEvent,
+     AccountLinkEvent,
++    MemberJoinedEvent,
++    MemberLeftEvent,
+     BeaconEvent,
+     Postback,
+     Beacon,
+diff --git a/linebot/models/events.py b/linebot/models/events.py
+index bc7255d..2f570b9 100644
+--- a/linebot/models/events.py
++++ b/linebot/models/events.py
+@@ -261,6 +261,68 @@ class BeaconEvent(Event):
+         )
+ 
+ 
++class MemberJoinedEvent(Event):
++    """Webhook MemberJoinedEvent.
++
++    https://developers.line.biz/en/reference/messaging-api/#member-joined-event
++
++    Event object for when a user joins a group or room that the bot is in.
++
++    """
++
++    def __init__(self, timestamp=None, source=None, reply_token=None,
++                 joined=None, **kwargs):
++        """__init__ method.
++
++        :param long timestamp: Time of the event in milliseconds
++        :param source: Source object
++        :type source: T <= :py:class:`linebot.models.sources.Source`
++        :param str reply_token: Reply token
++        :param joined: Joined object
++        :type joined: :py:class:`linebot.models.events.Joined`
++        :param kwargs:
++        """
++        super(MemberJoinedEvent, self).__init__(
++            timestamp=timestamp, source=source, **kwargs
++        )
++
++        self.type = 'memberJoined'
++        self.reply_token = reply_token
++        self.joined = self.get_or_new_from_json_dict(
++            joined, Joined
++        )
++
++
++class MemberLeftEvent(Event):
++    """Webhook MemberLeftEvent.
++
++    https://developers.line.biz/en/reference/messaging-api/#member-left-event
++
++    Event object for when a user leaves a group or room that the bot is in.
++
++    """
++
++    def __init__(self, timestamp=None, source=None,
++                 left=None, **kwargs):
++        """__init__ method.
++
++        :param long timestamp: Time of the event in milliseconds
++        :param source: Source object
++        :type source: T <= :py:class:`linebot.models.sources.Source`
++        :param left: Left object
++        :type left: :py:class:`linebot.models.events.Left`
++        :param kwargs:
++        """
++        super(MemberLeftEvent, self).__init__(
++            timestamp=timestamp, source=source, **kwargs
++        )
++
++        self.type = 'memberLeft'
++        self.left = self.get_or_new_from_json_dict(
++            left, Left
++        )
++
++
+ class AccountLinkEvent(Event):
+     """Webhook AccountLinkEvent.
+ 
+@@ -345,6 +407,50 @@ class Beacon(Base):
+         return bytearray.fromhex(self.dm) if self.dm is not None else None
+ 
+ 
++class Joined(Base):
++    """Joined.
++
++    https://developers.line.biz/en/reference/messaging-api/#member-joined-event
++    """
++
++    def __init__(self, members=None, **kwargs):
++        """__init__ method.
++
++        :param dict members: Member of users who joined
++        :param kwargs:
++        """
++        super(Joined, self).__init__(**kwargs)
++
++        self._members = members
++
++    @property
++    def members(self):
++        """Get members as list of SourceUser."""
++        return [SourceUser(user_id=x['userId']) for x in self._members]
++
++
++class Left(Base):
++    """Left.
++
++    https://developers.line.biz/en/reference/messaging-api/#member-left-event
++    """
++
++    def __init__(self, members=None, **kwargs):
++        """__init__ method.
++
++        :param dict members: Member of users who joined
++        :param kwargs:
++        """
++        super(Left, self).__init__(**kwargs)
++
++        self._members = members
++
++    @property
++    def members(self):
++        """Get members as list of SourceUser."""
++        return [SourceUser(user_id=x['userId']) for x in self._members]
++
++
+ class Link(Base):
+     """Link.
+ 
+diff --git a/linebot/webhook.py b/linebot/webhook.py
+index 6253dcb..415ceb1 100644
+--- a/linebot/webhook.py
++++ b/linebot/webhook.py
+@@ -32,6 +32,8 @@ from .models.events import (
+     PostbackEvent,
+     BeaconEvent,
+     AccountLinkEvent,
++    MemberJoinedEvent,
++    MemberLeftEvent,
+ )
+ from .utils import LOGGER, PY3, safe_compare_digest
+ 
+@@ -144,6 +146,10 @@ class WebhookParser(object):
+                 events.append(BeaconEvent.new_from_json_dict(event))
+             elif event_type == 'accountLink':
+                 events.append(AccountLinkEvent.new_from_json_dict(event))
++            elif event_type == 'memberJoined':
++                events.append(MemberJoinedEvent.new_from_json_dict(event))
++            elif event_type == 'memberLeft':
++                events.append(MemberLeftEvent.new_from_json_dict(event))
+             else:
+                 LOGGER.warn('Unknown event type. type=' + event_type)
+ 

@@ -1,0 +1,148 @@
+diff --git a/test/conftest.py b/test/conftest.py
+index c79dd0f..7a68895 100644
+--- a/test/conftest.py
++++ b/test/conftest.py
+@@ -1,3 +1,6 @@
++import os
++
++from contextlib import contextmanager
+ from pathlib import Path
+ 
+ import pytest
+@@ -31,3 +34,15 @@ def env():
+         extend_pythonpath=False,
+         shiv_version="0.0.1",
+     )
++
++
++@pytest.fixture
++def env_var():
++
++    @contextmanager
++    def _env_var(key, value):
++        os.environ[key] = value
++        yield
++        del os.environ[key]
++
++    return _env_var
+diff --git a/test/test_bootstrap.py b/test/test_bootstrap.py
+index 6fb5111..54df208 100644
+--- a/test/test_bootstrap.py
++++ b/test/test_bootstrap.py
+@@ -2,7 +2,6 @@ import os
+ import sys
+ 
+ from code import interact
+-from contextlib import contextmanager
+ from datetime import datetime
+ from pathlib import Path
+ from site import addsitedir
+@@ -26,13 +25,6 @@ from shiv.bootstrap.filelock import FileLock
+ from shiv.pip import install
+ 
+ 
+-@contextmanager
+-def env_var(key, value):
+-    os.environ[key] = value
+-    yield
+-    del os.environ[key]
+-
+-
+ class TestBootstrap:
+     def test_import_string(self):
+         assert import_string("site.addsitedir") == addsitedir
+@@ -68,12 +60,15 @@ class TestBootstrap:
+         with current_zipfile() as zipfile:
+             assert not zipfile
+ 
+-    def test_cache_path(self):
++    def test_cache_path(self, env_var):
+         mock_zip = mock.MagicMock(spec=ZipFile)
+         mock_zip.filename = "test"
+         uuid = str(uuid4())
+ 
+-        assert cache_path(mock_zip, Path.cwd(), uuid) == Path.cwd() / f"test_{uuid}"
++        assert cache_path(mock_zip, 'foo', uuid) == Path("foo", f"test_{uuid}")
++
++        with env_var("FOO", "foo"):
++            assert cache_path(mock_zip, '$FOO', uuid) == Path("foo", f"test_{uuid}")
+ 
+     def test_first_sitedir_index(self):
+         with mock.patch.object(sys, "path", ["site-packages", "dir", "dir", "dir"]):
+@@ -124,7 +119,7 @@ class TestBootstrap:
+ 
+ 
+ class TestEnvironment:
+-    def test_overrides(self):
++    def test_overrides(self, env_var):
+         now = str(datetime.now())
+         version = "0.0.1"
+         env = Environment(now, version)
+@@ -142,7 +137,7 @@ class TestEnvironment:
+ 
+         assert env.root is None
+         with env_var("SHIV_ROOT", "tmp"):
+-            assert env.root == Path("tmp")
++            assert env.root == "tmp"
+ 
+         assert env.force_extract is False
+         with env_var("SHIV_FORCE_EXTRACT", "1"):
+diff --git a/test/test_cli.py b/test/test_cli.py
+index 662a1ce..b5acf08 100644
+--- a/test/test_cli.py
++++ b/test/test_cli.py
+@@ -346,3 +346,54 @@ class TestCLI:
+ 
+         assert proc.returncode == 0
+         assert proc.stdout.decode().splitlines() == ["hello from preamble", "hello world"]
++
++    def test_alternate_root(self, runner, package_location, tmp_path):
++        """Test that the --root argument properly sets the extraction root."""
++
++        output_file = tmp_path / "test.pyz"
++        shiv_root = tmp_path / "root"
++        result = runner(
++            ["-e", "hello:main", "--root", str(shiv_root), "-o", str(output_file), str(package_location)]
++        )
++
++        # check that the command successfully completed
++        assert result.exit_code == 0
++
++        # ensure the created file actually exists
++        assert output_file.exists()
++
++        # now run the produced zipapp
++        proc = subprocess.run(
++            [str(output_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=os.environ,
++        )
++
++        assert proc.returncode == 0
++        assert "hello" in proc.stdout.decode()
++        assert shiv_root.exists()
++
++    def test_alternate_root_environment_variable(self, runner, package_location, tmp_path, env_var):
++        """Test that the --root argument works with environment variables."""
++
++        output_file = tmp_path / "test.pyz"
++        shiv_root_var = "NEW_ROOT"
++        shiv_root_path = tmp_path / 'new_root'
++        result = runner(
++            ["-e", "hello:main", "--root", "$" + shiv_root_var, "-o", str(output_file), str(package_location)]
++        )
++
++        with env_var(shiv_root_var, str(shiv_root_path)):
++
++            # check that the command successfully completed
++            assert result.exit_code == 0
++
++            # ensure the created file actually exists
++            assert output_file.exists()
++
++            # now run the produced zipapp
++            proc = subprocess.run(
++                [str(output_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, env=os.environ,
++            )
++
++        assert proc.returncode == 0
++        assert "hello" in proc.stdout.decode()
++        assert shiv_root_path.exists()

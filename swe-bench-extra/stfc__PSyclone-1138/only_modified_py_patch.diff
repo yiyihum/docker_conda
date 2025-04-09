@@ -1,0 +1,97 @@
+diff --git a/src/psyclone/psyir/backend/fortran.py b/src/psyclone/psyir/backend/fortran.py
+index 4b6c12b2a..e03cdcc1f 100644
+--- a/src/psyclone/psyir/backend/fortran.py
++++ b/src/psyclone/psyir/backend/fortran.py
+@@ -732,10 +732,13 @@ class FortranWriter(PSyIRVisitor):
+         if not node.name:
+             raise VisitorError("Expected node name to have a value.")
+ 
+-        args = [symbol.name for symbol in node.symbol_table.argument_list]
+-        result = (
+-            "{0}subroutine {1}({2})\n"
+-            "".format(self._nindent, node.name, ", ".join(args)))
++        if node.is_program:
++            result = ("{0}program {1}\n".format(self._nindent, node.name))
++        else:
++            args = [symbol.name for symbol in node.symbol_table.argument_list]
++            result = (
++                "{0}subroutine {1}({2})\n"
++                "".format(self._nindent, node.name, ", ".join(args)))
+ 
+         self._depth += 1
+ 
+@@ -773,9 +776,13 @@ class FortranWriter(PSyIRVisitor):
+             "".format(imports, declarations, exec_statements))
+ 
+         self._depth -= 1
++        if node.is_program:
++            keyword = "program"
++        else:
++            keyword = "subroutine"
+         result += (
+-            "{0}end subroutine {1}\n"
+-            "".format(self._nindent, node.name))
++            "{0}end {1} {2}\n"
++            "".format(self._nindent, keyword, node.name))
+ 
+         return result
+ 
+diff --git a/src/psyclone/psyir/frontend/fparser2.py b/src/psyclone/psyir/frontend/fparser2.py
+index a2b167a21..6a182367e 100644
+--- a/src/psyclone/psyir/frontend/fparser2.py
++++ b/src/psyclone/psyir/frontend/fparser2.py
+@@ -768,6 +768,7 @@ class Fparser2Reader(object):
+             Fortran2003.Call_Stmt: self._call_handler,
+             Fortran2003.Subroutine_Subprogram: self._subroutine_handler,
+             Fortran2003.Module: self._module_handler,
++            Fortran2003.Main_Program: self._main_program_handler,
+             Fortran2003.Program: self._program_handler,
+         }
+ 
+@@ -3436,6 +3437,45 @@ class Fparser2Reader(object):
+ 
+         return routine
+ 
++    def _main_program_handler(self, node, parent):
++        '''Transforms an fparser2 Main_Program statement into a PSyIR
++        Routine node.
++
++        :param node: node in fparser2 parse tree.
++        :type node: :py:class:`fparser.two.Fortran2003.Main_Program`
++        :param parent: parent node of the PSyIR node being constructed.
++        :type parent: subclass of :py:class:`psyclone.psyir.nodes.Node`
++
++        :returns: PSyIR representation of node.
++        :rtype: :py:class:`psyclone.psyir.nodes.Routine`
++
++        '''
++        name = node.children[0].children[1].string
++        routine = Routine(name, parent=parent, is_program=True)
++
++        try:
++            prog_spec = _first_type_match(node.content,
++                                          Fortran2003.Specification_Part)
++            decl_list = prog_spec.content
++        except ValueError:
++            # program has no Specification_Part so has no
++            # declarations. Continue with empty list.
++            decl_list = []
++        finally:
++            self.process_declarations(routine, decl_list, [])
++
++        try:
++            prog_exec = _first_type_match(node.content,
++                                          Fortran2003.Execution_Part)
++        except ValueError:
++            # Routines without any execution statements are still
++            # valid.
++            pass
++        else:
++            self.process_nodes(routine, prog_exec.content)
++
++        return routine
++
+     def _module_handler(self, node, parent):
+         '''Transforms an fparser2 Module statement into a PSyIR Container node.
+ 
+

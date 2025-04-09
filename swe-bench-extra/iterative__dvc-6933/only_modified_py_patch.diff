@@ -1,0 +1,141 @@
+diff --git a/dvc/command/experiments/show.py b/dvc/command/experiments/show.py
+--- a/dvc/command/experiments/show.py
++++ b/dvc/command/experiments/show.py
+@@ -3,10 +3,12 @@
+ from collections import Counter, OrderedDict, defaultdict
+ from datetime import date, datetime
+ from fnmatch import fnmatch
++from pathlib import Path
+ from typing import TYPE_CHECKING, Dict, Iterable, Optional
+ 
+ from funcy import lmap
+ 
++from dvc.command import completion
+ from dvc.command.base import CmdBase, append_doc_link
+ from dvc.command.metrics import DEFAULT_PRECISION
+ from dvc.exceptions import DvcException, InvalidArgumentError
+@@ -382,6 +384,7 @@ def show_experiments(
+     no_timestamp=False,
+     csv=False,
+     markdown=False,
++    html=False,
+     **kwargs,
+ ):
+     from funcy.seqs import flatten as flatten_list
+@@ -429,7 +432,7 @@ def show_experiments(
+         kwargs.get("iso"),
+     )
+ 
+-    if no_timestamp:
++    if no_timestamp or html:
+         td.drop("Created")
+ 
+     for col in ("State", "Executor"):
+@@ -466,9 +469,21 @@ def show_experiments(
+         }
+     )
+ 
+-    if kwargs.get("only_changed", False):
++    if kwargs.get("only_changed", False) or html:
+         td.drop_duplicates("cols")
+ 
++    html_args = {}
++    if html:
++        td.dropna("rows", how="all")
++        td.column("Experiment")[:] = [
++            # remove tree characters
++            str(x).encode("ascii", "ignore").strip().decode()
++            for x in td.column("Experiment")
++        ]
++        out = kwargs.get("out") or "dvc_plots"
++        html_args["output_path"] = (Path.cwd() / out).resolve()
++        html_args["color_by"] = kwargs.get("sort_by") or "Experiment"
++
+     td.render(
+         pager=pager,
+         borders=True,
+@@ -477,8 +492,13 @@ def show_experiments(
+         row_styles=row_styles,
+         csv=csv,
+         markdown=markdown,
++        html=html,
++        **html_args,
+     )
+ 
++    if html and kwargs.get("open"):
++        return ui.open_browser(Path(out) / "index.html")
++
+ 
+ def _normalize_headers(names, count):
+     return [
+@@ -544,6 +564,9 @@ def run(self):
+                 csv=self.args.csv,
+                 markdown=self.args.markdown,
+                 only_changed=self.args.only_changed,
++                html=self.args.html,
++                out=self.args.out,
++                open=self.args.open,
+             )
+         return 0
+ 
+@@ -693,4 +716,23 @@ def add_parser(experiments_subparsers, parent_parser):
+             "across the selected experiments."
+         ),
+     )
++    experiments_show_parser.add_argument(
++        "--html",
++        action="store_true",
++        default=False,
++        help="Generate a parallel coordinates plot from the tabulated output.",
++    )
++    experiments_show_parser.add_argument(
++        "-o",
++        "--out",
++        default=None,
++        help="Destination folder to save the HTML to",
++        metavar="<path>",
++    ).complete = completion.DIR
++    experiments_show_parser.add_argument(
++        "--open",
++        action="store_true",
++        default=False,
++        help="Open the HTML directly in the browser.",
++    )
+     experiments_show_parser.set_defaults(func=CmdExperimentsShow)
+diff --git a/dvc/compare.py b/dvc/compare.py
+--- a/dvc/compare.py
++++ b/dvc/compare.py
+@@ -153,6 +153,18 @@ def to_csv(self) -> str:
+             writer.writerow(row)
+         return buff.getvalue()
+ 
++    def to_parallel_coordinates(self, output_path, color_by):
++        from dvc.render.html import write
++        from dvc.render.plotly import ParallelCoordinatesRenderer
++
++        index_path = write(
++            output_path,
++            renderers=[
++                ParallelCoordinatesRenderer(self, color_by, self._fill_value)
++            ],
++        )
++        return index_path.as_uri()
++
+     def add_column(self, name: str) -> None:
+         self._columns[name] = Column([self._fill_value] * len(self))
+         self._keys.append(name)
+@@ -173,6 +185,14 @@ def render(self, **kwargs: Any):
+ 
+         if kwargs.pop("csv", False):
+             ui.write(self.to_csv(), end="")
++
++        elif kwargs.pop("html", False):
++            ui.write(
++                self.to_parallel_coordinates(
++                    kwargs["output_path"], kwargs.get("color_by")
++                )
++            )
++
+         else:
+             ui.table(self, headers=self.keys(), **kwargs)
+ 

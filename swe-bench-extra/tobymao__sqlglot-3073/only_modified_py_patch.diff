@@ -1,0 +1,193 @@
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 1a248750..b3c63460 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1605,7 +1605,7 @@ class TitleColumnConstraint(ColumnConstraintKind):
+ 
+ 
+ class UniqueColumnConstraint(ColumnConstraintKind):
+-    arg_types = {"this": False, "index_type": False}
++    arg_types = {"this": False, "index_type": False, "on_conflict": False}
+ 
+ 
+ class UppercaseColumnConstraint(ColumnConstraintKind):
+@@ -1883,8 +1883,8 @@ class OnConflict(Expression):
+     arg_types = {
+         "duplicate": False,
+         "expressions": False,
+-        "nothing": False,
+-        "key": False,
++        "action": False,
++        "conflict_keys": False,
+         "constraint": False,
+     }
+ 
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index e6f5c4b0..753d4391 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -869,7 +869,9 @@ class Generator(metaclass=_Generator):
+         this = f" {this}" if this else ""
+         index_type = expression.args.get("index_type")
+         index_type = f" USING {index_type}" if index_type else ""
+-        return f"UNIQUE{this}{index_type}"
++        on_conflict = self.sql(expression, "on_conflict")
++        on_conflict = f" {on_conflict}" if on_conflict else ""
++        return f"UNIQUE{this}{index_type}{on_conflict}"
+ 
+     def createable_sql(self, expression: exp.Create, locations: t.DefaultDict) -> str:
+         return self.sql(expression, "this")
+@@ -1457,14 +1459,15 @@ class Generator(metaclass=_Generator):
+         where = self.sql(expression, "where")
+         where = f"{self.sep()}REPLACE WHERE {where}" if where else ""
+         expression_sql = f"{self.sep()}{self.sql(expression, 'expression')}"
+-        conflict = self.sql(expression, "conflict")
++        on_conflict = self.sql(expression, "conflict")
++        on_conflict = f" {on_conflict}" if on_conflict else ""
+         by_name = " BY NAME" if expression.args.get("by_name") else ""
+         returning = self.sql(expression, "returning")
+ 
+         if self.RETURNING_END:
+-            expression_sql = f"{expression_sql}{conflict}{returning}"
++            expression_sql = f"{expression_sql}{on_conflict}{returning}"
+         else:
+-            expression_sql = f"{returning}{expression_sql}{conflict}"
++            expression_sql = f"{returning}{expression_sql}{on_conflict}"
+ 
+         sql = f"INSERT{alternative}{ignore}{this}{by_name}{exists}{partition_sql}{where}{expression_sql}"
+         return self.prepend_ctes(expression, sql)
+@@ -1496,17 +1499,20 @@ class Generator(metaclass=_Generator):
+ 
+     def onconflict_sql(self, expression: exp.OnConflict) -> str:
+         conflict = "ON DUPLICATE KEY" if expression.args.get("duplicate") else "ON CONFLICT"
++
+         constraint = self.sql(expression, "constraint")
+-        if constraint:
+-            constraint = f"ON CONSTRAINT {constraint}"
+-        key = self.expressions(expression, key="key", flat=True)
+-        do = "" if expression.args.get("duplicate") else " DO "
+-        nothing = "NOTHING" if expression.args.get("nothing") else ""
++        constraint = f" ON CONSTRAINT {constraint}" if constraint else ""
++
++        conflict_keys = self.expressions(expression, key="conflict_keys", flat=True)
++        conflict_keys = f"({conflict_keys}) " if conflict_keys else " "
++        action = self.sql(expression, "action")
++
+         expressions = self.expressions(expression, flat=True)
+-        set_keyword = "SET " if self.DUPLICATE_KEY_UPDATE_WITH_SET else ""
+         if expressions:
+-            expressions = f"UPDATE {set_keyword}{expressions}"
+-        return f"{self.seg(conflict)} {constraint}{key}{do}{nothing}{expressions}"
++            set_keyword = "SET " if self.DUPLICATE_KEY_UPDATE_WITH_SET else ""
++            expressions = f" {set_keyword}{expressions}"
++
++        return f"{conflict}{constraint}{conflict_keys}{action}{expressions}"
+ 
+     def returning_sql(self, expression: exp.Returning) -> str:
+         return f"{self.seg('RETURNING')} {self.expressions(expression, flat=True)}"
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 49dac2ea..ad2907b8 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -966,6 +966,11 @@ class Parser(metaclass=_Parser):
+         "READ": ("WRITE", "ONLY"),
+     }
+ 
++    CONFLICT_ACTIONS: OPTIONS_TYPE = dict.fromkeys(
++        ("ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK", "UPDATE"), tuple()
++    )
++    CONFLICT_ACTIONS["DO"] = ("NOTHING", "UPDATE")
++
+     USABLES: OPTIONS_TYPE = dict.fromkeys(("ROLE", "WAREHOUSE", "DATABASE", "SCHEMA"), tuple())
+ 
+     INSERT_ALTERNATIVES = {"ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"}
+@@ -2112,31 +2117,31 @@ class Parser(metaclass=_Parser):
+         if not conflict and not duplicate:
+             return None
+ 
+-        nothing = None
+-        expressions = None
+-        key = None
++        conflict_keys = None
+         constraint = None
+ 
+         if conflict:
+             if self._match_text_seq("ON", "CONSTRAINT"):
+                 constraint = self._parse_id_var()
+-            else:
+-                key = self._parse_csv(self._parse_value)
++            elif self._match(TokenType.L_PAREN):
++                conflict_keys = self._parse_csv(self._parse_id_var)
++                self._match_r_paren()
+ 
+-        self._match_text_seq("DO")
+-        if self._match_text_seq("NOTHING"):
+-            nothing = True
+-        else:
+-            self._match(TokenType.UPDATE)
++        action = self._parse_var_from_options(
++            self.CONFLICT_ACTIONS,
++        )
++        if self._prev.token_type == TokenType.UPDATE:
+             self._match(TokenType.SET)
+             expressions = self._parse_csv(self._parse_equality)
++        else:
++            expressions = None
+ 
+         return self.expression(
+             exp.OnConflict,
+             duplicate=duplicate,
+             expressions=expressions,
+-            nothing=nothing,
+-            key=key,
++            action=action,
++            conflict_keys=conflict_keys,
+             constraint=constraint,
+         )
+ 
+@@ -4417,9 +4422,7 @@ class Parser(metaclass=_Parser):
+         self._match_text_seq("LENGTH")
+         return self.expression(exp.InlineLengthColumnConstraint, this=self._parse_bitwise())
+ 
+-    def _parse_not_constraint(
+-        self,
+-    ) -> t.Optional[exp.Expression]:
++    def _parse_not_constraint(self) -> t.Optional[exp.Expression]:
+         if self._match_text_seq("NULL"):
+             return self.expression(exp.NotNullColumnConstraint)
+         if self._match_text_seq("CASESPECIFIC"):
+@@ -4447,16 +4450,21 @@ class Parser(metaclass=_Parser):
+         if not self._match(TokenType.CONSTRAINT):
+             return self._parse_unnamed_constraint(constraints=self.SCHEMA_UNNAMED_CONSTRAINTS)
+ 
+-        this = self._parse_id_var()
+-        expressions = []
++        return self.expression(
++            exp.Constraint,
++            this=self._parse_id_var(),
++            expressions=self._parse_unnamed_constraints(),
++        )
+ 
++    def _parse_unnamed_constraints(self) -> t.List[exp.Expression]:
++        constraints = []
+         while True:
+             constraint = self._parse_unnamed_constraint() or self._parse_function()
+             if not constraint:
+                 break
+-            expressions.append(constraint)
++            constraints.append(constraint)
+ 
+-        return self.expression(exp.Constraint, this=this, expressions=expressions)
++        return constraints
+ 
+     def _parse_unnamed_constraint(
+         self, constraints: t.Optional[t.Collection[str]] = None
+@@ -4478,6 +4486,7 @@ class Parser(metaclass=_Parser):
+             exp.UniqueColumnConstraint,
+             this=self._parse_schema(self._parse_id_var(any_token=False)),
+             index_type=self._match(TokenType.USING) and self._advance_any() and self._prev.text,
++            on_conflict=self._parse_on_conflict(),
+         )
+ 
+     def _parse_key_constraint_options(self) -> t.List[str]:
+

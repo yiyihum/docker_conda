@@ -1,0 +1,295 @@
+diff --git a/fetchai/ledger/__init__.py b/fetchai/ledger/__init__.py
+index 628f898..4bd17a6 100644
+--- a/fetchai/ledger/__init__.py
++++ b/fetchai/ledger/__init__.py
+@@ -1,4 +1,8 @@
+ # Ledger version that this API is compatible with
+-__version__ = '0.9.0a1'
++__version__ = '0.9.0-a1'
+ # This API is compatible with ledgers that meet all the requirements listed here:
+ __compatible__ = ['<0.10.0', '>=0.8.0-alpha']
++
++
++class IncompatibleLedgerVersion(Exception):
++    pass
+diff --git a/fetchai/ledger/api/__init__.py b/fetchai/ledger/api/__init__.py
+index 9c6c169..86945ed 100644
+--- a/fetchai/ledger/api/__init__.py
++++ b/fetchai/ledger/api/__init__.py
+@@ -19,11 +19,11 @@
+ import time
+ from datetime import datetime, timedelta
+ from typing import Sequence, Union
+-
+ import semver
+ 
++from fetchai.ledger.api import bootstrap
+ from fetchai.ledger.api.server import ServerApi
+-from fetchai.ledger import __compatible__
++from fetchai.ledger import __compatible__, IncompatibleLedgerVersion
+ from .common import ApiEndpoint, ApiError, submit_json_transaction
+ from .contracts import ContractsApi
+ from .token import TokenApi
+@@ -41,7 +41,13 @@ def _iterable(value):
+ 
+ 
+ class LedgerApi:
+-    def __init__(self, host, port):
++    def __init__(self, host=None, port=None, network=None):
++        if network:
++            assert not host and not port, 'Specify either a server name, or a host & port'
++            host, port = bootstrap.server_from_name(network)
++        else:
++            assert host and port, "Must specify either a server name, or a host & port"
++
+         self.tokens = TokenApi(host, port)
+         self.contracts = ContractsApi(host, port)
+         self.tx = TransactionApi(host, port)
+@@ -50,9 +56,9 @@ class LedgerApi:
+         # Check that ledger version is compatible with API version
+         server_version = self.server.version().lstrip('v')
+         if not all(semver.match(server_version, c) for c in __compatible__):
+-            raise RuntimeError("Ledger version running on server is not compatible with this API" +
+-                               "\nServer version: {} \nExpected version: {}".format(
+-                                   server_version, ', '.join(__compatible__)))
++            raise IncompatibleLedgerVersion("Ledger version running on server is not compatible with this API" +
++                                            "\nServer version: {} \nExpected version: {}".format(
++                                                server_version, ', '.join(__compatible__)))
+ 
+     def sync(self, txs: Transactions, timeout=None):
+         timeout = int(timeout or 120)
+diff --git a/fetchai/ledger/api/bootstrap.py b/fetchai/ledger/api/bootstrap.py
+new file mode 100644
+index 0000000..9991e24
+--- /dev/null
++++ b/fetchai/ledger/api/bootstrap.py
+@@ -0,0 +1,95 @@
++import requests
++import semver
++from fetchai.ledger import __version__, IncompatibleLedgerVersion
++
++
++class NetworkUnavailableError(Exception):
++    pass
++
++
++def list_servers(active=True):
++    """Gets list of (active) servers from bootstrap network"""
++    params = {'active': 1} if active else {}
++    servers_response = requests.get('https://bootstrap.fetch.ai/networks/', params=params)
++    if servers_response.status_code != 200:
++        raise requests.ConnectionError('Failed to get network status from bootstrap')
++
++    return servers_response.json()
++
++
++def is_server_valid(server_list, network):
++    # Check requested server is on list
++    available_servers = [s['name'] for s in server_list]
++    if network not in available_servers:
++        raise NetworkUnavailableError('Requested network not present on network: {}'.format(network))
++
++    # Check network version
++    server_details = next(s for s in server_list if s['name'] == network)
++    if server_details['versions'] != '*':
++        version_constraints = server_details['versions'].split(',')
++
++        # Build required version (e.g.: 0.9.1-alpha2 -> 0.9.0)
++        network_version_required = semver.parse(__version__)
++        network_version_required['prerelease'] = None
++        network_version_required['build'] = None
++        network_version_required['patch'] = 0
++
++        if not all(semver.match(network_version_required, c) for c in version_constraints):
++            raise IncompatibleLedgerVersion("Requested network does not support required version\n" +
++                                            "Required version: {}\nNetwork supports: {}".format(
++                                                network_version_required, ', '.join(version_constraints)
++                                            ))
++    # Return true if server valid
++    return True
++
++
++def get_ledger_address(network):
++    # Request server endpoints
++    params = {'network': network}
++    endpoints_response = requests.get('https://bootstrap.fetch.ai/endpoints', params=params)
++    if endpoints_response.status_code != 200:
++        raise requests.ConnectionError('Failed to get network endpoint from bootstrap')
++
++    # Retrieve ledger endpoint
++    ledger_endpoint = [s for s in endpoints_response.json() if s['component'] == 'ledger']
++    if len(ledger_endpoint) != 1:
++        raise NetworkUnavailableError('Requested server is not reporting a ledger endpoint')
++
++    # Return server address
++    ledger_endpoint = ledger_endpoint[0]
++    if 'address' not in ledger_endpoint:
++        raise RuntimeError('Ledger endpoint missing address')
++
++    return ledger_endpoint['address']
++
++
++def split_address(address):
++    """Splits a url into a protocol, host name and port"""
++    if '://' in address:
++        protocol, address = address.split('://')
++    else:
++        protocol = 'http'
++
++    if ':' in address:
++        address, port = address.split(':')
++    else:
++        port = 443 if protocol == 'https' else 8000
++
++    return protocol, address, int(port)
++
++
++def server_from_name(network):
++    """Queries bootstrap for the requested network and returns connection details"""
++    # Get list of active servers
++    server_list = list_servers(True)
++
++    # Check requested network exists and supports our ledger version
++    assert is_server_valid(server_list, network)
++
++    # Get address of network ledger
++    ledger_address = get_ledger_address(network)
++
++    # Check if address contains a port
++    protocol, host, port = split_address(ledger_address)
++
++    return protocol + '://' + host, port
+diff --git a/fetchai/ledger/api/common.py b/fetchai/ledger/api/common.py
+index 9a855d2..ef2ff6a 100644
+--- a/fetchai/ledger/api/common.py
++++ b/fetchai/ledger/api/common.py
+@@ -27,7 +27,7 @@ from fetchai.ledger.transaction import Transaction
+ DEFAULT_BLOCK_VALIDITY_PERIOD = 100
+ 
+ 
+-def format_contract_url(host: str, port: int, prefix: Optional[str], endpoint: Optional[str]):
++def format_contract_url(host: str, port: int, prefix: Optional[str], endpoint: Optional[str], protocol: str = None):
+     """
+     Constructs a URL based on specified contract prefix and endpoint
+ 
+@@ -35,11 +35,14 @@ def format_contract_url(host: str, port: int, prefix: Optional[str], endpoint: O
+     :param port: The target port
+     :param prefix: The dot separated prefix for the contract
+     :param endpoint: The dot separated name for the contract endpoint
++    :param protocol: Transfer protocol, either 'http' or 'https'
+     :return: The formatted URL
+     """
++    # Default to http protocol
++    protocol = protocol or 'http'
+ 
+     if endpoint is None:
+-        url = 'http://{}:{}/api/contract/submit'.format(host, port)
++        url = '{}://{}:{}/api/contract/submit'.format(protocol, host, port)
+ 
+     else:
+         if prefix is None:
+@@ -47,12 +50,12 @@ def format_contract_url(host: str, port: int, prefix: Optional[str], endpoint: O
+         else:
+             canonical_name = '.'.join([prefix, endpoint])
+ 
+-        url = 'http://{}:{}/api/contract/'.format(host, port) + canonical_name.replace('.', '/')
++        url = '{}://{}:{}/api/contract/'.format(protocol, host, port) + canonical_name.replace('.', '/')
+ 
+     return url
+ 
+ 
+-def submit_json_transaction(host: str, port: int, tx_data, session=None):
++def submit_json_transaction(host: str, port: int, tx_data, session=None, protocol: str = None):
+     """
+     Submit a JSON transaction to the target onde
+ 
+@@ -60,13 +63,14 @@ def submit_json_transaction(host: str, port: int, tx_data, session=None):
+     :param port: The port to target ledger instance
+     :param tx_data: The object that will be json encoded
+     :param session: Optional session object to be passed to the
++    :param protocol: Transfer protocol, either 'http' or 'https'
+     :return: True is the request was successful, otherwise False
+     """
+     if session is None:
+         session = requests.session()
+ 
+     # define the URL to be used
+-    uri = format_contract_url(host, port, None, 'submit')
++    uri = format_contract_url(host, port, None, 'submit', protocol=protocol)
+ 
+     headers = {
+         'content-type': 'application/vnd+fetch.transaction+json',
+@@ -91,10 +95,20 @@ class ApiEndpoint(object):
+     API_PREFIX = None
+ 
+     def __init__(self, host, port):
++        if '://' in host:
++            protocol, host = host.split('://')
++        else:
++            protocol = 'http'
++
++        self._protocol = protocol
+         self._host = str(host)
+         self._port = int(port)
+         self._session = requests.session()
+ 
++    @property
++    def protocol(self):
++        return self._protocol
++
+     @property
+     def host(self):
+         return self._host
+@@ -137,7 +151,7 @@ class ApiEndpoint(object):
+     def _get_json(self, path, **kwargs):
+         args = dict(**kwargs)
+         params = args if len(args) > 0 else None
+-        url = 'http://{}:{}/api/{}'.format(self._host, self._port, path)
++        url = '{}://{}:{}/api/{}'.format(self._protocol, self._host, self._port, path)
+ 
+         # make the request
+         raw_response = self._session.get(url, params=params)
+@@ -167,7 +181,7 @@ class ApiEndpoint(object):
+             endpoint = endpoint[1:]
+ 
+         # format and make the request
+-        url = format_contract_url(self.host, self.port, prefix or self.API_PREFIX, endpoint)
++        url = format_contract_url(self.host, self.port, prefix or self.API_PREFIX, endpoint, protocol=self.protocol)
+ 
+         # define the request headers
+         headers = {
+@@ -207,7 +221,7 @@ class ApiEndpoint(object):
+         tx_payload = dict(ver="1.2", data=base64.b64encode(tx_data).decode())
+ 
+         # format the URL
+-        url = format_contract_url(self.host, self.port, self.API_PREFIX, endpoint)
++        url = format_contract_url(self.host, self.port, self.API_PREFIX, endpoint, protocol=self.protocol)
+ 
+         # make the request
+         r = self._session.post(url, json=tx_payload, headers=headers)
+diff --git a/fetchai/ledger/api/server.py b/fetchai/ledger/api/server.py
+index dce39ef..0a76cf5 100644
+--- a/fetchai/ledger/api/server.py
++++ b/fetchai/ledger/api/server.py
+@@ -9,7 +9,7 @@ class ServerApi(ApiEndpoint):
+ 
+         :return: dict of info returned by the /api/status endpoint
+         """
+-        url = 'http://{}:{}/api/status'.format(self.host, self.port)
++        url = '{}://{}:{}/api/status'.format(self.protocol, self.host, self.port)
+ 
+         response = self._session.get(url).json()
+ 
+diff --git a/fetchai/ledger/api/tx.py b/fetchai/ledger/api/tx.py
+index c4dedf7..96a6746 100644
+--- a/fetchai/ledger/api/tx.py
++++ b/fetchai/ledger/api/tx.py
+@@ -10,7 +10,7 @@ class TransactionApi(ApiEndpoint):
+         :return:
+         """
+ 
+-        url = 'http://{}:{}/api/status/tx/{}'.format(self.host, self.port, tx_digest)
++        url = '{}://{}:{}/api/status/tx/{}'.format(self.protocol, self.host, self.port, tx_digest)
+ 
+         response = self._session.get(url).json()
+         return response.get('status')

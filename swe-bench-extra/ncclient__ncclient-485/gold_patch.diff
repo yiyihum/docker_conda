@@ -1,0 +1,114 @@
+diff --git a/ncclient/devices/default.py b/ncclient/devices/default.py
+index f9107b4..bac3195 100644
+--- a/ncclient/devices/default.py
++++ b/ncclient/devices/default.py
+@@ -242,16 +242,16 @@ class DefaultDeviceHandler(object):
+     def handle_connection_exceptions(self, sshsession):
+         return False
+ 
+-    def handle_reply_parsing_error(self, root, reply):
++    def reply_parsing_error_transform(self, reply_cls):
+         """
+-        Hook for working around bugs in replies from devices (the root emelent can be "fixed")
++        Hook for working around bugs in replies from devices (the root element can be "fixed")
+ 
+-        :param root: the rpc reply root element
+-        :param reply: the RPCReply object that is parsing 'root'
++        :param reply_cls: the RPCReply class that is parsing the reply 'root' xml element
+ 
+-        :return:
++        :return: transform function for the 'root' xml element of the RPC reply in case the normal parsing fails
+         """
+-        pass
++        # No transformation by default
++        return None
+ 
+     def transform_reply(self):
+         return False
+diff --git a/ncclient/devices/junos.py b/ncclient/devices/junos.py
+index 01e7501..d751560 100644
+--- a/ncclient/devices/junos.py
++++ b/ncclient/devices/junos.py
+@@ -39,7 +39,7 @@ class JunosDeviceHandler(DefaultDeviceHandler):
+ 
+     def __init__(self, device_params):
+         super(JunosDeviceHandler, self).__init__(device_params)
+-        self.__reply_parsing_error_handler_by_cls = {
++        self.__reply_parsing_error_transform_by_cls = {
+             GetSchemaReply: fix_get_schema_reply
+         }
+ 
+@@ -95,13 +95,9 @@ class JunosDeviceHandler(DefaultDeviceHandler):
+         c.exec_command("xml-mode netconf need-trailer")
+         return True
+ 
+-    def handle_reply_parsing_error(self, root, reply):
+-        reply_class = type(reply)
+-
+-        # Apply transform if found
+-        transform_handler = self.__reply_parsing_error_handler_by_cls.get(reply_class)
+-        if transform_handler is not None:
+-            transform_handler(root)
++    def reply_parsing_error_transform(self, reply_cls):
++        # return transform function if found, else None
++        return self.__reply_parsing_error_transform_by_cls.get(reply_cls)
+ 
+     def transform_reply(self):
+         reply = '''<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+diff --git a/ncclient/operations/rpc.py b/ncclient/operations/rpc.py
+index 2a6f32d..75f0839 100644
+--- a/ncclient/operations/rpc.py
++++ b/ncclient/operations/rpc.py
+@@ -144,9 +144,9 @@ class RPCReply(object):
+     ERROR_CLS = RPCError
+     "Subclasses can specify a different error class, but it should be a subclass of `RPCError`."
+ 
+-    def __init__(self, raw, device_handler, huge_tree=False):
++    def __init__(self, raw, huge_tree=False, parsing_error_transform=None):
+         self._raw = raw
+-        self._device_handler = device_handler
++        self._parsing_error_transform = parsing_error_transform
+         self._parsed = False
+         self._root = None
+         self._errors = []
+@@ -171,8 +171,13 @@ class RPCReply(object):
+         try:
+             self._parsing_hook(root)
+         except Exception as e:
++            if self._parsing_error_transform is None:
++                # re-raise as we have no workaround
++                exc_type, exc_value, exc_traceback = sys.exc_info()
++                six.reraise(exc_type, exc_value, exc_traceback)
++
+             # Apply device specific workaround and try again
+-            self._device_handler.handle_reply_parsing_error(root, self)
++            self._parsing_error_transform(root)
+             self._parsing_hook(root)
+ 
+         self._parsed = True
+@@ -181,6 +186,9 @@ class RPCReply(object):
+         "No-op by default. Gets passed the *root* element for the reply."
+         pass
+ 
++    def set_parsing_error_transform(self, transform_function):
++        self._parsing_error_transform = transform_function
++
+     @property
+     def xml(self):
+         "*rpc-reply* element as returned."
+@@ -387,7 +395,14 @@ class RPC(object):
+ 
+     def deliver_reply(self, raw):
+         # internal use
+-        self._reply = self.REPLY_CLS(raw, self._device_handler, huge_tree=self._huge_tree)
++        self._reply = self.REPLY_CLS(raw, huge_tree=self._huge_tree)
++
++        # Set the reply_parsing_error transform outside the constructor, to keep compatibility for
++        # third party reply classes outside of ncclient
++        self._reply.set_parsing_error_transform(
++            self._device_handler.reply_parsing_error_transform(self.REPLY_CLS)
++        )
++
+         self._event.set()
+ 
+     def deliver_error(self, err):

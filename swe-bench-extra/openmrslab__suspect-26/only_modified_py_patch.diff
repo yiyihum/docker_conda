@@ -1,0 +1,84 @@
+diff --git a/suspect/io/__init__.py b/suspect/io/__init__.py
+index c024146..040d217 100644
+--- a/suspect/io/__init__.py
++++ b/suspect/io/__init__.py
+@@ -2,4 +2,5 @@ from suspect.io.rda import load_rda
+ from suspect.io.twix import load_twix
+ from suspect.io.philips import load_sdat
+ from suspect.io.siemens import load_siemens_dicom
+-from . import tarquin, lcmodel, felix
+\ No newline at end of file
++from . import tarquin, lcmodel, felix
++from .dicom import load_dicom
+diff --git a/suspect/io/siemens.py b/suspect/io/siemens.py
+index 65f3798..ad3763d 100644
+--- a/suspect/io/siemens.py
++++ b/suspect/io/siemens.py
+@@ -4,6 +4,7 @@ import numpy
+ import struct
+ 
+ from suspect import MRSData
++from ._common import complex_array_from_iter
+ 
+ CSA1 = 0
+ CSA2 = 1
+@@ -143,14 +144,9 @@ def load_siemens_dicom(filename):
+     csa_data_bytes = dataset[0x7fe1, 0x0100 * data_index + 0x0010].value
+     # the data is stored as a list of 4 byte floats in (real, imaginary) pairs
+     data_floats = struct.unpack("<%df" % (len(csa_data_bytes) / 4), csa_data_bytes)
+-    # form an iterator which will provide the numbers one at a time, then an iterator which calls that iterator twice
+-    # each cycle to give a complex pair
+-    data_iter = iter(data_floats)
+-    complex_iter = (complex(r, i) for r, i in zip(data_iter, data_iter))
+-    # give this iterator to numpy to build the data array
+-    complex_data = numpy.fromiter(complex_iter, "complex128", int(len(csa_data_bytes) / 8))
+-    # reshape the array to structure of rows, columns and slices
+-    complex_data = numpy.reshape(complex_data, data_shape).squeeze()
++    complex_data = complex_array_from_iter(iter(data_floats),
++                                           length=len(data_floats) // 2,
++                                           shape=data_shape)
+ 
+     return MRSData(complex_data,
+                    csa_header["RealDwellTime"] * 1e-9,
+diff --git a/suspect/processing/denoising.py b/suspect/processing/denoising.py
+index fd49a14..f55b7ae 100644
+--- a/suspect/processing/denoising.py
++++ b/suspect/processing/denoising.py
+@@ -34,7 +34,7 @@ def sliding_window(input_signal, window_width):
+     window /= numpy.sum(window)
+     # pad the signal to cover half the window width on each side
+     padded_input = _pad(input_signal, len(input_signal) + window_width - 1)
+-    result = numpy.zeros(len(input_signal))
++    result = numpy.zeros_like(input_signal)
+     for i in range(len(input_signal)):
+         result[i] = numpy.dot(window, padded_input[i:(i + window_width)])
+     return result
+@@ -62,7 +62,7 @@ def sift(input_signal, threshold):
+ def svd(input_signal, rank):
+     matrix_width = int(len(input_signal) / 2)
+     matrix_height = len(input_signal) - matrix_width + 1
+-    hankel_matrix = numpy.zeros((matrix_width, matrix_height))
++    hankel_matrix = numpy.zeros((matrix_width, matrix_height), input_signal.dtype)
+     for i in range(matrix_height):
+         hankel_matrix[:, i] = input_signal[i:(i + matrix_width)]
+     # perform the singular value decomposition
+diff --git a/suspect/processing/frequency_correction.py b/suspect/processing/frequency_correction.py
+index 6ea3a89..6cd6e6c 100644
+--- a/suspect/processing/frequency_correction.py
++++ b/suspect/processing/frequency_correction.py
+@@ -29,10 +29,10 @@ def spectral_registration(data, target, initial_guess=(0.0, 0.0), frequency_rang
+ 
+     Parameters
+     ----------
+-    data :
+-    target :
+-    initial_guess :
+-    frequency_range:
++    data : MRSData
++    target : MRSData
++    initial_guess : tuple
++    frequency_range : 
+ 
+     Returns
+     -------
+

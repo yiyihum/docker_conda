@@ -1,0 +1,307 @@
+diff --git a/csaps/_reshape.py b/csaps/_reshape.py
+index a3f2ca2..98e520c 100644
+--- a/csaps/_reshape.py
++++ b/csaps/_reshape.py
+@@ -1,7 +1,19 @@
+ # -*- coding: utf-8 -*-
+ 
++import functools
++import operator
++from itertools import chain
+ import typing as ty
++
+ import numpy as np
++from numpy.lib.stride_tricks import as_strided
++
++
++def prod(x):
++    """Product of a list/tuple of numbers; ~40x faster vs np.prod for Python tuples"""
++    if len(x) == 0:
++        return 1
++    return functools.reduce(operator.mul, x)
+ 
+ 
+ def to_2d(arr: np.ndarray, axis: int) -> np.ndarray:
+@@ -76,26 +88,130 @@ def to_2d(arr: np.ndarray, axis: int) -> np.ndarray:
+     return arr.transpose(tr_axes).reshape(new_shape)
+ 
+ 
+-def block_view(arr: np.ndarray, block: ty.Tuple[int]) -> np.ndarray:
+-    """Returns array block view for given n-d array
++def umv_coeffs_to_canonical(arr: np.ndarray, pieces: int):
++    """
++
++    Parameters
++    ----------
++    arr : array
++        The 2-d array with shape (n, m) where:
++
++            n -- the number of spline dimensions (1 for univariate)
++            m -- order * pieces
++
++    pieces : int
++        The number of pieces
++
++    Returns
++    -------
++    arr_view : array view
++        The 2-d or 3-d array view with shape (k, p) or (k, p, n) where:
++
++            k -- spline order
++            p -- the number of spline pieces
++            n -- the number of spline dimensions (multivariate case)
++
++    """
++
++    ndim = arr.shape[0]
++    order = arr.shape[1] // pieces
++
++    if ndim == 1:
++        shape = (order, pieces)
++        strides = (arr.strides[1] * pieces, arr.strides[1])
++    else:
++        shape = (order, pieces, ndim)
++        strides = (arr.strides[1] * pieces, arr.strides[1], arr.strides[0])
+ 
+-    Creates n-d array block view with shape (k0, ..., kn, b0, ..., bn) for given
+-    array with shape (m0, ..., mn) and block (b0, ..., bn).
++    return as_strided(arr, shape=shape, strides=strides)
++
++
++def umv_coeffs_to_flatten(arr: np.ndarray):
++    """
+ 
+     Parameters
+     ----------
+-    arr : array-like
++    arr : array
++        The 2-d or 3-d array with shape (k, m) or (k, m, n) where:
++
++            k -- the spline order
++            m -- the number of spline pieces
++            n -- the number of spline dimensions (multivariate case)
++
++    Returns
++    -------
++    arr_view : array view
++        The array 2-d view with shape (1, k * m) or (n, k * m)
++
++    """
++
++    if arr.ndim == 2:
++        arr_view = arr.ravel()[np.newaxis]
++    elif arr.ndim == 3:
++        shape = (arr.shape[2], prod(arr.shape[:2]))
++        strides = arr.strides[:-3:-1]
++        arr_view = as_strided(arr, shape=shape, strides=strides)
++    else:  # pragma: no cover
++        raise ValueError(
++            f"The array ndim must be 2 or 3, but given array has ndim={arr.ndim}.")
++
++    return arr_view
++
++
++def ndg_coeffs_to_canonical(arr: np.ndarray, pieces: ty.Tuple[int]) -> np.ndarray:
++    """Returns array canonical view for given n-d grid coeffs flatten array
++
++    Creates n-d array canonical view with shape (k0, ..., kn, p0, ..., pn) for given
++    array with shape (m0, ..., mn) and pieces (p0, ..., pn).
++
++    Parameters
++    ----------
++    arr : array
+         The input array with shape (m0, ..., mn)
+-    block : tuple
+-        The block tuple (b0, ..., bn)
++    pieces : tuple
++        The number of pieces (p0, ..., pn)
+ 
+     Returns
+     -------
+-    a_view : array-like
+-        The block view for given array (k0, ..., kn, b0, ..., bn)
++    arr_view : array view
++        The canonical view for given array with shape (k0, ..., kn, p0, ..., pn)
+ 
+     """
+-    shape = tuple(size // blk for size, blk in zip(arr.shape, block)) + block
+-    strides = tuple(stride * blk for stride, blk in zip(arr.strides, block)) + arr.strides
+ 
+-    return np.lib.stride_tricks.as_strided(arr, shape=shape, strides=strides)
++    if arr.ndim > len(pieces):
++        return arr
++
++    shape = tuple(sz // p for sz, p in zip(arr.shape, pieces)) + pieces
++    strides = tuple(st * p for st, p in zip(arr.strides, pieces)) + arr.strides
++
++    return as_strided(arr, shape=shape, strides=strides)
++
++
++def ndg_coeffs_to_flatten(arr: np.ndarray):
++    """Creates flatten array view for n-d grid coeffs canonical array
++
++    For example for input array (4, 4, 20, 30) will be created the flatten view (80, 120)
++
++    Parameters
++    ----------
++    arr : array
++        The input array with shape (k0, ..., kn, p0, ..., pn) where:
++
++            ``k0, ..., kn`` -- spline orders
++            ``p0, ..., pn`` -- spline pieces
++
++    Returns
++    -------
++    arr_view : array view
++        Flatten view of array with shape (m0, ..., mn)
++
++    """
++
++    if arr.ndim == 2:
++        return arr
++
++    ndim = arr.ndim // 2
++    axes = tuple(chain.from_iterable(zip(range(ndim), range(ndim, arr.ndim))))
++    shape = tuple(prod(arr.shape[i::ndim]) for i in range(ndim))
++
++    return arr.transpose(axes).reshape(shape)
+diff --git a/csaps/_sspndg.py b/csaps/_sspndg.py
+index 2b75d9b..e485f12 100644
+--- a/csaps/_sspndg.py
++++ b/csaps/_sspndg.py
+@@ -10,12 +10,18 @@ from numbers import Number
+ from typing import Tuple, Sequence, Optional, Union
+ 
+ import numpy as np
+-from scipy.interpolate import NdPPoly
++from scipy.interpolate import PPoly, NdPPoly
+ 
+ from ._base import ISplinePPForm, ISmoothingSpline
+ from ._types import UnivariateDataType, NdGridDataType
+-from ._sspumv import SplinePPForm, CubicSmoothingSpline
+-from ._reshape import block_view
++from ._sspumv import CubicSmoothingSpline
++from ._reshape import (
++    prod,
++    umv_coeffs_to_canonical,
++    umv_coeffs_to_flatten,
++    ndg_coeffs_to_canonical,
++    ndg_coeffs_to_flatten,
++)
+ 
+ 
+ def ndgrid_prepare_data_vectors(data, name, min_size: int = 2) -> Tuple[np.ndarray, ...]:
+@@ -35,14 +41,6 @@ def ndgrid_prepare_data_vectors(data, name, min_size: int = 2) -> Tuple[np.ndarr
+     return tuple(data)
+ 
+ 
+-def _flatten_coeffs(spline: SplinePPForm):
+-    shape = list(spline.shape)
+-    shape.pop(spline.axis)
+-    c_shape = (spline.order * spline.pieces, int(np.prod(shape)))
+-
+-    return spline.c.reshape(c_shape).T
+-
+-
+ class NdGridSplinePPForm(ISplinePPForm[Tuple[np.ndarray, ...], Tuple[int, ...]],
+                          NdPPoly):
+     """N-D grid spline representation in PP-form
+@@ -115,9 +113,29 @@ class NdGridSplinePPForm(ISplinePPForm[Tuple[np.ndarray, ...], Tuple[int, ...]],
+             raise ValueError(
+                 f"'x' sequence must have length {self.ndim} according to 'breaks'")
+ 
+-        x = tuple(np.meshgrid(*x, indexing='ij'))
++        shape = tuple(x.size for x in x)
++
++        coeffs = ndg_coeffs_to_flatten(self.coeffs)
++        coeffs_shape = coeffs.shape
++
++        ndim_m1 = self.ndim - 1
++        permuted_axes = (ndim_m1, *range(ndim_m1))
++
++        for i in reversed(range(self.ndim)):
++            umv_ndim = prod(coeffs_shape[:ndim_m1])
++            c_shape = (umv_ndim, self.pieces[i] * self.order[i])
++            if c_shape != coeffs_shape:
++                coeffs = coeffs.reshape(c_shape)
++
++            coeffs_cnl = umv_coeffs_to_canonical(coeffs, self.pieces[i])
++            coeffs = PPoly.construct_fast(coeffs_cnl, self.breaks[i],
++                                          extrapolate=extrapolate, axis=1)(x[i])
++
++            shape_r = (*coeffs_shape[:ndim_m1], shape[i])
++            coeffs = coeffs.reshape(shape_r).transpose(permuted_axes)
++            coeffs_shape = coeffs.shape
+ 
+-        return super().__call__(x, nu, extrapolate)
++        return coeffs.reshape(shape)
+ 
+     def __repr__(self):  # pragma: no cover
+         return (
+@@ -298,13 +316,13 @@ class NdGridCubicSmoothingSpline(ISmoothingSpline[
+         # computing coordinatewise smoothing spline
+         for i in reversed(range(ndim)):
+             if ndim > 2:
+-                coeffs = coeffs.reshape(np.prod(coeffs.shape[:-1]), coeffs.shape[-1])
++                coeffs = coeffs.reshape(prod(coeffs.shape[:-1]), coeffs.shape[-1])
+ 
+             s = CubicSmoothingSpline(
+                 xdata[i], coeffs, weights=weights[i], smooth=smooth[i])
+ 
+             smooths.append(s.smooth)
+-            coeffs = _flatten_coeffs(s.spline)
++            coeffs = umv_coeffs_to_flatten(s.spline.coeffs)
+ 
+             if ndim > 2:
+                 coeffs_shape[-1] = s.spline.pieces * s.spline.order
+@@ -313,7 +331,7 @@ class NdGridCubicSmoothingSpline(ISmoothingSpline[
+             coeffs = coeffs.transpose(permute_axes)
+             coeffs_shape = list(coeffs.shape)
+ 
+-        block = tuple(int(size - 1) for size in shape)
+-        coeffs = block_view(coeffs.squeeze(), block)
++        pieces = tuple(int(size - 1) for size in shape)
++        coeffs = ndg_coeffs_to_canonical(coeffs.squeeze(), pieces)
+ 
+         return coeffs, tuple(reversed(smooths))
+diff --git a/csaps/_sspumv.py b/csaps/_sspumv.py
+index 63051d8..c8c9e71 100644
+--- a/csaps/_sspumv.py
++++ b/csaps/_sspumv.py
+@@ -6,7 +6,6 @@ Univariate/multivariate cubic smoothing spline implementation
+ """
+ 
+ import functools
+-import operator
+ from typing import Optional, Union, Tuple, List
+ 
+ import numpy as np
+@@ -17,7 +16,7 @@ from scipy.interpolate import PPoly
+ 
+ from ._base import ISplinePPForm, ISmoothingSpline
+ from ._types import UnivariateDataType, MultivariateDataType
+-from ._reshape import to_2d
++from ._reshape import to_2d, prod
+ 
+ 
+ class SplinePPForm(ISplinePPForm[np.ndarray, int], PPoly):
+@@ -59,9 +58,7 @@ class SplinePPForm(ISplinePPForm[np.ndarray, int], PPoly):
+         shape = list(self.shape)
+         shape.pop(self.axis)
+ 
+-        if len(shape) == 0:
+-            return 1
+-        return functools.reduce(operator.mul, shape)
++        return prod(shape)
+ 
+     @property
+     def shape(self) -> Tuple[int]:
+diff --git a/csaps/_version.py b/csaps/_version.py
+index d1a82ef..94446b6 100644
+--- a/csaps/_version.py
++++ b/csaps/_version.py
+@@ -1,3 +1,3 @@
+ # -*- coding: utf-8 -*-
+ 
+-__version__ = '1.0.0'
++__version__ = '1.0.1.dev'

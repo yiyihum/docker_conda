@@ -1,0 +1,179 @@
+diff --git a/phc/easy/patients/__init__.py b/phc/easy/patients/__init__.py
+index c6ecfb0..fe3c26d 100644
+--- a/phc/easy/patients/__init__.py
++++ b/phc/easy/patients/__init__.py
+@@ -1,24 +1,23 @@
+ import pandas as pd
+ 
+-from phc.easy.auth import Auth
+ from phc.easy.frame import Frame
++from phc.easy.item import Item
+ from phc.easy.patients.address import expand_address_column
+ from phc.easy.patients.name import expand_name_column
+-from phc.easy.query import Query
+ 
+ 
+-class Patient:
++class Patient(Item):
+     @staticmethod
+-    def get_count(query_overrides: dict = {}, auth_args=Auth.shared()):
+-        return Query.find_count_of_dsl_query(
+-            {
+-                "type": "select",
+-                "columns": "*",
+-                "from": [{"table": "patient"}],
+-                **query_overrides,
+-            },
+-            auth_args=auth_args,
+-        )
++    def table_name():
++        return "patient"
++
++    @staticmethod
++    def code_keys():
++        return [
++            "extension.valueCodeableConcept.coding",
++            "identifier.type.coding",
++            "meta.tag",
++        ]
+ 
+     @staticmethod
+     def transform_results(data_frame: pd.DataFrame, **expand_args):
+@@ -32,65 +31,3 @@ class Patient:
+         }
+ 
+         return Frame.expand(data_frame, **args)
+-
+-    @staticmethod
+-    def get_data_frame(
+-        all_results: bool = False,
+-        raw: bool = False,
+-        query_overrides: dict = {},
+-        auth_args: Auth = Auth.shared(),
+-        ignore_cache: bool = False,
+-        expand_args: dict = {},
+-    ):
+-        """Retrieve patients as a data frame with unwrapped FHIR columns
+-
+-        Attributes
+-        ----------
+-        all_results : bool = False
+-            Override limit to retrieve all patients
+-
+-        raw : bool = False
+-            If raw, then values will not be expanded (useful for manual
+-            inspection if something goes wrong). Note that this option will
+-            override all_results if True.
+-
+-        query_overrides : dict = {}
+-            Override any part of the elasticsearch FHIR query
+-
+-        auth_args : Any
+-            The authenication to use for the account and project (defaults to shared)
+-
+-        ignore_cache : bool = False
+-            Bypass the caching system that auto-saves results to a CSV file.
+-            Caching only occurs when all results are being retrieved.
+-
+-        expand_args : Any
+-            Additional arguments passed to phc.Frame.expand
+-
+-        Examples
+-        --------
+-        >>> import phc.easy as phc
+-        >>> phc.Auth.set({'account': '<your-account-name>'})
+-        >>> phc.Project.set_current('My Project Name')
+-        >>> phc.Patient.get_data_frame()
+-
+-        """
+-        query = {
+-            "type": "select",
+-            "columns": "*",
+-            "from": [{"table": "patient"}],
+-            **query_overrides,
+-        }
+-
+-        def transform(df: pd.DataFrame):
+-            return Patient.transform_results(df, **expand_args)
+-
+-        return Query.execute_fhir_dsl_with_options(
+-            query,
+-            transform,
+-            all_results,
+-            raw,
+-            query_overrides,
+-            auth_args,
+-            ignore_cache,
+-        )
+diff --git a/phc/easy/patients/address.py b/phc/easy/patients/address.py
+index edbd1c8..c7af9a3 100644
+--- a/phc/easy/patients/address.py
++++ b/phc/easy/patients/address.py
+@@ -1,4 +1,6 @@
+ import pandas as pd
++
++from funcy import first
+ from phc.easy.codeable import generic_codeable_to_dict
+ from phc.easy.util import concat_dicts
+ 
+@@ -22,18 +24,29 @@ def expand_address_value(value):
+     if type(value) is not list:
+         return {}
+ 
+-    # Value is always list of one item
+-    assert len(value) == 1
+-    value = value[0]
++    primary_address = first(
++        filter(lambda v: v.get("use") != "old", value)
++    ) or first(value)
++
++    other_addresses = list(
++        filter(lambda address: address != primary_address, value)
++    )
+ 
+-    return concat_dicts(
+-        [
+-            expand_address_attr(f"address_{key}", item_value)
+-            for key, item_value in value.items()
+-            if key != "text"
+-        ]
++    other_attrs = (
++        {"other_addresses": other_addresses} if len(other_addresses) > 0 else {}
+     )
+ 
++    return {
++        **concat_dicts(
++            [
++                expand_address_attr(f"address_{key}", item_value)
++                for key, item_value in primary_address.items()
++                if key != "text"
++            ]
++        ),
++        **other_attrs,
++    }
++
+ 
+ def expand_address_column(address_col):
+     return pd.DataFrame(map(expand_address_value, address_col.values))
+diff --git a/phc/util/api_cache.py b/phc/util/api_cache.py
+index 0e7f58d..475d88b 100644
+--- a/phc/util/api_cache.py
++++ b/phc/util/api_cache.py
+@@ -1,5 +1,6 @@
+ import hashlib
+ import json
++import os
+ from pathlib import Path
+ from typing import Callable
+ 
+@@ -86,6 +87,9 @@ class APICache:
+         writer = CSVWriter(filename)
+ 
+         def handle_batch(batch, is_finished):
++            if is_finished and not os.path.exists(filename):
++                return pd.DataFrame()
++
+             if is_finished:
+                 print(f'Loading data frame from "{filename}"')
+                 return APICache.read_csv(filename)
+

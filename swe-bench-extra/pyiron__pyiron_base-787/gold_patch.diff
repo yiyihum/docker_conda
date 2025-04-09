@@ -1,0 +1,133 @@
+diff --git a/.ci_support/environment.yml b/.ci_support/environment.yml
+index 1386182d..e688fc73 100644
+--- a/.ci_support/environment.yml
++++ b/.ci_support/environment.yml
+@@ -9,7 +9,7 @@ dependencies:
+ - gitpython =3.1.27
+ - h5io =0.1.7
+ - h5py =3.7.0
+-- numpy =1.23.0
++- numpy =1.23.1
+ - pandas =1.4.3
+ - pathlib2 =2.3.7.post1
+ - pint =0.19.2
+diff --git a/pyiron_base/generic/flattenedstorage.py b/pyiron_base/generic/flattenedstorage.py
+index 50476a14..3a66b81e 100644
+--- a/pyiron_base/generic/flattenedstorage.py
++++ b/pyiron_base/generic/flattenedstorage.py
+@@ -19,6 +19,7 @@ __date__ = "Jul 16, 2020"
+ 
+ 
+ import copy
++import warnings
+ from typing import Callable, Iterable, List, Tuple, Any
+ 
+ import numpy as np
+diff --git a/pyiron_base/job/generic.py b/pyiron_base/job/generic.py
+index 61f41709..afd96fcf 100644
+--- a/pyiron_base/job/generic.py
++++ b/pyiron_base/job/generic.py
+@@ -184,6 +184,10 @@ class GenericJob(JobCore):
+                 self.project_hdf5.file_name, job_name + "/status"
+             )
+             self._status = JobStatus(initial_status=initial_status)
++            if "job_id" in self.list_nodes():
++                self._job_id = h5io.read_hdf5(
++                    self.project_hdf5.file_name, job_name + "/job_id"
++                )
+         else:
+             self._status = JobStatus()
+         self._restart_file_list = list()
+@@ -741,6 +745,10 @@ class GenericJob(JobCore):
+                     delete_existing_job=delete_existing_job,
+                     run_again=run_again,
+                 )
++            elif status == "aborted":
++                raise ValueError(
++                    "Running an aborted job with `delete_existing_job=False` is meaningless."
++                )
+         except Exception:
+             self.drop_status_to_aborted()
+             raise
+@@ -1105,6 +1113,12 @@ class GenericJob(JobCore):
+         if not state.database.database_is_disabled:
+             job_id = self.project.db.add_item_dict(self.db_entry())
+             self._job_id = job_id
++            h5io.write_hdf5(
++                self.project_hdf5.file_name,
++                job_id,
++                title=self.job_name + "/job_id",
++                overwrite="update",
++            )
+             self.refresh_job_status()
+         else:
+             job_id = self.job_name
+@@ -1229,15 +1243,6 @@ class GenericJob(JobCore):
+         if not (self.status.finished or self.status.suspended):
+             self.status.aborted = True
+ 
+-    def _run_manually(self, _manually_print=True):
+-        """
+-        Internal helper function to run a job manually.
+-
+-        Args:
+-            _manually_print (bool): [True/False] print command for execution - default=True
+-        """
+-        run_job_with_runmode_manually(job=self, _manually_print=_manually_print)
+-
+     def _run_if_new(self, debug=False):
+         """
+         Internal helper function the run if new function is called when the job status is 'initialized'. It prepares
+diff --git a/pyiron_base/job/runfunction.py b/pyiron_base/job/runfunction.py
+index d16f674d..a38881c6 100644
+--- a/pyiron_base/job/runfunction.py
++++ b/pyiron_base/job/runfunction.py
+@@ -260,12 +260,12 @@ def run_job_with_runmode_manually(job, _manually_print=True):
+         _manually_print (bool): [True/False] print command for execution - default=True
+     """
+     if _manually_print:
++        abs_working = posixpath.abspath(job.project_hdf5.working_directory)
+         print(
+             "You have selected to start the job manually. "
+-            "To run it, go into the working directory {} and "
+-            "call 'python run_job.py' ".format(
+-                posixpath.abspath(job.project_hdf5.working_directory)
+-            )
++            + "To run it, go into the working directory {} and ".format(abs_working)
++            + "call 'python -m pyiron_base.cli wrapper -p {}".format(abs_working)
++            + " -j {} ' ".format(job.job_id)
+         )
+ 
+ 
+diff --git a/pyiron_base/server/queuestatus.py b/pyiron_base/server/queuestatus.py
+index a890c653..912cad14 100644
+--- a/pyiron_base/server/queuestatus.py
++++ b/pyiron_base/server/queuestatus.py
+@@ -263,11 +263,11 @@ def update_from_remote(project, recursive=True, ignore_exceptions=False):
+         df_queue = state.queue_adapter.get_status_of_my_jobs()
+         if (
+             len(df_queue) > 0
+-            and len(df_queue[df_queue.jobname.str.startswith("pi_")]) > 0
++            and len(df_queue[df_queue.jobname.str.contains(QUEUE_SCRIPT_PREFIX)]) > 0
+         ):
+-            df_queue = df_queue[df_queue.jobname.str.startswith("pi_")]
++            df_queue = df_queue[df_queue.jobname.str.contains(QUEUE_SCRIPT_PREFIX)]
+             df_queue["pyiron_id"] = df_queue.apply(
+-                lambda x: int(x["jobname"].split("pi_")[1]), axis=1
++                lambda x: int(x["jobname"].split(QUEUE_SCRIPT_PREFIX)[-1]), axis=1
+             )
+             jobs_now_running_lst = df_queue[
+                 df_queue.status == "running"
+diff --git a/setup.py b/setup.py
+index ae9a8674..303bea7b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -33,7 +33,7 @@ setup(
+         'gitpython==3.1.27',
+         'h5io==0.1.7',
+         'h5py==3.7.0',
+-        'numpy==1.23.0',
++        'numpy==1.23.1',
+         'pandas==1.4.3',
+         'pathlib2==2.3.7.post1',
+         'pint==0.19.2',

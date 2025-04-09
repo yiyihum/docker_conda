@@ -1,0 +1,124 @@
+diff --git a/c7n/resources/account.py b/c7n/resources/account.py
+index 1a422b5c0..6b6cdbb27 100644
+--- a/c7n/resources/account.py
++++ b/c7n/resources/account.py
+@@ -100,6 +100,71 @@ class AccountCredentialReport(CredentialReport):
+         return results
+ 
+ 
++@filters.register('organization')
++class AccountOrganization(ValueFilter):
++    """Check organization enrollment and configuration
++
++    :example:
++
++    determine if an account is not in an organization
++
++    .. code-block:: yaml
++
++      policies:
++        - name: no-org
++          resource: account
++          filters:
++            - type: organization
++              key: Id
++              value: absent
++
++
++    :example:
++
++    determine if an account is setup for organization policies
++
++    .. code-block:: yaml
++
++       policies:
++         - name: org-policies-not-enabled
++           resource: account
++           filters:
++             - type: organization
++               key: FeatureSet
++               value: ALL
++               op: not-equal
++    """
++    schema = type_schema('organization', rinherit=ValueFilter.schema)
++    schema_alias = False
++
++    annotation_key = 'c7n:org'
++    annotate = False
++
++    permissions = ('organizations:DescribeOrganization',)
++
++    def get_org_info(self, account):
++        client = local_session(
++            self.manager.session_factory).client('organizations')
++        try:
++            org_info = client.describe_organization().get('Organization')
++        except client.exceptions.AWSOrganizationsNotInUseException:
++            org_info = {}
++        except ClientError as e:
++            self.log.warning('organization filter error accessing org info %s', e)
++            org_info = None
++        account[self.annotation_key] = org_info
++
++    def process(self, resources, event=None):
++        if self.annotation_key not in resources[0]:
++            self.get_org_info(resources[0])
++        # if we can't access org info, we've already logged, and return
++        if resources[0][self.annotation_key] is None:
++            return []
++        if super().process([resources[0][self.annotation_key]]):
++            return resources
++        return []
++
++
+ @filters.register('check-macie')
+ class MacieEnabled(ValueFilter):
+     """Check status of macie v2 in the account.
+diff --git a/c7n/resources/connect.py b/c7n/resources/connect.py
+index b2fb5ede0..af920d0c2 100644
+--- a/c7n/resources/connect.py
++++ b/c7n/resources/connect.py
+@@ -52,6 +52,7 @@ class ConnectInstanceAttributeFilter(ValueFilter):
+             if self.annotation_key not in r:
+                 instance_attribute = client.describe_instance_attribute(InstanceId=r['Id'],
+                                 AttributeType=str.upper(self.data.get('attribute_type')))
++                instance_attribute.pop('ResponseMetadata', None)
+                 r[self.annotation_key] = instance_attribute
+ 
+             if self.match(r[self.annotation_key]):
+diff --git a/tools/c7n_left/c7n_left/filters.py b/tools/c7n_left/c7n_left/filters.py
+index 2e80586b7..7dee0e881 100644
+--- a/tools/c7n_left/c7n_left/filters.py
++++ b/tools/c7n_left/c7n_left/filters.py
+@@ -24,7 +24,7 @@ class Traverse(Filter):
+           filters:
+             - not:
+                - type: traverse
+-                 resource: aws_s3_bucket_server_side_encryption_configuration
++                 resources: aws_s3_bucket_server_side_encryption_configuration
+                  attrs:
+                   - rule.apply_server_side_encryption_by_default.sse_algorithm: aws:kms
+ 
+@@ -40,7 +40,7 @@ class Traverse(Filter):
+           filters:
+             - network_configuration: present
+             - type: traverse
+-              resource: [aws_apprunner_vpc_connector, aws_subnet, aws_vpc]
++              resources: [aws_apprunner_vpc_connector, aws_subnet, aws_vpc]
+               attrs:
+                - type: value
+                  key: tag:Env
+diff --git a/tools/c7n_left/c7n_left/output.py b/tools/c7n_left/c7n_left/output.py
+index c537282e7..80b9d581b 100644
+--- a/tools/c7n_left/c7n_left/output.py
++++ b/tools/c7n_left/c7n_left/output.py
+@@ -94,7 +94,7 @@ class RichCli(Output):
+     def on_execution_ended(self):
+         message = "[green]Success[green]"
+         if self.matches:
+-            message = "[red]%d Failures[/red]" % len(self.matches)
++            message = "[red]%d Failures[/red]" % self.matches
+         self.console.print(
+             "Evaluation complete %0.2f seconds -> %s"
+             % (time.time() - self.started, message)
+

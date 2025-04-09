@@ -1,0 +1,110 @@
+diff --git a/.gitignore b/.gitignore
+index fed2d343..4899559b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,6 +16,7 @@ env
+ .tox
+ venv
+ .venv 
++.python-version
+ 
+ # Ignore coverage reports
+ .coverage
+diff --git a/src/sqlfluff/cli/commands.py b/src/sqlfluff/cli/commands.py
+index a8bb8e90..16672d55 100644
+--- a/src/sqlfluff/cli/commands.py
++++ b/src/sqlfluff/cli/commands.py
+@@ -1,6 +1,7 @@
+ """Contains the CLI."""
+ 
+ import sys
++import json
+ 
+ import click
+ # For the profiler
+@@ -111,8 +112,11 @@ def rules(**kwargs):
+ 
+ @cli.command()
+ @common_options
++@click.option('-f', '--format', 'format', default='human',
++              type=click.Choice(['human', 'json'], case_sensitive=False),
++              help='What format to return the lint result in.')
+ @click.argument('paths', nargs=-1)
+-def lint(paths, **kwargs):
++def lint(paths, format, **kwargs):
+     """Lint SQL files via passing a list of files or using stdin.
+ 
+     PATH is the path to a sql file or directory to lint. This can be either a
+@@ -132,12 +136,13 @@ def lint(paths, **kwargs):
+ 
+     """
+     c = get_config(**kwargs)
+-    lnt = get_linter(c)
++    lnt = get_linter(c, silent=format == 'json')
+     verbose = c.get('verbose')
+ 
+     config_string = format_config(lnt, verbose=verbose)
+     if len(config_string) > 0:
+         lnt.log(config_string)
++
+     # add stdin if specified via lone '-'
+     if ('-',) == paths:
+         result = lnt.lint_string_wrapped(sys.stdin.read(), fname='stdin', verbosity=verbose)
+@@ -151,6 +156,10 @@ def lint(paths, **kwargs):
+             sys.exit(1)
+         # Output the final stats
+         lnt.log(format_linting_result_footer(result, verbose=verbose))
++
++    if format == 'json':
++        click.echo(json.dumps(result.as_records()))
++
+     sys.exit(result.stats()['exit code'])
+ 
+ 
+diff --git a/src/sqlfluff/errors.py b/src/sqlfluff/errors.py
+index 8768703c..fee9577e 100644
+--- a/src/sqlfluff/errors.py
++++ b/src/sqlfluff/errors.py
+@@ -96,6 +96,17 @@ class SQLBaseError(ValueError):
+         """
+         return self.rule_code(), self.line_no(), self.line_pos(), self.desc()
+ 
++    def get_info_dict(self):
++        """Get a dictionary representation of this violation.
++
++        Returns:
++            A `dictionary` with keys (code, line_no, line_pos, description)
++        """
++        return dict(zip(
++            ('code', 'line_no', 'line_pos', 'description'),
++            self.get_info_tuple()
++        ))
++
+     def ignore_if_in(self, ignore_iterable):
+         """Ignore this violation if it matches the iterable."""
+         # Type conversion
+diff --git a/src/sqlfluff/linter.py b/src/sqlfluff/linter.py
+index 933c2569..4ce17449 100644
+--- a/src/sqlfluff/linter.py
++++ b/src/sqlfluff/linter.py
+@@ -386,6 +386,20 @@ class LintingResult:
+         all_stats['status'] = 'FAIL' if all_stats['violations'] > 0 else 'PASS'
+         return all_stats
+ 
++    def as_records(self):
++        """Return the result as a list of dictionaries.
++
++        Each record contains a key specifying the filepath, and a list of violations. This
++        method is useful for serialization as all objects will be builtin python types
++        (ints, strs).
++        """
++        return [
++            {'filepath': path, 'violations': [v.get_info_dict() for v in violations]}
++            for lintedpath in self.paths
++            for path, violations in lintedpath.violations().items()
++            if violations
++        ]
++
+     def persist_changes(self, verbosity=0, output_func=None, **kwargs):
+         """Run all the fixes for all the files and return a dict."""
+         return self.combine_dicts(

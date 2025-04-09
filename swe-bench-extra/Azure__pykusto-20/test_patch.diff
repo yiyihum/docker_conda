@@ -1,0 +1,92 @@
+diff --git a/test/test_query.py b/test/test_query.py
+index b4ed016..a228e03 100644
+--- a/test/test_query.py
++++ b/test/test_query.py
+@@ -69,7 +69,7 @@ class TestQuery(TestBase):
+         table = PyKustoClient(mock_kusto_client)['test_db']['test_table']
+ 
+         self.assertEqual(
+-            " | where foo > 4 | take 5 | join kind=inner (test_table) on col0, $left.col1==$right.col2",
++            ' | where foo > 4 | take 5 | join kind=inner (cluster("test_cluster.kusto.windows.net").database("test_db").table("test_table")) on col0, $left.col1==$right.col2',
+             Query().where(col.foo > 4).take(5).join(
+                 Query(table), kind=JoinKind.INNER).on(col.col0).on(col.col1, col.col2).render(),
+         )
+@@ -79,7 +79,7 @@ class TestQuery(TestBase):
+         table = PyKustoClient(mock_kusto_client)['test_db']['test_table']
+ 
+         self.assertEqual(
+-            " | where foo > 4 | take 5 | join kind=inner (test_table | where bla == 2 | take 6) on col0, "
++            ' | where foo > 4 | take 5 | join kind=inner (cluster("test_cluster.kusto.windows.net").database("test_db").table("test_table") | where bla == 2 | take 6) on col0, '
+             "$left.col1==$right.col2",
+             Query().where(col.foo > 4).take(5).join(
+                 Query(table).where(col.bla == 2).take(6), kind=JoinKind.INNER).on(col.col0).on(col.col1,
+diff --git a/test/test_table.py b/test/test_table.py
+index d7a81b6..755acb2 100644
+--- a/test/test_table.py
++++ b/test/test_table.py
+@@ -1,8 +1,10 @@
+ from typing import List, Tuple
+ from unittest.mock import patch
++from urllib.parse import urljoin
+ 
+ from azure.kusto.data.request import KustoClient, ClientRequestProperties
+ 
++from pykusto.expressions import column_generator as col
+ from pykusto.client import PyKustoClient
+ from pykusto.query import Query
+ from test.test_base import TestBase
+@@ -12,8 +14,9 @@ from test.test_base import TestBase
+ class MockKustoClient(KustoClient):
+     executions: List[Tuple[str, str, ClientRequestProperties]]
+ 
+-    def __init__(self):
++    def __init__(self, cluster="https://test_cluster.kusto.windows.net"):
+         self.executions = []
++        self._query_endpoint = urljoin(cluster, "/v2/rest/query")
+ 
+     def execute(self, database: str, rendered_query: str, properties: ClientRequestProperties = None):
+         self.executions.append((database, rendered_query, properties))
+@@ -85,3 +88,43 @@ class TestTable(TestBase):
+             [('test_db', 'test_table | take 5', None)],
+             mock_kusto_client.executions,
+         )
++
++    def test_cross_cluster_join(self):
++        mock_kusto_client_1 = MockKustoClient("https://one.kusto.windows.net")
++        mock_kusto_client_2 = MockKustoClient("https://two.kusto.windows.net")
++
++        table1 = PyKustoClient(mock_kusto_client_1)['test_db_1']['test_table_1']
++        table2 = PyKustoClient(mock_kusto_client_2)['test_db_2']['test_table_2']
++        Query(table1).take(5).join(Query(table2).take(6)).on(col.foo).execute()
++        self.assertEqual(
++            [('test_db_1', 'test_table_1 | take 5 | join  (cluster("two.kusto.windows.net").database("test_db_2").table("test_table_2") | take 6) on foo', None)],
++            mock_kusto_client_1.executions,
++        )
++
++    def test_cross_cluster_join_with_union(self):
++        mock_kusto_client_1 = MockKustoClient("https://one.kusto.windows.net")
++        mock_kusto_client_2 = MockKustoClient("https://two.kusto.windows.net")
++
++        table1 = PyKustoClient(mock_kusto_client_1)['test_db_1']['test_table_1']
++        table2 = PyKustoClient(mock_kusto_client_2)['test_db_2'].get_tables('test_table_2_*')
++        Query(table1).take(5).join(Query(table2).take(6)).on(col.foo).execute()
++        self.assertEqual(
++            [('test_db_1',
++              'test_table_1 | take 5 | join  (union cluster("two.kusto.windows.net").database("test_db_2").table("test_table_2_*") | take 6) on foo',
++              None)],
++            mock_kusto_client_1.executions,
++        )
++
++    def test_cross_cluster_join_with_union_2(self):
++        mock_kusto_client_1 = MockKustoClient("https://one.kusto.windows.net")
++        mock_kusto_client_2 = MockKustoClient("https://two.kusto.windows.net")
++
++        table1 = PyKustoClient(mock_kusto_client_1)['test_db_1']['test_table_1']
++        table2 = PyKustoClient(mock_kusto_client_2)['test_db_2'].get_tables('test_table_2_*', 'test_table_3_*')
++        Query(table1).take(5).join(Query(table2).take(6)).on(col.foo).execute()
++        self.assertEqual(
++            [('test_db_1',
++              'test_table_1 | take 5 | join  (union cluster("two.kusto.windows.net").database("test_db_2").table("test_table_2_*"), cluster("two.kusto.windows.net").database("test_db_2").table("test_table_3_*") | take 6) on foo',
++              None)],
++            mock_kusto_client_1.executions,
++        )

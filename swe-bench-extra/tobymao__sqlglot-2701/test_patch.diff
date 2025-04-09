@@ -1,0 +1,160 @@
+diff --git a/tests/dialects/test_clickhouse.py b/tests/dialects/test_clickhouse.py
+index e56bdabb..1f528b62 100644
+--- a/tests/dialects/test_clickhouse.py
++++ b/tests/dialects/test_clickhouse.py
+@@ -70,6 +70,18 @@ class TestClickhouse(Validator):
+         self.validate_identity("CAST(x AS DATETIME)")
+         self.validate_identity("CAST(x as MEDIUMINT)", "CAST(x AS Int32)")
+         self.validate_identity("SELECT arrayJoin([1, 2, 3] AS src) AS dst, 'Hello', src")
++        self.validate_identity(
++            "SELECT n, source FROM (SELECT toFloat32(number % 10) AS n, 'original' AS source FROM numbers(10) WHERE number % 3 = 1) ORDER BY n WITH FILL"
++        )
++        self.validate_identity(
++            "SELECT n, source FROM (SELECT toFloat32(number % 10) AS n, 'original' AS source FROM numbers(10) WHERE number % 3 = 1) ORDER BY n WITH FILL FROM 0 TO 5.51 STEP 0.5"
++        )
++        self.validate_identity(
++            "SELECT toDate((number * 10) * 86400) AS d1, toDate(number * 86400) AS d2, 'original' AS source FROM numbers(10) WHERE (number % 3) = 1 ORDER BY d2 WITH FILL, d1 WITH FILL STEP 5"
++        )
++        self.validate_identity(
++            "SELECT n, source, inter FROM (SELECT toFloat32(number % 10) AS n, 'original' AS source, number AS inter FROM numbers(10) WHERE number % 3 = 1) ORDER BY n WITH FILL FROM 0 TO 5.51 STEP 0.5 INTERPOLATE (inter AS inter + 1)"
++        )
+         self.validate_identity(
+             "SELECT SUM(1) AS impressions, arrayJoin(cities) AS city, arrayJoin(browsers) AS browser FROM (SELECT ['Istanbul', 'Berlin', 'Bobruisk'] AS cities, ['Firefox', 'Chrome', 'Chrome'] AS browsers) GROUP BY 2, 3"
+         )
+diff --git a/tests/dialects/test_postgres.py b/tests/dialects/test_postgres.py
+index 0332ae1a..91556960 100644
+--- a/tests/dialects/test_postgres.py
++++ b/tests/dialects/test_postgres.py
+@@ -8,6 +8,11 @@ class TestPostgres(Validator):
+     dialect = "postgres"
+ 
+     def test_ddl(self):
++        expr = parse_one("CREATE TABLE t (x INTERVAL day)", read="postgres")
++        cdef = expr.find(exp.ColumnDef)
++        cdef.args["kind"].assert_is(exp.DataType)
++        self.assertEqual(expr.sql(dialect="postgres"), "CREATE TABLE t (x INTERVAL day)")
++
+         self.validate_identity("CREATE INDEX idx_x ON x USING BTREE(x, y) WHERE (NOT y IS NULL)")
+         self.validate_identity("CREATE TABLE test (elems JSONB[])")
+         self.validate_identity("CREATE TABLE public.y (x TSTZRANGE NOT NULL)")
+diff --git a/tests/dialects/test_presto.py b/tests/dialects/test_presto.py
+index ad85ddc6..a9d88cb0 100644
+--- a/tests/dialects/test_presto.py
++++ b/tests/dialects/test_presto.py
+@@ -544,26 +544,18 @@ class TestPresto(Validator):
+             },
+         )
+ 
+-    def test_presto(self):
+-        self.validate_identity("string_agg(x, ',')", "ARRAY_JOIN(ARRAY_AGG(x), ',')")
+-        self.validate_identity(
+-            "SELECT * FROM example.testdb.customer_orders FOR VERSION AS OF 8954597067493422955"
+-        )
+-        self.validate_identity(
+-            "SELECT * FROM example.testdb.customer_orders FOR TIMESTAMP AS OF CAST('2022-03-23 09:59:29.803 Europe/Vienna' AS TIMESTAMP)"
+-        )
+-
+-        self.validate_identity("SELECT * FROM x OFFSET 1 LIMIT 1")
+-        self.validate_identity("SELECT * FROM x OFFSET 1 FETCH FIRST 1 ROWS ONLY")
+-        self.validate_identity("SELECT BOOL_OR(a > 10) FROM asd AS T(a)")
+-        self.validate_identity("SELECT * FROM (VALUES (1))")
+-        self.validate_identity("START TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE")
+-        self.validate_identity("START TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+-        self.validate_identity("APPROX_PERCENTILE(a, b, c, d)")
+-        self.validate_identity(
+-            "SELECT SPLIT_TO_MAP('a:1;b:2;a:3', ';', ':', (k, v1, v2) -> CONCAT(v1, v2))"
+-        )
++    def test_unicode_string(self):
++        for prefix in ("u&", "U&"):
++            self.validate_identity(
++                f"{prefix}'Hello winter \\2603 !'",
++                "U&'Hello winter \\2603 !'",
++            )
++            self.validate_identity(
++                f"{prefix}'Hello winter #2603 !' UESCAPE '#'",
++                "U&'Hello winter #2603 !' UESCAPE '#'",
++            )
+ 
++    def test_presto(self):
+         with self.assertLogs(helper_logger) as cm:
+             self.validate_all(
+                 "SELECT COALESCE(ELEMENT_AT(MAP_FROM_ENTRIES(ARRAY[(51, '1')]), id), quantity) FROM my_table",
+@@ -582,6 +574,24 @@ class TestPresto(Validator):
+                 },
+             )
+ 
++        self.validate_identity("string_agg(x, ',')", "ARRAY_JOIN(ARRAY_AGG(x), ',')")
++        self.validate_identity("SELECT * FROM x OFFSET 1 LIMIT 1")
++        self.validate_identity("SELECT * FROM x OFFSET 1 FETCH FIRST 1 ROWS ONLY")
++        self.validate_identity("SELECT BOOL_OR(a > 10) FROM asd AS T(a)")
++        self.validate_identity("SELECT * FROM (VALUES (1))")
++        self.validate_identity("START TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE")
++        self.validate_identity("START TRANSACTION ISOLATION LEVEL REPEATABLE READ")
++        self.validate_identity("APPROX_PERCENTILE(a, b, c, d)")
++        self.validate_identity(
++            "SELECT SPLIT_TO_MAP('a:1;b:2;a:3', ';', ':', (k, v1, v2) -> CONCAT(v1, v2))"
++        )
++        self.validate_identity(
++            "SELECT * FROM example.testdb.customer_orders FOR VERSION AS OF 8954597067493422955"
++        )
++        self.validate_identity(
++            "SELECT * FROM example.testdb.customer_orders FOR TIMESTAMP AS OF CAST('2022-03-23 09:59:29.803 Europe/Vienna' AS TIMESTAMP)"
++        )
++
+         self.validate_all(
+             "SELECT MAX_BY(a.id, a.timestamp) FROM a",
+             read={
+diff --git a/tests/dialects/test_snowflake.py b/tests/dialects/test_snowflake.py
+index 13f32c13..4c2d7ca7 100644
+--- a/tests/dialects/test_snowflake.py
++++ b/tests/dialects/test_snowflake.py
+@@ -127,11 +127,45 @@ WHERE
+             "SELECT TO_TIMESTAMP(x) FROM t",
+             "SELECT CAST(x AS TIMESTAMPNTZ) FROM t",
+         )
++        self.validate_identity(
++            "CAST(x AS BYTEINT)",
++            "CAST(x AS INT)",
++        )
++        self.validate_identity(
++            "CAST(x AS CHAR VARYING)",
++            "CAST(x AS VARCHAR)",
++        )
++        self.validate_identity(
++            "CAST(x AS CHARACTER VARYING)",
++            "CAST(x AS VARCHAR)",
++        )
++        self.validate_identity(
++            "CAST(x AS NCHAR VARYING)",
++            "CAST(x AS VARCHAR)",
++        )
++        self.validate_identity(
++            "SELECT TO_ARRAY(x::ARRAY)",
++            "SELECT CAST(x AS ARRAY)",
++        )
++        self.validate_identity(
++            "SELECT TO_ARRAY(['test']::VARIANT)",
++            "SELECT TO_ARRAY(CAST(['test'] AS VARIANT))",
++        )
+ 
+-        self.validate_all("CAST(x AS BYTEINT)", write={"snowflake": "CAST(x AS INT)"})
+-        self.validate_all("CAST(x AS CHAR VARYING)", write={"snowflake": "CAST(x AS VARCHAR)"})
+-        self.validate_all("CAST(x AS CHARACTER VARYING)", write={"snowflake": "CAST(x AS VARCHAR)"})
+-        self.validate_all("CAST(x AS NCHAR VARYING)", write={"snowflake": "CAST(x AS VARCHAR)"})
++        self.validate_all(
++            "SELECT TO_ARRAY(['test'])",
++            write={
++                "snowflake": "SELECT ['test']",
++                "spark": "SELECT ARRAY('test')",
++            },
++        )
++        self.validate_all(
++            "SELECT TO_ARRAY(['test'])",
++            write={
++                "snowflake": "SELECT ['test']",
++                "spark": "SELECT ARRAY('test')",
++            },
++        )
+         self.validate_all(
+             # We need to qualify the columns in this query because "value" would be ambiguous
+             'WITH t(x, "value") AS (SELECT [1, 2, 3], 1) SELECT IFF(_u.pos = _u_2.pos_2, _u_2."value", NULL) AS "value" FROM t, TABLE(FLATTEN(INPUT => ARRAY_GENERATE_RANGE(0, (GREATEST(ARRAY_SIZE(t.x)) - 1) + 1))) AS _u(seq, key, path, index, pos, this) CROSS JOIN TABLE(FLATTEN(INPUT => t.x)) AS _u_2(seq, key, path, pos_2, "value", this) WHERE _u.pos = _u_2.pos_2 OR (_u.pos > (ARRAY_SIZE(t.x) - 1) AND _u_2.pos_2 = (ARRAY_SIZE(t.x) - 1))',

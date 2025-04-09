@@ -1,0 +1,138 @@
+diff --git a/sqlglot/dialects/clickhouse.py b/sqlglot/dialects/clickhouse.py
+index 55095c88..03b116e4 100644
+--- a/sqlglot/dialects/clickhouse.py
++++ b/sqlglot/dialects/clickhouse.py
+@@ -43,6 +43,7 @@ class ClickHouse(Dialect):
+         STRING_ESCAPES = ["'", "\\"]
+         BIT_STRINGS = [("0b", "")]
+         HEX_STRINGS = [("0x", ""), ("0X", "")]
++        HEREDOC_STRINGS = ["$"]
+ 
+         KEYWORDS = {
+             **tokens.Tokenizer.KEYWORDS,
+@@ -75,6 +76,11 @@ class ClickHouse(Dialect):
+             "UINT8": TokenType.UTINYINT,
+         }
+ 
++        SINGLE_TOKENS = {
++            **tokens.Tokenizer.SINGLE_TOKENS,
++            "$": TokenType.HEREDOC_STRING,
++        }
++
+     class Parser(parser.Parser):
+         FUNCTIONS = {
+             **parser.Parser.FUNCTIONS,
+diff --git a/sqlglot/dialects/postgres.py b/sqlglot/dialects/postgres.py
+index 342fd95a..c22a30b3 100644
+--- a/sqlglot/dialects/postgres.py
++++ b/sqlglot/dialects/postgres.py
+@@ -248,11 +248,10 @@ class Postgres(Dialect):
+     }
+ 
+     class Tokenizer(tokens.Tokenizer):
+-        QUOTES = ["'", "$$"]
+-
+         BIT_STRINGS = [("b'", "'"), ("B'", "'")]
+         HEX_STRINGS = [("x'", "'"), ("X'", "'")]
+         BYTE_STRINGS = [("e'", "'"), ("E'", "'")]
++        HEREDOC_STRINGS = ["$"]
+ 
+         KEYWORDS = {
+             **tokens.Tokenizer.KEYWORDS,
+@@ -296,7 +295,7 @@ class Postgres(Dialect):
+ 
+         SINGLE_TOKENS = {
+             **tokens.Tokenizer.SINGLE_TOKENS,
+-            "$": TokenType.PARAMETER,
++            "$": TokenType.HEREDOC_STRING,
+         }
+ 
+         VAR_SINGLE_TOKENS = {"$"}
+diff --git a/sqlglot/dialects/spark.py b/sqlglot/dialects/spark.py
+index 2eaa2ae9..63924d43 100644
+--- a/sqlglot/dialects/spark.py
++++ b/sqlglot/dialects/spark.py
+@@ -96,3 +96,17 @@ class Spark(Spark2):
+                 return self.func("DATEDIFF", unit, start, end)
+ 
+             return self.func("DATEDIFF", end, start)
++
++        def create_sql(self, expression: exp.Create) -> str:
++            kind = self.sql(expression, "kind").upper()
++            properties = expression.args.get("properties")
++            temporary = any(
++                isinstance(prop, exp.TemporaryProperty)
++                for prop in (properties.expressions if properties else [])
++            )
++            if kind == "TABLE" and temporary:
++                provider = exp.FileFormatProperty(this=exp.Literal.string("parquet"))
++                expression = expression.copy()
++                expression.args["properties"].append("expressions", provider)
++
++            return super().create_sql(expression)
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 84f7e46d..5f8a8448 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -590,6 +590,9 @@ class Parser(metaclass=_Parser):
+             exp.National, this=token.text
+         ),
+         TokenType.RAW_STRING: lambda self, token: self.expression(exp.RawString, this=token.text),
++        TokenType.HEREDOC_STRING: lambda self, token: self.expression(
++            exp.RawString, this=token.text
++        ),
+         TokenType.SESSION_PARAMETER: lambda self, _: self._parse_session_parameter(),
+     }
+ 
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index 4d5f1983..6b86a6b3 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -77,6 +77,7 @@ class TokenType(AutoName):
+     BYTE_STRING = auto()
+     NATIONAL_STRING = auto()
+     RAW_STRING = auto()
++    HEREDOC_STRING = auto()
+ 
+     # types
+     BIT = auto()
+@@ -418,6 +419,7 @@ class _Tokenizer(type):
+             **_quotes_to_format(TokenType.BYTE_STRING, klass.BYTE_STRINGS),
+             **_quotes_to_format(TokenType.HEX_STRING, klass.HEX_STRINGS),
+             **_quotes_to_format(TokenType.RAW_STRING, klass.RAW_STRINGS),
++            **_quotes_to_format(TokenType.HEREDOC_STRING, klass.HEREDOC_STRINGS),
+         }
+ 
+         klass._STRING_ESCAPES = set(klass.STRING_ESCAPES)
+@@ -484,6 +486,7 @@ class Tokenizer(metaclass=_Tokenizer):
+     BYTE_STRINGS: t.List[str | t.Tuple[str, str]] = []
+     HEX_STRINGS: t.List[str | t.Tuple[str, str]] = []
+     RAW_STRINGS: t.List[str | t.Tuple[str, str]] = []
++    HEREDOC_STRINGS: t.List[str | t.Tuple[str, str]] = []
+     IDENTIFIERS: t.List[str | t.Tuple[str, str]] = ['"']
+     IDENTIFIER_ESCAPES = ['"']
+     QUOTES: t.List[t.Tuple[str, str] | str] = ["'"]
+@@ -997,9 +1000,11 @@ class Tokenizer(metaclass=_Tokenizer):
+                 word = word.upper()
+                 self._add(self.KEYWORDS[word], text=word)
+                 return
++
+         if self._char in self.SINGLE_TOKENS:
+             self._add(self.SINGLE_TOKENS[self._char], text=self._char)
+             return
++
+         self._scan_var()
+ 
+     def _scan_comment(self, comment_start: str) -> bool:
+@@ -1126,6 +1131,10 @@ class Tokenizer(metaclass=_Tokenizer):
+                 base = 16
+             elif token_type == TokenType.BIT_STRING:
+                 base = 2
++            elif token_type == TokenType.HEREDOC_STRING:
++                self._advance()
++                tag = "" if self._char == end else self._extract_string(end)
++                end = f"{start}{tag}{end}"
+         else:
+             return False
+ 
+

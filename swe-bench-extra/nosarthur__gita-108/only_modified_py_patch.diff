@@ -1,0 +1,112 @@
+diff --git a/gita/__main__.py b/gita/__main__.py
+index e00f20d..13a048e 100644
+--- a/gita/__main__.py
++++ b/gita/__main__.py
+@@ -57,7 +57,7 @@ def f_ll(args: argparse.Namespace):
+     if args.group:  # only display repos in this group
+         group_repos = utils.get_groups()[args.group]
+         repos = {k: repos[k] for k in group_repos if k in repos}
+-    for line in utils.describe(repos):
++    for line in utils.describe(repos, no_colors=args.no_colors):
+         print(line)
+ 
+ 
+@@ -245,6 +245,8 @@ def main(argv=None):
+                       nargs='?',
+                       choices=utils.get_groups(),
+                       help="show repos in the chosen group")
++    p_ll.add_argument('-n', '--no-colors', action='store_true',
++            help='Disable coloring on the branch names.')
+     p_ll.set_defaults(func=f_ll)
+ 
+     p_context = subparsers.add_parser('context',
+diff --git a/gita/info.py b/gita/info.py
+index 18d20fd..2d1d33f 100644
+--- a/gita/info.py
++++ b/gita/info.py
+@@ -42,6 +42,7 @@ def get_info_items() -> Tuple[Dict[str, Callable[[str], str]], List[str]]:
+             'path': get_path, }
+     display_items = ['branch', 'commit_msg']
+ 
++    # FIXME: remove these code
+     # custom settings
+     root = common.get_config_dir()
+     src_fname = os.path.join(root, 'extra_repo_info.py')
+@@ -113,13 +114,15 @@ def get_commit_msg(path: str) -> str:
+     return result.stdout.strip()
+ 
+ 
+-def get_repo_status(path: str) -> str:
++def get_repo_status(path: str, no_colors=False) -> str:
+     head = get_head(path)
+-    dirty, staged, untracked, color = _get_repo_status(path)
+-    return f'{color}{head+" "+dirty+staged+untracked:<10}{Color.end}'
++    dirty, staged, untracked, color = _get_repo_status(path, no_colors)
++    if color:
++        return f'{color}{head+" "+dirty+staged+untracked:<10}{Color.end}'
++    return f'{head+" "+dirty+staged+untracked:<10}'
+ 
+ 
+-def _get_repo_status(path: str) -> Tuple[str]:
++def _get_repo_status(path: str, no_colors: bool) -> Tuple[str]:
+     """
+     Return the status of one repo
+     """
+@@ -128,6 +131,9 @@ def _get_repo_status(path: str) -> Tuple[str]:
+     staged = '+' if run_quiet_diff(['--cached']) else ''
+     untracked = '_' if has_untracked() else ''
+ 
++    if no_colors:
++        return dirty, staged, untracked, ''
++
+     diff_returncode = run_quiet_diff(['@{u}', '@{0}'])
+     has_no_remote = diff_returncode == 128
+     has_no_diff = diff_returncode == 0
+diff --git a/gita/utils.py b/gita/utils.py
+index 900aefa..cc0a354 100644
+--- a/gita/utils.py
++++ b/gita/utils.py
+@@ -2,7 +2,7 @@ import os
+ import yaml
+ import asyncio
+ import platform
+-from functools import lru_cache
++from functools import lru_cache, partial
+ from pathlib import Path
+ from typing import List, Dict, Coroutine, Union
+ 
+@@ -197,13 +197,19 @@ def exec_async_tasks(tasks: List[Coroutine]) -> List[Union[None, str]]:
+     return errors
+ 
+ 
+-def describe(repos: Dict[str, str]) -> str:
++def describe(repos: Dict[str, str], no_colors: bool=False) -> str:
+     """
+     Return the status of all repos
+     """
+     if repos:
+         name_width = max(len(n) for n in repos) + 1
+     funcs = info.get_info_funcs()
++
++    get_repo_status = info.get_repo_status
++    if get_repo_status in funcs and no_colors:
++        idx = funcs.index(get_repo_status)
++        funcs[idx] = partial(get_repo_status, no_colors=True)
++
+     for name in sorted(repos):
+         path = repos[name]
+         display_items = ' '.join(f(path) for f in funcs)
+diff --git a/setup.py b/setup.py
+index 0cdd33f..cf4ab90 100644
+--- a/setup.py
++++ b/setup.py
+@@ -7,7 +7,7 @@ with open('README.md', encoding='utf-8') as f:
+ setup(
+     name='gita',
+     packages=['gita'],
+-    version='0.11.6',
++    version='0.11.7',
+     license='MIT',
+     description='Manage multiple git repos with sanity',
+     long_description=long_description,
+

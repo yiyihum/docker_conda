@@ -1,0 +1,128 @@
+diff --git a/changes/pr3681.yaml b/changes/pr3681.yaml
+new file mode 100644
+index 0000000000..e707ece5c9
+--- /dev/null
++++ b/changes/pr3681.yaml
+@@ -0,0 +1,2 @@
++enhancement:
++  - "Add `task_definition_arn` to `ECSRun` run-config - [#3681](https://github.com/PrefectHQ/prefect/pull/3681)"
+diff --git a/src/prefect/agent/ecs/agent.py b/src/prefect/agent/ecs/agent.py
+index 7d9df496a4..1052add1dc 100644
+--- a/src/prefect/agent/ecs/agent.py
++++ b/src/prefect/agent/ecs/agent.py
+@@ -310,8 +310,7 @@ class ECSAgent(Agent):
+             )
+             raise ValueError("Flow is missing a `run_config`")
+ 
+-        # Check if a task definition already exists
+-        taskdef_arn = self.lookup_task_definition_arn(flow_run)
++        taskdef_arn = self.get_task_definition_arn(flow_run, run_config)
+         if taskdef_arn is None:
+             # Register a new task definition
+             self.logger.debug(
+@@ -359,16 +358,22 @@ class ECSAgent(Agent):
+             "prefect:flow-version": str(flow_run.flow.version),
+         }
+ 
+-    def lookup_task_definition_arn(self, flow_run: GraphQLResult) -> Optional[str]:
+-        """Lookup an existing task definition ARN for a flow run.
++    def get_task_definition_arn(
++        self, flow_run: GraphQLResult, run_config: ECSRun
++    ) -> Optional[str]:
++        """Get an existing task definition ARN for a flow run.
+ 
+         Args:
+             - flow_run (GraphQLResult): the flow run
++            - run_config (ECSRun): The flow's run config
+ 
+         Returns:
+             - Optional[str]: the task definition ARN. Returns `None` if no
+                 existing definition is found.
+         """
++        if run_config.task_definition_arn is not None:
++            return run_config.task_definition_arn
++
+         tags = self.get_task_definition_tags(flow_run)
+ 
+         from botocore.exceptions import ClientError
+diff --git a/src/prefect/run_configs/ecs.py b/src/prefect/run_configs/ecs.py
+index 6e2f3d9183..f75f55c80f 100644
+--- a/src/prefect/run_configs/ecs.py
++++ b/src/prefect/run_configs/ecs.py
+@@ -11,11 +11,11 @@ class ECSRun(RunConfig):
+ 
+     ECS Tasks are composed of task definitions and runtime parameters.
+ 
+-    Task definitions can be configured using either the `task_definition` or
+-    `task_definition_path` parameters. If neither is specified, the default
+-    configured on the agent will be used. At runtime this task definition will
+-    be registered once per flow version - subsequent runs of the same flow
+-    version will reuse the existing definition.
++    Task definitions can be configured using either the `task_definition`,
++    `task_definition_path`, or `task_definition_arn` parameters. If neither is
++    specified, the default configured on the agent will be used. At runtime
++    this task definition will be registered once per flow version - subsequent
++    runs of the same flow version will reuse the existing definition.
+ 
+     Runtime parameters can be specified via `run_task_kwargs`. These will be
+     merged with any runtime parameters configured on the agent when starting
+@@ -34,6 +34,9 @@ class ECSRun(RunConfig):
+             Otherwise the task definition will be loaded at runtime on the
+             agent.  Supported runtime file schemes include (`s3`, `gcs`, and
+             `agent` (for paths local to the runtime agent)).
++        - task_definition_arn (str, optional): A pre-registered task definition
++            ARN to use (either `family`, `family:version`, or a full task
++            definition ARN).
+         - image (str, optional): The image to use for this task. If not
+             provided, will be either inferred from the flow's storage (if using
+             `Docker` storage), or use the default configured on the agent.
+@@ -99,6 +102,7 @@ ecs.html#ECS.Client.run_task
+         *,
+         task_definition: dict = None,
+         task_definition_path: str = None,
++        task_definition_arn: str = None,
+         image: str = None,
+         env: dict = None,
+         cpu: Union[int, str] = None,
+@@ -109,9 +113,19 @@ ecs.html#ECS.Client.run_task
+     ) -> None:
+         super().__init__(labels=labels)
+ 
+-        if task_definition is not None and task_definition_path is not None:
++        if (
++            sum(
++                [
++                    task_definition is not None,
++                    task_definition_path is not None,
++                    task_definition_arn is not None,
++                ]
++            )
++            > 1
++        ):
+             raise ValueError(
+-                "Cannot provide both `task_definition` and `task_definition_path`"
++                "Can only provide one of `task_definition`, `task_definition_path`, "
++                "or `task_definition_arn`"
+             )
+         if task_definition_path is not None:
+             parsed = parse_path(task_definition_path)
+@@ -127,6 +141,7 @@ ecs.html#ECS.Client.run_task
+ 
+         self.task_definition = task_definition
+         self.task_definition_path = task_definition_path
++        self.task_definition_arn = task_definition_arn
+         self.image = image
+         self.env = env
+         self.cpu = cpu
+diff --git a/src/prefect/serialization/run_config.py b/src/prefect/serialization/run_config.py
+index 96129353cf..ca94f386ee 100644
+--- a/src/prefect/serialization/run_config.py
++++ b/src/prefect/serialization/run_config.py
+@@ -28,6 +28,7 @@ class ECSRunSchema(RunConfigSchemaBase):
+ 
+     task_definition_path = fields.String(allow_none=True)
+     task_definition = JSONCompatible(allow_none=True)
++    task_definition_arn = fields.String(allow_none=True)
+     image = fields.String(allow_none=True)
+     env = fields.Dict(keys=fields.String(), allow_none=True)
+     cpu = fields.String(allow_none=True)

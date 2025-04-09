@@ -1,0 +1,132 @@
+diff --git a/scrapyd/tests/conftest.py b/scrapyd/tests/conftest.py
+index 632957a..e0ef5c9 100644
+--- a/scrapyd/tests/conftest.py
++++ b/scrapyd/tests/conftest.py
+@@ -47,9 +47,15 @@ def txrequest():
+     return Request(http_channel)
+ 
+ 
+-def common_app_fixture(request):
+-    config = Config()
++@pytest.fixture(params=[None, ('scrapyd', 'items_dir', 'items')], ids=["default", "default_with_local_items"])
++def fxt_config(request):
++    conf = Config()
++    if request.param:
++        conf.cp.set(*request.param)
++    return conf
+ 
++
++def common_app_fixture(request, config):
+     app = application(config)
+     project, version = 'quotesbot', '0.1'
+     storage = app.getComponent(IEggStorage)
+@@ -65,14 +71,14 @@ def common_app_fixture(request):
+ 
+ 
+ @pytest.fixture
+-def site_no_egg(request):
+-    root, storage = common_app_fixture(request)
++def site_no_egg(request, fxt_config):
++    root, storage = common_app_fixture(request, fxt_config)
+     return root
+ 
+ 
+ @pytest.fixture
+-def site_with_egg(request):
+-    root, storage = common_app_fixture(request)
++def site_with_egg(request, fxt_config):
++    root, storage = common_app_fixture(request, fxt_config)
+ 
+     egg_path = Path(__file__).absolute().parent / "quotesbot.egg"
+     project, version = 'quotesbot', '0.1'
+diff --git a/scrapyd/tests/test_webservice.py b/scrapyd/tests/test_webservice.py
+index e20fe61..ab4b4e8 100644
+--- a/scrapyd/tests/test_webservice.py
++++ b/scrapyd/tests/test_webservice.py
+@@ -2,6 +2,11 @@ from pathlib import Path
+ from unittest import mock
+ 
+ from scrapyd.interfaces import IEggStorage
++from scrapyd.jobstorage import Job
++
++
++def fake_list_jobs(*args, **kwargs):
++    yield Job('proj1', 'spider-a', 'id1234')
+ 
+ 
+ def fake_list_spiders(*args, **kwargs):
+@@ -49,6 +54,23 @@ class TestWebservice:
+ 
+         assert content['projects'] == ['quotesbot']
+ 
++    def test_list_jobs(self, txrequest, site_with_egg):
++        txrequest.args = {}
++        endpoint = b'listjobs.json'
++        content = site_with_egg.children[endpoint].render_GET(txrequest)
++
++        assert set(content) == {'node_name', 'status', 'pending', 'running', 'finished'}
++
++    @mock.patch('scrapyd.jobstorage.MemoryJobStorage.__iter__', new=fake_list_jobs)
++    def test_list_jobs_finished(self, txrequest, site_with_egg):
++        txrequest.args = {}
++        endpoint = b'listjobs.json'
++        content = site_with_egg.children[endpoint].render_GET(txrequest)
++
++        assert set(content['finished'][0]) == {
++            'project', 'spider', 'id', 'start_time', 'end_time', 'log_url', 'items_url'
++        }
++
+     def test_delete_version(self, txrequest, site_with_egg):
+         endpoint = b'delversion.json'
+         txrequest.args = {
+diff --git a/scrapyd/tests/test_website.py b/scrapyd/tests/test_website.py
+index 5fa21f2..fad881e 100644
+--- a/scrapyd/tests/test_website.py
++++ b/scrapyd/tests/test_website.py
+@@ -3,22 +3,37 @@ class TestWebsite:
+         content = site_no_egg.children[b'jobs'].render(txrequest)
+         expect_headers = {
+             b'Content-Type': [b'text/html; charset=utf-8'],
+-            b'Content-Length': [b'643']
++            b'Content-Length': [b'643'],
+         }
+-        headers = txrequest.responseHeaders.getAllRawHeaders()
+-        initial = (
++        if site_no_egg.local_items:
++            expect_headers[b'Content-Length'] = [b'601']
++
++        headers = dict(txrequest.responseHeaders.getAllRawHeaders())
++
++        assert headers == expect_headers
++        assert content.decode().startswith(
+             '<html><head><title>Scrapyd</title><style type="text/css">'
+             '#jobs>thead td {text-align: center; font-weight'
+         )
+-
+-        assert dict(headers) == expect_headers
+-        assert content.decode().startswith(initial)
++        if site_no_egg.local_items:
++            assert b'display: none' not in content
++        else:
++            assert b'display: none' in content
+ 
+     def test_render_home(self, txrequest, site_no_egg):
+         content = site_no_egg.children[b''].render_GET(txrequest)
++        expect_headers = {
++            b'Content-Type': [b'text/html; charset=utf-8'],
++            b'Content-Length': [b'708'],
++        }
++        if site_no_egg.local_items:
++            expect_headers[b'Content-Length'] = [b'744']
++
+         headers = dict(txrequest.responseHeaders.getAllRawHeaders())
+ 
++        assert headers == expect_headers
+         assert b'Available projects' in content
+-        assert headers[b'Content-Type'] == [b'text/html; charset=utf-8']
+-        # content-length different between my localhost and build environment
+-        assert b'Content-Length' in headers
++        if site_no_egg.local_items:
++            assert b'Items' in content
++        else:
++            assert b'Items' not in content

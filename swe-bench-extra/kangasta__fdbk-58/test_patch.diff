@@ -1,0 +1,163 @@
+diff --git a/fdbk/utils/_common_tests.py b/fdbk/utils/_common_tests.py
+index 772beb7..c90bc56 100644
+--- a/fdbk/utils/_common_tests.py
++++ b/fdbk/utils/_common_tests.py
+@@ -19,6 +19,32 @@ class CommonTest:
+         with self.assertRaises(KeyError):
+             self.C.add_data("topic_id", {"key": "value"})
+ 
++    def test_template_topics(self):
++        template_id = self.C.add_topic(
++            "test_template",
++            type_str='template',
++            fields=['number'])
++        self.assertEqual(template_id, "test_template")
++
++        topic_id = self.C.add_topic('topic', template=template_id)
++        topic_d = self.C.get_topic(topic_id)
++        self.assertEqual(topic_d.get('fields'), ['number'])
++
++        topics = self.C.get_topics()
++        self.assertEqual(len(topics), 2)
++        for topic in topics:
++            self.assertEqual(topic.get('fields'), ['number'])
++
++    def test_cannot_add_topic_with_invalid_template(self):
++        with self.assertRaises(KeyError):
++            self.C.add_topic('topic1', template='test_template')
++
++        self.C.add_topic("test_template", type_str='template')
++        topic_id = self.C.add_topic('topic2', template='test_template')
++
++        with self.assertRaises(AssertionError):
++            self.C.add_topic('topic3', template=topic_id)
++
+     def test_cannot_add_data_with_non_matching_number_of_fields(self):
+         topic_id = self.C.add_topic(
+             "topic",
+@@ -35,6 +61,14 @@ class CommonTest:
+         with self.assertRaises(ValueError):
+             self.C.add_data(topic_id, {"key": "value"})
+ 
++    def test_cannot_add_data_to_template(self):
++        topic_id = self.C.add_topic(
++            "topic",
++            type_str="template",
++            fields=["number"])
++        with self.assertRaises(AssertionError):
++            self.C.add_data(topic_id, {"number": 3})
++
+     def test_add_data_affects_get_data_output(self):
+         topic_id = self.C.add_topic(
+             "topic",
+@@ -110,22 +144,33 @@ class CommonTest:
+         self.assertEqual(dataset["data"][0]["x"], '2020-01-01T01:03:00Z')
+         self.assertEqual(dataset["data"][-1]["x"], '2020-01-01T01:07:00Z')
+ 
+-    def test_can_get_topics_type(self):
++    def test_can_get_topics_type_and_template(self):
+         self.C.add_topic(
+-            "1",
+-            type_str="a",
++            "te1",
++            type_str="template",
+             fields=["number"])
++        self.C.add_topic(
++            "te2",
++            type_str="template",
++            fields=["letter"])
++        self.C.add_topic(
++            "1",
++            template="te1")
+         self.C.add_topic(
+             "2",
+-            type_str="a",
+-            fields=["number"])
++            template="te1")
+         self.C.add_topic(
+             "3",
+-            type_str="b",
+-            fields=["letter"])
++            template="te2")
++
++        topics = self.C.get_topics('template')
++        self.assertEqual(len(topics), 2)
++
++        topics = self.C.get_topics('topic')
++        self.assertEqual(len(topics), 3)
+ 
+-        topics = self.C.get_topics('a')
++        topics = self.C.get_topics(template='te1')
+         self.assertEqual(len(topics), 2)
+ 
+-        topics = self.C.get_topics('b')
++        topics = self.C.get_topics(template='te2')
+         self.assertEqual(len(topics), 1)
+diff --git a/tst/test_client_connection.py b/tst/test_client_connection.py
+index 600e1bf..e47fb2c 100644
+--- a/tst/test_client_connection.py
++++ b/tst/test_client_connection.py
+@@ -57,8 +57,8 @@ class ClientConnectionTest(TestCase):
+     def test_add_topic_triggers_correct_call(self):
+         c = ClientConnection("")
+         with patch('requests.post', side_effect=self.mock_requests_post), patch('fdbk.DictConnection.add_topic', return_value="topic_id") as add_topic:
+-            c.add_topic("topic", type_str="test")
+-            add_topic.assert_called_with("topic", type_str="test", description=None, fields=[], units=[], data_tools=[], metadata={})
++            c.add_topic("topic", type_str="template")
++            add_topic.assert_called_with("topic", type_str="template", description=None, fields=[], units=[], data_tools=[], metadata={}, template=None)
+ 
+     def test_add_data_triggers_correct_call(self):
+         c = ClientConnection("")
+diff --git a/tst/test_db_connection.py b/tst/test_db_connection.py
+index 6f5a0d5..d4c1b8a 100644
+--- a/tst/test_db_connection.py
++++ b/tst/test_db_connection.py
+@@ -198,7 +198,7 @@ class DBConnectionTest(TestCase):
+             C.add_data(topic_ids[-1], {"number": 4})
+             C.add_data(topic_ids[-1], {"number": 2})
+         if fn == "get_comparison":
+-            result = C.get_comparison(topic_ids)
++            result = C.get_overview(topic_ids)
+         elif fn == "get_overview":
+             result = C.get_overview()
+         self.assertEqual(result["topic_names"], ["topic_0", "topic_1", "topic_2"])
+diff --git a/tst/test_dict_connection.py b/tst/test_dict_connection.py
+index eb8ec6a..b0bca0d 100644
+--- a/tst/test_dict_connection.py
++++ b/tst/test_dict_connection.py
+@@ -1,5 +1,6 @@
+ import os
+ from unittest import TestCase
++from uuid import uuid4
+ 
+ try:
+     from unittest.mock import Mock, patch
+@@ -15,13 +16,25 @@ class DictConnectionCommonTest(CommonTest, TestCase):
+ 
+ class DictConnectionTest(TestCase):
+     def test_topics_backup_saves_dict_to_file(self):
+-        C1 = DictConnection('/tmp/asd.json')
++        filename = f'{uuid4()}.json'
++        C1 = DictConnection(f'/tmp/{filename}')
+         C1.add_topic('Test topic 1')
+         C1.add_topic('Test topic 2')
+ 
+-        C2 = DictConnection('/tmp/asd.json')
++        C2 = DictConnection(f'/tmp/{filename}')
+         topics = C2.get_topics()
+ 
+-        os.remove('/tmp/asd.json')
++        os.remove(f'/tmp/{filename}')
+ 
+         self.assertEqual(len(topics), 2)
++
++    def test_get_topics_raises_keyerror_on_template_not_found(self):
++        C = DictConnection()
++        C.add_topic('test_template', type_str='template')
++        C.add_topic('topic', template='test_template')
++
++        C.get_topics()
++
++        C._dict['topics'] = C._dict['topics'][1:]
++        with self.assertRaises(KeyError):
++            C.get_topics()

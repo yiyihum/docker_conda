@@ -1,0 +1,152 @@
+diff --git a/CHANGES b/CHANGES
+index 4b8acb7..ef16948 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -1,3 +1,13 @@
++Release 4.4 (Oct 26, 2020)
++----------------------------
++
++* Implement a non-destructive path-fixing algorithm for ``MP_Node.fix_tree``.
++* Ensure ``post_save`` is triggered *after* the parent node is updated in ``MP_AddChildHandler``.
++* Fix static URL generation to use ``static`` template tag instead of constructing the URL manually.
++* Declare support for Django 2.2, 3.0 and 3.1.
++* Drop support for Django 2.1 and lower.
++* Drop support for Python 2.7 and Python 3.5.
++
+ Release 4.3.1 (Dec 25, 2019)
+ ----------------------------
+ 
+@@ -221,7 +231,7 @@ New features added
+   - script to build documentation
+ 
+   - updated numconv.py
+-  
++
+ 
+ Bugs fixed
+ ~~~~~~~~~~
+@@ -230,7 +240,7 @@ Bugs fixed
+   Solves bug in postgres when the table isn't created by syncdb.
+ 
+ * Removing unused method NS_Node._find_next_node
+-  
++
+ * Fixed MP_Node.get_tree to include the given parent when given a leaf node
+ 
+ 
+diff --git a/README.rst b/README.rst
+index 8e31be6..688ea51 100644
+--- a/README.rst
++++ b/README.rst
+@@ -16,6 +16,9 @@ Status
+ .. image:: https://travis-ci.org/django-treebeard/django-treebeard.svg?branch=master
+     :target: https://travis-ci.org/django-treebeard/django-treebeard
+ 
++.. image:: https://ci.appveyor.com/api/projects/status/mwbf062v68lhw05c?svg=true
++    :target: https://ci.appveyor.com/project/mvantellingen/django-treebeard
++
+ .. image:: https://img.shields.io/pypi/v/django-treebeard.svg
+     :target: https://pypi.org/project/django-treebeard/
+ 
+diff --git a/appveyor.yml b/appveyor.yml
+index 5ee9a8f..807ce95 100644
+--- a/appveyor.yml
++++ b/appveyor.yml
+@@ -1,7 +1,25 @@
+-# Do a dummy build so that AppVeyor doesn't fail
+-# while we're waiting for it to be disconnected altogether
++services:
++  - mssql2016
+ 
+-branches:
+-  only: []
++environment:
++  matrix:
++    - TOXENV: py36-dj22-mssql
++    - TOXENV: py37-dj22-mssql
++    - TOXENV: py38-dj22-mssql
++    - TOXENV: py36-dj30-mssql
++    - TOXENV: py37-dj30-mssql
++    - TOXENV: py38-dj30-mssql
++    - TOXENV: py36-dj31-mssql
++    - TOXENV: py37-dj31-mssql
++    - TOXENV: py38-dj31-mssql
+ 
+-build: false  # i.e. do nut run msbuild
++matrix:
++  fast_finish: true
++
++install:
++  - C:\Python36\python -m pip install tox
++
++build: false  # Not a C# project
++
++test_script:
++  - C:\Python36\scripts\tox
+diff --git a/tox.ini b/tox.ini
+index d909363..2105bd3 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -6,7 +6,7 @@
+ 
+ [tox]
+ envlist =
+-    py{36,37,38}-dj{22,30,31}-{sqlite,postgres,mysql}
++    py{36,37,38}-dj{22,30,31}-{sqlite,postgres,mysql,mssql}
+ 
+ [testenv:docs]
+ basepython = python
+@@ -25,9 +25,11 @@ deps =
+     dj31: Django>=3.1,<3.2
+     postgres: psycopg2>=2.6
+     mysql: mysqlclient>=1.3.9
++    mssql: django-mssql-backend>=2.8.1
+ 
+ setenv =
+     sqlite: DATABASE_ENGINE=sqlite
+     postgres: DATABASE_ENGINE=psql
+     mysql: DATABASE_ENGINE=mysql
++    mssql: DATABASE_ENGINE=mssql
+ commands = pytest
+diff --git a/treebeard/__init__.py b/treebeard/__init__.py
+index 00d37f5..80f4727 100644
+--- a/treebeard/__init__.py
++++ b/treebeard/__init__.py
+@@ -10,10 +10,13 @@ Release logic:
+  5. git push
+  6. assure that all tests pass on https://travis-ci.org/django-treebeard/django-treebeard/builds/
+  7. git push --tags
+- 8. python setup.py sdist upload
+- 9. bump the version, append ".dev0" to __version__
+-10. git add treebeard/__init__.py
+-11. git commit -m 'Start with <version>'
+-12. git push
++ 8. pip install --upgrade pip wheel twine
++ 9. python setup.py clean --all
++ 9. python setup.py sdist bdist_wheel
++10. twine upload dist/*
++11. bump the version, append ".dev0" to __version__
++12. git add treebeard/__init__.py
++13. git commit -m 'Start with <version>'
++14. git push
+ """
+-__version__ = '4.3.1'
++__version__ = '4.4.0'
+diff --git a/treebeard/forms.py b/treebeard/forms.py
+index 4f9ef11..547c6d9 100644
+--- a/treebeard/forms.py
++++ b/treebeard/forms.py
+@@ -178,11 +178,8 @@ class MoveNodeForm(forms.ModelForm):
+     def add_subtree(cls, for_node, node, options):
+         """ Recursively build options tree. """
+         if cls.is_loop_safe(for_node, node):
+-            options.append(
+-                (node.pk,
+-                 mark_safe(cls.mk_indent(node.get_depth()) + escape(node))))
+-            for subnode in node.get_children():
+-                cls.add_subtree(for_node, subnode, options)
++            for item, _ in node.get_annotated_list(node):
++                options.append((item.pk, mark_safe(cls.mk_indent(item.get_depth()) + escape(item))))
+ 
+     @classmethod
+     def mk_dropdown_tree(cls, model, for_node=None):

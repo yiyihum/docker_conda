@@ -1,0 +1,81 @@
+diff --git a/lark/common.py b/lark/common.py
+index cc8c73c..714399a 100644
+--- a/lark/common.py
++++ b/lark/common.py
+@@ -17,9 +17,6 @@ class LexerConf(Serialize):
+         self.skip_validation = skip_validation
+         self.use_bytes = use_bytes
+ 
+-    def _deserialize(self):
+-        self.callbacks = {} # TODO
+-
+ ###}
+ 
+ class ParserConf:
+diff --git a/lark/lark.py b/lark/lark.py
+index daab45b..3ed96d7 100644
+--- a/lark/lark.py
++++ b/lark/lark.py
+@@ -344,7 +344,14 @@ class Lark(Serialize):
+         self.rules = [Rule.deserialize(r, memo) for r in data['rules']]
+         self.source = '<deserialized>'
+         self._prepare_callbacks()
+-        self.parser = self.parser_class.deserialize(data['parser'], memo, self._callbacks, self.options.postlex, re_module)
++        self.parser = self.parser_class.deserialize(
++            data['parser'],
++            memo,
++            self._callbacks,
++            self.options.postlex,
++            self.options.transformer,
++            re_module
++        )
+         return self
+ 
+     @classmethod
+diff --git a/lark/parser_frontends.py b/lark/parser_frontends.py
+index 33ad9bc..a45bf9c 100644
+--- a/lark/parser_frontends.py
++++ b/lark/parser_frontends.py
+@@ -1,6 +1,6 @@
+ from .utils import get_regexp_width, Serialize
+ from .parsers.grammar_analysis import GrammarAnalyzer
+-from .lexer import TraditionalLexer, ContextualLexer, Lexer, Token
++from .lexer import TraditionalLexer, ContextualLexer, Lexer, Token, TerminalDef
+ from .parsers import earley, xearley, cyk
+ from .parsers.lalr_parser import LALR_Parser
+ from .grammar import Rule
+@@ -58,6 +58,16 @@ class _ParserFrontend(Serialize):
+         return self.parser.parse(input, start, *args)
+ 
+ 
++def _recreate_lexer_callbacks(memo, transformer):
++    result = {}
++    terminals = [item for item in memo.values() if isinstance(item, TerminalDef)]
++    for terminal in terminals:
++        callback = getattr(transformer, terminal.name, None)
++        if callback is not None:
++            result[terminal.name] = callback
++    return result
++
++
+ class WithLexer(_ParserFrontend):
+     lexer = None
+     parser = None
+@@ -73,10 +83,11 @@ class WithLexer(_ParserFrontend):
+         self.postlex = lexer_conf.postlex
+ 
+     @classmethod
+-    def deserialize(cls, data, memo, callbacks, postlex, re_module):
++    def deserialize(cls, data, memo, callbacks, postlex, transformer, re_module):
+         inst = super(WithLexer, cls).deserialize(data, memo)
+         inst.postlex = postlex
+         inst.parser = LALR_Parser.deserialize(inst.parser, memo, callbacks)
++        inst.lexer_conf.callbacks = _recreate_lexer_callbacks(memo, transformer)
+         inst.lexer_conf.re_module = re_module
+         inst.lexer_conf.skip_validation=True
+         inst.init_lexer()
+@@ -229,4 +240,3 @@ class CYK(WithLexer):
+ 
+     def _apply_callback(self, tree):
+         return self.callbacks[tree.rule](tree.children)
+-

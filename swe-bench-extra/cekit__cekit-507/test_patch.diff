@@ -1,0 +1,299 @@
+diff --git a/tests/test_integ_builder_osbs.py b/tests/test_integ_builder_osbs.py
+new file mode 100644
+index 0000000..3ae9568
+--- /dev/null
++++ b/tests/test_integ_builder_osbs.py
+@@ -0,0 +1,195 @@
++# -*- encoding: utf-8 -*-
++
++# pylint: disable=protected-access
++
++import logging
++import os
++import subprocess
++import yaml
++
++import pytest
++
++from click.testing import CliRunner
++
++from cekit.cli import Cekit, Map, cli
++from cekit.tools import Chdir
++from cekit.config import Config
++from cekit.errors import CekitError
++from cekit.builders.osbs import OSBSBuilder
++from cekit.tools import Map
++
++config = Config()
++
++
++@pytest.fixture(autouse=True)
++def reset_config():
++    config.cfg['common'] = {}
++
++
++config = Config()
++config.cfg['common'] = {'redhat': True}
++
++image_descriptor = {
++    'schema_version': 1,
++    'from': 'centos:latest',
++    'name': 'test/image',
++    'version': '1.0',
++    'labels': [{'name': 'foo', 'value': 'bar'}, {'name': 'labela', 'value': 'a'}],
++    'osbs': {
++            'repository': {
++                'name': 'repo',
++                'branch': 'branch'
++            }
++    }
++}
++
++
++def run_cekit(cwd,
++              parameters=['build', '--dry-run', 'docker'],
++              message=None):
++    with Chdir(cwd):
++        result = CliRunner().invoke(cli, parameters, catch_exceptions=False)
++        if message:
++            assert message in result.output
++
++        return result
++
++
++def run_osbs(descriptor, image_dir, mocker):
++    # We are mocking it, so do not require it at test time
++    mocker.patch('cekit.builders.osbs.OSBSBuilder.dependencies', return_value={})
++    mocker.patch('cekit.builders.osbs.OSBSBuilder._wait_for_osbs_task')
++    mocker.patch('cekit.builders.osbs.DistGit.clean')
++    mocker.patch('cekit.builders.osbs.DistGit.prepare')
++    mocker.patch('cekit.tools.decision', return_value=True)
++
++    mocker_check_call = mocker.patch.object(subprocess, 'check_output', side_effect=[
++        b"true",  # git rev-parse --is-inside-work-tree
++        b"/home/repos/path",  # git rev-parse --show-toplevel
++        b"branch",  # git rev-parse --abbrev-ref HEAD
++        b"3b9283cb26b35511517ff5c0c3e11f490cba8feb",  # git rev-parse HEAD
++        b"",  # git ls-files --others --exclude-standard
++        b"",  # git diff-files --name-only
++        b"ssh://someuser@somehost.com/containers/somerepo",  # git config --get remote.origin.url
++        b"3b9283cb26b35511517ff5c0c3e11f490cba8feb",  # git rev-parse HEAD
++        b"1234",  # brew call --python...
++    ])
++
++    with open(os.path.join(image_dir, 'config'), 'w') as fd:
++        fd.write("[common]\n")
++        fd.write("redhat = True")
++
++    with open(os.path.join(image_dir, 'image.yaml'), 'w') as fd:
++        yaml.dump(descriptor, fd, default_flow_style=False)
++
++    return run_cekit(image_dir, ['-v',
++                                 '--work-dir', image_dir,
++                                 '--config',
++                                 'config',
++                                 'build',
++                                 'osbs'])
++
++
++def run_cekit(cwd,
++              parameters=['build', '--dry-run', 'docker'],
++              message=None):
++    with Chdir(cwd):
++        result = CliRunner().invoke(cli, parameters, catch_exceptions=False)
++        if message:
++            assert message in result.output
++
++        return result
++
++
++def test_osbs_builder_kick_build_without_push(tmpdir, mocker, caplog):
++    """
++    Does not push sources to dist-git. This is the case when the
++    generated files are the same as already existing in dist-git
++    """
++
++    caplog.set_level(logging.DEBUG, logger="cekit")
++
++    mocker.patch.object(subprocess, 'call', return_value=0)
++
++    source_dir = tmpdir.mkdir('source')
++    repo_dir = source_dir.mkdir('osbs').mkdir('repo')
++
++    mock_check_call = mocker.patch.object(subprocess, 'check_call')
++
++    descriptor = image_descriptor.copy()
++
++    run_osbs(descriptor, str(source_dir), mocker)
++
++    assert os.path.exists(str(repo_dir.join('Dockerfile'))) is True
++
++    mock_check_call.assert_has_calls(
++        [
++            mocker.call(['git', 'add', 'Dockerfile']),
++        ])
++
++    assert "No changes made to the code, committing skipped" in caplog.text
++    assert "Image was built successfully in OSBS!" in caplog.text
++
++
++def test_osbs_builder_kick_build_with_push(tmpdir, mocker, caplog):
++    """
++    Does not push sources to dist-git. This is the case when the
++    generated files are the same as already existing in dist-git
++    """
++
++    caplog.set_level(logging.DEBUG, logger="cekit")
++
++    source_dir = tmpdir.mkdir('source')
++    repo_dir = source_dir.mkdir('osbs').mkdir('repo')
++
++    mocker.patch.object(subprocess, 'call', return_value=1)
++
++    mock_check_call = mocker.patch.object(subprocess, 'check_call')
++
++    descriptor = image_descriptor.copy()
++
++    run_osbs(descriptor, str(source_dir), mocker)
++
++    assert os.path.exists(str(repo_dir.join('Dockerfile'))) is True
++
++    mock_check_call.assert_has_calls(
++        [
++            mocker.call(['git', 'add', 'Dockerfile']),
++            mocker.call(['git', 'commit', '-q', '-m',
++                         'Sync with path, commit 3b9283cb26b35511517ff5c0c3e11f490cba8feb']),
++            mocker.call(['git', 'push', '-q', 'origin', 'branch'])
++        ])
++
++    assert "Commiting with message: 'Sync with path, commit 3b9283cb26b35511517ff5c0c3e11f490cba8feb'" in caplog.text
++    assert "Image was built successfully in OSBS!" in caplog.text
++
++
++# https://github.com/cekit/cekit/issues/504
++def test_osbs_builder_add_help_file(tmpdir, mocker, caplog):
++    """
++    Checks if help.md file is generated and added to dist-git
++    """
++
++    caplog.set_level(logging.DEBUG, logger="cekit")
++
++    source_dir = tmpdir.mkdir('source')
++    repo_dir = source_dir.mkdir('osbs').mkdir('repo')
++
++    mocker.patch.object(subprocess, 'call', return_value=0)
++    mock_check_call = mocker.patch.object(subprocess, 'check_call')
++
++    descriptor = image_descriptor.copy()
++    descriptor['help'] = {'add': True}
++
++    run_osbs(descriptor, str(source_dir), mocker)
++
++    assert os.path.exists(str(repo_dir.join('Dockerfile'))) is True
++    assert os.path.exists(str(repo_dir.join('help.md'))) is True
++
++    mock_check_call.assert_has_calls(
++        [
++            mocker.call(['git', 'add', 'Dockerfile']),
++            mocker.call(['git', 'add', 'help.md']),
++        ])
++
++    assert "Image was built successfully in OSBS!" in caplog.text
+diff --git a/tests/test_unit_builder_docker.py b/tests/test_unit_builder_docker.py
+index 26d6f3b..bdd8378 100644
+--- a/tests/test_unit_builder_docker.py
++++ b/tests/test_unit_builder_docker.py
+@@ -134,3 +134,19 @@ def test_docker_client_build_with_failure(mocker, caplog):
+     docker_client_build.assert_called_once_with(path='something/image', pull=None, rm=True)
+     assert "Docker: Step 3/159 : COPY modules /tmp/scripts/" in caplog.text
+     assert "You can look inside the failed image by running 'docker run --rm -ti 81a88b63f47f bash'" in caplog.text
++
++
++# https://github.com/cekit/cekit/issues/508
++def test_docker_tag(mocker):
++    builder = DockerBuilder(Map({'target': 'something'}), Map({'tags': ['foo', 'bar']}))
++
++    docker_client_mock = mocker.Mock()
++
++    builder._tag(docker_client_mock, "image_id", ["image:latest", "host:5000/repo/image:tag"])
++
++    assert len(docker_client_mock.tag.mock_calls) == 2
++
++    docker_client_mock.tag.assert_has_calls([
++        mocker.call("image_id", "image", tag="latest"),
++        mocker.call("image_id", "host:5000/repo/image", tag="tag")
++    ])
+diff --git a/tests/test_unit_tools.py b/tests/test_unit_tools.py
+index 859d5c5..24ffe42 100644
+--- a/tests/test_unit_tools.py
++++ b/tests/test_unit_tools.py
+@@ -1,5 +1,6 @@
+ import logging
+ import pytest
++import subprocess
+ import yaml
+ 
+ from contextlib import contextmanager
+@@ -187,7 +188,7 @@ def brew_call_ok(*args, **kwargs):
+             "artifact_id": "artifact_id",
+             "version": "version",
+           }
+-        ]"""
++        ]""".encode("utf8")
+     if 'getBuild' in args[0]:
+         return """
+         {
+@@ -195,8 +196,8 @@ def brew_call_ok(*args, **kwargs):
+           "release": "release",
+           "state": 1
+         }
+-        """
+-    return ""
++        """.encode("utf8")
++    return "".encode("utf8")
+ 
+ 
+ def brew_call_removed(*args, **kwargs):
+@@ -210,7 +211,7 @@ def brew_call_removed(*args, **kwargs):
+             "artifact_id": "artifact_id",
+             "version": "version",
+           }
+-        ]"""
++        ]""".encode("utf8")
+     if 'getBuild' in args[0]:
+         return """
+         {
+@@ -218,8 +219,8 @@ def brew_call_removed(*args, **kwargs):
+           "release": "release",
+           "state": 2
+         }
+-        """
+-    return ""
++        """.encode("utf8")
++    return "".encode("utf8")
+ 
+ 
+ def test_get_brew_url(mocker):
+@@ -239,6 +240,22 @@ def test_get_brew_url_when_build_was_removed(mocker):
+         excinfo.value)
+ 
+ 
++# https://github.com/cekit/cekit/issues/502
++def test_get_brew_url_no_kerberos(mocker, caplog):
++    caplog.set_level(logging.DEBUG, logger="cekit")
++
++    kerberos_error = subprocess.CalledProcessError(1, 'CMD')
++    kerberos_error.output = "2019-05-06 14:58:44,502 [ERROR] koji: AuthError: unable to obtain a session"
++
++    mocker.patch('subprocess.check_output', side_effect=kerberos_error)
++
++    with pytest.raises(CekitError) as excinfo:
++        tools.get_brew_url('aa')
++
++    assert 'Could not fetch archives for checksum aa' in str(excinfo.value)
++    assert "Brew authentication failed, please make sure you have a valid Kerberos ticket" in caplog.text
++
++
+ @contextmanager
+ def mocked_dependency_handler(mocker, data="ID=fedora\nNAME=somefedora\nVERSION=123"):
+     dh = None

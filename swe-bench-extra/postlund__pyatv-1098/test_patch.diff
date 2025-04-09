@@ -1,0 +1,150 @@
+diff --git a/tests/raop/test_parsers.py b/tests/raop/test_parsers.py
+index c58bd541..ef71eb04 100644
+--- a/tests/raop/test_parsers.py
++++ b/tests/raop/test_parsers.py
+@@ -5,8 +5,10 @@ import pytest
+ from pyatv.exceptions import ProtocolError
+ from pyatv.raop.parsers import (
+     EncryptionType,
++    MetadataType,
+     get_audio_properties,
+     get_encryption_types,
++    get_metadata_types,
+ )
+ 
+ 
+@@ -19,7 +21,7 @@ from pyatv.raop.parsers import (
+         ({"ss": "32"}, 44100, 2, 4),
+     ],
+ )
+-def test_parse_properties(properties, expected_sr, expected_ch, expected_ss):
++def test_parse_audio_properties(properties, expected_sr, expected_ch, expected_ss):
+     sample_rate, channels, sample_size = get_audio_properties(properties)
+     assert sample_rate == expected_sr
+     assert channels == expected_ch
+@@ -27,7 +29,7 @@ def test_parse_properties(properties, expected_sr, expected_ch, expected_ss):
+ 
+ 
+ @pytest.mark.parametrize("properties", [{"sr": "abc"}, {"ch": "cde"}, {"ss": "fgh"}])
+-def test_parse_invalid_property_raises(properties):
++def test_parse_invalid_audio_property_raises(properties):
+     with pytest.raises(ProtocolError):
+         get_audio_properties(properties)
+ 
+@@ -64,3 +66,19 @@ def test_parse_encryption_include_unknown_type():
+         get_encryption_types({"et": "0,1000"})
+         == EncryptionType.Unknown | EncryptionType.Unencrypted
+     )
++
++
++@pytest.mark.parametrize(
++    "properties,expected",
++    [
++        ({}, MetadataType.NotSupported),
++        ({"md": "0"}, MetadataType.Text),
++        ({"md": "1"}, MetadataType.Artwork),
++        (
++            {"md": "0,1,2"},
++            MetadataType.Text | MetadataType.Artwork | MetadataType.Progress,
++        ),
++    ],
++)
++def test_parse_metadata_types(properties, expected):
++    assert get_metadata_types(properties) == expected
+diff --git a/tests/raop/test_rtsp.py b/tests/raop/test_rtsp.py
+index cdc3a8d7..dc373c18 100644
+--- a/tests/raop/test_rtsp.py
++++ b/tests/raop/test_rtsp.py
+@@ -6,51 +6,62 @@ from pyatv.raop.rtsp import parse_response
+ 
+ 
+ def test_parse_ok_first_line():
+-    resp, rest = parse_response("RTSP/1.0 200 OK\r\n\r\n")
++    resp, rest = parse_response(b"RTSP/1.0 200 OK\r\n\r\n")
+     assert resp.code == 200
+     assert resp.message == "OK"
+-    assert rest == ""
++    assert rest == b""
+ 
+ 
+ def test_parse_missing_ending():
+     with pytest.raises(ValueError) as exc:
+-        parse_response("RTSP/1.0 200 OK\r\n")
++        parse_response(b"RTSP/1.0 200 OK\r\n")
+ 
+     assert "missing end lines" in str(exc)
+ 
+ 
+ def test_parse_headers():
+-    resp, rest = parse_response("RTSP/1.0 200 OK\r\nA: B\r\nC: D\r\n\r\n")
++    resp, rest = parse_response(b"RTSP/1.0 200 OK\r\nA: B\r\nC: D\r\n\r\n")
+     assert len(resp.headers) == 2
+     assert resp.headers["A"] == "B"
+     assert resp.headers["C"] == "D"
+-    assert rest == ""
++    assert rest == b""
+ 
+ 
+ def test_parse_body():
+-    resp, rest = parse_response("RTSP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nbody")
++    resp, rest = parse_response(b"RTSP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nbody")
+     assert resp.body == "body"
+-    assert rest == ""
++    assert rest == b""
++
++
++def test_parse_too_no_body():
++    content = b"RTSP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n"
++    resp, rest = parse_response(content)
++
++    assert resp is None
++    assert rest == content
+ 
+ 
+ def test_parse_too_short_body():
+-    with pytest.raises(ValueError) as exc:
+-        parse_response("RTSP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nbody")
++    content = b"RTSP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nbody"
++    resp, rest = parse_response(content)
+ 
+-    assert "too short body" in str(exc)
++    assert resp is None
++    assert rest == content
+ 
+ 
+ def test_parse_body_excessive_data():
+-    resp, rest = parse_response("RTSP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nbodyextra")
++    resp, rest = parse_response(
++        b"RTSP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nbodyextra"
++    )
+     assert resp.body == "body"
+-    assert rest == "extra"
++    assert rest == b"extra"
+ 
+ 
+ def test_parse_sequent_messages():
+     resp, rest = parse_response(
+-        "RTSP/1.0 200 OK\r\nA: B\r\n\r\n"
+-        "RTSP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nAB"
+-        "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"
++        b"RTSP/1.0 200 OK\r\nA: B\r\n\r\n"
++        b"RTSP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nAB"
++        b"RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"
+     )
+     assert resp.headers["A"] == "B"
+     assert resp.body == ""
+@@ -61,4 +72,13 @@ def test_parse_sequent_messages():
+     resp, rest = parse_response(rest)
+     assert resp.headers["Content-Length"] == "0"
+     assert resp.body == ""
+-    assert rest == ""
++    assert rest == b""
++
++
++def test_parse_raw_body():
++    resp, rest = parse_response(
++        b"RTSP/1.0 200 OK\r\nContent-Length: 4\r\n"
++        + b"Content-Type: application/octet-stream\r\n\r\nbodyextra"
++    )
++    assert resp.body == b"body"
++    assert rest == b"extra"

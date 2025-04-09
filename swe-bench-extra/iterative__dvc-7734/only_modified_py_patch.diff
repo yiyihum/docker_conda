@@ -1,0 +1,231 @@
+diff --git a/dvc/cli/__init__.py b/dvc/cli/__init__.py
+--- a/dvc/cli/__init__.py
++++ b/dvc/cli/__init__.py
+@@ -36,6 +36,43 @@ def parse_args(argv=None):
+     return args
+ 
+ 
++def _log_exceptions(exc: Exception):
++    """Try to log some known exceptions, that are not DVCExceptions."""
++    from dvc.objects.cache import DiskError
++    from dvc.utils import error_link
++
++    if isinstance(exc, DiskError):
++        from dvc.utils import relpath
++
++        directory = relpath(exc.directory)
++        logger.exception(
++            f"Could not open pickled '{exc.type}' cache.\n"
++            f"Remove the '{directory}' directory and then retry this command."
++            f"\nSee {error_link('pickle')} for more information.",
++            extra={"tb_only": True},
++        )
++        return
++
++    if isinstance(exc, OSError):
++        import errno
++
++        if exc.errno == errno.EMFILE:
++            logger.exception(
++                "too many open files, please visit "
++                "{} to see how to handle this "
++                "problem".format(error_link("many-files")),
++                extra={"tb_only": True},
++            )
++            return
++
++    from dvc.info import get_dvc_info
++    from dvc.logger import FOOTER
++
++    logger.exception("unexpected error")
++    logger.debug("Version info for developers:\n%s", get_dvc_info())
++    logger.info(FOOTER)
++
++
+ def main(argv=None):  # noqa: C901
+     """Main entry point for dvc CLI.
+ 
+@@ -48,7 +85,7 @@ def main(argv=None):  # noqa: C901
+     from dvc._debug import debugtools
+     from dvc.config import ConfigError
+     from dvc.exceptions import DvcException, NotDvcRepoError
+-    from dvc.logger import FOOTER, disable_other_loggers
++    from dvc.logger import disable_other_loggers
+ 
+     # NOTE: stderr/stdout may be closed if we are running from dvc.daemon.
+     # On Linux we directly call cli.main after double forking and closing
+@@ -104,26 +141,7 @@ def main(argv=None):  # noqa: C901
+         ret = 254
+     except Exception as exc:  # noqa, pylint: disable=broad-except
+         # pylint: disable=no-member
+-        import errno
+-
+-        if isinstance(exc, OSError) and exc.errno == errno.EMFILE:
+-            from dvc.utils import error_link
+-
+-            logger.exception(
+-                "too many open files, please visit "
+-                "{} to see how to handle this "
+-                "problem".format(error_link("many-files")),
+-                extra={"tb_only": True},
+-            )
+-        else:
+-            from dvc.info import get_dvc_info
+-
+-            logger.exception("unexpected error")
+-
+-            dvc_info = get_dvc_info()
+-            logger.debug("Version info for developers:\n%s", dvc_info)
+-
+-            logger.info(FOOTER)
++        _log_exceptions(exc)
+         ret = 255
+ 
+     try:
+diff --git a/dvc/data/db/index.py b/dvc/data/db/index.py
+--- a/dvc/data/db/index.py
++++ b/dvc/data/db/index.py
+@@ -4,7 +4,6 @@
+ from typing import TYPE_CHECKING, Iterable, Set
+ 
+ from dvc.objects.errors import ObjectDBError
+-from dvc.utils.decorators import with_diskcache
+ 
+ if TYPE_CHECKING:
+     from dvc.types import StrPath
+@@ -89,49 +88,40 @@ def __init__(
+         tmp_dir: "StrPath",
+         name: str,
+     ):  # pylint: disable=super-init-not-called
+-        from diskcache import Cache, Index
+-
+         from dvc.fs.local import LocalFileSystem
++        from dvc.objects.cache import Cache, Index
+         from dvc.utils.fs import makedirs
+ 
+         self.index_dir = os.path.join(tmp_dir, self.INDEX_DIR, name)
+         makedirs(self.index_dir, exist_ok=True)
+         self.fs = LocalFileSystem()
+-        self.index = Index.fromcache(
+-            Cache(
+-                self.index_dir,
+-                disk_pickle_protocol=4,
+-                eviction_policy="none",
+-            )
++        cache = Cache(
++            self.index_dir, eviction_policy="none", disk_type="index"
+         )
++        self.index = Index.fromcache(cache)
+ 
+-    @with_diskcache(name="index")
+     def __iter__(self):
+         return iter(self.index)
+ 
+-    @with_diskcache(name="index")
+     def __contains__(self, hash_):
+         return hash_ in self.index
+ 
+-    @with_diskcache(name="index")
+     def dir_hashes(self):
+         """Iterate over .dir hashes stored in the index."""
+         yield from (hash_ for hash_, is_dir in self.index.items() if is_dir)
+ 
+-    @with_diskcache(name="index")
+     def clear(self):
+         """Clear this index (to force re-indexing later)."""
+-        from diskcache import Timeout
++        from dvc.objects.cache import Timeout
+ 
+         try:
+             self.index.clear()
+         except Timeout as exc:
+             raise ObjectDBError("Failed to clear ODB index") from exc
+ 
+-    @with_diskcache(name="index")
+     def update(self, dir_hashes: Iterable[str], file_hashes: Iterable[str]):
+         """Update this index, adding the specified hashes."""
+-        from diskcache import Timeout
++        from dvc.objects.cache import Timeout
+ 
+         try:
+             with self.index.transact():
+@@ -143,7 +133,6 @@ def update(self, dir_hashes: Iterable[str], file_hashes: Iterable[str]):
+         except Timeout as exc:
+             raise ObjectDBError("Failed to update ODB index") from exc
+ 
+-    @with_diskcache(name="index")
+     def intersection(self, hashes: Set[str]):
+         """Iterate over values from `hashes` which exist in the index."""
+         yield from hashes.intersection(self.index.keys())
+diff --git a/dvc/objects/state.py b/dvc/objects/state.py
+--- a/dvc/objects/state.py
++++ b/dvc/objects/state.py
+@@ -7,7 +7,6 @@
+ from dvc.fs.local import LocalFileSystem
+ from dvc.fs.system import inode as get_inode
+ from dvc.utils import relpath
+-from dvc.utils.decorators import with_diskcache
+ 
+ from .hash_info import HashInfo
+ from .utils import get_mtime_and_size
+@@ -49,7 +48,7 @@ def save_link(self, path, fs):
+ 
+ class State(StateBase):  # pylint: disable=too-many-instance-attributes
+     def __init__(self, root_dir=None, tmp_dir=None, dvcignore=None):
+-        from diskcache import Cache
++        from .cache import Cache
+ 
+         super().__init__()
+ 
+@@ -60,10 +59,7 @@ def __init__(self, root_dir=None, tmp_dir=None, dvcignore=None):
+         if not tmp_dir:
+             return
+ 
+-        config = {
+-            "eviction_policy": "least-recently-used",
+-            "disk_pickle_protocol": 4,
+-        }
++        config = {"eviction_policy": "least-recently-used"}
+         self.links = Cache(directory=os.path.join(tmp_dir, "links"), **config)
+         self.md5s = Cache(directory=os.path.join(tmp_dir, "md5s"), **config)
+ 
+@@ -71,7 +67,6 @@ def close(self):
+         self.md5s.close()
+         self.links.close()
+ 
+-    @with_diskcache(name="md5s")
+     def save(self, path, fs, hash_info):
+         """Save hash for the specified path info.
+ 
+@@ -96,7 +91,6 @@ def save(self, path, fs, hash_info):
+ 
+         self.md5s[inode] = (mtime, str(size), hash_info.value)
+ 
+-    @with_diskcache(name="md5s")
+     def get(self, path, fs):
+         """Gets the hash for the specified path info. Hash will be
+         retrieved from the state database if available.
+@@ -127,7 +121,6 @@ def get(self, path, fs):
+ 
+         return Meta(size=size), HashInfo("md5", value[2])
+ 
+-    @with_diskcache(name="links")
+     def save_link(self, path, fs):
+         """Adds the specified path to the list of links created by dvc. This
+         list is later used on `dvc checkout` to cleanup old links.
+@@ -149,7 +142,6 @@ def save_link(self, path, fs):
+         with self.links as ref:
+             ref[relative_path] = (inode, mtime)
+ 
+-    @with_diskcache(name="links")
+     def get_unused_links(self, used, fs):
+         """Removes all saved links except the ones that are used.
+ 
+@@ -177,7 +169,6 @@ def get_unused_links(self, used, fs):
+ 
+         return unused
+ 
+-    @with_diskcache(name="links")
+     def remove_links(self, unused, fs):
+         if not isinstance(fs, LocalFileSystem):
+             return

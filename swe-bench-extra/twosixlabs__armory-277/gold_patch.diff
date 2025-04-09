@@ -1,0 +1,346 @@
+diff --git a/armory/data/README.md b/armory/data/README.md
+index 26bb48eb..870ca113 100644
+--- a/armory/data/README.md
++++ b/armory/data/README.md
+@@ -1,20 +1,37 @@
+ # Datasets
+ 
+-The data module implements functionality to download external and internal datasets to
+-the armory repository and standardizes them across all evaluations.
++The datasets module implements functionality to download external and internal 
++datasets to the armory repository and standardizes them across all evaluations.
++
++### Image Datasets
++
++| Dataset    | Description | x_shape | x_dtype  | y_shape  | y_dtype |
++|:---------- |:----------- |:------- |:-------- |:-------- |:------- |
++| `cifar10` | CIFAR 10 classes image dataset | (N, 32, 32, 3) | uint8 | (N,) | int64 |
++| `german_traffic_sign` | German traffic sign dataset | (N, variable_height, variable_width, 3) | uint8 | (N,) | int64 |
++| `imagenet_adversarial` | ILSVRC12 adversarial image dataset from ResNet50 | (N, 224, 224, 3) | float32 | (N,) | int32 |
++| `imagenette` | Smaller subset of 10 classes from Imagenet | (N, variable_height, variable_width, 3) | uint8  | (N,) | int64 |
++| `mnist` | MNIST hand written digit image dataset | (N, 28, 28, 1) | uint8 | (N,) | int64 |
++| `resisc45` | REmote Sensing Image Scene Classification | (N, 256, 256, 3) | uint8 | (N,) | int64 |
++
++### Audio Datasets
++| Dataset    | Description | x_shape | x_dtype  | y_shape  | y_dtype |
++|:---------- |:----------- |:------- |:-------- |:-------- |:------- |
++| `digit` | Audio dataset of spoken digits | (N, variable_length) | int16 | (N,) | int64 |
++| `librispeech_dev_clean` | Librispeech dev dataset for speaker identification  | (N, variable_length)  | int64 | (N,)  | int64 |
++
++### Video Datasets
++| Dataset    | Description | x_shape | x_dtype  | y_shape  | y_dtype |
++|:---------- |:----------- |:------- |:-------- |:-------- |:------- |
++| `ucf101` | UCF 101 Action Recognition | (N, variable_frames, 240, 320, 3) | uint8 | (N,) | int64 |
+ 
+-### Available Datasets
+-* `mnist` : MNIST hand written digit image dataset
+-* `cifar10`: CIFAR 10 classes image dataset
+-* `digit`:  Audio dataset of spoken digits
+-* `imagenet_adversarial`: ILSVRC12 adversarial image dataset for ResNet50
+ 
+ ### TF Data Loading
+ We load datasets using `tf.data` and convert the data to numpy arrays for ingestion in 
+ any framework. While not the most efficient strategy, this current implementation 
+ helps us standardize evaluations across all frameworks.
+ 
+-### In-Memory or Generator
+-At the moment we have all datasets return as in memory NumPy arrays. This was done for 
+-the initial release so all examples align with their ART counterparts. Going forward 
+-we plan to generators so that larger datasets can be processed.
+\ No newline at end of file
++### ArmoryDataSet Generator
++*  All DataSets return an `ArmoryDataGenerator` which implements the methods needed 
++by the ART framework. Specifically `get_batch` will return a tuple of `(data, labels)` 
++for a specficied batch size.
+diff --git a/armory/docker/management.py b/armory/docker/management.py
+index 013341fa..8e665e40 100644
+--- a/armory/docker/management.py
++++ b/armory/docker/management.py
+@@ -19,11 +19,22 @@ class ArmoryInstance(object):
+     """
+ 
+     def __init__(
+-        self, image_name, runtime: str = "runc", envs: dict = None, ports: dict = None
++        self,
++        image_name,
++        runtime: str = "runc",
++        envs: dict = None,
++        ports: dict = None,
++        container_subdir: str = None,
+     ):
++        self.docker_client = docker.from_env(version="auto")
++
+         host_paths = paths.host()
+         docker_paths = paths.docker()
+-        self.docker_client = docker.from_env(version="auto")
++        host_tmp_dir = host_paths.tmp_dir
++        host_output_dir = host_paths.output_dir
++        if container_subdir:
++            host_tmp_dir = os.path.join(host_tmp_dir, container_subdir)
++            host_output_dir = os.path.join(host_output_dir, container_subdir)
+ 
+         container_args = {
+             "runtime": runtime,
+@@ -39,8 +50,8 @@ def __init__(
+                     "bind": docker_paths.saved_model_dir,
+                     "mode": "rw",
+                 },
+-                host_paths.output_dir: {"bind": docker_paths.output_dir, "mode": "rw"},
+-                host_paths.tmp_dir: {"bind": docker_paths.tmp_dir, "mode": "rw"},
++                host_output_dir: {"bind": docker_paths.output_dir, "mode": "rw"},
++                host_tmp_dir: {"bind": docker_paths.tmp_dir, "mode": "rw"},
+             },
+         }
+         if ports is not None:
+@@ -87,10 +98,14 @@ def __init__(self, image_name: str, runtime="runc"):
+         self.name = image_name
+ 
+     def start_armory_instance(
+-        self, envs: dict = None, ports: dict = None
++        self, envs: dict = None, ports: dict = None, container_subdir: str = None,
+     ) -> ArmoryInstance:
+         temp_inst = ArmoryInstance(
+-            self.name, runtime=self.runtime, envs=envs, ports=ports
++            self.name,
++            runtime=self.runtime,
++            envs=envs,
++            ports=ports,
++            container_subdir=container_subdir,
+         )
+         self.instances[temp_inst.docker_container.short_id] = temp_inst
+         return temp_inst
+diff --git a/armory/docker/volumes_util.py b/armory/docker/volumes_util.py
+new file mode 100644
+index 00000000..ced52680
+--- /dev/null
++++ b/armory/docker/volumes_util.py
+@@ -0,0 +1,42 @@
++"""
++Utility functions for dealing with docker directories and mounted volumes
++"""
++
++import datetime
++import logging
++import os
++
++from armory import paths
++
++logger = logging.getLogger(__name__)
++
++
++def tmp_output_subdir(retries=10):
++    """
++    Return (<subdir name>, <tmp subdir path>, <output subdir path>)
++
++    retries - number of times to retry folder creation before returning an error
++        if retries < 0, it will retry indefinitely.
++        retries are necessary to prevent timestamp collisions.
++    """
++    tries = int(retries) + 1
++    host_paths = paths.host()
++    while tries:
++        subdir = datetime.datetime.utcnow().isoformat()
++        # ":" characters violate docker-py volume specifications
++        subdir = subdir.replace(":", "-")
++        # Use tmp_subdir for locking
++        try:
++            tmp_subdir = os.path.join(host_paths.tmp_dir, subdir)
++            os.mkdir(tmp_subdir)
++        except FileExistsError:
++            tries -= 1
++            if tries:
++                logger.warning(f"Failed to create {tmp_subdir}. Retrying...")
++            continue
++
++        output_subdir = os.path.join(host_paths.output_dir, subdir)
++        os.mkdir(output_subdir)
++        return subdir, tmp_subdir, output_subdir
++
++    raise ValueError("Failed to create tmp and output subdirectories")
+diff --git a/armory/eval/evaluator.py b/armory/eval/evaluator.py
+index 0f33fd6c..50e939a3 100644
+--- a/armory/eval/evaluator.py
++++ b/armory/eval/evaluator.py
+@@ -15,6 +15,7 @@
+ from docker.errors import ImageNotFound
+ 
+ from armory.docker.management import ManagementInstance
++from armory.docker import volumes_util
+ from armory.utils.configuration import load_config
+ from armory.utils import external_repo
+ from armory.utils.printing import bold, red
+@@ -43,9 +44,17 @@ def __init__(
+             self.config = config_path
+         else:
+             raise ValueError(f"config_path {config_path} must be a str or dict")
+-        self.tmp_config = os.path.join(self.host_paths.tmp_dir, container_config_name)
++        (
++            self.container_subdir,
++            self.tmp_dir,
++            self.output_dir,
++        ) = volumes_util.tmp_output_subdir()
++        self.tmp_config = os.path.join(self.tmp_dir, container_config_name)
++        self.external_repo_dir = paths.get_external(self.tmp_dir)
+         self.docker_config_path = Path(
+-            os.path.join(self.docker_paths.tmp_dir, container_config_name)
++            os.path.join(
++                self.docker_paths.tmp_dir, self.container_subdir, container_config_name
++            )
+         ).as_posix()
+ 
+         kwargs = dict(runtime="runc")
+@@ -71,16 +80,22 @@ def __init__(
+         except ImageNotFound:
+             logger.info(f"Image {image_name} was not found. Downloading...")
+             docker_api.pull_verbose(docker_client, image_name)
++        except requests.exceptions.ConnectionError:
++            logger.error(f"Docker connection refused. Is Docker Daemon running?")
++            raise
+ 
+         self.manager = ManagementInstance(**kwargs)
+ 
+     def _download_external(self):
+         external_repo.download_and_extract_repo(
+-            self.config["sysconfig"]["external_github_repo"]
++            self.config["sysconfig"]["external_github_repo"],
++            external_repo_dir=self.external_repo_dir,
+         )
+ 
+     def _download_private(self):
+-        external_repo.download_and_extract_repo("twosixlabs/armory-private")
++        external_repo.download_and_extract_repo(
++            "twosixlabs/armory-private", external_repo_dir=self.external_repo_dir
++        )
+         self.extra_env_vars.update(
+             {
+                 "ARMORY_PRIVATE_S3_ID": os.getenv("ARMORY_PRIVATE_S3_ID"),
+@@ -89,26 +104,34 @@ def _download_private(self):
+         )
+ 
+     def _write_tmp(self):
+-        os.makedirs(self.host_paths.tmp_dir, exist_ok=True)
++        os.makedirs(self.tmp_dir, exist_ok=True)
+         if os.path.exists(self.tmp_config):
+             logger.warning(f"Overwriting previous temp config: {self.tmp_config}...")
+         with open(self.tmp_config, "w") as f:
+             json.dump(self.config, f)
+ 
+     def _delete_tmp(self):
+-        if os.path.exists(self.host_paths.external_repo_dir):
++        if os.path.exists(self.external_repo_dir):
+             try:
+-                shutil.rmtree(self.host_paths.external_repo_dir)
++                shutil.rmtree(self.external_repo_dir)
+             except OSError as e:
+                 if not isinstance(e, FileNotFoundError):
+                     logger.exception(
+-                        f"Error removing external repo {self.host_paths.external_repo_dir}"
++                        f"Error removing external repo {self.external_repo_dir}"
+                     )
++
++        logger.info(f"Deleting tmp_dir {self.tmp_dir}")
+         try:
+-            os.remove(self.tmp_config)
++            shutil.rmtree(self.tmp_dir)
+         except OSError as e:
+             if not isinstance(e, FileNotFoundError):
+-                logger.exception(f"Error removing tmp config {self.tmp_config}")
++                logger.exception(f"Error removing tmp_dir {self.tmp_dir}")
++
++        logger.info(f"Removing output_dir {self.output_dir} if empty")
++        try:
++            os.rmdir(self.output_dir)
++        except OSError:
++            pass
+ 
+     def run(
+         self, interactive=False, jupyter=False, host_port=8888, command=None
+@@ -118,8 +141,11 @@ def run(
+         ports = {container_port: host_port} if jupyter else None
+         try:
+             runner = self.manager.start_armory_instance(
+-                envs=self.extra_env_vars, ports=ports
++                envs=self.extra_env_vars,
++                ports=ports,
++                container_subdir=self.container_subdir,
+             )
++            logger.warning(f"Outputs will be written to {self.output_dir}")
+             try:
+                 if jupyter:
+                     self._run_jupyter(runner, host_port=host_port)
+diff --git a/armory/paths.py b/armory/paths.py
+index 710bd802..930e4948 100644
+--- a/armory/paths.py
++++ b/armory/paths.py
+@@ -105,6 +105,10 @@ def __init__(self):
+         os.makedirs(self.output_dir, exist_ok=True)
+ 
+ 
++def get_external(tmp_dir):
++    return os.path.join(tmp_dir, "external")
++
++
+ class HostDefault:
+     def __init__(self):
+         self.cwd = os.getcwd()
+@@ -116,7 +120,7 @@ def __init__(self):
+         self.saved_model_dir = os.path.join(self.armory_dir, "saved_models")
+         self.tmp_dir = os.path.join(self.armory_dir, "tmp")
+         self.output_dir = os.path.join(self.armory_dir, "outputs")
+-        self.external_repo_dir = os.path.join(self.tmp_dir, "external")
++        self.external_repo_dir = get_external(self.tmp_dir)
+ 
+ 
+ class DockerPaths:
+diff --git a/armory/utils/external_repo.py b/armory/utils/external_repo.py
+index c0a49ff8..9e28570f 100644
+--- a/armory/utils/external_repo.py
++++ b/armory/utils/external_repo.py
+@@ -14,16 +14,19 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def download_and_extract_repo(external_repo_name: str) -> None:
++def download_and_extract_repo(
++    external_repo_name: str, external_repo_dir: str = None
++) -> None:
+     """
+     Downloads and extracts an external repository for use within ARMORY.
+ 
+     Private repositories require a `GITHUB_TOKEN` environment variable.
+     :param external_repo_name: String name of "organization/repo-name"
+     """
+-    host_paths = paths.host()
++    if external_repo_dir is None:
++        external_repo_dir = paths.host().external_repo_dir
+ 
+-    os.makedirs(host_paths.external_repo_dir, exist_ok=True)
++    os.makedirs(external_repo_dir, exist_ok=True)
+     headers = {}
+     repo_name = external_repo_name.split("/")[-1]
+ 
+@@ -39,20 +42,19 @@ def download_and_extract_repo(external_repo_name: str) -> None:
+     if response.status_code == 200:
+         logging.info(f"Downloading external repo: {external_repo_name}")
+ 
+-        tar_filename = os.path.join(host_paths.external_repo_dir, repo_name + ".tar.gz")
++        tar_filename = os.path.join(external_repo_dir, repo_name + ".tar.gz")
+         with open(tar_filename, "wb") as f:
+             f.write(response.raw.read())
+         tar = tarfile.open(tar_filename, "r:gz")
+         dl_directory_name = tar.getnames()[0]
+-        tar.extractall(path=host_paths.external_repo_dir)
++        tar.extractall(path=external_repo_dir)
+ 
+         # Always overwrite existing repositories to keep them at HEAD
+-        final_dir_name = os.path.join(host_paths.external_repo_dir, repo_name)
++        final_dir_name = os.path.join(external_repo_dir, repo_name)
+         if os.path.isdir(final_dir_name):
+             shutil.rmtree(final_dir_name)
+         os.rename(
+-            os.path.join(host_paths.external_repo_dir, dl_directory_name),
+-            final_dir_name,
++            os.path.join(external_repo_dir, dl_directory_name), final_dir_name,
+         )
+         # os.remove(tar_filename)
+ 

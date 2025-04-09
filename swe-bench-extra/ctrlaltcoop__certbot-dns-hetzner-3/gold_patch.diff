@@ -1,0 +1,113 @@
+diff --git a/certbot_dns_hetzner/dns_hetzner.py b/certbot_dns_hetzner/dns_hetzner.py
+index 3c72c52..509dabb 100644
+--- a/certbot_dns_hetzner/dns_hetzner.py
++++ b/certbot_dns_hetzner/dns_hetzner.py
+@@ -23,7 +23,6 @@ class Authenticator(dns_common.DNSAuthenticator):
+     """
+ 
+     description = 'Obtain certificates using a DNS TXT record (if you are using Hetzner for DNS).'
+-    record_id = None
+ 
+     def __init__(self, *args, **kwargs):
+         super(Authenticator, self).__init__(*args, **kwargs)
+@@ -49,14 +48,13 @@ class Authenticator(dns_common.DNSAuthenticator):
+ 
+     def _perform(self, domain, validation_name, validation):
+         try:
+-            record_response = self._get_hetzner_client().add_record(
++            self._get_hetzner_client().add_record(
+                 domain,
+                 "TXT",
+-                '{0}.'.format(validation_name),
++                self._fqdn_format(validation_name),
+                 validation,
+                 TTL
+             )
+-            self.record_id = record_response['record']['id']
+         except (
+                 _ZoneNotFoundException,
+                 requests.ConnectionError,
+@@ -67,8 +65,7 @@ class Authenticator(dns_common.DNSAuthenticator):
+ 
+     def _cleanup(self, domain, validation_name, validation):
+         try:
+-            if self.record_id:
+-                self._get_hetzner_client().delete_record(record_id=self.record_id)
++            self._get_hetzner_client().delete_record_by_name(domain, self._fqdn_format(validation_name))
+         except (requests.ConnectionError, _NotAuthorizedException) as exception:
+             raise errors.PluginError(exception)
+ 
+@@ -76,3 +73,9 @@ class Authenticator(dns_common.DNSAuthenticator):
+         return _HetznerClient(
+             self.credentials.conf('api_token'),
+         )
++
++    @staticmethod
++    def _fqdn_format(name):
++        if not name.endswith('.'):
++            return '{0}.'.format(name)
++        return name
+diff --git a/certbot_dns_hetzner/fakes.py b/certbot_dns_hetzner/fakes.py
+index 9b7c0d6..e22f1fa 100644
+--- a/certbot_dns_hetzner/fakes.py
++++ b/certbot_dns_hetzner/fakes.py
+@@ -12,6 +12,7 @@ FAKE_RECORD = {
+ FAKE_DOMAIN = 'some.domain'
+ FAKE_ZONE_ID = 'xyz'
+ FAKE_RECORD_ID = 'zzz'
++FAKE_RECORD_NAME = 'thisisarecordname'
+ 
+ FAKE_RECORD_RESPONSE = {
+     "record": {
+@@ -20,6 +21,24 @@ FAKE_RECORD_RESPONSE = {
+     }
+ }
+ 
++FAKE_RECORDS_RESPONSE_WITH_RECORD = {
++    "records": [
++        {
++            "id": FAKE_RECORD_ID,
++            "name": FAKE_RECORD_NAME,
++        }
++    ]
++}
++
++FAKE_RECORDS_RESPONSE_WITHOUT_RECORD = {
++    "records": [
++        {
++            "id": 'nottheoneuwant',
++            "name": "string",
++        }
++    ]
++}
++
+ FAKE_ZONES_RESPONSE_WITH_DOMAIN = {
+     "zones": [
+         {
+diff --git a/certbot_dns_hetzner/hetzner_client.py b/certbot_dns_hetzner/hetzner_client.py
+index 0c55125..c8048c8 100644
+--- a/certbot_dns_hetzner/hetzner_client.py
++++ b/certbot_dns_hetzner/hetzner_client.py
+@@ -88,6 +88,22 @@ class _HetznerClient:
+         except (ValueError, UnicodeDecodeError) as exception:
+             raise _MalformedResponseException(exception)
+ 
++    def delete_record_by_name(self, domain, record_name):
++        """
++        Searches for a zone matching ``domain``, if found find and delete a record matching ``record_name`
++        Deletes record with ``record_id`` from your Hetzner Account
++        :param domain: Domain of zone in which the record should be found
++        :param record_name: ID of record to be deleted
++        :raises requests.exceptions.ConnectionError: If the API request fails
++        :raises ._MalformedResponseException: If the API response is not 200
++        :raises ._ZoneNotFoundException: If no zone is found matching ``domain``
++        :raises ._RecordNotFoundException: If no record is found matching ``record_name``
++        :raises ._NotAuthorizedException: If Hetzner does not accept the authorization credentials
++        """
++        zone_id = self._get_zone_id_by_domain(domain)
++        record_id = self._get_record_id_by_name(zone_id, record_name)
++        self.delete_record(record_id)
++
+     def delete_record(self, record_id):
+         """
+         Deletes record with ``record_id`` from your Hetzner Account

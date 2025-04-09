@@ -1,0 +1,197 @@
+diff --git a/README.md b/README.md
+index d260fac..4b4c516 100644
+--- a/README.md
++++ b/README.md
+@@ -62,6 +62,8 @@ The additional status symbols denote
+ The bookkeeping sub-commands are
+ 
+ - `gita add <repo-path(s)>`: add repo(s) to `gita`
++- `gita add -a <repo-parent-path(s)>`: add repo(s) in <repo-parent-path(s)> recursively
++  and automatically generate hierarchical groups. See the [customization section](#custom) for more details.
+ - `gita add -b <bare-repo-path(s)>`: add bare repo(s) to `gita`. See the [customization section](#custom) for more details on setting custom worktree.
+ - `gita add -m <main-repo-path(s)>`: add main repo(s) to `gita`. See the [customization section](#custom) for more details.
+ - `gita add -r <repo-parent-path(s)>`: add repo(s) in <repo-parent-path(s)> recursively
+@@ -207,6 +209,32 @@ gita ll
+ gita pull
+ ```
+ 
++It is also possible to recursively add repos within a directory and
++generate hierarchical groups automatically. For example, running
++
++```
++gita add -a src
++```
++on the following folder structure
++```
++src
++├── project1
++│   ├── repo1
++│   └── repo2
++├── repo3
++├── project2
++│   ├── repo4
++│   └── repo5
++└── repo6
++```
++gives rise to
++```
++src:repo1,repo2,repo3,repo4,repo5,repo6
++src-project1:repo1,repo2
++src-project2:repo4,repo5
++```
++
++
+ ### define main repos and shadow the global configuration setting with local setting
+ 
+ The so-called main repos contain `.gita` folder for local configurations.
+diff --git a/doc/README_CN.md b/doc/README_CN.md
+index 45f5926..03d96a7 100644
+--- a/doc/README_CN.md
++++ b/doc/README_CN.md
+@@ -46,6 +46,7 @@
+ 基础指令：
+ 
+ - `gita add <repo-path(s)>`: 添加库
++- `gita add -a <repo-parent-path(s)>`:
+ - `gita add -b <bare-repo-path(s)>`:
+ - `gita add -m <main-repo-path(s)>`:
+ - `gita add -r <repo-parent-path(s)>`:
+diff --git a/gita/__main__.py b/gita/__main__.py
+index 5288632..ee4e7e7 100644
+--- a/gita/__main__.py
++++ b/gita/__main__.py
+@@ -52,11 +52,16 @@ def f_add(args: argparse.Namespace):
+             sub_paths = glob.glob(os.path.join(main_path,'**/'), recursive=True)
+             utils.add_repos({}, sub_paths, root=main_path)
+     else:
+-        if args.recursive:
++        if args.recursive or args.auto_group:
+             paths = chain.from_iterable(
+                     glob.glob(os.path.join(p, '**/'), recursive=True)
+                     for p in args.paths)
+-        utils.add_repos(repos, paths, is_bare=args.bare)
++        new_repos = utils.add_repos(repos, paths, is_bare=args.bare)
++        if args.auto_group:
++            new_groups = utils.auto_group(new_repos, args.paths)
++            if new_groups:
++                print(f'Created {len(new_groups)} new group(s).')
++                utils.write_to_groups_file(new_groups, 'a+')
+ 
+ 
+ def f_rename(args: argparse.Namespace):
+@@ -377,12 +382,15 @@ def main(argv=None):
+     # bookkeeping sub-commands
+     p_add = subparsers.add_parser('add', description='add repo(s)',
+             help='add repo(s)')
+-    p_add.add_argument('paths', nargs='+', help="repo(s) to add")
++    p_add.add_argument('paths', nargs='+', type=os.path.abspath, help="repo(s) to add")
+     xgroup = p_add.add_mutually_exclusive_group()
+     xgroup.add_argument('-r', '--recursive', action='store_true',
+-            help="recursively add repo(s) in the given path.")
++            help="recursively add repo(s) in the given path(s).")
+     xgroup.add_argument('-m', '--main', action='store_true',
+             help="make main repo(s), sub-repos are recursively added.")
++    xgroup.add_argument('-a', '--auto-group', action='store_true',
++            help="recursively add repo(s) in the given path(s) "
++                "and create hierarchical groups based on folder structure.")
+     xgroup.add_argument('-b', '--bare', action='store_true',
+             help="add bare repo(s)")
+     p_add.set_defaults(func=f_add)
+diff --git a/gita/utils.py b/gita/utils.py
+index 21d7a8f..34fc435 100644
+--- a/gita/utils.py
++++ b/gita/utils.py
+@@ -6,8 +6,8 @@ import platform
+ import subprocess
+ from functools import lru_cache, partial
+ from pathlib import Path
+-from typing import List, Dict, Coroutine, Union, Iterator
+-from collections import Counter
++from typing import List, Dict, Coroutine, Union, Iterator, Tuple
++from collections import Counter, defaultdict
+ 
+ from . import info
+ from . import common
+@@ -187,7 +187,7 @@ def _make_name(path: str, repos: Dict[str, Dict[str, str]],
+     Given a new repo `path`, create a repo name. By default, basename is used.
+     If name collision exists, further include parent path name.
+ 
+-    @param path: It should not be in `repos`
++    @param path: It should not be in `repos` and is absolute
+     """
+     name = os.path.basename(os.path.normpath(path))
+     if name in repos or name_counts[name] > 1:
+@@ -202,7 +202,7 @@ def _get_repo_type(path, repo_type, root) -> str:
+     """
+     if repo_type != '':  # explicitly set
+         return repo_type
+-    if root == path:  # main repo
++    if root is not None and os.path.normpath(root) == os.path.normpath(path):
+         return 'm'
+     return ''
+ 
+@@ -215,7 +215,7 @@ def add_repos(repos: Dict[str, Dict[str, str]], new_paths: List[str],
+     @param repos: name -> path
+     """
+     existing_paths = {prop['path'] for prop in repos.values()}
+-    new_paths = {os.path.abspath(p) for p in new_paths if is_git(p, is_bare)}
++    new_paths = {p for p in new_paths if is_git(p, is_bare)}
+     new_paths = new_paths - existing_paths
+     new_repos = {}
+     if new_paths:
+@@ -236,6 +236,42 @@ def add_repos(repos: Dict[str, Dict[str, str]], new_paths: List[str],
+     return new_repos
+ 
+ 
++def _generate_dir_hash(repo_path: str, paths: List[str]) -> Tuple[str, ...]:
++    """
++    Return relative parent strings
++
++    For example, if `repo_path` is /a/b/c/d/here, and one of `paths` is /a/b/
++    then return (b, c, d)
++    """
++    for p in paths:
++        if is_relative_to(repo_path, p):
++            break
++    else:
++        return ()
++    return (os.path.basename(p),
++            *os.path.normpath(os.path.relpath(repo_path, p)).split(os.sep)[:-1])
++
++
++def auto_group(repos: Dict[str, Dict[str, str]], paths: List[str]
++        ) -> Dict[str, List[str]]:
++    """
++
++    """
++    # FIXME: the upstream code should make sure that paths are all independent
++    #        i.e., each repo should be contained in one and only one path
++    new_groups = defaultdict(list)
++    for repo_name, prop in repos.items():
++        hash = _generate_dir_hash(prop['path'], paths)
++        if not hash:
++            continue
++        for i in range(1, len(hash)+1):
++            group_name = '-'.join(hash[:i])
++            new_groups[group_name].append(repo_name)
++    # FIXME: need to make sure the new group names don't clash with old ones
++    #        or repo names
++    return new_groups
++
++
+ def parse_clone_config(fname: str) -> Iterator[List[str]]:
+     """
+     Return the url, name, and path of all repos in `fname`.
+diff --git a/setup.py b/setup.py
+index 8bf0fc9..6fb92eb 100644
+--- a/setup.py
++++ b/setup.py
+@@ -7,7 +7,7 @@ with open('README.md', encoding='utf-8') as f:
+ setup(
+     name='gita',
+     packages=['gita'],
+-    version='0.15.0',
++    version='0.15.1',
+     license='MIT',
+     description='Manage multiple git repos with sanity',
+     long_description=long_description,

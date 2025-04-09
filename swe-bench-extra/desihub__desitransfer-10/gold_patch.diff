@@ -1,0 +1,205 @@
+diff --git a/bin/desi_transfer_status_restore b/bin/desi_transfer_status_restore
+new file mode 100755
+index 0000000..4766fc8
+--- /dev/null
++++ b/bin/desi_transfer_status_restore
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python
++"""
++Quick and dirty script to restore raw data transfer status.
++
++1. Obtain rsync time from modification time of exposure directory.
++2. Set checksum time to rsync time.
++3. Ignore pipeline time (as of early 2020).
++4. Obtain backup time from HPSS backup files.
++
++This script is deliberately kept separate from the package because it
++uses hpsspy.
++"""
++from sys import exit
++import json
++import os
++import hpsspy.os as hpos
++
++
++def backup_times(path='desi/spectro/data'):
++    """Obtain backup times from HPSS files.
++
++    Parameters
++    ----------
++    path : :class:`str`
++        The HPSS path to the raw data backup files.
++
++    Returns
++    -------
++    :class:`dict`
++        A mapping of night to backup time.  The backup time is in milliseconds
++        for compatibility with JavaScript.
++    """
++    ls = hpos.listdir(path)
++    return dict([(os.path.splitext(f.name)[0].split('_')[-1], f.st_mtime*1000)
++                 for f in ls if f.name.endswith('.tar')])
++
++
++def main():
++    """Entry point for :command:`desi_transfer_status_restore`.
++
++    Returns
++    -------
++    :class:`int`
++        An integer suitable for passing to :func:`sys.exit`.
++    """
++    bt = backup_times()
++    nights = os.listdir(os.environ['DESI_SPECTRO_DATA'])
++    status = list()
++    for night in nights:
++        if night != 'README.html':
++            exposures = os.listdir(os.path.join(os.environ['DESI_SPECTRO_DATA'], night))
++            for exp in exposures:
++                rt = int(os.stat(os.path.join(os.environ['DESI_SPECTRO_DATA'], night, exp)).st_mtime * 1000)
++                status.append([int(night), int(exp), 'rsync', True, '', rt])
++                status.append([int(night), int(exp), 'checksum', True, '', rt])
++                try:
++                    status.append([int(night), int(exp), 'backup', True, '', bt[night]])
++                except KeyError:
++                    pass
++    status = sorted(status, key=lambda x: x[0]*10000000 + x[1], reverse=True)
++    with open('desi_transfer_status_restore.json', 'w') as j:
++        json.dump(status, j, indent=None, separators=(',', ':'))
++    return 0
++
++
++if __name__ == '__main__':
++    try:
++        foo = os.environ['HPSS_DIR']
++    except KeyError:
++        os.environ['HPSS_DIR'] = '/usr/common/mss'
++    exit(main())
+diff --git a/doc/api.rst b/doc/api.rst
+index 418593d..9ee155f 100644
+--- a/doc/api.rst
++++ b/doc/api.rst
+@@ -5,6 +5,9 @@ desitransfer API
+ .. automodule:: desitransfer
+     :members:
+ 
++.. automodule:: desitransfer.common
++    :members:
++
+ .. automodule:: desitransfer.daemon
+     :members:
+ 
+diff --git a/doc/changes.rst b/doc/changes.rst
+index c55f0ac..44903e1 100644
+--- a/doc/changes.rst
++++ b/doc/changes.rst
+@@ -5,7 +5,10 @@ Change Log
+ 0.3.4 (unreleased)
+ ------------------
+ 
+-* No changes yet.
++* Guard against corrupted status JSON files; restore transfer status;
++  additional daily transfers (PR `#10`_).
++
++.. _`#10`: https://github.com/desihub/desitransfer/pull/10
+ 
+ 0.3.3 (2019-12-18)
+ ------------------
+diff --git a/py/desitransfer/daily.py b/py/desitransfer/daily.py
+index 94b63d5..d27b1f7 100644
+--- a/py/desitransfer/daily.py
++++ b/py/desitransfer/daily.py
+@@ -98,6 +98,8 @@ def _config():
+             #                os.path.join(engineering, 'fxc')),
+             DailyDirectory('/data/focalplane/logs/calib_logs',
+                            os.path.join(engineering, 'focalplane', 'logs', 'calib_logs')),
++            DailyDirectory('/data/focalplane/logs/kpno',
++                           os.path.join(engineering, 'focalplane', 'logs', 'kpno')),
+             DailyDirectory('/data/focalplane/logs/xytest_data',
+                            os.path.join(engineering, 'focalplane', 'logs', 'xytest_data')),
+             DailyDirectory('/data/fvc/data',
+diff --git a/py/desitransfer/status.py b/py/desitransfer/status.py
+index 21cb7a9..e92998f 100644
+--- a/py/desitransfer/status.py
++++ b/py/desitransfer/status.py
+@@ -14,10 +14,6 @@ import time
+ from argparse import ArgumentParser
+ from pkg_resources import resource_filename
+ from . import __version__ as dtVersion
+-# from desiutil.log import get_logger
+-
+-
+-# log = None
+ 
+ 
+ class TransferStatus(object):
+@@ -47,11 +43,44 @@ class TransferStatus(object):
+             return
+         try:
+             with open(self.json) as j:
+-                self.status = json.load(j)
++                try:
++                    self.status = json.load(j)
++                except json.JSONDecodeError:
++                    self._handle_malformed()
+         except FileNotFoundError:
+             pass
+         return
+ 
++    def _handle_malformed(self):
++        """Handle malformed JSON files.
++
++        This function will save the malformed file to a .bad file for
++        later analysis, and write an empty array to a new status file.
++        """
++        from .daemon import log
++        bad = self.json + '.bad'
++        m = "Malformed JSON file detected: %s; saving original file as %s."
++        try:
++            log.error(m, self.json, bad)
++        except AttributeError:
++            # If the status code is running stand-alone, the log object
++            # will be None.
++            print("ERROR: " + (m % (self.json, bad)))
++        m = "shutil.copy2('%s', '%s')"
++        try:
++            log.debug(m, self.json, bad)
++        except AttributeError:
++            print("DEBUG: " + (m % (self.json, bad)))
++        shutil.copy2(self.json, bad)
++        m = "Writing empty array to %s."
++        try:
++            log.info(m, self.json)
++        except AttributeError:
++            print("INFO: " + (m % (self.json,)))
++        with open(self.json, 'w') as j:
++            j.write('[]')
++        return
++
+     def update(self, night, exposure, stage, failure=False, last=''):
+         """Update the transfer status.
+ 
+@@ -92,6 +121,14 @@ class TransferStatus(object):
+             self.status.insert(0, row)
+         self.status = sorted(self.status, key=lambda x: x[0]*10000000 + x[1],
+                              reverse=True)
++        #
++        # Copy the original file before modifying.
++        # This will overwrite any existing .bak file
++        #
++        try:
++            shutil.copy2(self.json, self.json + '.bak')
++        except FileNotFoundError:
++            pass
+         with open(self.json, 'w') as j:
+             json.dump(self.status, j, indent=None, separators=(',', ':'))
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 345f714..98fc19f 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,3 @@
+ setuptools
+ pytz
+-git+https://github.com/desihub/desiutil.git@1.9.15#egg=desiutil
++git+https://github.com/desihub/desiutil.git@2.0.1#egg=desiutil

@@ -1,0 +1,123 @@
+diff --git a/quom/__main__.py b/quom/__main__.py
+index d717853..ed25d0b 100644
+--- a/quom/__main__.py
++++ b/quom/__main__.py
+@@ -1,12 +1,12 @@
+ import argparse
+ import sys
+-import traceback
+ from pathlib import Path
++from typing import List
+ 
+ from .quom import Quom
+ 
+ 
+-def main():
++def main(args: List[str]):
+     parser = argparse.ArgumentParser(prog='quom', description='Single header generator for C/C++ libraries.')
+     parser.add_argument('input_path', metavar='input', type=Path, help='Input file path of the main file.')
+     parser.add_argument('output_path', metavar='output', type=Path,
+@@ -20,12 +20,33 @@ def main():
+                         help='Reduce continuous line breaks to one. Default: %(default)s')
+     parser.add_argument('--include_directory', '-I', type=Path, action='append', default=[],
+                         help='Add include directories for header files.')
++    parser.add_argument('--source_directory', '-S', type=str, action='append', default=['.'],
++                        help='Set the source directories for source files. '
++                             'Use ./ in front of a path to mark as relative to the header file.')
+ 
+-    args = parser.parse_args()
++    args = parser.parse_args(args)
++
++    # Transform source directories to distingue between:
++    # - relative from header file (starting with dot)
++    # - relative from workdir
++    # - absolute path
++    relative_source_directories = []
++    source_directories = []
++    for src in args.source_directory:
++        path = Path(src)
++        if src == '.' or src.startswith('./'):
++            relative_source_directories.append(path)
++        else:
++            source_directories.append(path.resolve())
+ 
+     with args.output_path.open('w+') as file:
+-        Quom(args.input_path, file, args.stitch, args.include_guard, args.trim, args.include_directory)
++        Quom(args.input_path, file, args.stitch, args.include_guard, args.trim, args.include_directory,
++             relative_source_directories, source_directories)
++
++
++def run():
++    main(sys.argv[1:])
+ 
+ 
+ if __name__ == '__main__':
+-    sys.exit(main())
++    run()
+diff --git a/quom/quom.py b/quom/quom.py
+index 20bc83e..d366219 100644
+--- a/quom/quom.py
++++ b/quom/quom.py
+@@ -1,3 +1,4 @@
++import os
+ import re
+ from pathlib import Path
+ from queue import Queue
+@@ -29,12 +30,17 @@ def contains_only_whitespace_and_comment_tokens(tokens: List[Token]):
+ class Quom:
+     def __init__(self, src_file_path: Union[Path, str], dst: TextIO, stitch_format: str = None,
+                  include_guard_format: str = None, trim: bool = True,
+-                 include_directories: List[Union[Path, str]] = None):
++                 include_directories: List[Union[Path, str]] = None,
++                 relative_source_directories: List[Union[Path]] = None,
++                 source_directories: List[Union[Path]] = None):
+         self.__dst = dst
+         self.__stitch_format = stitch_format
+         self.__include_guard_format = re.compile('^{}$'.format(include_guard_format)) if include_guard_format else None
+         self.__trim = trim
+         self.__include_directories = [Path(x) for x in include_directories] if include_directories else []
++        self.__relative_source_directories = relative_source_directories if relative_source_directories else [] \
++            if source_directories else [Path('.')]
++        self.__source_directories = source_directories if source_directories else [Path('.')]
+ 
+         self.__processed_files = set()
+         self.__source_files = Queue()
+@@ -87,7 +93,9 @@ class Quom:
+ 
+             self.__write_token(token, is_main_header)
+ 
+-        self.__find_possible_source_file(file_path)
++        file_path = self.__find_possible_source_file(file_path)
++        if file_path:
++            self.__source_files.put(file_path)
+ 
+     def __write_token(self, token: Token, is_main_header: bool):
+         if isinstance(token, StartToken) or isinstance(token, EndToken):
+@@ -129,16 +137,21 @@ class Quom:
+                     contains_only_whitespace_and_comment_tokens(token.preprocessor_arguments[i + 1:]):
+                 return True
+ 
+-    def __find_possible_source_file(self, header_file_path: Path):
++    def __find_possible_source_file(self, header_file_path: Path) -> Union[Path, None]:
+         if header_file_path.suffix in ['.c', '.cpp', '.cxx', '.cc', '.c++', '.cp', '.C']:
+             return
+ 
+         # Checks if a equivalent compilation unit exits.
+         for extension in ['.c', '.cpp', '.cxx', '.cc', '.c++', '.cp', '.C']:
+-            file_path = header_file_path.with_suffix(extension)
+-            if file_path.exists():
+-                self.__source_files.put(file_path)
+-                break
++            for src_dir in self.__relative_source_directories:
++                file_path = (header_file_path.parent / src_dir / header_file_path.name).with_suffix(extension)
++                if file_path.exists():
++                    return file_path
++            for src_dir in self.__source_directories:
++                file_path = (src_dir / header_file_path.name).with_suffix(extension).resolve()
++                if file_path.exists():
++                    return file_path
++        return None
+ 
+     def __scan_for_include(self, file_path: Path, token: Token, is_source_file: bool) -> Union[Token, None]:
+         if not isinstance(token, PreprocessorIncludeToken) or not token.is_local_include:
+

@@ -1,0 +1,87 @@
+diff --git a/README.md b/README.md
+index 16b11cb..2f14c63 100644
+--- a/README.md
++++ b/README.md
+@@ -352,8 +352,9 @@ The configuration parameters are:
+       ...
+       return True/False
+   ```
+-Early stopping is one of Mango's important features that allow to early terminate the current parallel search based on the custom user-designed criteria, such as the total optimization time spent, current validation accuracy achieved, or improvements in the past few iterations. For usage see early stopping examples [notebook](https://github.com/ARM-software/mango/blob/master/examples/EarlyStopping.ipynb).
++  Early stopping is one of Mango's important features that allow to early terminate the current parallel search based on the custom user-designed criteria, such as the total optimization time spent, current validation accuracy achieved, or improvements in the past few iterations. For usage see early stopping examples [notebook](https://github.com/ARM-software/mango/blob/master/examples/EarlyStopping.ipynb).
+ 
++- initial_custom: A list of initial evaluation points to warm up the optimizer instead of random sampling. For example, for a search space with two parameters `x1` and `x2` the input could be:   `[{'x1': 10, 'x2': -5}, {'x1': 0, 'x2': 10}]`. This allows the user to customize the initial evaluation points and therefore guide the optimization process. If this option is given then `initial_random` is ignored.  
+ 
+ The default configuration parameters can be modified, as shown below. Only the parameters whose values need to adjusted can be passed as the dictionary.
+ 
+diff --git a/mango/tuner.py b/mango/tuner.py
+index 360a859..97f02a1 100644
+--- a/mango/tuner.py
++++ b/mango/tuner.py
+@@ -29,6 +29,7 @@ class Tuner:
+     class Config:
+         domain_size: int = None
+         initial_random: int = 2
++        initial_custom: dict = None
+         num_iteration: int = 20
+         batch_size: int = 1
+         optimizer: str = 'Bayesian'
+@@ -151,25 +152,35 @@ class Tuner:
+         self.maximize_objective = False
+         return self.run()
+ 
++
++    def run_initial(self):
++        if self.config.initial_custom is not None:
++            X_tried = copy.deepcopy(self.config.initial_custom)
++            X_list, Y_list = self.runUserObjective(X_tried)
++        else:
++            # getting first few random values
++            X_tried = self.ds.get_random_sample(self.config.initial_random)
++            X_list, Y_list = self.runUserObjective(X_tried)
++
++            # in case initial random results are invalid try different samples
++            n_tries = 1
++            while len(Y_list) < self.config.initial_random and n_tries < 3:
++                X_tried2 = self.ds.get_random_sample(self.config.initial_random - len(Y_list))
++                X_list2, Y_list2 = self.runUserObjective(X_tried2)
++                X_tried2.extend(X_tried2)
++                X_list = np.append(X_list, X_list2)
++                Y_list = np.append(Y_list, Y_list2)
++                n_tries += 1
++
++            if len(Y_list) == 0:
++                raise ValueError("No valid configuration found to initiate the Bayesian Optimizer")
++        return X_list, Y_list, X_tried
++
+     def runBayesianOptimizer(self):
+         results = dict()
+ 
+-        # getting first few random values
+-        random_hyper_parameters = self.ds.get_random_sample(self.config.initial_random)
+-        X_list, Y_list = self.runUserObjective(random_hyper_parameters)
+-
+-        # in case initial random results are invalid try different samples
+-        n_tries = 1
+-        while len(Y_list) < self.config.initial_random and n_tries < 3:
+-            random_hps = self.ds.get_random_sample(self.config.initial_random - len(Y_list))
+-            X_list2, Y_list2 = self.runUserObjective(random_hps)
+-            random_hyper_parameters.extend(random_hps)
+-            X_list = np.append(X_list, X_list2)
+-            Y_list = np.append(Y_list, Y_list2)
+-            n_tries += 1
++        X_list, Y_list, X_tried = self.run_initial()
+ 
+-        if len(Y_list) == 0:
+-            raise ValueError("No valid configuration found to initiate the Bayesian Optimizer")
+ 
+         # evaluated hyper parameters are used
+         X_init = self.ds.convert_GP_space(X_list)
+@@ -186,7 +197,7 @@ class Tuner:
+         X_sample = X_init
+         Y_sample = Y_init
+ 
+-        hyper_parameters_tried = random_hyper_parameters
++        hyper_parameters_tried = X_tried
+         objective_function_values = Y_list
+         surrogate_values = Y_list
+ 

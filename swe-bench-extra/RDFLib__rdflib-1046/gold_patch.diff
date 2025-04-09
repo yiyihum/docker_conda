@@ -1,0 +1,100 @@
+diff --git a/rdflib/graph.py b/rdflib/graph.py
+index 12d18dce..145224b8 100644
+--- a/rdflib/graph.py
++++ b/rdflib/graph.py
+@@ -2,6 +2,8 @@ from __future__ import absolute_import
+ from __future__ import division
+ from __future__ import print_function
+ 
++from xml.sax import SAXParseException
++
+ from rdflib.term import Literal  # required for doctests
+ from rdflib.namespace import Namespace  # required for doctests
+ 
+@@ -21,6 +23,7 @@ from rdflib.parser import create_input_source
+ from rdflib.namespace import NamespaceManager
+ from rdflib.resource import Resource
+ from rdflib.collection import Collection
++import rdflib.util  # avoid circular dependency
+ 
+ import os
+ import shutil
+@@ -31,6 +34,7 @@ from urllib.parse import urlparse
+ 
+ assert Literal  # avoid warning
+ assert Namespace  # avoid warning
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -1066,13 +1070,24 @@ class Graph(Node):
+         )
+         if format is None:
+             format = source.content_type
++        assumed_xml = False
+         if format is None:
+-            # raise Exception("Could not determine format for %r. You can" + \
+-            # "expicitly specify one with the format argument." % source)
+-            format = "application/rdf+xml"
++            if (hasattr(source, "file")
++                    and getattr(source.file, "name", None)
++                    and isinstance(source.file.name, str)):
++                format = rdflib.util.guess_format(source.file.name)
++            if format is None:
++                format = "application/rdf+xml"
++                assumed_xml = True
+         parser = plugin.get(format, Parser)()
+         try:
+             parser.parse(source, self, **args)
++        except SAXParseException as saxpe:
++            if assumed_xml:
++                logger.warning(
++                    "Could not guess format for %r, so assumed xml."
++                    " You can explicitly specify format using the format argument." % source)
++            raise saxpe
+         finally:
+             if source.auto_close:
+                 source.close()
+diff --git a/rdflib/util.py b/rdflib/util.py
+index 57b20915..92996ec7 100644
+--- a/rdflib/util.py
++++ b/rdflib/util.py
+@@ -47,8 +47,7 @@ from rdflib.exceptions import ContextTypeError
+ from rdflib.exceptions import ObjectTypeError
+ from rdflib.exceptions import PredicateTypeError
+ from rdflib.exceptions import SubjectTypeError
+-from rdflib.graph import Graph
+-from rdflib.graph import QuotedGraph
++import rdflib.graph  # avoid circular dependency
+ from rdflib.namespace import Namespace
+ from rdflib.namespace import NamespaceManager
+ from rdflib.term import BNode
+@@ -161,7 +160,7 @@ def from_n3(s, default=None, backend=None, nsm=None):
+         >>> from rdflib import RDFS
+         >>> from_n3('rdfs:label') == RDFS['label']
+         True
+-        >>> nsm = NamespaceManager(Graph())
++        >>> nsm = NamespaceManager(rdflib.graph.Graph())
+         >>> nsm.bind('dbpedia', 'http://dbpedia.org/resource/')
+         >>> berlin = URIRef('http://dbpedia.org/resource/Berlin')
+         >>> from_n3('dbpedia:Berlin', nsm=nsm) == berlin
+@@ -207,16 +206,16 @@ def from_n3(s, default=None, backend=None, nsm=None):
+         return Literal(int(s))
+     elif s.startswith("{"):
+         identifier = from_n3(s[1:-1])
+-        return QuotedGraph(backend, identifier)
++        return rdflib.graph.QuotedGraph(backend, identifier)
+     elif s.startswith("["):
+         identifier = from_n3(s[1:-1])
+-        return Graph(backend, identifier)
++        return rdflib.graph.Graph(backend, identifier)
+     elif s.startswith("_:"):
+         return BNode(s[2:])
+     elif ":" in s:
+         if nsm is None:
+             # instantiate default NamespaceManager and rely on its defaults
+-            nsm = NamespaceManager(Graph())
++            nsm = NamespaceManager(rdflib.graph.Graph())
+         prefix, last_part = s.split(":", 1)
+         ns = dict(nsm.namespaces())[prefix]
+         return Namespace(ns)[last_part]

@@ -1,0 +1,104 @@
+diff --git a/tests/test_client.py b/tests/test_client.py
+index a4f5fc9..12f1726 100644
+--- a/tests/test_client.py
++++ b/tests/test_client.py
+@@ -23,6 +23,7 @@ import time
+ import warnings
+ import unittest
+ from unittest import mock
++from contextlib import contextmanager
+ 
+ import requests.exceptions
+ from plucky import merge
+@@ -479,7 +480,7 @@ class FeatureBasedSolverSelection(unittest.TestCase):
+         self.assertSolvers(self.client.get_solvers(online=True), self.solvers)
+         self.assertSolvers(self.client.get_solvers(online=False), [])
+ 
+-    def test_qpu_hybrid_software(self):
++    def test_derived_category_properties(self):
+         self.assertSolvers(self.client.get_solvers(qpu=True), self.qpu_solvers)
+         self.assertSolvers(self.client.get_solvers(qpu=False), self.software_solvers + self.hybrid_solvers)
+         self.assertSolvers(self.client.get_solvers(software=True), self.software_solvers)
+@@ -487,6 +488,30 @@ class FeatureBasedSolverSelection(unittest.TestCase):
+         self.assertSolvers(self.client.get_solvers(hybrid=True), self.hybrid_solvers)
+         self.assertSolvers(self.client.get_solvers(hybrid=False), self.qpu_solvers + self.software_solvers)
+ 
++    # Test fallback for legacy solvers without the `category` property
++    # TODO: remove when all production solvers are updated
++    def test_derived_category_properties_without_category(self):
++        "Category-based filtering works without explicit `category` property."
++
++        @contextmanager
++        def multi_solver_properties_patch(solvers, update):
++            """Update properties for all `solvers` at once."""
++            patchers = [mock.patch.dict(s.properties, update) for s in solvers]
++            try:
++                yield (p.start() for p in patchers)
++            finally:
++                return (p.stop() for p in patchers)
++
++        with mock.patch.object(self.software, 'id', 'c4-sw_solver3'):
++            # patch categories and re-run the category-based filtering test
++            with multi_solver_properties_patch(self.solvers, {'category': ''}):
++                self.test_derived_category_properties()
++
++            # verify patching
++            with multi_solver_properties_patch(self.solvers, {'category': 'x'}):
++                with self.assertRaises(AssertionError):
++                    self.test_derived_category_properties()
++
+     def test_category(self):
+         self.assertSolvers(self.client.get_solvers(category='qpu'), self.qpu_solvers)
+         self.assertSolvers(self.client.get_solvers(category='software'), self.software_solvers)
+diff --git a/tests/test_mock_solver_loading.py b/tests/test_mock_solver_loading.py
+index 492226c..3fdc8ec 100644
+--- a/tests/test_mock_solver_loading.py
++++ b/tests/test_mock_solver_loading.py
+@@ -25,6 +25,7 @@ import requests_mock
+ from dwave.cloud.client import Client, Solver
+ from dwave.cloud.qpu import Client as QPUClient
+ from dwave.cloud.sw import Client as SoftwareClient
++from dwave.cloud.hybrid import Client as HybridClient
+ from dwave.cloud.exceptions import (
+     SolverPropertyMissingError, ConfigFileReadError, ConfigFileParseError,
+     SolverError, SolverNotFoundError)
+@@ -226,6 +227,12 @@ class MockSolverLoading(unittest.TestCase):
+         self.assertFalse(SoftwareClient.is_solver_handled(solver_object('test', 'hybrid')))
+         self.assertFalse(SoftwareClient.is_solver_handled(solver_object('test', 'whatever')))
+         self.assertFalse(SoftwareClient.is_solver_handled(None))
++        # hybrid client
++        self.assertFalse(HybridClient.is_solver_handled(solver_object('test', 'qpu')))
++        self.assertFalse(HybridClient.is_solver_handled(solver_object('test', 'software')))
++        self.assertTrue(HybridClient.is_solver_handled(solver_object('test', 'hybrid')))
++        self.assertFalse(HybridClient.is_solver_handled(solver_object('test', 'whatever')))
++        self.assertFalse(HybridClient.is_solver_handled(None))
+ 
+     def test_solver_feature_properties(self):
+         self.assertTrue(solver_object('solver', 'qpu').qpu)
+@@ -275,6 +282,26 @@ class MockSolverLoading(unittest.TestCase):
+         del data['status']
+         self.assertTrue(Solver(None, data).online)
+ 
++    # Test fallback for legacy solvers without the `category` property
++    # TODO: remove when all production solvers are updated
++    def test_solver_with_category_missing(self):
++
++        # client type filtering support
++        self.assertTrue(QPUClient.is_solver_handled(solver_object('solver', cat='')))
++        self.assertTrue(SoftwareClient.is_solver_handled(solver_object('c4-sw_x', cat='')))
++        self.assertTrue(HybridClient.is_solver_handled(solver_object('hybrid_x', cat='')))
++
++        # derived properties are correct
++        self.assertTrue(solver_object('solver', cat='').qpu)
++        self.assertFalse(solver_object('solver', cat='').software)
++        self.assertFalse(solver_object('solver', cat='').hybrid)
++        self.assertFalse(solver_object('c4-sw_x', cat='').qpu)
++        self.assertTrue(solver_object('c4-sw_x', cat='').software)
++        self.assertFalse(solver_object('c4-sw_x', cat='').hybrid)
++        self.assertFalse(solver_object('hybrid_x', cat='').qpu)
++        self.assertFalse(solver_object('hybrid_x', cat='').software)
++        self.assertTrue(solver_object('hybrid_x', cat='').hybrid)
++
+ 
+ class RequestEvent(Exception):
+     """Throws exception when mocked client submits an HTTP request."""

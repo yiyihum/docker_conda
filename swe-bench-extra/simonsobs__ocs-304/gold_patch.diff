@@ -1,0 +1,122 @@
+diff --git a/docs/developer/session-data.rst b/docs/developer/session-data.rst
+index 480a0c6..5aa89d7 100644
+--- a/docs/developer/session-data.rst
++++ b/docs/developer/session-data.rst
+@@ -147,6 +147,9 @@ This block formats the latest values for each "channel" into a dictionary and
+ stores it in ``session.data``.
+ 
+ 
++Structure and Content
++---------------------
++
+ The structure of the ``data`` entry is not strictly defined, but
+ please observe the following guidelines:
+ 
+@@ -170,6 +173,30 @@ please observe the following guidelines:
+     object to break. Changes that do take place should be announced in the
+     change logs of new OCS versions.
+ 
++
++There are some restrictions on what data can be carried in
++``session.data``:
++
++- The session.data will ultimately be converted and transported using
++  JSON, so some containers will be automatically converted into
++  JSON-compatible forms.  Specifically note that:
++
++  - dict keys will be converted to strings.
++  - there is no distinction between lists and tuples.
++  - there is no (standardized) support for non-finite floats such as
++    inf, -inf, or NaN.
++
++- If your session.data contains any NaN, they will be converted to
++  None (which is transported as JSON null).
++- If your session.data contains inf/-inf, or other JSON-encodable
++  entities, OCS will raise an error.  To have those transported as
++  None/null, you should convert inf/-inf to NaN before storing the
++  data in session.data.
++- If your session.data includes numpy arrays (or scalars), these will
++  be converted to serializable types automatically using
++  ``numpy.tolist``.
++
++
+ Client Access
+ -------------
+ Once your Agent is storing information in the ``session.data`` object you
+diff --git a/ocs/ocs_agent.py b/ocs/ocs_agent.py
+index 8230daf..af5134f 100644
+--- a/ocs/ocs_agent.py
++++ b/ocs/ocs_agent.py
+@@ -17,6 +17,8 @@ from autobahn.wamp.exception import ApplicationError, TransportLost
+ from autobahn.exception import Disconnected
+ from .ocs_twisted import in_reactor_context
+ 
++import json
++import math
+ import time
+ import datetime
+ import socket
+@@ -1055,7 +1057,9 @@ class OpSession:
+         data : dict
+           This is an area for the Operation code to store custom
+           information for Control Clients to consume.  See notes
+-          below.
++          below.  This structure will be tested for strict JSON
++          compliance, and certain translations performed (such as
++          converting NaN to None/null).
+         messages : list
+           A buffer of messages posted by the Operation.  Each element
+           of the list is a tuple, (timestamp, message) where timestamp
+@@ -1073,6 +1077,43 @@ class OpSession:
+         advice on structuring your Agent session data.
+ 
+         """
++        def json_safe(data, check_ok=False):
++            """Convert data so it can be serialized and decoded on
++            the other end.  This includes:
++
++            - Converting numpy arrays and scalars to generic lists and
++              Python basic types.
++
++            - Converting NaN to None (although crossbar handles
++              NaN/inf, web browsers may fail to deserialize the
++              invalid JSON this requires).
++
++            In the case of inf/-inf, a ValueError is raised.
++
++            """
++            if check_ok:
++                output = json_safe(data)
++                json.dumps(output, allow_nan=False)
++                return output
++            if isinstance(data, dict):
++                return {k: json_safe(v) for k, v in data.items()}
++            if isinstance(data, (list, tuple)):
++                return [json_safe(x) for x in data]
++            if hasattr(data, 'dtype'):
++                # numpy arrays and scalars.
++                return json_safe(data.tolist())
++            if isinstance(data, (str, int, bool)):
++                return data
++            if isinstance(data, float):
++                if math.isnan(data):
++                    return None
++                if not math.isfinite(data):
++                    raise ValueError('Session.data cannot store inf/-inf; '
++                                     'please convert to NaN.')
++            # This could still be something weird but json.dumps will
++            # probably reject it!
++            return data
++
+         return {'session_id': self.session_id,
+                 'op_name': self.op_name,
+                 'op_code': self.op_code.value,
+@@ -1080,7 +1121,7 @@ class OpSession:
+                 'success': self.success,
+                 'start_time': self.start_time,
+                 'end_time': self.end_time,
+-                'data': self.data,
++                'data': json_safe(self.data, True),
+                 'messages': self.messages}
+ 
+     @property

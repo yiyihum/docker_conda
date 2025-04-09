@@ -1,0 +1,227 @@
+diff --git a/README.md b/README.md
+index 551f73a..1fddaa2 100644
+--- a/README.md
++++ b/README.md
+@@ -50,7 +50,27 @@ The typical command run, assuming `tutors.csv`, `sessions.csv` and `availability
+ allocate tutors.csv sessions.csv availability.csv
+ ```
+ 
+-## Examples
++The `--stub` flag generates template `tutors.csv` and `sessions.csv` files from an availability spreadsheet.
++*Note* Ensure that the tutors.csv and sessions.csv files are empty first.
++```bash
++allocate --stub tutors.csv sessions.csv availability.csv
++```
++
++The `--doodle` flag tells the tool to parse the availability CSV file as if it is an export from doodle.
++```bash
++allocate --doodle tutors.csv sessions.csv doodle_export.csv
++```
++
++The `--update-availability` flag causes the output to be an availability CSV with the allocations removed from each tutors availability.
++An example usage might look like the below, in this case we first get the allocations and place them in `allocations.csv`
++We then update the availability and run availability again and place it in `extras.csv`
++```bash
++allocate tutors.csv sessions.csv availability.csv > allocations.csv
++allocate --update-availability tutors.csv sessions.csv availability.csv > updated_availability.csv
++allocate tutors.csv sessions.csv updated_availability > extras.csv
++```
++
++## Example 1
+ The following tables represent the 3 example CSV files that come with the project.
+ 
+ ### tutors.csv
+@@ -96,6 +116,45 @@ Brae,T02,T04,P01,P03,P04,P05
+ Emily,T03,P02,P04
+ ```
+ 
++
++## Example 2
++This is an example of how to generate an allocation from doodle along with an extras allocation for weeks with extra tutors.
++
++Starting with a CSV file exported from doodle like the one below, named `doodle.csv`
++| "Poll ""Sample Doodle Availability""" |   |   |   |  |  |  |  |  |  |
++|---|---|---|---|---|---|---|---|---|---|
++| https://doodle\.com/poll/v7scx5pzwgeu3m2y |   |   |   |  |  |  |  |  |  |
++|   |   |   |   |  |  |  |  |  |  |
++|   | February 2020 |   |   |  |  |  |  |  |  |
++|   | Tue 4 |   |   | Wed 5 |  |  | Thu 6 | Fri 7 |  |
++|   | 11:00 AM – 1:00 PM | 1:00 PM – 3:00 PM | 3:00 PM – 5:00 PM | 8:00 AM – 9:00 AM | 9:00 AM – 10:00 AM | 12:00 PM – 2:00 PM | 9:00 AM – 11:00 AM | 11:00 AM – 12:00 PM | 12:00 PM – 1:00 PM |
++| Brae | OK |   | OK |  | OK | OK | OK |  | OK |
++| Henry | OK | OK | OK | OK |  |  | OK |  |  |
++| Emily |   | OK |   |  | OK | OK |  | OK | OK |
++| Count | 2 | 2 | 1 | 2 | 2 | 2 | 2 | 2 | 2 |
++
++The first thing we do is generate `tutors.csv` and `sessions.csv` files from the availability:
++```bash
++allocate --stub --doodle tutors.csv sessions.csv doodle.csv
++```
++
++Once this is completed we open the `tutors.csv` and `sessions.csv` files and fill out the required details.
++
++After filling out details in those spreadsheets, we perform the first allocations.
++```bash
++allocate --doodle tutors.csv sessions.csv doodle.csv
++```
++
++This will provide us the allocation for regular weeks. If we want allocations for extra weeks, we first need to update the tutors availabilities based on the first round of allocations.
++```bash
++allocate --update-availability --doodle tutors.csv sessions.csv doodle.csv > updated_availability.csv
++```
++
++We can then generate allocations for weeks with extra tutors (edit the sessions.csv file as required)
++```bash
++allocate tutors.csv sessions.csv updated_availability.csv
++```
++
+ ## Support
+ You are most welcome to use this in your courses to allocate tutors. If you want to use this in your course but need assistance and would like to ask any questions please email <email@braewebb.com>.
+ 
+diff --git a/allocate/allocation.py b/allocate/allocation.py
+index c6f72a4..e23edfc 100644
+--- a/allocate/allocation.py
++++ b/allocate/allocation.py
+@@ -2,10 +2,10 @@ import csv
+ import sys
+ import pprint
+ import argparse
+-from typing import Dict, List
++from typing import Dict, List, Iterable, Any
+ 
+ from allocate.solver import validate_availability, Engine
+-from allocate.model import Tutor, Session
++from allocate.model import Tutor, Session, TimeSlot
+ from allocate.csvalidator import CSVModel
+ from allocate.availability import Availability
+ 
+@@ -49,8 +49,33 @@ def stub_files(tutors: str, sessions: str, availability: str,
+             writer.writerow(["", session.day, session.start, session.duration, "", ""])
+ 
+ 
+-def run_allocation(tutors: str, sessions: str, availability: str,
+-                   doodle: bool = False, json: bool = False):
++def new_availability(sessions: Iterable[Session], availability: Availability,
++                     solution: Dict[str, Any]):
++    session_map = {session.id: TimeSlot(session.day.value, session.start_time,
++                                        session.duration)
++                   for session in sessions}
++
++    for tutor, allocated in solution.items():
++        for session in allocated:
++            slot = session_map[session]
++            availability.set_available(tutor, slot, False)
++
++    print(availability.to_csv())
++
++
++def run_allocation(tutors: Iterable[Tutor], sessions: Iterable[Session],
++                   availability: Availability):
++    matrix = availability.to_matrix(tutors, sessions)
++
++    for message in validate_availability(matrix):
++        print(message)
++
++    engine = Engine(tutors, sessions, matrix)
++    return engine.solve()
++
++
++def load_data(tutors: str, sessions: str, availability: str,
++              doodle: bool = False):
+     tutor_model = CSVModel(Tutor)
+     tutor_model.load(tutors, allow_defaults=True)
+ 
+@@ -61,23 +86,34 @@ def run_allocation(tutors: str, sessions: str, availability: str,
+         availability_data = Availability.from_doodle(availability)
+     else:
+         availability_data = Availability.from_csv(availability)
+-    availability_matrix = availability_data.to_matrix(tutor_model, session_model)
+ 
+-    for message in validate_availability(availability_matrix):
+-        print(message)
++    return tutor_model, session_model, availability_data
++
++
++def output_results(solution, json: bool = False):
++    if json:
++        pprint.pprint(solution)
++    else:
++        solution_to_csv(solution, sys.stdout)
++
+ 
+-    engine = Engine(tutor_model, session_model, availability_matrix)
+-    solution = engine.solve()
++def run(tutors: str, sessions: str, availability: str,
++        doodle: bool = False, update_availability: bool = False,
++        json: bool = False):
++    data = load_data(tutors, sessions, availability,
++                     doodle=doodle)
++
++    solution = run_allocation(*data)
+ 
+     if solution is None:
+         print("No allocation was found because the allocation is infeasible.")
+         print("Please ensure that a valid allocation is possible based on tutor availability.")
+         print("If you think something is wrong, contact Brae at b.webb@uq.edu.au")
++
++    if update_availability:
++        new_availability(data[1], data[2], solution)
+     else:
+-        if json:
+-            pprint.pprint(solution)
+-        else:
+-            solution_to_csv(solution, sys.stdout)
++        output_results(solution, json=json)
+ 
+ 
+ def main():
+@@ -91,6 +127,8 @@ def main():
+     parser.add_argument('availability', type=str,
+                         help='CSV file of tutors availabilities to sessions')
+ 
++    parser.add_argument('--update-availability', action='store_true',
++                        help='Allocate tutors and print the availability spreadsheet with allocation applied')
+     parser.add_argument('--doodle', action='store_true',
+                         help='Parse the input availability table as a doodle export')
+     parser.add_argument('--stub', action='store_true',
+@@ -104,8 +142,9 @@ def main():
+         stub_files(args.tutors, args.sessions, args.availability,
+                    doodle=args.doodle)
+     else:
+-        run_allocation(args.tutors, args.sessions, args.availability,
+-                       doodle=args.doodle, json=args.json)
++        run(args.tutors, args.sessions, args.availability,
++            doodle=args.doodle, update_availability=args.update_availability,
++            json=args.json)
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/allocate/availability.py b/allocate/availability.py
+index 90eac30..ee261b5 100644
+--- a/allocate/availability.py
++++ b/allocate/availability.py
+@@ -51,7 +51,7 @@ class Availability:
+ 
+         return instance
+ 
+-    def get_available_slots(self, tutor: str) -> Iterable[TimeSlot]:
++    def get_available_slots(self, tutor: str) -> List[TimeSlot]:
+         """Get the time slots a tutor is available"""
+         return self._tutors_to_times[tutor]
+ 
+@@ -59,6 +59,16 @@ class Availability:
+         """Determine if a tutor is available at the given timeslot"""
+         return session in self.get_available_slots(tutor)
+ 
++    def set_available(self, tutor: str, session: TimeSlot, available: bool):
++        """Set a tutor as (un)available for a timeslot"""
++        slots = self.get_available_slots(tutor)
++        if available:
++            if session not in slots:
++                slots.append(session)
++        else:
++            if session in slots:
++                slots.remove(session)
++
+     @property
+     def tutors(self) -> Iterable[str]:
+         """All the tutors in this availability"""

@@ -1,0 +1,297 @@
+diff --git a/parsimonious/exceptions.py b/parsimonious/exceptions.py
+index b51c336..29cdef9 100644
+--- a/parsimonious/exceptions.py
++++ b/parsimonious/exceptions.py
+@@ -30,14 +30,17 @@ class ParseError(StrAndRepr, Exception):
+         match."""
+         # This is a method rather than a property in case we ever wanted to
+         # pass in which line endings we want to use.
+-        return self.text.count('\n', 0, self.pos) + 1
++        if isinstance(self.text, list):  # TokenGrammar
++            return None
++        else:
++            return self.text.count('\n', 0, self.pos) + 1
+ 
+     def column(self):
+         """Return the 1-based column where the expression ceased to match."""
+         # We choose 1-based because that's what Python does with SyntaxErrors.
+         try:
+             return self.pos - self.text.rindex('\n', 0, self.pos)
+-        except ValueError:
++        except (ValueError, AttributeError):
+             return self.pos + 1
+ 
+ 
+diff --git a/parsimonious/expressions.py b/parsimonious/expressions.py
+index 0679527..bf10656 100644
+--- a/parsimonious/expressions.py
++++ b/parsimonious/expressions.py
+@@ -375,105 +375,71 @@ class Lookahead(Compound):
+     """An expression which consumes nothing, even if its contained expression
+     succeeds"""
+ 
+-    # TODO: Merge this and Not for better cache hit ratios and less code.
+-    # Downside: pretty-printed grammars might be spelled differently than what
+-    # went in. That doesn't bother me.
++    __slots__ = ['negativity']
+ 
+-    def _uncached_match(self, text, pos, cache, error):
+-        node = self.members[0].match_core(text, pos, cache, error)
+-        if node is not None:
+-            return Node(self, text, pos, pos)
+-
+-    def _as_rhs(self):
+-        return u'&%s' % self._unicode_members()[0]
++    def __init__(self, member, *, negative=False, **kwargs):
++        super(Lookahead, self).__init__(member, **kwargs)
++        self.negativity = bool(negative)
+ 
+-
+-class Not(Compound):
+-    """An expression that succeeds only if the expression within it doesn't
+-
+-    In any case, it never consumes any characters; it's a negative lookahead.
+-
+-    """
+     def _uncached_match(self, text, pos, cache, error):
+-        # FWIW, the implementation in Parsing Techniques in Figure 15.29 does
+-        # not bother to cache NOTs directly.
+         node = self.members[0].match_core(text, pos, cache, error)
+-        if node is None:
++        if (node is None) == self.negativity: # negative lookahead == match only if not found
+             return Node(self, text, pos, pos)
+ 
+     def _as_rhs(self):
+-        # TODO: Make sure this parenthesizes the member properly if it's an OR
+-        # or AND.
+-        return u'!%s' % self._unicode_members()[0]
++        return u'%s%s' % ('!' if self.negativity else '&', self._unicode_members()[0])
+ 
++def Not(term):
++    return Lookahead(term, negative=True)
+ 
+ # Quantifiers. None of these is strictly necessary, but they're darn handy.
+ 
+-class Optional(Compound):
+-    """An expression that succeeds whether or not the contained one does
+-
+-    If the contained expression succeeds, it goes ahead and consumes what it
+-    consumes. Otherwise, it consumes nothing.
+-
+-    """
+-    def _uncached_match(self, text, pos, cache, error):
+-        node = self.members[0].match_core(text, pos, cache, error)
+-        return (Node(self, text, pos, pos) if node is None else
+-                Node(self, text, pos, node.end, children=[node]))
+-
+-    def _as_rhs(self):
+-        return u'%s?' % self._unicode_members()[0]
++class Quantifier(Compound):
++    """An expression wrapper like the */+/?/{n,m} quantifier in regexes."""
+ 
++    __slots__ = ['min', 'max']
+ 
+-# TODO: Merge with OneOrMore.
+-class ZeroOrMore(Compound):
+-    """An expression wrapper like the * quantifier in regexes."""
+-
+-    def _uncached_match(self, text, pos, cache, error):
+-        new_pos = pos
+-        children = []
+-        while True:
+-            node = self.members[0].match_core(text, new_pos, cache, error)
+-            if node is None or not (node.end - node.start):
+-                # Node was None or 0 length. 0 would otherwise loop infinitely.
+-                return Node(self, text, pos, new_pos, children)
+-            children.append(node)
+-            new_pos += node.end - node.start
+-
+-    def _as_rhs(self):
+-        return u'%s*' % self._unicode_members()[0]
+-
+-
+-class OneOrMore(Compound):
+-    """An expression wrapper like the + quantifier in regexes.
+-
+-    You can also pass in an alternate minimum to make this behave like "2 or
+-    more", "3 or more", etc.
+-
+-    """
+-    __slots__ = ['min']
+-
+-    # TODO: Add max. It should probably succeed if there are more than the max
+-    # --just not consume them.
+-
+-    def __init__(self, member, name='', min=1):
+-        super(OneOrMore, self).__init__(member, name=name)
++    def __init__(self, member, *, min=0, max=float('inf'), name='', **kwargs):
++        super(Quantifier, self).__init__(member, name=name, **kwargs)
+         self.min = min
++        self.max = max
+ 
+     def _uncached_match(self, text, pos, cache, error):
+         new_pos = pos
+         children = []
+-        while True:
++        size = len(text)
++        while new_pos < size and len(children) < self.max:
+             node = self.members[0].match_core(text, new_pos, cache, error)
+             if node is None:
+-                break
++                break # no more matches
+             children.append(node)
+             length = node.end - node.start
+-            if length == 0:  # Don't loop infinitely.
++            if len(children) >= self.min and length == 0:  # Don't loop infinitely
+                 break
+             new_pos += length
+         if len(children) >= self.min:
+             return Node(self, text, pos, new_pos, children)
+ 
+     def _as_rhs(self):
+-        return u'%s+' % self._unicode_members()[0]
++        if self.min == 0 and self.max == 1:
++            qualifier = '?'
++        elif self.min == 0 and self.max == float('inf'):
++            qualifier = '*'
++        elif self.min == 1 and self.max == float('inf'):
++            qualifier = '+'
++        elif self.max == float('inf'):
++            qualifier = '{%d,}' % self.min
++        elif self.min == 0:
++            qualifier = '{,%d}' % self.max
++        else:
++            qualifier = '{%d,%d}' % (self.min, self.max)
++        return '%s%s' % (self._unicode_members()[0], qualifier)
++
++def ZeroOrMore(member, name=''):
++    return Quantifier(member, name=name, min=0, max=float('inf'))
++
++def OneOrMore(member, name='', min=1):
++    return Quantifier(member, name=name, min=min, max=float('inf'))
++
++def Optional(member, name=''):
++    return Quantifier(member, name=name, min=0, max=1)
+diff --git a/parsimonious/grammar.py b/parsimonious/grammar.py
+index 617f4d1..ff4739f 100644
+--- a/parsimonious/grammar.py
++++ b/parsimonious/grammar.py
+@@ -10,7 +10,7 @@ from textwrap import dedent
+ 
+ from parsimonious.exceptions import BadGrammar, UndefinedLabel
+ from parsimonious.expressions import (Literal, Regex, Sequence, OneOf,
+-    Lookahead, Optional, ZeroOrMore, OneOrMore, Not, TokenMatcher,
++    Lookahead, Quantifier, Optional, ZeroOrMore, OneOrMore, Not, TokenMatcher,
+     expression, is_callable)
+ from parsimonious.nodes import NodeVisitor
+ from parsimonious.utils import evaluate_string
+@@ -241,7 +241,7 @@ rule_syntax = (r'''
+     atom = reference / literal / regex / parenthesized
+     regex = "~" spaceless_literal ~"[ilmsuxa]*"i _
+     parenthesized = "(" _ expression ")" _
+-    quantifier = ~"[*+?]" _
++    quantifier = ~r"[*+?]|\{\d*,\d+\}|\{\d+,\d*\}|\{\d+\}" _
+     reference = label !equals
+ 
+     # A subsequent equal sign is the only thing that distinguishes a label
+@@ -305,7 +305,17 @@ class RuleVisitor(NodeVisitor):
+ 
+     def visit_quantified(self, node, quantified):
+         atom, quantifier = quantified
+-        return self.quantifier_classes[quantifier.text](atom)
++        try:
++            return self.quantifier_classes[quantifier.text](atom)
++        except KeyError:
++            # This should pass: assert re.full_match("\{(\d*)(,(\d*))?\}", quantifier)
++            quantifier = quantifier.text[1:-1].split(",")
++            if len(quantifier) == 1:
++                min_match = max_match = int(quantifier[0])
++            else:
++                min_match = int(quantifier[0]) if quantifier[0] else 0
++                max_match = int(quantifier[1]) if quantifier[1] else float('inf')
++            return Quantifier(atom, min=min_match, max=max_match)
+ 
+     def visit_lookahead_term(self, node, lookahead_term):
+         ampersand, term, _ = lookahead_term
+@@ -405,7 +415,7 @@ class RuleVisitor(NodeVisitor):
+         """
+         return visited_children or node  # should semantically be a tuple
+ 
+-    def _resolve_refs(self, rule_map, expr, done):
++    def _resolve_refs(self, rule_map, expr, resolved):
+         """Return an expression with all its lazy references recursively
+         resolved.
+ 
+@@ -415,24 +425,42 @@ class RuleVisitor(NodeVisitor):
+         :arg done: The set of Expressions that have already been or are
+             currently being resolved, to ward off redundant work and prevent
+             infinite recursion for circular refs
+-
+         """
+-        if isinstance(expr, LazyReference):
++        if expr in resolved:
++            newref = resolved[expr]
++        elif isinstance(expr, LazyReference):
+             label = str(expr)
+             try:
+                 reffed_expr = rule_map[label]
+             except KeyError:
+                 raise UndefinedLabel(expr)
+-            return self._resolve_refs(rule_map, reffed_expr, done)
++            newref = resolved[expr] = self._resolve_refs(rule_map, reffed_expr, resolved)
+         else:
+-            if getattr(expr, 'members', ()) and expr not in done:
++            if getattr(expr, 'members', ()) and expr not in resolved:
+                 # Prevents infinite recursion for circular refs. At worst, one
+                 # of `expr.members` can refer back to `expr`, but it can't go
+                 # any farther.
+-                done.add(expr)
+-                expr.members = tuple(self._resolve_refs(rule_map, member, done)
++                resolved[expr] = expr
++                expr.members = tuple(self._resolve_refs(rule_map, member, resolved)
+                                      for member in expr.members)
+-            return expr
++            newref = expr
++        return newref
++
++    def _find_unresolved(self, rules):
++        """Recursively find all LazyReference objects and return them as a set"""
++        seen = set()
++        to_resolve = set()
++        def _find_referenced_rules(rulelist):
++            for expr in rulelist:
++                if expr in seen:
++                    continue
++                seen.add(expr)
++                if isinstance(expr, LazyReference):
++                    to_resolve.add(expr)
++                elif getattr(expr, 'members', None):
++                    _find_referenced_rules(expr.members)
++        _find_referenced_rules(rules)
++        return to_resolve
+ 
+     def visit_rules(self, node, rules_list):
+         """Collate all the rules into a map. Return (map, default rule).
+@@ -458,9 +486,18 @@ class RuleVisitor(NodeVisitor):
+         rule_map.update(self.custom_rules)
+ 
+         # Resolve references. This tolerates forward references.
+-        done = set()
+-        rule_map = OrderedDict((expr.name, self._resolve_refs(rule_map, expr, done))
+-                               for expr in rule_map.values())
++        # We use a job pool `to_resolve` to remember all rules to resolve. It is
++        # initialized with all existing rules in `rule_map` and all
++        # LazyReference rules found later will be added as well.
++        to_resolve = set(rule_map.values())
++        resolved = {}
++        while to_resolve:
++            expr = to_resolve.pop()
++            newexpr = self._resolve_refs(rule_map, expr, resolved)
++            if getattr(expr, 'name', None):
++                rule_map[expr.name] = newexpr
++            if getattr(newexpr, 'members', ()):
++                to_resolve.update(self._find_unresolved(newexpr.members))
+ 
+         # isinstance() is a temporary hack around the fact that * rules don't
+         # always get transformed into lists by NodeVisitor. We should fix that;
+

@@ -1,0 +1,105 @@
+diff --git a/sqlglot/dialects/redshift.py b/sqlglot/dialects/redshift.py
+index a41b6ea8..70066677 100644
+--- a/sqlglot/dialects/redshift.py
++++ b/sqlglot/dialects/redshift.py
+@@ -171,6 +171,8 @@ class Redshift(Postgres):
+             ),
+             exp.SortKeyProperty: lambda self,
+             e: f"{'COMPOUND ' if e.args['compound'] else ''}SORTKEY({self.format_args(*e.this)})",
++            exp.StartsWith: lambda self,
++            e: f"{self.sql(e.this)} LIKE {self.sql(e.expression)} || '%'",
+             exp.TableSample: no_tablesample_sql,
+             exp.TsOrDsAdd: date_delta_sql("DATEADD"),
+             exp.TsOrDsDiff: date_delta_sql("DATEDIFF"),
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 804df019..3186becf 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -46,9 +46,11 @@ class Generator(metaclass=_Generator):
+             'safe': Only quote identifiers that are case insensitive.
+         normalize: Whether to normalize identifiers to lowercase.
+             Default: False.
+-        pad: The pad size in a formatted string.
++        pad: The pad size in a formatted string. For example, this affects the indentation of
++            a projection in a query, relative to its nesting level.
+             Default: 2.
+-        indent: The indentation size in a formatted string.
++        indent: The indentation size in a formatted string. For example, this affects the
++            indentation of subqueries and filters under a `WHERE` clause.
+             Default: 2.
+         normalize_functions: How to normalize function names. Possible values are:
+             "upper" or True (default): Convert names to uppercase.
+@@ -3221,7 +3223,7 @@ class Generator(metaclass=_Generator):
+         num_sqls = len(expressions)
+ 
+         # These are calculated once in case we have the leading_comma / pretty option set, correspondingly
+-        pad = " " * self.pad
++        pad = " " * len(sep)
+         stripped_sep = sep.strip()
+ 
+         result_sqls = []
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index 824ebe74..1ba8b2ad 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -565,8 +565,7 @@ class Tokenizer(metaclass=_Tokenizer):
+         "~": TokenType.TILDA,
+         "?": TokenType.PLACEHOLDER,
+         "@": TokenType.PARAMETER,
+-        # used for breaking a var like x'y' but nothing else
+-        # the token type doesn't matter
++        # Used for breaking a var like x'y' but nothing else the token type doesn't matter
+         "'": TokenType.QUOTE,
+         "`": TokenType.IDENTIFIER,
+         '"': TokenType.IDENTIFIER,
+@@ -892,7 +891,7 @@ class Tokenizer(metaclass=_Tokenizer):
+ 
+     COMMAND_PREFIX_TOKENS = {TokenType.SEMICOLON, TokenType.BEGIN}
+ 
+-    # handle numeric literals like in hive (3L = BIGINT)
++    # Handle numeric literals like in hive (3L = BIGINT)
+     NUMERIC_LITERALS: t.Dict[str, str] = {}
+ 
+     COMMENTS = ["--", ("/*", "*/")]
+@@ -965,8 +964,7 @@ class Tokenizer(metaclass=_Tokenizer):
+         while self.size and not self._end:
+             current = self._current
+ 
+-            # skip spaces inline rather than iteratively call advance()
+-            # for performance reasons
++            # Skip spaces here rather than iteratively calling advance() for performance reasons
+             while current < self.size:
+                 char = self.sql[current]
+ 
+@@ -975,12 +973,10 @@ class Tokenizer(metaclass=_Tokenizer):
+                 else:
+                     break
+ 
+-            n = current - self._current
+-            self._start = current
+-            self._advance(n if n > 1 else 1)
++            offset = current - self._current if current > self._current else 1
+ 
+-            if self._char is None:
+-                break
++            self._start = current
++            self._advance(offset)
+ 
+             if not self._char.isspace():
+                 if self._char.isdigit():
+@@ -1008,12 +1004,9 @@ class Tokenizer(metaclass=_Tokenizer):
+     def _advance(self, i: int = 1, alnum: bool = False) -> None:
+         if self.WHITE_SPACE.get(self._char) is TokenType.BREAK:
+             # Ensures we don't count an extra line if we get a \r\n line break sequence
+-            if self._char == "\r" and self._peek == "\n":
+-                i = 2
+-                self._start += 1
+-
+-            self._col = 1
+-            self._line += 1
++            if not (self._char == "\r" and self._peek == "\n"):
++                self._col = 1
++                self._line += 1
+         else:
+             self._col += i
+ 

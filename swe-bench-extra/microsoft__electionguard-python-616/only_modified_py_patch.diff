@@ -1,0 +1,346 @@
+diff --git a/src/electionguard/__init__.py b/src/electionguard/__init__.py
+index d3df433..81e0c42 100644
+--- a/src/electionguard/__init__.py
++++ b/src/electionguard/__init__.py
+@@ -211,6 +211,7 @@ from electionguard.elgamal import (
+     hashed_elgamal_encrypt,
+ )
+ from electionguard.encrypt import (
++    ContestData,
+     EncryptionDevice,
+     EncryptionMediator,
+     contest_from,
+@@ -338,6 +339,9 @@ from electionguard.schnorr import (
+     make_schnorr_proof,
+ )
+ from electionguard.serialize import (
++    PAD_INDICATOR_SIZE,
++    PaddedDataSize,
++    TruncationError,
+     construct_path,
+     from_file,
+     from_file_wrapper,
+@@ -345,6 +349,8 @@ from electionguard.serialize import (
+     from_list_in_file_wrapper,
+     from_raw,
+     get_schema,
++    padded_decode,
++    padded_encode,
+     to_file,
+     to_raw,
+ )
+@@ -371,6 +377,9 @@ from electionguard.type import (
+     VerifierId,
+ )
+ from electionguard.utils import (
++    BYTE_ENCODING,
++    BYTE_ORDER,
++    ContestErrorType,
+     flatmap_optional,
+     get_optional,
+     get_or_else_optional,
+@@ -384,6 +393,8 @@ from electionguard.utils import (
+ 
+ __all__ = [
+     "AnnotatedString",
++    "BYTE_ENCODING",
++    "BYTE_ORDER",
+     "BackupVerificationState",
+     "BallotBox",
+     "BallotBoxState",
+@@ -415,8 +426,10 @@ __all__ = [
+     "Configuration",
+     "ConstantChaumPedersenProof",
+     "ContactInformation",
++    "ContestData",
+     "ContestDescription",
+     "ContestDescriptionWithPlaceholders",
++    "ContestErrorType",
+     "ContestId",
+     "CryptoHashCheckable",
+     "CryptoHashable",
+@@ -476,6 +489,8 @@ __all__ = [
+     "NO_VOTE",
+     "Nonces",
+     "OrderedObjectBase",
++    "PAD_INDICATOR_SIZE",
++    "PaddedDataSize",
+     "Party",
+     "PlaintextBallot",
+     "PlaintextBallotContest",
+@@ -503,6 +518,7 @@ __all__ = [
+     "SelectionId",
+     "Singleton",
+     "SubmittedBallot",
++    "TruncationError",
+     "VerifierId",
+     "VoteVariationType",
+     "YES_VOTE",
+@@ -654,6 +670,8 @@ __all__ = [
+     "mult_q",
+     "negate_q",
+     "nonces",
++    "padded_decode",
++    "padded_encode",
+     "partially_decrypt",
+     "pow_p",
+     "pow_q",
+diff --git a/src/electionguard/encrypt.py b/src/electionguard/encrypt.py
+index 3177377..a42df32 100644
+--- a/src/electionguard/encrypt.py
++++ b/src/electionguard/encrypt.py
+@@ -1,8 +1,9 @@
+ from datetime import datetime
+-from dataclasses import dataclass
+-from typing import List, Optional
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional, Type, TypeVar
+ from uuid import getnode
+ 
++
+ from .ballot import (
+     CiphertextBallot,
+     CiphertextBallotContest,
+@@ -18,6 +19,7 @@ from .ballot import (
+ from .ballot_code import get_hash_for_device
+ from .election import CiphertextElectionContext
+ from .elgamal import ElGamalPublicKey, elgamal_encrypt
++from .serialize import PaddedDataSize, padded_decode, padded_encode
+ from .group import ElementModQ, rand_q
+ from .logs import log_info, log_warning
+ from .manifest import (
+@@ -27,7 +29,28 @@ from .manifest import (
+     SelectionDescription,
+ )
+ from .nonces import Nonces
+-from .utils import get_optional, get_or_else_optional_func
++from .type import SelectionId
++from .utils import get_optional, get_or_else_optional_func, ContestErrorType
++
++
++_T = TypeVar("_T", bound="ContestData")
++CONTEST_DATA_SIZE: PaddedDataSize = PaddedDataSize.Bytes_512
++
++
++@dataclass
++class ContestData:
++    """Contests errors and extended data from the selections on the contest."""
++
++    error: Optional[ContestErrorType] = field(default=None)
++    error_data: Optional[List[SelectionId]] = field(default=None)
++    write_ins: Optional[Dict[SelectionId, str]] = field(default=None)
++
++    @classmethod
++    def from_bytes(cls: Type[_T], data: bytes) -> _T:
++        return padded_decode(cls, data, CONTEST_DATA_SIZE)
++
++    def to_bytes(self) -> bytes:
++        return padded_encode(self, CONTEST_DATA_SIZE)
+ 
+ 
+ @dataclass
+diff --git a/src/electionguard/hash.py b/src/electionguard/hash.py
+index 9ecc52b..3b0daf6 100644
+--- a/src/electionguard/hash.py
++++ b/src/electionguard/hash.py
+@@ -12,6 +12,7 @@ from typing import (
+ )
+ 
+ from .constants import get_small_prime
++from .utils import BYTE_ENCODING, BYTE_ORDER
+ from .group import (
+     ElementModPOrQ,
+     ElementModQ,
+@@ -68,7 +69,7 @@ def hash_elems(*a: CryptoHashableAll) -> ElementModQ:
+     :return: A cryptographic hash of these elements, concatenated.
+     """
+     h = sha256()
+-    h.update("|".encode("utf-8"))
++    h.update("|".encode(BYTE_ENCODING))
+     for x in a:
+         # We could just use str(x) for everything, but then we'd have a resulting string
+         # that's a bit Python-specific, and we'd rather make it easier for other languages
+@@ -95,6 +96,8 @@ def hash_elems(*a: CryptoHashableAll) -> ElementModQ:
+         else:
+             hash_me = str(x)
+ 
+-        h.update((hash_me + "|").encode("utf-8"))
++        h.update((hash_me + "|").encode(BYTE_ENCODING))
+ 
+-    return ElementModQ(int.from_bytes(h.digest(), byteorder="big") % get_small_prime())
++    return ElementModQ(
++        int.from_bytes(h.digest(), byteorder=BYTE_ORDER) % get_small_prime()
++    )
+diff --git a/src/electionguard/serialize.py b/src/electionguard/serialize.py
+index 91943bc..b9b3c4e 100644
+--- a/src/electionguard/serialize.py
++++ b/src/electionguard/serialize.py
+@@ -1,4 +1,5 @@
+ from datetime import datetime
++from enum import IntEnum
+ from io import TextIOWrapper
+ import json
+ import os
+@@ -7,26 +8,32 @@ from typing import Any, List, Type, TypeVar, Union
+ 
+ from dacite import Config, from_dict
+ from pydantic.json import pydantic_encoder
+-from pydantic.tools import parse_raw_as, schema_json_of
++from pydantic.tools import schema_json_of, parse_raw_as
+ 
+ from .big_integer import BigInteger
+ from .ballot_box import BallotBoxState
+-from .manifest import ElectionType, ReportingUnitType, VoteVariationType
+ from .group import ElementModP, ElementModQ
++from .manifest import ElectionType, ReportingUnitType, VoteVariationType
+ from .proof import ProofUsage
++from .utils import BYTE_ENCODING, BYTE_ORDER, ContestErrorType
++
++
++_PAD_BYTE = b"\x00"
++PAD_INDICATOR_SIZE = 2
+ 
+ _T = TypeVar("_T")
+ 
+ _indent = 2
+-_encoding = "utf-8"
+ _file_extension = "json"
+ 
+ _config = Config(
+     cast=[
+         datetime,
+         BigInteger,
++        ContestErrorType,
+         ElementModP,
+         ElementModQ,
++        ElectionType,
+         BallotBoxState,
+         ElectionType,
+         ReportingUnitType,
+@@ -37,6 +44,50 @@ _config = Config(
+ )
+ 
+ 
++class PaddedDataSize(IntEnum):
++    """Define the sizes for padded data."""
++
++    Bytes_512 = 512 - PAD_INDICATOR_SIZE
++
++
++class TruncationError(ValueError):
++    """A specific truncation error to indicate when padded data is truncated."""
++
++
++def padded_encode(data: Any, size: PaddedDataSize) -> bytes:
++    return _add_padding(to_raw(data).encode(BYTE_ENCODING), size)
++
++
++def padded_decode(type_: Type[_T], padded_data: bytes, size: PaddedDataSize) -> _T:
++    return from_raw(type_, _remove_padding(padded_data, size))
++
++
++def _add_padding(
++    message: bytes, size: PaddedDataSize, allow_truncation: bool = False
++) -> bytes:
++    """Add padding to message in bytes."""
++    message_length = len(message)
++    if message_length > size:
++        if allow_truncation:
++            message_length = size
++        else:
++            raise TruncationError(
++                "Padded data exceeds allowed padded data size of {size}."
++            )
++    padding_length = size - message_length
++    leading_byte = padding_length.to_bytes(PAD_INDICATOR_SIZE, byteorder=BYTE_ORDER)
++    padded = leading_byte + message[:message_length] + _PAD_BYTE * padding_length
++    return padded
++
++
++def _remove_padding(padded: bytes, size: PaddedDataSize) -> bytes:
++    """Remove padding from padded message in bytes."""
++
++    padding_length = int.from_bytes(padded[:PAD_INDICATOR_SIZE], byteorder=BYTE_ORDER)
++    message_end = size + PAD_INDICATOR_SIZE - padding_length
++    return padded[PAD_INDICATOR_SIZE:message_end]
++
++
+ def construct_path(
+     target_file_name: str,
+     target_path: str = "",
+@@ -48,13 +99,15 @@ def construct_path(
+     return os.path.join(target_path, target_file)
+ 
+ 
+-def from_raw(type_: Type[_T], obj: Any) -> _T:
+-    """Deserialize raw as type."""
++def from_raw(type_: Type[_T], raw: Union[str, bytes]) -> _T:
++    """Deserialize raw json string as type."""
+ 
+-    return parse_raw_as(type_, obj)
++    if type_ is datetime:
++        return parse_raw_as(type_, raw)
++    return from_dict(type_, json.loads(raw), _config)
+ 
+ 
+-def to_raw(data: Any) -> Any:
++def to_raw(data: Any) -> str:
+     """Serialize data to raw json format."""
+ 
+     return json.dumps(data, indent=_indent, default=pydantic_encoder)
+@@ -70,7 +123,7 @@ def from_file_wrapper(type_: Type[_T], file: TextIOWrapper) -> _T:
+ def from_file(type_: Type[_T], path: Union[str, Path]) -> _T:
+     """Deserialize json file as type."""
+ 
+-    with open(path, "r", encoding=_encoding) as json_file:
++    with open(path, "r", encoding=BYTE_ENCODING) as json_file:
+         data = json.load(json_file)
+     return from_dict(type_, data, _config)
+ 
+@@ -78,7 +131,7 @@ def from_file(type_: Type[_T], path: Union[str, Path]) -> _T:
+ def from_list_in_file(type_: Type[_T], path: Union[str, Path]) -> List[_T]:
+     """Deserialize json file that has an array of certain type."""
+ 
+-    with open(path, "r", encoding=_encoding) as json_file:
++    with open(path, "r", encoding=BYTE_ENCODING) as json_file:
+         data = json.load(json_file)
+         ls: List[_T] = []
+         for item in data:
+@@ -110,7 +163,7 @@ def to_file(
+     with open(
+         path,
+         "w",
+-        encoding=_encoding,
++        encoding=BYTE_ENCODING,
+     ) as outfile:
+         json.dump(data, outfile, indent=_indent, default=pydantic_encoder)
+         return path
+diff --git a/src/electionguard/utils.py b/src/electionguard/utils.py
+index e2c9b8a..eb28ffa 100644
+--- a/src/electionguard/utils.py
++++ b/src/electionguard/utils.py
+@@ -1,4 +1,5 @@
+ from datetime import datetime, timezone
++from enum import Enum
+ from re import sub
+ from typing import Callable, Optional, TypeVar
+ from base64 import b16decode
+@@ -6,6 +7,17 @@ from base64 import b16decode
+ _T = TypeVar("_T")
+ _U = TypeVar("_U")
+ 
++BYTE_ORDER = "big"
++BYTE_ENCODING = "utf-8"
++
++
++class ContestErrorType(Enum):
++    """Various errors that can occur on ballots contest after voting."""
++
++    NullVote = "nullvote"
++    UnderVote = "undervote"
++    OverVote = "overvote"
++
+ 
+ def get_optional(optional: Optional[_T]) -> _T:
+     """
+

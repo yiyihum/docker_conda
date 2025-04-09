@@ -1,0 +1,184 @@
+diff --git a/stix2validator/errors.py b/stix2validator/errors.py
+index c3e70b7..a0f3f42 100644
+--- a/stix2validator/errors.py
++++ b/stix2validator/errors.py
+@@ -222,9 +222,9 @@ def pretty_error(error, verbose=False):
+                          "not an allowed value", msg)
+         elif ('target_ref' in error.schema_path or
+               'source_ref' in error.schema_path):
+-                msg = "Relationships cannot link bundles, marking definitions"\
+-                      ", sightings, or other relationships. This field must "\
+-                      "contain the id of an SDO."
++            msg = "Relationships cannot link bundles, marking definitions"\
++                    ", sightings, or other relationships. This field must "\
++                    "contain the id of an SDO."
+         elif 'sighting_of_ref' in error.schema_path:
+             msg = "'sighting_of_ref' must refer to a STIX Domain Object or "\
+                   "Custom Object"
+diff --git a/stix2validator/util.py b/stix2validator/util.py
+index df790d9..725a3d5 100644
+--- a/stix2validator/util.py
++++ b/stix2validator/util.py
+@@ -324,7 +324,7 @@ class ValidationOptions(object):
+             contained within the same bundle
+ 
+     """
+-    def __init__(self, cmd_args=None, version=DEFAULT_VER, verbose=False, silent=False,
++    def __init__(self, cmd_args=None, version=None, verbose=False, silent=False,
+                  files=None, recursive=False, schema_dir=None,
+                  disabled="", enabled="", strict=False,
+                  strict_types=False, strict_properties=False, no_cache=False,
+@@ -348,7 +348,10 @@ class ValidationOptions(object):
+             self.enforce_refs = cmd_args.enforce_refs
+         else:
+             # input options
+-            self.version = version
++            if version is not None:
++                self.version = version
++            else:
++                self.version = None
+             self.files = files
+             self.recursive = recursive
+             self.schema_dir = schema_dir
+@@ -391,6 +394,25 @@ class ValidationOptions(object):
+                             for x in self.enabled]
+ 
+ 
++def set_check_codes(options):
++    if options.version == '2.0':
++        options.check_codes = CHECK_CODES20
++    else:
++        options.check_codes = CHECK_CODES21
++
++    if options.disabled:
++        if isinstance(options.disabled, str):
++            options.disabled = options.disabled.split(',')
++        options.disabled = [options.check_codes[x] if x in options.check_codes else x
++                            for x in options.disabled]
++    if options.enabled:
++        if isinstance(options.enabled, str):
++            options.enabled = options.enabled.split(',')
++        options.enabled = [options.check_codes[x] if x in options.check_codes else x
++                           for x in options.enabled]
++    return options
++
++
+ def has_cyber_observable_data(instance):
+     """Return True only if the given instance is an observed-data object
+     containing STIX Cyber Observable objects.
+@@ -402,6 +424,31 @@ def has_cyber_observable_data(instance):
+     return False
+ 
+ 
++def check_spec(instance, options):
++    """ Checks to see if there are differences in command-line option
++    provided spec_version and the spec_version found with bundles
++    and/or objects.
++    """
++    warnings = []
++    if options.version:
++        try:
++            if instance['type'] == 'bundle' and 'spec_version' in instance:
++                if instance['spec_version'] != options.version:
++                    warnings.append(instance['id'] + ": spec_version mismatch with command-"
++                                    "line option. Defaulting to spec_version " + options.version)
++            if instance['type'] == 'bundle' and 'objects' in instance:
++                for obj in instance['objects']:
++                    if 'spec_version' in obj:
++                        if obj['spec_version'] != options.version:
++                            warnings.append(obj['id'] + ": spec_version mismatch with command-"
++                                            "line option. Defaulting to spec_version "
++                                            + options.version)
++        except Exception:
++            pass
++
++    return warnings
++
++
+ def cyber_observable_check(original_function):
+     """Decorator for functions that require cyber observable data.
+     """
+diff --git a/stix2validator/v21/musts.py b/stix2validator/v21/musts.py
+index 41dd81a..007e69b 100644
+--- a/stix2validator/v21/musts.py
++++ b/stix2validator/v21/musts.py
+@@ -350,8 +350,8 @@ def language(instance):
+     """Ensure the 'lang' property of SDOs is a valid RFC 5646 language code.
+     """
+     if ('lang' in instance and instance['lang'] not in enums.LANG_CODES):
+-                yield JSONError("'%s' is not a valid RFC 5646 language code."
+-                                % instance['lang'], instance['id'])
++        yield JSONError("'%s' is not a valid RFC 5646 language code."
++                        % instance['lang'], instance['id'])
+ 
+ 
+ @cyber_observable_check
+diff --git a/stix2validator/validator.py b/stix2validator/validator.py
+index e13fae2..4259724 100644
+--- a/stix2validator/validator.py
++++ b/stix2validator/validator.py
+@@ -15,8 +15,8 @@ from six import iteritems, string_types, text_type
+ from . import output
+ from .errors import (NoJSONFileFoundError, SchemaError, SchemaInvalidError,
+                      ValidationError, pretty_error)
+-from .util import (DEFAULT_VER, ValidationOptions, clear_requests_cache,
+-                   init_requests_cache)
++from .util import (DEFAULT_VER, ValidationOptions, check_spec,
++                   clear_requests_cache, init_requests_cache, set_check_codes)
+ from .v20 import musts as musts20
+ from .v20 import shoulds as shoulds20
+ from .v21 import musts as musts21
+@@ -645,6 +645,13 @@ def _schema_validate(sdo, options):
+     else:
+         error_prefix = ''
+ 
++    if options.version is None and 'spec_version' in sdo:
++        options.version = sdo['spec_version']
++    if options.version is None:
++        options.version = "2.1"
++
++    options = set_check_codes(options)
++
+     # Get validator for built-in schema
+     base_sdo_errors = _get_error_generator(sdo['type'], sdo, version=options.version)
+     if base_sdo_errors:
+@@ -718,6 +725,8 @@ def validate_instance(instance, options=None):
+ 
+     # Schema validation
+     if instance['type'] == 'bundle' and 'objects' in instance:
++        if options.version is None and 'spec_version' in instance:
++            options.version = instance['spec_version']
+         # Validate each object in a bundle separately
+         for sdo in instance['objects']:
+             if 'type' not in sdo:
+@@ -726,6 +735,8 @@ def validate_instance(instance, options=None):
+     else:
+         error_gens += _schema_validate(instance, options)
+ 
++    spec_warnings = check_spec(instance, options)
++
+     # Custom validation
+     must_checks = _get_musts(options)
+     should_checks = _get_shoulds(options)
+@@ -741,6 +752,7 @@ def validate_instance(instance, options=None):
+         else:
+             chained_errors = errors
+             warnings = [pretty_error(x, options.verbose) for x in warnings]
++            warnings.extend(spec_warnings)
+     except schema_exceptions.RefResolutionError:
+         raise SchemaInvalidError('Invalid JSON schema: a JSON reference '
+                                  'failed to resolve')
+@@ -756,11 +768,11 @@ def validate_instance(instance, options=None):
+         for error in gen:
+             msg = prefix + pretty_error(error, options.verbose)
+             error_list.append(SchemaError(msg))
+-
++    if options.strict:
++        error_list.extend(spec_warnings)
+     if error_list:
+         valid = False
+     else:
+         valid = True
+-
+     return ObjectValidationResults(is_valid=valid, object_id=instance.get('id', ''),
+                                    errors=error_list, warnings=warnings)

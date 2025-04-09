@@ -1,0 +1,144 @@
+diff --git a/docs/index.rst b/docs/index.rst
+index bb58db3..dca92e0 100644
+--- a/docs/index.rst
++++ b/docs/index.rst
+@@ -24,7 +24,7 @@ unpack those dependencies to a known location, add them to your interpreter's se
+ .. note::
+     "Conventional" zipapps don't include any dependencies, which is what sets shiv apart from the stdlib zipapp module.
+ 
+-shiv accepts only a few command line parameters of its own, `described here <cli-reference>`_, and any unprocessed parameters are
++shiv accepts only a few command line parameters of its own, `described here <cli-reference.html>`_, and any unprocessed parameters are
+ delegated to ``pip install``. This allows users to fully leverage all the functionality that pip provides.
+ 
+ For example, if you wanted to create an executable for ``flake8``, you'd specify the required
+@@ -94,7 +94,7 @@ Influencing Runtime
+ -------------------
+ 
+ Whenever you are creating a zipapp with ``shiv``, you can specify a few flags that influence the runtime.
+-For example, the `-c/--console-script` and `-e/--entry-point` options already mentioned in this doc.
++For example, the ``-c/--console-script`` and ``-e/--entry-point`` options already mentioned in this doc.
+ To see the full list of command line options, see this page.
+ 
+ In addition to options that are settable during zipapp creation, there are a number of environment variables
+@@ -117,7 +117,7 @@ dropping into an interactive session in the environment of a built cli utility.
+ SHIV_ENTRY_POINT
+ ^^^^^^^^^^^^^^^^
+ 
+-.. note:: Same functionality as "-e/--entry-point" at build time
++.. note:: Same functionality as ``-e/--entry-point`` at build time
+ 
+ This should be populated with a setuptools-style callable, e.g. "module.main:main". This will
+ execute the pyz with whatever callable entry point you supply. Useful for sharing a single pyz
+@@ -132,7 +132,7 @@ hotfixes/modifications to the 'cached' dependencies, this will overwrite them.
+ SHIV_EXTEND_PYTHONPATH
+ ^^^^^^^^^^^^^^^^^^^^^^
+ 
+-.. note:: Same functionality as "-E/--extend-pythonpath" at build time.
++.. note:: Same functionality as ``-E/--extend-pythonpath`` at build time.
+ 
+ This is a boolean that adds the modules bundled into the zipapp into the ``PYTHONPATH`` environment
+ variable. It is not needed for most applications, but if an application calls Python as a
+diff --git a/src/shiv/bootstrap/__init__.py b/src/shiv/bootstrap/__init__.py
+index 46a0454..708ab05 100644
+--- a/src/shiv/bootstrap/__init__.py
++++ b/src/shiv/bootstrap/__init__.py
+@@ -89,9 +89,17 @@ def cache_path(archive, root_dir, build_id):
+     """Returns a ~/.shiv cache directory for unzipping site-packages during bootstrap.
+ 
+     :param ZipFile archive: The zipfile object we are bootstrapping from.
+-    :param Path root_dir: Optional, the path to a SHIV_ROOT.
++    :param str root_dir: Optional, either a path or environment variable pointing to a SHIV_ROOT.
+     :param str build_id: The build id generated at zip creation.
+     """
++
++    if root_dir:
++
++        if root_dir.startswith("$"):
++            root_dir = os.environ.get(root_dir[1:], root_dir[1:])
++
++        root_dir = Path(root_dir)
++
+     root = root_dir or Path("~/.shiv").expanduser()
+     name = Path(archive.filename).resolve().stem
+     return root / f"{name}_{build_id}"
+diff --git a/src/shiv/bootstrap/environment.py b/src/shiv/bootstrap/environment.py
+index 1f7c6f0..9cce42e 100644
+--- a/src/shiv/bootstrap/environment.py
++++ b/src/shiv/bootstrap/environment.py
+@@ -5,8 +5,6 @@ overrides defined at runtime (via environment variables).
+ import json
+ import os
+ 
+-from pathlib import Path
+-
+ 
+ def str_bool(v):
+     if not isinstance(v, bool):
+@@ -38,6 +36,7 @@ class Environment:
+         reproducible=False,
+         script=None,
+         preamble=None,
++        root=None,
+     ):
+         self.always_write_cache = always_write_cache
+         self.build_id = build_id
+@@ -53,6 +52,7 @@ class Environment:
+         self._entry_point = entry_point
+         self._compile_pyc = compile_pyc
+         self._extend_pythonpath = extend_pythonpath
++        self._root = root
+ 
+     @classmethod
+     def from_json(cls, json_data):
+@@ -74,8 +74,8 @@ class Environment:
+ 
+     @property
+     def root(self):
+-        root = os.environ.get(self.ROOT)
+-        return Path(root) if root is not None else None
++        root = os.environ.get(self.ROOT, self._root)
++        return root
+ 
+     @property
+     def force_extract(self):
+diff --git a/src/shiv/cli.py b/src/shiv/cli.py
+index 8273395..f92f0ef 100644
+--- a/src/shiv/cli.py
++++ b/src/shiv/cli.py
+@@ -168,6 +168,7 @@ def copytree(src: Path, dst: Path) -> None:
+         "but before invoking your entry point."
+     ),
+ )
++@click.option("--root", type=click.Path(), help="Override the 'root' path (default is ~/.shiv).")
+ @click.argument("pip_args", nargs=-1, type=click.UNPROCESSED)
+ def main(
+     output_file: str,
+@@ -181,6 +182,7 @@ def main(
+     reproducible: bool,
+     no_modify: bool,
+     preamble: Optional[str],
++    root: Optional[str],
+     pip_args: List[str],
+ ) -> None:
+     """
+@@ -258,6 +260,7 @@ def main(
+             no_modify=no_modify,
+             reproducible=reproducible,
+             preamble=Path(preamble).name if preamble else None,
++            root=root,
+         )
+ 
+         if no_modify:
+diff --git a/src/shiv/constants.py b/src/shiv/constants.py
+index f126101..36fee4f 100644
+--- a/src/shiv/constants.py
++++ b/src/shiv/constants.py
+@@ -17,7 +17,7 @@ DISALLOWED_ARGS: Dict[Tuple[str, ...], str] = {
+         "--editable",
+     ): "Editable installs don't actually install via pip (they are just linked), so they are not allowed.",
+     ("-d", "--download"): "Shiv needs to actually perform an install, not merely a download.",
+-    ("--user", "--root", "--prefix"): "Which conflicts with Shiv's internal use of '--target'.",
++    ("--user", "--prefix"): "Which conflicts with Shiv's internal use of '--target'.",
+ }
+ 
+ SOURCE_DATE_EPOCH_ENV = "SOURCE_DATE_EPOCH"

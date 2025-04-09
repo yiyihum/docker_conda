@@ -1,0 +1,143 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 9a58abee..75df67bc 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -10,7 +10,7 @@ repos:
+       - id: check-toml
+       - id: debug-statements
+   - repo: https://github.com/psf/black
+-    rev: 23.10.1
++    rev: 23.11.0
+     hooks:
+       - id: black
+         args:
+@@ -25,7 +25,7 @@ repos:
+     hooks:
+       - id: pyupgrade
+   - repo: https://github.com/hadialqattan/pycln
+-    rev: v2.3.0
++    rev: v2.4.0
+     hooks:
+       - id: pycln
+         args:
+diff --git a/src/qibolab/instruments/qblox/controller.py b/src/qibolab/instruments/qblox/controller.py
+index 245bf018..d2e5fc3e 100644
+--- a/src/qibolab/instruments/qblox/controller.py
++++ b/src/qibolab/instruments/qblox/controller.py
+@@ -216,6 +216,7 @@ class QbloxController(Controller):
+         for ro_pulse in sequence.ro_pulses:
+             if options.acquisition_type is AcquisitionType.DISCRIMINATION:
+                 _res = acquisition_results[ro_pulse.serial][2]
++                _res = _res.reshape(nshots, -1) if options.averaging_mode == AveragingMode.SINGLESHOT else _res
+                 if average:
+                     _res = np.mean(_res, axis=0)
+             else:
+diff --git a/src/qibolab/instruments/zhinst.py b/src/qibolab/instruments/zhinst.py
+index 7a1df9ac..e8b5c8db 100644
+--- a/src/qibolab/instruments/zhinst.py
++++ b/src/qibolab/instruments/zhinst.py
+@@ -503,8 +503,13 @@ class Zurich(Controller):
+         )
+ 
+     def run_exp(self):
+-        """Compilation settings, compilation step, execution step and data retrival"""
+-        # self.experiment.save("saved_exp")
++        """
++        Compilation settings, compilation step, execution step and data retrival
++        - Save a experiment Python object:
++        self.experiment.save("saved_exp")
++        - Save a experiment compiled experiment ():
++        self.exp.save("saved_exp")  # saving compiled experiment
++        """
+         self.exp = self.session.compile(self.experiment, compiler_settings=COMPILER_SETTINGS)
+         # self.exp.save_compiled_experiment("saved_exp")
+         self.results = self.session.run(self.exp)
+@@ -890,38 +895,18 @@ class Zurich(Controller):
+         """qubit readout pulse, data acquisition and qubit relaxation"""
+         play_after = None
+ 
+-        if len(self.sequence_qibo.qf_pulses) != 0 and len(self.sequence_qibo.qd_pulses) != 0:
+-            play_after = (
+-                self.play_after_set(self.sequence_qibo.qf_pulses, "bias")
+-                if self.sequence_qibo.qf_pulses.finish > self.sequence_qibo.qd_pulses.finish
+-                else self.play_after_set(self.sequence_qibo.qd_pulses, "drive")
+-            )
+-        if len(self.sequence_qibo.cf_pulses) != 0 and len(self.sequence_qibo.qd_pulses) != 0:
+-            play_after = (
+-                self.play_after_set(self.sequence_qibo.cf_pulses, "bias_coupler")
+-                if self.sequence_qibo.cf_pulses.finish > self.sequence_qibo.qd_pulses.finish
+-                else self.play_after_set(self.sequence_qibo.qd_pulses, "drive")
+-            )
++        # TODO: if we use duration sweepers, the code might not behave as expected
++        # i.e.: self.sequence_qibo will contain the a pulse or sweeper with a static duration that may screw the comparison
++        qf_finish = self.sequence_qibo.qf_pulses.finish
++        qd_finish = self.sequence_qibo.qd_pulses.finish
++        cf_finish = self.sequence_qibo.cf_pulses.finish
+ 
+-        elif len(self.sequence_qibo.qf_pulses) != 0:
++        if qf_finish > qd_finish and qf_finish > cf_finish:
+             play_after = self.play_after_set(self.sequence_qibo.qf_pulses, "bias")
+-        elif len(self.sequence_qibo.qd_pulses) != 0:
++        elif qd_finish > qf_finish and qd_finish > cf_finish:
+             play_after = self.play_after_set(self.sequence_qibo.qd_pulses, "drive")
+-        elif (
+-            len(self.sequence_qibo.qf_pulses) != 0
+-            and len(self.sequence_qibo.qd_pulses) != 0
+-            and len(self.sequence_qibo.cf_pulses) != 0
+-        ):
+-            seq_qf = self.sequence_qibo.qf_pulses.finish
+-            seq_qd = self.sequence_qibo.qd_pulses.finish
+-            seq_cf = self.sequence_qibo.cf_pulses.finish
+-            # add here for flux coupler pulses
+-            if seq_qf > seq_qd and seq_qf > seq_cf:
+-                play_after = self.play_after_set(self.sequence_qibo.qf_pulses, "bias")
+-            elif seq_qd > seq_qf and seq_qd > seq_cf:
+-                play_after = self.play_after_set(self.sequence_qibo.qd_pulses, "drive")
+-            elif seq_cf > seq_qf and seq_cf > seq_qd:
+-                play_after = self.play_after_set(self.sequence_qibo.cf_pulse, "bias_coupler")
++        elif cf_finish > qf_finish and cf_finish > qd_finish:
++            play_after = self.play_after_set(self.sequence_qibo.cf_pulses, "bias_coupler")
+ 
+         readout_schedule = defaultdict(list)
+         qubit_readout_schedule = defaultdict(list)
+@@ -946,6 +931,9 @@ class Zurich(Controller):
+                 for pulse, q, iq_angle in zip(pulses, qubits, iq_angles):
+                     pulse.zhpulse.uid += str(i)
+ 
++                    # TODO: if the measure sequence starts after the last pulse, add a delay
++                    # keep in mind that the signal might start before the last pulse
++                    # if sweepers are involved
+                     if play_after is None:
+                         exp.delay(
+                             signal=f"measure{q}",
+diff --git a/src/qibolab/pulses.py b/src/qibolab/pulses.py
+index 90c6c1d6..100bf498 100644
+--- a/src/qibolab/pulses.py
++++ b/src/qibolab/pulses.py
+@@ -733,7 +733,7 @@ class Pulse:
+             value (se_int | int | np.integer): the time in ns.
+         """
+ 
+-        if not isinstance(value, (se_int, int, np.integer)):
++        if not isinstance(value, (se_int, int, np.integer, float)):
+             raise TypeError(f"start argument type should be intSymbolicExpression or int, got {type(value).__name__}")
+         if not value >= 0:
+             raise ValueError(f"start argument must be >= 0, got {value}")
+@@ -749,7 +749,7 @@ class Pulse:
+         else:
+             if isinstance(value, np.integer):
+                 self._start = int(value)
+-            elif isinstance(value, int):
++            else:
+                 self._start = value
+ 
+         if not self._duration is None:
+@@ -794,7 +794,7 @@ class Pulse:
+         else:
+             if isinstance(value, np.integer):
+                 self._duration = int(value)
+-            elif isinstance(value, int):
++            else:
+                 self._duration = value
+ 
+         if not self._start is None:

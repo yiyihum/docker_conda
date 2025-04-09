@@ -1,0 +1,489 @@
+diff --git a/README.rst b/README.rst
+index 82cc9b5..1dd50fc 100644
+--- a/README.rst
++++ b/README.rst
+@@ -246,6 +246,40 @@ It can be enabled by using the ``-q``/``--quiet`` flag:
+ 
+ If enabled, the tool will only print errors and failures but no information or warning messages.
+ 
++Configuration files
++-------------------
++Both tools allow users to specify the options in a configuration file with `--config-file`/`-c`:
++
++.. code:: bash
++
++    diff-cover coverage.xml --config-file myconfig.toml
++    diff-quality --violations=pycodestyle --config-file myconfig.toml
++
++Currently, only TOML files are supported.
++Please note, that only non-mandatory options are supported.
++If an option is specified in the configuration file and over the command line, the value of the
++command line is used.
++
++TOML configuration
++~~~~~~~~~~~~~~~~~~
++
++The parser will only react to configuration files ending with `.toml`.
++To use it, install `diff-cover` with the extra requirement `toml`.
++
++The option names are the same as on the command line, but all dashes should be underscores.
++If an option can be specified multiple times, the configuration value should be specified as a list.
++
++.. code:: toml
++
++    [tool.diff_quality]
++    compare_branch = "origin/feature"
++    quiet = true
++
++    [tool.diff_quality]
++    compare_branch = "origin/feature"
++    ignore_staged = true
++
++
+ Troubleshooting
+ ----------------------
+ 
+diff --git a/diff_cover/config_parser.py b/diff_cover/config_parser.py
+new file mode 100644
+index 0000000..2621f4a
+--- /dev/null
++++ b/diff_cover/config_parser.py
+@@ -0,0 +1,82 @@
++import abc
++import enum
++
++try:
++    import tomli
++
++    _HAS_TOML = True
++except ImportError:  # pragma: no cover
++    _HAS_TOML = False
++
++
++class Tool(enum.Enum):
++    DIFF_COVER = enum.auto()
++    DIFF_QUALITY = enum.auto()
++
++
++class ParserError(Exception):
++    pass
++
++
++class ConfigParser(abc.ABC):
++    def __init__(self, file_name, tool):
++        self._file_name = file_name
++        self._tool = tool
++
++    @abc.abstractmethod
++    def parse(self):
++        """Returns a dict of the parsed data or None if the file cannot be handled."""
++
++
++class TOMLParser(ConfigParser):
++    def __init__(self, file_name, tool):
++        super().__init__(file_name, tool)
++        self._section = "diff_cover" if tool == Tool.DIFF_COVER else "diff_quality"
++
++    def parse(self):
++        if not self._file_name.endswith(".toml"):
++            return None
++
++        if not _HAS_TOML:
++            raise ParserError("tomli is not installed")
++
++        with open(self._file_name, "rb") as file_handle:
++            config = tomli.load(file_handle)
++
++        config = config.get("tool", {}).get(self._section, {})
++        if not config:
++            raise ParserError(f"No 'tool.{self._section}' configuration available")
++        return config
++
++
++_PARSERS = [TOMLParser]
++
++
++def _parse_config_file(file_name, tool):
++    for parser_class in _PARSERS:
++        parser = parser_class(file_name, tool)
++        config = parser.parse()
++        if config:
++            return config
++
++    raise ParserError(f"No config parser could handle {file_name}")
++
++
++def get_config(parser, argv, defaults, tool):
++    cli_config = vars(parser.parse_args(argv))
++    if cli_config["config_file"]:
++        file_config = _parse_config_file(cli_config["config_file"], tool)
++    else:
++        file_config = {}
++
++    config = defaults
++    for config_dict in [file_config, cli_config]:
++        for key, value in config_dict.items():
++            if value is None:
++                # if the value is None, it's a default one; only override if not present
++                config.setdefault(key, value)
++            else:
++                # else just override the existing value
++                config[key] = value
++
++    return config
+diff --git a/diff_cover/diff_cover_tool.py b/diff_cover/diff_cover_tool.py
+index fc660ae..1e88187 100644
+--- a/diff_cover/diff_cover_tool.py
++++ b/diff_cover/diff_cover_tool.py
+@@ -6,6 +6,7 @@ import sys
+ import xml.etree.ElementTree as etree
+ 
+ from diff_cover import DESCRIPTION, VERSION
++from diff_cover.config_parser import Tool, get_config
+ from diff_cover.diff_reporter import GitDiffReporter
+ from diff_cover.git_diff import GitDiffTool
+ from diff_cover.git_path import GitPathTool
+@@ -37,6 +38,7 @@ DIFF_RANGE_NOTATION_HELP = (
+ QUIET_HELP = "Only print errors and failures"
+ SHOW_UNCOVERED = "Show uncovered lines on the console"
+ INCLUDE_UNTRACKED_HELP = "Include untracked files"
++CONFIG_FILE_HELP = "The configuration file to use"
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
+@@ -65,7 +67,6 @@ def parse_coverage_args(argv):
+         "--html-report",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=HTML_REPORT_HELP,
+     )
+ 
+@@ -73,7 +74,6 @@ def parse_coverage_args(argv):
+         "--json-report",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=JSON_REPORT_HELP,
+     )
+ 
+@@ -81,19 +81,17 @@ def parse_coverage_args(argv):
+         "--markdown-report",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=MARKDOWN_REPORT_HELP,
+     )
+ 
+     parser.add_argument(
+-        "--show-uncovered", action="store_true", default=False, help=SHOW_UNCOVERED
++        "--show-uncovered", action="store_true", default=None, help=SHOW_UNCOVERED
+     )
+ 
+     parser.add_argument(
+         "--external-css-file",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=CSS_FILE_HELP,
+     )
+ 
+@@ -101,7 +99,6 @@ def parse_coverage_args(argv):
+         "--compare-branch",
+         metavar="BRANCH",
+         type=str,
+-        default="origin/main",
+         help=COMPARE_BRANCH_HELP,
+     )
+ 
+@@ -110,20 +107,20 @@ def parse_coverage_args(argv):
+     )
+ 
+     parser.add_argument(
+-        "--ignore-staged", action="store_true", default=False, help=IGNORE_STAGED_HELP
++        "--ignore-staged", action="store_true", default=None, help=IGNORE_STAGED_HELP
+     )
+ 
+     parser.add_argument(
+         "--ignore-unstaged",
+         action="store_true",
+-        default=False,
++        default=None,
+         help=IGNORE_UNSTAGED_HELP,
+     )
+ 
+     parser.add_argument(
+         "--include-untracked",
+         action="store_true",
+-        default=False,
++        default=None,
+         help=INCLUDE_UNTRACKED_HELP,
+     )
+ 
+@@ -136,7 +133,6 @@ def parse_coverage_args(argv):
+         metavar="DIRECTORY",
+         type=str,
+         nargs="+",
+-        default=["src/main/java", "src/test/java"],
+         help=SRC_ROOTS_HELP,
+     )
+ 
+@@ -144,7 +140,6 @@ def parse_coverage_args(argv):
+         "--diff-range-notation",
+         metavar="RANGE_NOTATION",
+         type=str,
+-        default="...",
+         choices=["...", ".."],
+         help=DIFF_RANGE_NOTATION_HELP,
+     )
+@@ -154,13 +149,32 @@ def parse_coverage_args(argv):
+     parser.add_argument(
+         "--ignore-whitespace",
+         action="store_true",
+-        default=False,
++        default=None,
+         help=IGNORE_WHITESPACE,
+     )
+ 
+-    parser.add_argument("-q", "--quiet", action="store_true", help=QUIET_HELP)
++    parser.add_argument(
++        "-q", "--quiet", action="store_true", default=None, help=QUIET_HELP
++    )
++
++    parser.add_argument(
++        "-c", "--config-file", help=CONFIG_FILE_HELP, metavar="CONFIG_FILE"
++    )
+ 
+-    return vars(parser.parse_args(argv))
++    defaults = {
++        "show_uncovered": False,
++        "compare_branch": "origin/main",
++        "fail_under": "0",
++        "ignore_staged": False,
++        "ignore_unstaged": False,
++        "ignore_untracked": False,
++        "src_roots": ["src/main/java", "src/test/java"],
++        "ignore_whitespace": False,
++        "diff_range_notation": "...",
++        "quiet": False,
++    }
++
++    return get_config(parser=parser, argv=argv, defaults=defaults, tool=Tool.DIFF_COVER)
+ 
+ 
+ def generate_coverage_report(
+diff --git a/diff_cover/diff_quality_tool.py b/diff_cover/diff_quality_tool.py
+index b9d3e37..29663e5 100644
+--- a/diff_cover/diff_quality_tool.py
++++ b/diff_cover/diff_quality_tool.py
+@@ -12,8 +12,10 @@ import pluggy
+ 
+ import diff_cover
+ from diff_cover import hookspecs
++from diff_cover.config_parser import Tool, get_config
+ from diff_cover.diff_cover_tool import (
+     COMPARE_BRANCH_HELP,
++    CONFIG_FILE_HELP,
+     CSS_FILE_HELP,
+     DIFF_RANGE_NOTATION_HELP,
+     EXCLUDE_HELP,
+@@ -103,7 +105,6 @@ def parse_quality_args(argv):
+         "--html-report",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=HTML_REPORT_HELP,
+     )
+ 
+@@ -111,7 +112,6 @@ def parse_quality_args(argv):
+         "--json-report",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=JSON_REPORT_HELP,
+     )
+ 
+@@ -119,7 +119,6 @@ def parse_quality_args(argv):
+         "--markdown-report",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=MARKDOWN_REPORT_HELP,
+     )
+ 
+@@ -127,7 +126,6 @@ def parse_quality_args(argv):
+         "--external-css-file",
+         metavar="FILENAME",
+         type=str,
+-        default=None,
+         help=CSS_FILE_HELP,
+     )
+ 
+@@ -135,37 +133,32 @@ def parse_quality_args(argv):
+         "--compare-branch",
+         metavar="BRANCH",
+         type=str,
+-        default="origin/main",
+         help=COMPARE_BRANCH_HELP,
+     )
+ 
+-    parser.add_argument(
+-        "input_reports", type=str, nargs="*", default=[], help=INPUT_REPORTS_HELP
+-    )
++    parser.add_argument("input_reports", type=str, nargs="*", help=INPUT_REPORTS_HELP)
+ 
+-    parser.add_argument(
+-        "--options", type=str, nargs="?", default=None, help=OPTIONS_HELP
+-    )
++    parser.add_argument("--options", type=str, nargs="?", help=OPTIONS_HELP)
+ 
+     parser.add_argument(
+-        "--fail-under", metavar="SCORE", type=float, default="0", help=FAIL_UNDER_HELP
++        "--fail-under", metavar="SCORE", type=float, help=FAIL_UNDER_HELP
+     )
+ 
+     parser.add_argument(
+-        "--ignore-staged", action="store_true", default=False, help=IGNORE_STAGED_HELP
++        "--ignore-staged", action="store_true", default=None, help=IGNORE_STAGED_HELP
+     )
+ 
+     parser.add_argument(
+         "--ignore-unstaged",
+         action="store_true",
+-        default=False,
++        default=None,
+         help=IGNORE_UNSTAGED_HELP,
+     )
+ 
+     parser.add_argument(
+         "--include-untracked",
+         action="store_true",
+-        default=False,
++        default=None,
+         help=INCLUDE_UNTRACKED_HELP,
+     )
+ 
+@@ -181,7 +174,6 @@ def parse_quality_args(argv):
+         "--diff-range-notation",
+         metavar="RANGE_NOTATION",
+         type=str,
+-        default="...",
+         help=DIFF_RANGE_NOTATION_HELP,
+     )
+ 
+@@ -193,13 +185,33 @@ def parse_quality_args(argv):
+     parser.add_argument(
+         "--ignore-whitespace",
+         action="store_true",
+-        default=False,
++        default=None,
+         help=IGNORE_WHITESPACE,
+     )
+ 
+-    parser.add_argument("-q", "--quiet", action="store_true", help=QUIET_HELP)
++    parser.add_argument(
++        "-q", "--quiet", action="store_true", default=None, help=QUIET_HELP
++    )
++
++    parser.add_argument(
++        "-c", "--config-file", help=CONFIG_FILE_HELP, metavar="CONFIG_FILE"
++    )
+ 
+-    return vars(parser.parse_args(argv))
++    defaults = {
++        "ignore_whitespace": False,
++        "compare_branch": "origin/main",
++        "diff_range_notation": "...",
++        "input_reports": [],
++        "fail_under": 0,
++        "ignore_staged": False,
++        "ignore_unstaged": False,
++        "ignore_untracked": False,
++        "quiet": False,
++    }
++
++    return get_config(
++        parser=parser, argv=argv, defaults=defaults, tool=Tool.DIFF_QUALITY
++    )
+ 
+ 
+ def generate_quality_report(
+diff --git a/poetry.lock b/poetry.lock
+index 9b11ba7..98838a3 100644
+--- a/poetry.lock
++++ b/poetry.lock
+@@ -37,10 +37,10 @@ optional = false
+ python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*"
+ 
+ [package.extras]
+-dev = ["coverage[toml] (>=5.0.2)", "hypothesis", "pympler", "pytest (>=4.3.0)", "six", "mypy", "pytest-mypy-plugins", "zope.interface", "furo", "sphinx", "sphinx-notfound-page", "pre-commit"]
+ docs = ["furo", "sphinx", "zope.interface", "sphinx-notfound-page"]
+ tests = ["coverage[toml] (>=5.0.2)", "hypothesis", "pympler", "pytest (>=4.3.0)", "six", "mypy", "pytest-mypy-plugins", "zope.interface"]
+ tests_no_zope = ["coverage[toml] (>=5.0.2)", "hypothesis", "pympler", "pytest (>=4.3.0)", "six", "mypy", "pytest-mypy-plugins"]
++dev = ["coverage[toml] (>=5.0.2)", "hypothesis", "pympler", "pytest (>=4.3.0)", "six", "mypy", "pytest-mypy-plugins", "zope.interface", "furo", "sphinx", "sphinx-notfound-page", "pre-commit"]
+ 
+ [[package]]
+ name = "black"
+@@ -62,10 +62,10 @@ typed-ast = {version = ">=1.4.2", markers = "python_version < \"3.8\""}
+ typing-extensions = {version = ">=3.7.4", markers = "python_version < \"3.8\""}
+ 
+ [package.extras]
+-colorama = ["colorama (>=0.4.3)"]
+-d = ["aiohttp (>=3.6.0)", "aiohttp-cors (>=0.4.0)"]
+ python2 = ["typed-ast (>=1.4.2)"]
++colorama = ["colorama (>=0.4.3)"]
+ uvloop = ["uvloop (>=0.15.2)"]
++d = ["aiohttp (>=3.6.0)", "aiohttp-cors (>=0.4.0)"]
+ 
+ [[package]]
+ name = "chardet"
+@@ -164,8 +164,8 @@ zipp = ">=0.5"
+ 
+ [package.extras]
+ docs = ["sphinx", "jaraco.packaging (>=8.2)", "rst.linker (>=1.9)"]
+-perf = ["ipython"]
+ testing = ["pytest (>=4.6)", "pytest-checkdocs (>=2.4)", "pytest-flake8", "pytest-cov", "pytest-enabler (>=1.0.1)", "packaging", "pep517", "pyfakefs", "flufl.flake8", "pytest-perf (>=0.9.2)", "pytest-black (>=0.3.7)", "pytest-mypy", "importlib-resources (>=1.3)"]
++perf = ["ipython"]
+ 
+ [[package]]
+ name = "inflect"
+@@ -196,9 +196,9 @@ optional = false
+ python-versions = ">=3.6.1,<4.0"
+ 
+ [package.extras]
++colors = ["colorama (>=0.4.3,<0.5.0)"]
+ pipfile_deprecated_finder = ["pipreqs", "requirementslib"]
+ requirements_deprecated_finder = ["pipreqs", "pip-api"]
+-colors = ["colorama (>=0.4.3,<0.5.0)"]
+ plugins = ["setuptools"]
+ 
+ [[package]]
+@@ -535,10 +535,13 @@ python-versions = ">=3.6"
+ docs = ["sphinx", "jaraco.packaging (>=8.2)", "rst.linker (>=1.9)"]
+ testing = ["pytest (>=4.6)", "pytest-checkdocs (>=2.4)", "pytest-flake8", "pytest-cov", "pytest-enabler (>=1.0.1)", "jaraco.itertools", "func-timeout", "pytest-black (>=0.3.7)", "pytest-mypy"]
+ 
++[extras]
++toml = ["tomli"]
++
+ [metadata]
+ lock-version = "1.1"
+ python-versions = "^3.6.2"
+-content-hash = "0b95c193832e8a28f469376c38f6d26f7a7cad6ce35bf557ffc5084fb6c30d1e"
++content-hash = "adaa725397777a11ed97ecaafb0f963c2ea1c246359ba729fbc2c79c8d752b37"
+ 
+ [metadata.files]
+ appdirs = [
+diff --git a/pyproject.toml b/pyproject.toml
+index 1e4aa60..37cd898 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -62,6 +62,9 @@ black = "^21.7b0"
+ isort = "^5.9.3"
+ doc8 = "0.9.0"
+ 
++[tool.poetry.extras]
++toml = ["tomli"]
++
+ [build-system]
+ requires = ["poetry-core>=1.0.0"]
+ build-backend = "poetry.core.masonry.api"

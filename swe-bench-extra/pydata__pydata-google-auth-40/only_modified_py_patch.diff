@@ -1,0 +1,122 @@
+diff --git a/pydata_google_auth/__init__.py b/pydata_google_auth/__init__.py
+index dafec61..9ea95f5 100644
+--- a/pydata_google_auth/__init__.py
++++ b/pydata_google_auth/__init__.py
+@@ -2,6 +2,7 @@ from .auth import default
+ from .auth import get_user_credentials
+ from .auth import load_user_credentials
+ from .auth import save_user_credentials
++from .auth import load_service_account_credentials
+ from ._version import get_versions
+ 
+ versions = get_versions()
+@@ -20,4 +21,5 @@ __all__ = [
+     "get_user_credentials",
+     "load_user_credentials",
+     "save_user_credentials",
++    "load_service_account_credentials",
+ ]
+diff --git a/pydata_google_auth/auth.py b/pydata_google_auth/auth.py
+index 6c9a7ba..7ac86ce 100644
+--- a/pydata_google_auth/auth.py
++++ b/pydata_google_auth/auth.py
+@@ -402,3 +402,51 @@ def load_user_credentials(path):
+     if not credentials:
+         raise exceptions.PyDataCredentialsError("Could not load credentials.")
+     return credentials
++
++
++def load_service_account_credentials(path, scopes=None):
++    """
++    Gets service account credentials from JSON file at ``path``.
++
++    Parameters
++    ----------
++    path : str
++        Path to credentials JSON file.
++    scopes : list[str], optional
++        A list of scopes to use when authenticating to Google APIs. See the
++        `list of OAuth 2.0 scopes for Google APIs
++        <https://developers.google.com/identity/protocols/googlescopes>`_.
++
++    Returns
++    -------
++
++    google.oauth2.service_account.Credentials
++
++    Raises
++    ------
++    pydata_google_auth.exceptions.PyDataCredentialsError
++        If unable to load service credentials.
++
++    Examples
++    --------
++
++    Load credentials and use them to construct a BigQuery client.
++
++    .. code-block:: python
++
++       import pydata_google_auth
++       import google.cloud.bigquery
++
++       credentials = pydata_google_auth.load_service_account_credentials(
++           "/home/username/keys/google-service-account-credentials.json",
++       )
++       client = google.cloud.bigquery.BigQueryClient(
++           credentials=credentials,
++           project=credentials.project_id
++       )
++    """
++
++    credentials = cache._load_service_account_credentials_from_file(path, scopes=scopes)
++    if not credentials:
++        raise exceptions.PyDataCredentialsError("Could not load credentials.")
++    return credentials
+diff --git a/pydata_google_auth/cache.py b/pydata_google_auth/cache.py
+index cad9097..16051a3 100644
+--- a/pydata_google_auth/cache.py
++++ b/pydata_google_auth/cache.py
+@@ -7,6 +7,7 @@ import os
+ import os.path
+ 
+ import google.oauth2.credentials
++from google.oauth2 import service_account
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -123,6 +124,34 @@ def _save_user_account_credentials(credentials, credentials_path):
+         logger.warning("Unable to save credentials.")
+ 
+ 
++def _load_service_account_credentials_from_file(credentials_path, **kwargs):
++    try:
++        with open(credentials_path) as credentials_file:
++            credentials_json = json.load(credentials_file)
++    except (IOError, ValueError) as exc:
++        logger.debug(
++            "Error loading credentials from {}: {}".format(credentials_path, str(exc))
++        )
++        return None
++
++    return _load_service_account_credentials_from_info(credentials_json, **kwargs)
++
++
++def _load_service_account_credentials_from_info(credentials_json, **kwargs):
++    credentials = service_account.Credentials.from_service_account_info(
++        credentials_json, **kwargs
++    )
++    if not credentials.valid:
++        request = google.auth.transport.requests.Request()
++        try:
++            credentials.refresh(request)
++        except google.auth.exceptions.RefreshError:
++            # Credentials could be expired or revoked.
++            return None
++
++    return credentials
++
++
+ class CredentialsCache(object):
+     """
+     Shared base class for crentials classes.
+

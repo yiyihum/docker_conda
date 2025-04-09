@@ -1,0 +1,222 @@
+diff --git a/dvc/cli.py b/dvc/cli.py
+--- a/dvc/cli.py
++++ b/dvc/cli.py
+@@ -20,6 +20,7 @@
+     imp_url,
+     init,
+     install,
++    ls,
+     lock,
+     metrics,
+     move,
+@@ -62,6 +63,7 @@
+     metrics,
+     install,
+     root,
++    ls,
+     lock,
+     pipeline,
+     daemon,
+diff --git a/dvc/command/ls.py b/dvc/command/ls.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/command/ls.py
+@@ -0,0 +1,68 @@
++import argparse
++import logging
++
++from dvc.command.base import append_doc_link
++from dvc.command.base import CmdBaseNoRepo
++from dvc.exceptions import DvcException
++
++
++logger = logging.getLogger(__name__)
++
++
++class CmdList(CmdBaseNoRepo):
++    def run(self):
++        from dvc.repo import Repo
++
++        try:
++            nodes = Repo.ls(
++                self.args.url,
++                self.args.target,
++                rev=self.args.rev,
++                recursive=self.args.recursive,
++                outs_only=self.args.outs_only,
++            )
++            if nodes:
++                logger.info("\n".join(nodes))
++            return 0
++        except DvcException:
++            logger.exception("failed to list '{}'".format(self.args.url))
++            return 1
++
++
++def add_parser(subparsers, parent_parser):
++    LIST_HELP = "List files and DVC outputs in the repo."
++    list_parser = subparsers.add_parser(
++        "list",
++        parents=[parent_parser],
++        description=append_doc_link(LIST_HELP, "list"),
++        help=LIST_HELP,
++        formatter_class=argparse.RawTextHelpFormatter,
++    )
++    list_parser.add_argument(
++        "url",
++        help="Supported urls:\n"
++        "/path/to/file\n"
++        "/path/to/directory\n"
++        "C:\\\\path\\to\\file\n"
++        "C:\\\\path\\to\\directory\n"
++        "https://github.com/path/to/repo\n"
++        "git@github.com:path/to/repo.git\n",
++    )
++    list_parser.add_argument(
++        "-R",
++        "--recursive",
++        action="store_true",
++        help="Recursively list files.",
++    )
++    list_parser.add_argument(
++        "--outs-only", action="store_true", help="Show only DVC outputs."
++    )
++    list_parser.add_argument(
++        "--rev", nargs="?", help="Git revision (e.g. branch, tag, SHA)"
++    )
++    list_parser.add_argument(
++        "target",
++        nargs="?",
++        help="Path to directory within the repository to list outputs for",
++    )
++    list_parser.set_defaults(func=CmdList)
+diff --git a/dvc/exceptions.py b/dvc/exceptions.py
+--- a/dvc/exceptions.py
++++ b/dvc/exceptions.py
+@@ -294,12 +294,23 @@ def __init__(self, code, reason):
+ 
+ 
+ class PathMissingError(DvcException):
+-    def __init__(self, path, repo):
++    default_msg = (
++        "The path '{}' does not exist in the target repository '{}'"
++        " neither as an output nor a git-handled file."
++    )
++    default_msg_output_only = (
++        "The path '{}' does not exist in the target repository '{}'"
++        " as an output."
++    )
++
++    def __init__(self, path, repo, output_only=False):
+         msg = (
+-            "The path '{}' does not exist in the target repository '{}'"
+-            " neither as an output nor a git-handled file."
++            self.default_msg
++            if not output_only
++            else self.default_msg_output_only
+         )
+         super().__init__(msg.format(path, repo))
++        self.output_only = output_only
+ 
+ 
+ class RemoteCacheRequiredError(DvcException):
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -43,6 +43,7 @@ class Repo(object):
+     from dvc.repo.install import install
+     from dvc.repo.add import add
+     from dvc.repo.remove import remove
++    from dvc.repo.ls import ls
+     from dvc.repo.lock import lock as lock_stage
+     from dvc.repo.move import move
+     from dvc.repo.run import run
+diff --git a/dvc/repo/ls.py b/dvc/repo/ls.py
+new file mode 100644
+--- /dev/null
++++ b/dvc/repo/ls.py
+@@ -0,0 +1,84 @@
++import os
++
++from dvc.exceptions import PathMissingError, OutputNotFoundError
++
++
++@staticmethod
++def ls(url, target=None, rev=None, recursive=None, outs_only=False):
++    from dvc.external_repo import external_repo
++    from dvc.repo import Repo
++    from dvc.utils import relpath
++
++    with external_repo(url, rev) as repo:
++        target_path_info = _get_target_path_info(repo, target)
++        result = []
++        if isinstance(repo, Repo):
++            result.extend(_ls_outs_repo(repo, target_path_info, recursive))
++
++        if not outs_only:
++            result.extend(_ls_files_repo(target_path_info, recursive))
++
++        if target and not result:
++            raise PathMissingError(target, repo, output_only=outs_only)
++
++        def prettify(path_info):
++            if path_info == target_path_info:
++                return path_info.name
++            return relpath(path_info, target_path_info)
++
++        result = list(set(map(prettify, result)))
++        result.sort()
++    return result
++
++
++def _ls_files_repo(target_path_info, recursive=None):
++    from dvc.compat import fspath
++    from dvc.ignore import CleanTree
++    from dvc.path_info import PathInfo
++    from dvc.scm.tree import WorkingTree
++
++    if not os.path.exists(fspath(target_path_info)):
++        return []
++
++    files = []
++    tree = CleanTree(WorkingTree(target_path_info))
++    try:
++        for dirpath, dirnames, filenames in tree.walk(target_path_info):
++            files.extend(map(lambda f: PathInfo(dirpath, f), filenames))
++            if not recursive:
++                files.extend(map(lambda d: PathInfo(dirpath, d), dirnames))
++                break
++    except NotADirectoryError:
++        if os.path.isfile(fspath(target_path_info)):
++            return [target_path_info]
++
++    return files
++
++
++def _ls_outs_repo(repo, target_path_info, recursive=None):
++    from dvc.compat import fspath
++    from dvc.path_info import PathInfo
++
++    try:
++        outs = repo.find_outs_by_path(fspath(target_path_info), recursive=True)
++    except OutputNotFoundError:
++        return []
++
++    if recursive:
++        return [out.path_info for out in outs]
++
++    def get_top_part(path_info):
++        relpath = path_info.relpath(target_path_info)
++        if relpath.parts:
++            return PathInfo(target_path_info, relpath.parts[0])
++        return path_info
++
++    return list({get_top_part(out.path_info) for out in outs})
++
++
++def _get_target_path_info(repo, target=None):
++    from dvc.path_info import PathInfo
++
++    if not target:
++        return PathInfo(repo.root_dir)
++    return PathInfo(repo.root_dir, target)

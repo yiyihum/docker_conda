@@ -1,0 +1,222 @@
+diff --git a/globus_sdk/auth/client_types/base.py b/globus_sdk/auth/client_types/base.py
+index 23cb7668..a9785bfe 100644
+--- a/globus_sdk/auth/client_types/base.py
++++ b/globus_sdk/auth/client_types/base.py
+@@ -223,6 +223,72 @@ class AuthClient(BaseClient):
+             form_data.update(additional_params)
+         return self.oauth2_token(form_data)
+ 
++    def oauth2_validate_token(self, token, additional_params=None):
++        """
++        Validate a token. It can be an Access Token or a Refresh token.
++
++        This call can be used to check tokens issued to your client,
++        confirming that they are or are not still valid. The resulting response
++        has the form ``{"active": True}`` when the token is valid, and
++        ``{"active": False}`` when it is not.
++
++        It is not necessary to validate tokens immediately after receiving them
++        from the service -- any tokens which you are issued will be valid at
++        that time. This is more for the purpose of doing checks like
++
++        - confirm that ``oauth2_revoke_token`` succeeded
++        - at application boot, confirm no need to do fresh login
++
++        **Parameters**
++
++            ``token`` (*string*)
++              The token which should be validated. Can be a refresh token or an
++              access token
++
++            ``additional_params`` (*dict*)
++              A ``dict`` or ``None``, which specifies additional
++              parameters to include in the validation body. Primarily for
++              internal use
++
++        **Examples**
++
++        Revoke a token and confirm that it is no longer active:
++
++        >>> from globus_sdk import ConfidentialAppAuthClient
++        >>> ac = ConfidentialAppAuthClient(CLIENT_ID, CLIENT_SECRET)
++        >>> ac.oauth2_revoke_token('<token_string>')
++        >>> data = ac.oauth2_validate_token('<token_string>')
++        >>> assert not data['active']
++
++        During application boot, check if the user needs to do a login, even
++        if a token is present:
++
++        >>> from globus_sdk import ConfidentialAppAuthClient
++        >>> ac = ConfidentialAppAuthClient(CLIENT_ID, CLIENT_SECRET)
++        >>> # this is not an SDK function, but a hypothetical function which
++        >>> # you use to load a token out of configuration data
++        >>> tok = load_token_from_config(...)
++        >>>
++        >>> if not tok or not ac.oauth2_validate_token(tok)['active']:
++        >>>     # do_new_login() is another hypothetical helper
++        >>>     tok = do_new_login()
++        >>> # at this point, tok is expected to be a valid token
++        """
++        self.logger.info('Validating token')
++        body = {'token': token}
++
++        # if this client has no way of authenticating itself but
++        # it does have a client_id, we'll send that in the request
++        no_authentication = (self.authorizer is None or
++                             isinstance(self.authorizer, NullAuthorizer))
++        if no_authentication and self.client_id:
++            self.logger.debug('Validating token with unauthenticated client')
++            body.update({'client_id': self.client_id})
++
++        if additional_params:
++            body.update(additional_params)
++        return self.post('/v2/oauth2/token/validate', text_body=body)
++
+     def oauth2_revoke_token(self, token, additional_params=None):
+         """
+         Revoke a token. It can be an Access Token or a Refresh token.
+diff --git a/globus_sdk/auth/oauth2_authorization_code.py b/globus_sdk/auth/oauth2_authorization_code.py
+index 0a359e88..df5141a0 100644
+--- a/globus_sdk/auth/oauth2_authorization_code.py
++++ b/globus_sdk/auth/oauth2_authorization_code.py
+@@ -3,7 +3,7 @@ from six.moves.urllib.parse import urlencode
+ 
+ from globus_sdk.base import slash_join
+ from globus_sdk.auth.oauth2_constants import DEFAULT_REQUESTED_SCOPES
+-from globus_sdk.auth.oauth_flow_manager import GlobusOAuthFlowManager
++from globus_sdk.auth.oauth2_flow_manager import GlobusOAuthFlowManager
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/globus_sdk/auth/oauth_flow_manager.py b/globus_sdk/auth/oauth2_flow_manager.py
+similarity index 100%
+rename from globus_sdk/auth/oauth_flow_manager.py
+rename to globus_sdk/auth/oauth2_flow_manager.py
+diff --git a/globus_sdk/auth/oauth2_native_app.py b/globus_sdk/auth/oauth2_native_app.py
+index b32bad8e..af646d6d 100644
+--- a/globus_sdk/auth/oauth2_native_app.py
++++ b/globus_sdk/auth/oauth2_native_app.py
+@@ -7,7 +7,7 @@ from six.moves.urllib.parse import urlencode
+ 
+ from globus_sdk.base import slash_join
+ from globus_sdk.auth.oauth2_constants import DEFAULT_REQUESTED_SCOPES
+-from globus_sdk.auth.oauth_flow_manager import GlobusOAuthFlowManager
++from globus_sdk.auth.oauth2_flow_manager import GlobusOAuthFlowManager
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/globus_sdk/authorizers/client_credentials.py b/globus_sdk/authorizers/client_credentials.py
+index f087c675..225ea426 100644
+--- a/globus_sdk/authorizers/client_credentials.py
++++ b/globus_sdk/authorizers/client_credentials.py
+@@ -64,14 +64,18 @@ class ClientCredentialsAuthorizer(RenewingAuthorizer):
+         super(ClientCredentialsAuthorizer, self).__init__(
+             access_token, expires_at, on_refresh)
+ 
+-    def _get_token_data(self):
++    def _get_token_response(self):
+         """
+-        Make a client credentials grant, get the tokens .by_resource_server,
+-        Ensure that only one token was gotten, and return that token.
++        Make a client credentials grant
+         """
+-        res = self.confidential_client.oauth2_client_credentials_tokens(
++        return self.confidential_client.oauth2_client_credentials_tokens(
+             requested_scopes=self.scopes)
+ 
++    def _extract_token_data(self, res):
++        """
++        Get the tokens .by_resource_server,
++        Ensure that only one token was gotten, and return that token.
++        """
+         token_data = res.by_resource_server.values()
+         if len(token_data) != 1:
+             raise ValueError(
+diff --git a/globus_sdk/authorizers/refresh_token.py b/globus_sdk/authorizers/refresh_token.py
+index ab21b7c8..6ca6e458 100644
+--- a/globus_sdk/authorizers/refresh_token.py
++++ b/globus_sdk/authorizers/refresh_token.py
+@@ -59,13 +59,17 @@ class RefreshTokenAuthorizer(RenewingAuthorizer):
+         super(RefreshTokenAuthorizer, self).__init__(
+             access_token, expires_at, on_refresh)
+ 
+-    def _get_token_data(self):
++    def _get_token_response(self):
+         """
+-        Make a refresh token grant, get the tokens .by_resource_server,
+-        Ensure that only one token was gotten, and return that token.
++        Make a refresh token grant
+         """
+-        res = self.auth_client.oauth2_refresh_token(self.refresh_token)
++        return self.auth_client.oauth2_refresh_token(self.refresh_token)
+ 
++    def _extract_token_data(self, res):
++        """
++        Get the tokens .by_resource_server,
++        Ensure that only one token was gotten, and return that token.
++        """
+         token_data = res.by_resource_server.values()
+         if len(token_data) != 1:
+             raise ValueError(
+diff --git a/globus_sdk/authorizers/renewing.py b/globus_sdk/authorizers/renewing.py
+index 80f513c2..8a47f22e 100644
+--- a/globus_sdk/authorizers/renewing.py
++++ b/globus_sdk/authorizers/renewing.py
+@@ -25,7 +25,8 @@ class RenewingAuthorizer(GlobusAuthorizer):
+     expiration time, callbacks on renewal, and 401 handling.
+ 
+     To make an authorizer that implements this class implement
+-    the _get_token_data method for that authorization type.
++    the _get_token_response and _extract_token_data methods for that
++    authorization type,
+     """
+ 
+     def __init__(self, access_token=None, expires_at=None, on_refresh=None):
+@@ -61,11 +62,17 @@ class RenewingAuthorizer(GlobusAuthorizer):
+             self._get_new_access_token()
+ 
+     @abc.abstractmethod
+-    def _get_token_data(self):
++    def _get_token_response(self):
+         """
+-        Get the first element of token_response.by_resource_server using
+-        whatever flow or client or credentials the specific authorizer
+-        implementing this class uses.
++        Using whatever method the specific authorizer implementing this class
++        does, get a new token response.
++        """
++
++    @abc.abstractmethod
++    def _extract_token_data(self, res):
++        """
++        Given a token response object, get the first element of
++        token_response.by_resource_server
+         This method is expected to enforce that by_resource_server is only
+         returning one access token, and return a ValueError otherwise.
+         """
+@@ -81,11 +88,12 @@ class RenewingAuthorizer(GlobusAuthorizer):
+ 
+     def _get_new_access_token(self):
+         """
+-        Given token data from _get_token_data,
++        Given token data from _get_token_response and _extract_token_data,
+         set the access token and expiration time, and call on_refresh
+         """
+-        # get the first (and only) item from this iterable
+-        token_data = self._get_token_data()
++        # get the first (and only) token
++        res = self._get_token_response()
++        token_data = self._extract_token_data(res)
+ 
+         self._set_expiration_time(token_data['expires_at_seconds'])
+         self.access_token = token_data['access_token']
+@@ -95,7 +103,7 @@ class RenewingAuthorizer(GlobusAuthorizer):
+                     .format(self.access_token[-5:]))
+ 
+         if callable(self.on_refresh):
+-            self.on_refresh(token_data)
++            self.on_refresh(res)
+             logger.debug("Invoked on_refresh callback")
+ 
+     def _check_expiration_time(self):
+

@@ -1,0 +1,305 @@
+diff --git a/eof/cli.py b/eof/cli.py
+index e5a2432..948c96c 100644
+--- a/eof/cli.py
++++ b/eof/cli.py
+@@ -35,7 +35,13 @@ from eof import log
+     type=click.Choice(["S1A", "S1B"]),
+     help="Optionally specify Sentinel satellite to download (default: gets both S1A and S1B)",
+ )
+-def cli(search_path, save_dir, sentinel_file, date, mission):
++@click.option(
++    "--use-scihub",
++    is_flag=True,
++    default=False,
++    help="Use SciHub as primary provider to download orbits (default: False)",
++)
++def cli(search_path, save_dir, sentinel_file, date, mission, use_scihub):
+     """Download Sentinel precise orbit files.
+ 
+     Saves files to `save-dir` (default = current directory)
+@@ -51,4 +57,5 @@ def cli(search_path, save_dir, sentinel_file, date, mission):
+         sentinel_file=sentinel_file,
+         mission=mission,
+         date=date,
++        use_scihub=use_scihub,
+     )
+diff --git a/eof/download.py b/eof/download.py
+index ab06273..b9db51e 100644
+--- a/eof/download.py
++++ b/eof/download.py
+@@ -45,7 +45,8 @@ PRECISE_ORBIT = "POEORB"
+ RESTITUTED_ORBIT = "RESORB"
+ 
+ 
+-def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir="."):
++def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir=".",
++                  use_scihub: bool = False):
+     """Downloads and saves EOF files for specific dates
+ 
+     Args:
+@@ -54,6 +55,8 @@ def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir=".
+             No input downloads both, must be same len as orbit_dts
+         sentinel_file (str): path to Sentinel-1 filename to download one .EOF for
+         save_dir (str): directory to save the EOF files into
++        use_scihub (bool): use SciHub to download orbits
++            (if False SciHUb is used only as a fallback)
+ 
+     Returns:
+         list[str]: all filenames of saved orbit files
+@@ -76,18 +79,51 @@ def download_eofs(orbit_dts=None, missions=None, sentinel_file=None, save_dir=".
+     # First make sures all are datetimes if given string
+     orbit_dts = [parse(dt) if isinstance(dt, str) else dt for dt in orbit_dts]
+ 
+-    # Download and save all links in parallel
+-    pool = ThreadPool(processes=MAX_WORKERS)
+-    result_dt_dict = {
+-        pool.apply_async(_download_and_write, (mission, dt, save_dir)): dt
+-        for mission, dt in zip(missions, orbit_dts)
+-    }
+     filenames = []
+-    for result in result_dt_dict:
+-        cur_filenames = result.get()
+-        dt = result_dt_dict[result]
+-        logger.info("Finished {}, saved to {}".format(dt.date(), cur_filenames))
+-        filenames.extend(cur_filenames)
++
++    if not use_scihub:
++        # Download and save all links in parallel
++        pool = ThreadPool(processes=MAX_WORKERS)
++        result_dt_dict = {
++            pool.apply_async(_download_and_write, (mission, dt, save_dir)): dt
++            for mission, dt in zip(missions, orbit_dts)
++        }
++
++        for result in result_dt_dict:
++            cur_filenames = result.get()
++            if cur_filenames is None:
++                use_scihub = True
++                continue
++            dt = result_dt_dict[result]
++            logger.info("Finished {}, saved to {}".format(dt.date(), cur_filenames))
++            filenames.extend(cur_filenames)
++    
++    if use_scihub:
++        # try to search on scihub
++        from .scihubclient import ScihubGnssClient
++        client = ScihubGnssClient()
++        query = {}
++        if sentinel_file:
++            query.update(client.query_orbit_for_product(sentinel_file))
++        else:
++            for mission, dt in zip(missions, orbit_dts):
++                result = client.query_orbit(dt, dt + timedelta(days=1),
++                                            mission, product_type='AUX_POEORB')
++                if result:
++                    query.update(result)
++                else:
++                    # try with RESORB
++                    result = client.query_orbit(dt, dt + timedelta(minutes=1),
++                                                mission,
++                                                product_type='AUX_RESORB')
++                    query.update(result)
++
++        if query:
++            result = client.download_all(query)
++            filenames.extend(
++                item['path'] for item in result.downloaded.values()
++            )
++    
+     return filenames
+ 
+ 
+@@ -299,7 +335,8 @@ def find_scenes_to_download(search_path="./", save_dir="./"):
+     return orbit_dts, missions
+ 
+ 
+-def main(search_path=".", save_dir=",", sentinel_file=None, mission=None, date=None):
++def main(search_path=".", save_dir=",", sentinel_file=None, mission=None, date=None,
++         use_scihub: bool = False):
+     """Function used for entry point to download eofs"""
+ 
+     if not os.path.exists(save_dir):
+@@ -331,4 +368,5 @@ def main(search_path=".", save_dir=",", sentinel_file=None, mission=None, date=N
+         missions=missions,
+         sentinel_file=sentinel_file,
+         save_dir=save_dir,
++        use_scihub=use_scihub,
+     )
+diff --git a/eof/scihubclient.py b/eof/scihubclient.py
+new file mode 100644
+index 0000000..9060ea8
+--- /dev/null
++++ b/eof/scihubclient.py
+@@ -0,0 +1,143 @@
++"""sentinelsat based client to get orbit files form scihub.copernicu.eu."""
++
++
++import re
++import logging
++import datetime
++import operator
++import collections
++from typing import NamedTuple, Sequence
++
++from .products import Sentinel as S1Product
++
++from sentinelsat import SentinelAPI
++
++
++_log = logging.getLogger(__name__)
++
++
++DATE_FMT = '%Y%m%dT%H%M%S'
++
++
++class ValidityError(ValueError):
++    pass
++
++
++class ValidityInfo(NamedTuple):
++    product_id: str
++    generation_date: datetime.datetime
++    start_validity: datetime.datetime
++    stop_validity: datetime.datetime
++
++
++def get_validity_info(products: Sequence[str],
++                      pattern=None) -> Sequence[ValidityInfo]:
++    if pattern is None:
++        # use a generic pattern
++        pattern = re.compile(
++            r'S1\w+_(?P<generation_date>\d{8}T\d{6})_'
++            r'V(?P<start_validity>\d{8}T\d{6})_'
++            r'(?P<stop_validity>\d{8}T\d{6})\w*')
++
++    keys = ('generation_date', 'start_validity', 'stop_validity')
++    out = []
++    for product_id in products:
++        mobj = pattern.match(product_id)
++        if mobj:
++            validity_data = {
++                name: datetime.datetime.strptime(mobj.group(name), DATE_FMT)
++                for name in keys
++            }
++            out.append(ValidityInfo(product_id, **validity_data))
++        else:
++            raise ValueError(
++                f'"{product_id}" does not math the regular expression '
++                f'for validity')
++
++    return out
++
++
++def lastval_cover(t0: datetime.datetime, t1: datetime.datetime,
++                  data: Sequence[ValidityInfo]) -> str:
++    candidates = [
++        item for item in data
++        if item.start_validity <= t0 and item.stop_validity >= t1
++    ]
++    if not candidates:
++        raise ValidityError(
++            f'none of the input products completely covers the requested '
++            f'time interval: [t0={t0}, t1={t1}]')
++
++    candidates.sort(key=operator.attrgetter('generation_date'), reverse=True)
++
++    return candidates[0].product_id
++
++
++class OrbitSelectionError(RuntimeError):
++    pass
++
++
++class ScihubGnssClient:
++    T0 = datetime.timedelta(days=1)
++    T1 = datetime.timedelta(days=1)
++
++    def __init__(self, user: str = "gnssguest", password: str = "gnssguest",
++                 api_url: str = "https://scihub.copernicus.eu/gnss/",
++                 **kwargs):
++        self._api = SentinelAPI(user=user, password=password, api_url=api_url,
++                                **kwargs)
++
++    def query_orbit(self, t0, t1, satellite_id: str,
++                    product_type: str = 'AUX_POEORB'):
++        assert satellite_id in {'S1A', 'S1B'}
++        assert product_type in {'AUX_POEORB', 'AUX_RESORB'}
++
++        query_padams = dict(
++            producttype=product_type,
++            platformserialidentifier=satellite_id[1:],
++            date=[t0, t1],
++        )
++        _log.debug('query parameter: %s', query_padams)
++        products = self._api.query(**query_padams)
++        return products
++
++    @staticmethod
++    def _select_orbit(products, t0, t1):
++        orbit_products = [p['identifier'] for p in products.values()]
++        validity_info = get_validity_info(orbit_products)
++        product_id = lastval_cover(t0, t1, validity_info)
++        return collections.OrderedDict(
++            (k, v) for k, v in products.items()
++            if v['identifier'] == product_id
++        )
++
++    def query_orbit_for_product(self, product,
++                                product_type: str = 'AUX_POEORB',
++                                t0_margin: datetime.timedelta = T0,
++                                t1_margin: datetime.timedelta = T1):
++        if isinstance(product, str):
++            product = S1Product(product)
++
++        t0 = product.start_time
++        t1 = product.stop_time
++
++        products = self.query_orbit(t0 - t0_margin, t1 + t1_margin,
++                                    satellite_id=product.mission,
++                                    product_type=product_type)
++        return self._select_orbit(products, t0, t1)
++
++    def download(self, uuid, **kwargs):
++        """Download a single orbit product.
++
++        See sentinelsat.SentinelAPI.download for a detailed description
++        of arguments.
++        """
++        return self._api.download(uuid, **kwargs)
++
++    def download_all(self, products, **kwargs):
++        """Download all the specified orbit products.
++
++        See sentinelsat.SentinelAPI.download_all for a detailed description
++        of arguments.
++        """
++        return self._api.download_all(products, **kwargs)
+diff --git a/requirements.txt b/requirements.txt
+index e5ecbfe..18eaad6 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,4 @@
+ python-dateutil==2.5.1
+ requests>=2.20.0
+ click==6.7
++sentinelsat>=1.0
+diff --git a/setup.py b/setup.py
+index fd829be..e82e843 100644
+--- a/setup.py
++++ b/setup.py
+@@ -20,6 +20,7 @@ setuptools.setup(
+         "Programming Language :: Python :: 3.6",
+         "Programming Language :: Python :: 3.7",
+         "Programming Language :: Python :: 3.8",
++        "Programming Language :: Python :: 3.9",
+         "Programming Language :: C",
+         "License :: OSI Approved :: MIT License",
+         "Topic :: Scientific/Engineering",
+@@ -29,6 +30,7 @@ setuptools.setup(
+         "requests",
+         "click",
+         "python-dateutil",
++        "sentinelsat >= 1.0",
+     ],
+     entry_points={
+         "console_scripts": [

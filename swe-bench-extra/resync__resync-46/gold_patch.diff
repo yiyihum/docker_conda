@@ -1,0 +1,188 @@
+diff --git a/resync/client.py b/resync/client.py
+index 4cf99e6..8474cc6 100644
+--- a/resync/client.py
++++ b/resync/client.py
+@@ -11,7 +11,8 @@ import distutils.dir_util
+ import re
+ import time
+ import logging
+-import requests
++import shutil
++import socket
+ 
+ from .resource_list_builder import ResourceListBuilder
+ from .resource_list import ResourceList
+@@ -504,15 +505,12 @@ class Client(object):
+             # 1. GET
+             for try_i in range(1, self.tries + 1):
+                 try:
+-                    r = requests.get(resource.uri, timeout=self.timeout, stream=True)
+-                    # Fail on 4xx or 5xx
+-                    r.raise_for_status()
+-                    with open(filename, 'wb') as fd:
+-                        for chunk in r.iter_content(chunk_size=1024):
+-                            fd.write(chunk)
++                    with url_or_file_open(resource.uri, timeout=self.timeout) as fh_in:
++                        with open(filename, 'wb') as fh_out:
++                            shutil.copyfileobj(fh_in, fh_out)
+                     num_updated += 1
+                     break
+-                except requests.Timeout as e:
++                except socket.timeout as e:
+                     if try_i < self.tries:
+                         msg = 'Download timed out, retrying...'
+                         self.logger.info(msg)
+@@ -525,7 +523,7 @@ class Client(object):
+                             return(num_updated)
+                         else:
+                             raise ClientFatalError(msg)
+-                except (requests.RequestException, IOError) as e:
++                except IOError as e:
+                     msg = "Failed to GET %s -- %s" % (resource.uri, str(e))
+                     if (self.ignore_failures):
+                         self.logger.warning(msg)
+diff --git a/resync/client_utils.py b/resync/client_utils.py
+index 15f1e47..02a6ba1 100644
+--- a/resync/client_utils.py
++++ b/resync/client_utils.py
+@@ -7,8 +7,6 @@ import argparse
+ from datetime import datetime
+ import logging
+ import logging.config
+-import re
+-from urllib.request import urlopen
+ 
+ from .url_or_file_open import set_url_or_file_open_config
+ 
+diff --git a/resync/explorer.py b/resync/explorer.py
+index a4c102f..3e3a3bc 100644
+--- a/resync/explorer.py
++++ b/resync/explorer.py
+@@ -17,7 +17,6 @@ import distutils.dir_util
+ import re
+ import time
+ import logging
+-import requests
+ 
+ from .mapper import Mapper
+ from .sitemap import Sitemap
+@@ -164,7 +163,7 @@ class Explorer(Client):
+                 caps = 'resource'
+             else:
+                 caps = self.allowed_entries(capability)
+-        elif (r.capability is 'resource'):
++        elif (r.capability == 'resource'):
+             caps = r.capability
+         else:
+             caps = [r.capability]
+@@ -278,38 +277,36 @@ class Explorer(Client):
+         print("HEAD %s" % (uri))
+         if (re.match(r'^\w+:', uri)):
+             # Looks like a URI
+-            response = requests.head(uri)
++            with url_or_file_open(uri, method='HEAD') as response:
++                status_code = response.code()
++                headers = response.headers()
+         else:
+             # Mock up response if we have a local file
+-            response = self.head_on_file(uri)
+-        print("  status: %s" % (response.status_code))
+-        if (response.status_code == '200'):
++            (status_code, headers) = self.head_on_file(uri)
++        print("  status: %s" % (status_code))
++        if (status_code == '200'):
+             # print some of the headers
+             for header in ['content-length', 'last-modified',
+                            'lastmod', 'content-type', 'etag']:
+-                if header in response.headers:
++                if header in headers:
+                     check_str = ''
+                     if (check_headers is not None and header in check_headers):
+-                        if (response.headers[header] == check_headers[header]):
++                        if (headers[header] == check_headers[header]):
+                             check_str = ' MATCHES EXPECTED VALUE'
+                         else:
+                             check_str = ' EXPECTED %s' % (
+                                 check_headers[header])
+-                    print(
+-                        "  %s: %s%s" %
+-                        (header, response.headers[header], check_str))
++                    print("  %s: %s%s" % (header, headers[header], check_str))
+ 
+     def head_on_file(self, file):
+-        """Mock up requests.head(..) response on local file."""
+-        response = HeadResponse()
+-        if (not os.path.isfile(file)):
+-            response.status_code = '404'
+-        else:
+-            response.status_code = '200'
+-            response.headers[
+-                'last-modified'] = datetime_to_str(os.path.getmtime(file))
+-            response.headers['content-length'] = os.path.getsize(file)
+-        return(response)
++        """Get fake status code and headers from local file."""
++        status_code = '404'
++        headers = {}
++        if os.path.isfile(file):
++            status_code = '200'
++            headers['last-modified'] = datetime_to_str(os.path.getmtime(file))
++            headers['content-length'] = os.path.getsize(file)
++        return(status_code, headers)
+ 
+     def allowed_entries(self, capability):
+         """Return list of allowed entries for given capability document.
+@@ -367,15 +364,6 @@ class XResource(object):
+         self.checks = checks
+ 
+ 
+-class HeadResponse(object):
+-    """Object to mock up requests.head(...) response."""
+-
+-    def __init__(self):
+-        """Initialize with no status_code and no headers."""
+-        self.status_code = None
+-        self.headers = {}
+-
+-
+ class ExplorerQuit(Exception):
+     """Exception raised when user quits normally, no error."""
+ 
+diff --git a/resync/url_or_file_open.py b/resync/url_or_file_open.py
+index 983e1aa..4981fa4 100644
+--- a/resync/url_or_file_open.py
++++ b/resync/url_or_file_open.py
+@@ -21,11 +21,14 @@ def set_url_or_file_open_config(key, value):
+     CONFIG[key] = value
+ 
+ 
+-def url_or_file_open(uri):
++def url_or_file_open(uri, method=None, timeout=None):
+     """Wrapper around urlopen() to prepend file: if no scheme provided.
+ 
+     Can be used as a context manager because the return value from urlopen(...)
+     supports both that and straightforwrd use as simple file handle object.
++
++    If timeout is exceeded then urlopen(..) will raise a socket.timeout exception. If
++    no timeout is specified then the global default will be used.
+     """
+     if (not re.match(r'''\w+:''', uri)):
+         uri = 'file:' + uri
+@@ -42,4 +45,5 @@ def url_or_file_open(uri):
+     if NUM_REQUESTS != 0 and CONFIG['delay'] is not None and not uri.startswith('file:'):
+         time.sleep(CONFIG['delay'])
+     NUM_REQUESTS += 1
+-    return urlopen(Request(url=uri, headers=headers))
++    maybe_timeout = {} if timeout is None else {'timeout': timeout}
++    return urlopen(Request(url=uri, headers=headers, method=method), **maybe_timeout)
+diff --git a/setup.py b/setup.py
+index 8d110dd..9a049d8 100644
+--- a/setup.py
++++ b/setup.py
+@@ -61,7 +61,6 @@ setup(
+     long_description=open('README.md').read(),
+     long_description_content_type='text/markdown',
+     install_requires=[
+-        "requests",
+         "python-dateutil>=1.5",
+         "defusedxml>=0.4.1"
+     ],

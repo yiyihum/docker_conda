@@ -1,0 +1,107 @@
+diff --git a/src/betamax/configure.py b/src/betamax/configure.py
+index 1eca77c..b065eff 100644
+--- a/src/betamax/configure.py
++++ b/src/betamax/configure.py
+@@ -1,8 +1,9 @@
++from collections import defaultdict
++
+ from .cassette import Cassette
+ 
+ 
+ class Configuration(object):
+-
+     """This object acts as a proxy to configure different parts of Betamax.
+ 
+     You should only ever encounter this object when configuring the library as
+@@ -20,6 +21,7 @@ class Configuration(object):
+     """
+ 
+     CASSETTE_LIBRARY_DIR = 'vcr/cassettes'
++    recording_hooks = defaultdict(list)
+ 
+     def __enter__(self):
+         return self
+@@ -33,6 +35,26 @@ class Configuration(object):
+         else:
+             super(Configuration, self).__setattr__(prop, value)
+ 
++    def after_start(self, callback=None):
++        """Register a function to call after Betamax is started.
++
++        Example usage:
++
++        .. code-block:: python
++
++            def on_betamax_start(cassette):
++                if cassette.is_recording():
++                    print("Setting up authentication...")
++
++            with Betamax.configure() as config:
++                config.cassette_load(callback=on_cassette_load)
++
++        :param callable callback:
++            The function which accepts a cassette and might mutate
++            it before returning.
++        """
++        self.recording_hooks['after_start'].append(callback)
++
+     def before_playback(self, tag=None, callback=None):
+         """Register a function to call before playing back an interaction.
+ 
+@@ -79,6 +101,26 @@ class Configuration(object):
+         """
+         Cassette.hooks['before_record'].append(callback)
+ 
++    def before_stop(self, callback=None):
++        """Register a function to call before Betamax stops.
++
++        Example usage:
++
++        .. code-block:: python
++
++            def on_betamax_stop(cassette):
++                if not cassette.is_recording():
++                    print("Playback completed.")
++
++            with Betamax.configure() as config:
++                config.cassette_eject(callback=on_betamax_stop)
++
++        :param callable callback:
++            The function which accepts a cassette and might mutate
++            it before returning.
++        """
++        self.recording_hooks['before_stop'].append(callback)
++
+     @property
+     def cassette_library_dir(self):
+         """Retrieve and set the directory to store the cassettes in."""
+diff --git a/src/betamax/recorder.py b/src/betamax/recorder.py
+index 2a4b069..d89b8bd 100644
+--- a/src/betamax/recorder.py
++++ b/src/betamax/recorder.py
+@@ -123,10 +123,13 @@ class Betamax(object):
+         """Start recording or replaying interactions."""
+         for k in self.http_adapters:
+             self.session.mount(k, self.betamax_adapter)
++        dispatch_hooks('after_start', self.betamax_adapter.cassette)
+ 
+     # ■
+     def stop(self):
+         """Stop recording or replaying interactions."""
++        dispatch_hooks('before_stop', self.betamax_adapter.cassette)
++
+         # No need to keep the cassette in memory any longer.
+         self.betamax_adapter.eject_cassette()
+         # On exit, we no longer wish to use our adapter and we want the
+@@ -166,3 +169,10 @@ class Betamax(object):
+             raise ValueError('Cassette must have a valid name and may not be'
+                              ' None.')
+         return self
++
++
++def dispatch_hooks(hook_name, *args):
++    """Dispatch registered hooks."""
++    hooks = Configuration.recording_hooks[hook_name]
++    for hook in hooks:
++        hook(*args)
+

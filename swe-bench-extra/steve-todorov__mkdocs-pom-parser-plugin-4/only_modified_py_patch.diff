@@ -1,0 +1,141 @@
+diff --git a/setup.py b/setup.py
+index 7f51d15..fc0553e 100644
+--- a/setup.py
++++ b/setup.py
+@@ -117,7 +117,7 @@ setup(
+     # Note that this is a list of additional keywords, separated
+     # by commas, to be used to assist searching for the distribution in a
+     # larger catalog.
+-    keywords='mkdocs, setuptools, development',  # Optional
++    keywords='mkdocs, maven, pom, parser, plugin',  # Optional
+ 
+     # When your source code is in a subdirectory under the project root, e.g.
+     # `src/`, it is necessary to specify the `package_dir` argument.
+diff --git a/src/mkdocs_pom_parser_plugin/parser.py b/src/mkdocs_pom_parser_plugin/parser.py
+index d3ed244..c07ea40 100644
+--- a/src/mkdocs_pom_parser_plugin/parser.py
++++ b/src/mkdocs_pom_parser_plugin/parser.py
+@@ -1,10 +1,9 @@
+-import xml.etree.ElementTree as ET
+-
+ import re
++import sys
++import xml.etree.ElementTree as ET
++from pathlib import Path
+ 
+-namespaces = {
+-    '': 'http://maven.apache.org/POM/4.0.0',
+-}
++namespaces = {'': 'http://maven.apache.org/POM/4.0.0', 'mvn': 'http://maven.apache.org/POM/4.0.0'}
+ 
+ 
+ class PomParser:
+@@ -12,16 +11,23 @@ class PomParser:
+     This class is simply a wrapper around ElementTree
+     """
+ 
+-    def __init__(self, arg: str):
+-        result = re.search("([\n+])", arg)
++    oldPython = True
+ 
++    def __init__(self, fileOrContent: str, **kwargs):
++        version = sys.version_info
++        if kwargs.get("version_info", None):
++            version = kwargs.get("version_info")
++
++        self.oldPython = version < (3, 8)
++
++        path = Path(fileOrContent)
+         # arg is the xml string. (easier testing)
+-        if result is not None:
+-            self.tree = ET.fromstring(arg)
++        if path.exists() is not True:
++            self.tree = ET.fromstring(fileOrContent)
+ 
+         # arg is file
+         else:
+-            self.tree = ET.parse(arg)
++            self.tree = ET.parse(fileOrContent)
+ 
+     def getTree(self):
+         return self.tree
+@@ -50,10 +56,16 @@ class PomParser:
+     def getUrl(self):
+         return self.findTextByXpath("./url")
+ 
+-    def findByXpath(self, xpath: str):
+-        return self.tree.find(xpath, namespaces)
+-
+     def findTextByXpath(self, xpath: str):
+-        element = self.tree.find(xpath, namespaces)
++        element = self.findByXpath(xpath)
+         # print(element.text) if element is not None else None
+         return element.text if element is not None else None
++
++    def findByXpath(self, xpath: str):
++        # Add support for older Python versions - necessary for Netlify since it does not support >= 3.8 at the time of
++        # writing this.
++        defaultNamespace = "./{" + namespaces.get('') + "}"
++        if self.oldPython and xpath.startswith(defaultNamespace) is False and xpath.startswith("./mvn:") is False:
++            xpath = re.sub(r"^\./(.+)$", r'./mvn:\1', xpath)
++
++        return self.tree.find(xpath, namespaces)
+diff --git a/src/mkdocs_pom_parser_plugin/plugin.py b/src/mkdocs_pom_parser_plugin/plugin.py
+index 9544ec3..8ea4feb 100644
+--- a/src/mkdocs_pom_parser_plugin/plugin.py
++++ b/src/mkdocs_pom_parser_plugin/plugin.py
+@@ -43,6 +43,12 @@ class PomParserPlugin(BasePlugin):
+     }
+ 
+     def on_config(self, config: Config):
++        oldPython = sys.version_info < (3, 8)
++
++        if oldPython:
++            log.warning("Python versions lower than 3.8 (current: %s) do not support default namespace! ", str(sys.version_info.major) + "." + str(sys.version_info.minor))
++            log.warning("None results while referencing POM_* variables in templates are likely because of that.")
++
+         env_vars = {}
+         for name, plugin in config.get('plugins').items():
+             if name == 'mkdocs-pom-parser-plugin':
+@@ -56,21 +62,24 @@ class PomParserPlugin(BasePlugin):
+                 path = plugin_config.get('path')
+                 if path is not None:
+                     log.debug("Configured pom file: %s", path)
+-                    path = Path(path).resolve().__str__()
++                    path = Path(path).resolve()
+                     log.info("Resolved pom file: %s", path)
+ 
+-                    additional = plugin_config.get('additional', {})
+-                    env_vars = copy.copy(self.DEFAULT_ENV_VARS)
++                    if path.exists():
++                        additional = plugin_config.get('additional', {})
++                        env_vars = copy.copy(self.DEFAULT_ENV_VARS)
+ 
+-                    if additional is not None:
+-                        log.debug("Additional pom variables detected: %s", additional)
+-                        for key, value in additional.items():
+-                            env_vars["POM_" + key.upper()] = value
++                        if additional is not None:
++                            log.debug("Additional pom variables detected: %s", additional)
++                            for key, value in additional.items():
++                                env_vars["POM_" + key.upper()] = value
+ 
+-                    parser = PomParser(path)
+-                    for key, xpath in env_vars.items():
+-                        value = parser.findTextByXpath(xpath)
+-                        env_vars[key] = value
++                        parser = PomParser(path.__str__())
++                        for key, xpath in env_vars.items():
++                            value = parser.findTextByXpath(xpath)
++                            env_vars[key] = value
++                    else:
++                        log.warning("File %s does not exist or is not readable/accessible!", path)
+ 
+         config.update({"pom_env_vars": env_vars})
+         if env_vars.__sizeof__() > 0:
+@@ -89,4 +98,4 @@ class PomParserPlugin(BasePlugin):
+         # md_template = Template(markdown)
+         env = jinja2.Environment(undefined=jinja2.DebugUndefined)
+         md_template = env.from_string(markdown)
+-        return md_template.render(copy.copy(config.get("pom_env_vars")))
++        return md_template.render(copy.deepcopy(config.get("pom_env_vars")))

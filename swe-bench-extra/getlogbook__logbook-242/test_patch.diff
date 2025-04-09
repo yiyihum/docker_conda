@@ -1,0 +1,164 @@
+diff --git a/tests/test_logging_compat.py b/tests/test_logging_compat.py
+index 31fdd40..7964993 100644
+--- a/tests/test_logging_compat.py
++++ b/tests/test_logging_compat.py
+@@ -33,7 +33,7 @@ def test_basic_compat(request, set_root_logger_level):
+             with redirected_logging(set_root_logger_level):
+                 logger.debug('This is from the old system')
+                 logger.info('This is from the old system')
+-                logger.warn('This is from the old %s', 'system')
++                logger.warning('This is from the old %s', 'system')
+                 logger.error('This is from the old system')
+                 logger.critical('This is from the old system')
+                 logger.error('This is a %(what)s %(where)s', {'what': 'mapping', 'where': 'test'})
+diff --git a/tests/test_mail_handler.py b/tests/test_mail_handler.py
+index fd7730b..718d936 100644
+--- a/tests/test_mail_handler.py
++++ b/tests/test_mail_handler.py
+@@ -40,11 +40,11 @@ def test_mail_handler(activation_strategy, logger):
+         header, data = mail.split('\n\n', 1)
+         if 'Content-Transfer-Encoding: base64' in header:
+             data = base64.b64decode(data).decode('utf-8')
+-        assert re.search('Message type:\s+ERROR', data)
+-        assert re.search('Location:.*%s' %
++        assert re.search(r'Message type:\s+ERROR', data)
++        assert re.search(r'Location:.*%s' %
+                          re.escape(__file_without_pyc__), data)
+-        assert re.search('Module:\s+%s' % __name__, data)
+-        assert re.search('Function:\s+test_mail_handler', data)
++        assert re.search(r'Module:\s+%s' % __name__, data)
++        assert re.search(r'Function:\s+test_mail_handler', data)
+         body = u('Viva la Espa\xf1a')
+         if sys.version_info < (3, 0):
+             body = body.encode('utf-8')
+@@ -72,14 +72,14 @@ def test_mail_handler_batching(activation_strategy, logger):
+     body, rest = pieces
+     rest = rest.replace('\r', '')
+ 
+-    assert re.search('Message type:\s+ERROR', body)
+-    assert re.search('Module:\s+%s' % __name__, body)
+-    assert re.search('Function:\s+test_mail_handler_batching', body)
++    assert re.search(r'Message type:\s+ERROR', body)
++    assert re.search(r'Module:\s+%s' % __name__, body)
++    assert re.search(r'Function:\s+test_mail_handler_batching', body)
+ 
+     related = rest.strip().split('\n\n')
+     assert len(related) == 2
+-    assert re.search('Message type:\s+WARNING', related[0])
+-    assert re.search('Message type:\s+DEBUG', related[1])
++    assert re.search(r'Message type:\s+WARNING', related[0])
++    assert re.search(r'Message type:\s+DEBUG', related[1])
+ 
+     assert 'And this triggers it again' in mail_handler.mails[1][2]
+ 
+@@ -101,14 +101,14 @@ def test_group_handler_mail_combo(activation_strategy, logger):
+     body, rest = pieces
+     rest = rest.replace('\r', '')
+ 
+-    assert re.search('Message type:\\s+ERROR', body)
+-    assert re.search('Module:\s+' + __name__, body)
+-    assert re.search('Function:\s+test_group_handler_mail_combo', body)
++    assert re.search(r'Message type:\s+ERROR', body)
++    assert re.search(r'Module:\s+' + __name__, body)
++    assert re.search(r'Function:\s+test_group_handler_mail_combo', body)
+ 
+     related = rest.strip().split('\n\n')
+     assert len(related) == 2
+-    assert re.search('Message type:\s+WARNING', related[0])
+-    assert re.search('Message type:\s+DEBUG', related[1])
++    assert re.search(r'Message type:\s+WARNING', related[0])
++    assert re.search(r'Message type:\s+DEBUG', related[1])
+ 
+ 
+ def test_mail_handler_arguments():
+diff --git a/tests/test_syslog_handler.py b/tests/test_syslog_handler.py
+index 9772a2a..d19d3f2 100644
+--- a/tests/test_syslog_handler.py
++++ b/tests/test_syslog_handler.py
+@@ -1,4 +1,5 @@
+ import os
++import re
+ import socket
+ from contextlib import closing
+ 
+@@ -7,33 +8,59 @@ from logbook.helpers import u
+ 
+ import pytest
+ 
++unix_socket = "/tmp/__unixsock_logbook.test"
+ 
+-def test_syslog_handler(logger, activation_strategy, unix_sock_path):
+-    to_test = [
+-        (socket.AF_INET, ('127.0.0.1', 0)),
+-    ]
+-    if hasattr(socket, 'AF_UNIX'):
+-        to_test.append((socket.AF_UNIX, unix_sock_path))
+-    for sock_family, address in to_test:
+-        with closing(socket.socket(sock_family, socket.SOCK_DGRAM)) as inc:
+-            inc.bind(address)
+-            inc.settimeout(1)
+-            for app_name in [None, 'Testing']:
+-                handler = logbook.SyslogHandler(app_name, inc.getsockname())
+-                with activation_strategy(handler):
+-                    logger.warn('Syslog is weird')
+-                try:
++to_test = [
++    (socket.AF_INET, socket.SOCK_DGRAM, ('127.0.0.1', 0)),
++    (socket.AF_INET, socket.SOCK_STREAM, ('127.0.0.1', 0)),
++]
++if hasattr(socket, 'AF_UNIX'):
++    to_test.append((socket.AF_UNIX, socket.SOCK_DGRAM, unix_socket))
++
++@pytest.mark.usefixtures("unix_sock_path")
++@pytest.mark.parametrize("sock_family,socktype,address", to_test)
++def test_syslog_handler(logger, activation_strategy,
++                        sock_family, socktype, address):
++    delimiter = {socket.AF_UNIX: '\x00',
++                 socket.AF_INET: '\n'}[sock_family]
++    with closing(socket.socket(sock_family, socktype)) as inc:
++        inc.bind(address)
++        if socktype == socket.SOCK_STREAM:
++            inc.listen(0)
++        inc.settimeout(1)
++        for app_name in [None, 'Testing']:
++            if sock_family == socket.AF_UNIX:
++                expected = (r'^<12>%stestlogger: Syslog is weird%s$' %
++                            (app_name + ':' if app_name else '',
++                             delimiter))
++            else:
++                expected = (r'^<12>1 \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z %s %s %d '
++                            '- - %sSyslog is weird%s$' %
++                            (socket.gethostname(),
++                             app_name if app_name else 'testlogger',
++                             os.getpid(), 'testlogger: ' if app_name else '',
++                             delimiter))
++
++            handler = logbook.SyslogHandler(app_name, inc.getsockname(),
++                                            socktype=socktype)
++            with activation_strategy(handler):
++                logger.warn('Syslog is weird')
++            try:
++                if socktype == socket.SOCK_STREAM:
++                    with closing(inc.accept()[0]) as inc2:
++                        rv = inc2.recv(1024)
++                else:
+                     rv = inc.recvfrom(1024)[0]
+-                except socket.error:
+-                    assert False, 'got timeout on socket'
+-                assert rv == (
+-                    u('<12>%stestlogger: Syslog is weird\x00') %
+-                    ((app_name and (app_name + u(':'))) or u(''))).encode('utf-8')
++            except socket.error:
++                assert False, 'got timeout on socket'
++            rv = rv.decode('utf-8')
++            assert re.match(expected, rv), \
++                'expected {}, got {}'.format(expected, rv)
+ 
+ 
+ @pytest.fixture
+ def unix_sock_path(request):
+-    returned = "/tmp/__unixsock_logbook.test"
++    returned = unix_socket
+ 
+     @request.addfinalizer
+     def cleanup():

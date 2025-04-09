@@ -1,0 +1,215 @@
+diff --git a/docs/examples/models_signature.py b/docs/examples/models_signature.py
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/models_signature.py
+@@ -0,0 +1,10 @@
++import inspect
++from pydantic import BaseModel, Field
++
++class FooModel(BaseModel):
++    id: int
++    name: str = None
++    description: str = 'Foo'
++    apple: int = Field(..., alias='pear')
++
++print(inspect.signature(FooModel))
+diff --git a/docs/examples/models_signature_custom_init.py b/docs/examples/models_signature_custom_init.py
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/models_signature_custom_init.py
+@@ -0,0 +1,13 @@
++import inspect
++
++from pydantic import BaseModel
++
++class MyModel(BaseModel):
++    id: int
++    info: str = 'Foo'
++
++    def __init__(self, id: int = 1, *, bar: str, **data) -> None:
++        """My custom init!"""
++        super().__init__(id=id, bar=bar, **data)
++
++print(inspect.signature(MyModel))
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -18,9 +18,18 @@
+ from .schema import model_schema
+ from .types import PyObject, StrBytes
+ from .typing import AnyCallable, AnyType, ForwardRef, is_classvar, resolve_annotations, update_field_forward_refs
+-from .utils import GetterDict, Representation, ValueItems, lenient_issubclass, sequence_like, validate_field_name
++from .utils import (
++    GetterDict,
++    Representation,
++    ValueItems,
++    generate_model_signature,
++    lenient_issubclass,
++    sequence_like,
++    validate_field_name,
++)
+ 
+ if TYPE_CHECKING:
++    from inspect import Signature
+     from .class_validators import ValidatorListDict
+     from .types import ModelOrDc
+     from .typing import CallableGenerator, TupleGenerator, DictStrAny, DictAny, SetStr
+@@ -156,6 +165,8 @@ def __new__(mcs, name, bases, namespace, **kwargs):  # noqa C901
+         fields: Dict[str, ModelField] = {}
+         config = BaseConfig
+         validators: 'ValidatorListDict' = {}
++        fields_defaults: Dict[str, Any] = {}
++
+         pre_root_validators, post_root_validators = [], []
+         for base in reversed(bases):
+             if issubclass(base, BaseModel) and base != BaseModel:
+@@ -170,6 +181,9 @@ def __new__(mcs, name, bases, namespace, **kwargs):  # noqa C901
+         vg = ValidatorGroup(validators)
+ 
+         for f in fields.values():
++            if not f.required:
++                fields_defaults[f.name] = f.default
++
+             f.set_config(config)
+             extra_validators = vg.get_validators(f.name)
+             if extra_validators:
+@@ -196,13 +210,15 @@ def __new__(mcs, name, bases, namespace, **kwargs):  # noqa C901
+                         and not lenient_issubclass(getattr(ann_type, '__origin__', None), Type)
+                     ):
+                         continue
+-                    fields[ann_name] = ModelField.infer(
++                    fields[ann_name] = inferred = ModelField.infer(
+                         name=ann_name,
+                         value=value,
+                         annotation=ann_type,
+                         class_validators=vg.get_validators(ann_name),
+                         config=config,
+                     )
++                    if not inferred.required:
++                        fields_defaults[ann_name] = inferred.default
+ 
+             for var_name, value in namespace.items():
+                 if (
+@@ -225,6 +241,8 @@ def __new__(mcs, name, bases, namespace, **kwargs):  # noqa C901
+                             f'if you wish to change the type of this field, please use a type annotation'
+                         )
+                     fields[var_name] = inferred
++                    if not inferred.required:
++                        fields_defaults[var_name] = inferred.default
+ 
+         _custom_root_type = ROOT_KEY in fields
+         if _custom_root_type:
+@@ -238,7 +256,7 @@ def __new__(mcs, name, bases, namespace, **kwargs):  # noqa C901
+         new_namespace = {
+             '__config__': config,
+             '__fields__': fields,
+-            '__field_defaults__': {n: f.default for n, f in fields.items() if not f.required},
++            '__field_defaults__': fields_defaults,
+             '__validators__': vg.validators,
+             '__pre_root_validators__': pre_root_validators + pre_rv_new,
+             '__post_root_validators__': post_root_validators + post_rv_new,
+@@ -247,7 +265,10 @@ def __new__(mcs, name, bases, namespace, **kwargs):  # noqa C901
+             '__custom_root_type__': _custom_root_type,
+             **{n: v for n, v in namespace.items() if n not in fields},
+         }
+-        return super().__new__(mcs, name, bases, new_namespace, **kwargs)
++
++        cls = super().__new__(mcs, name, bases, new_namespace, **kwargs)
++        cls.__signature__ = generate_model_signature(cls.__init__, fields, config)
++        return cls
+ 
+ 
+ class BaseModel(metaclass=ModelMetaclass):
+@@ -263,6 +284,7 @@ class BaseModel(metaclass=ModelMetaclass):
+         __json_encoder__: Callable[[Any], Any] = lambda x: x
+         __schema_cache__: 'DictAny' = {}
+         __custom_root_type__: bool = False
++        __signature__: 'Signature'
+ 
+     Config = BaseConfig
+     __slots__ = ('__dict__', '__fields_set__')
+@@ -274,6 +296,11 @@ class BaseModel(metaclass=ModelMetaclass):
+     __repr__ = Representation.__repr__
+ 
+     def __init__(__pydantic_self__, **data: Any) -> None:
++        """
++        Create a new model by parsing and validating input data from keyword arguments.
++
++        Raises ValidationError if the input data cannot be parsed to form a valid model.
++        """
+         # Uses something other than `self` the first arg to allow "self" as a settable attribute
+         if TYPE_CHECKING:
+             __pydantic_self__.__dict__: Dict[str, Any] = {}
+diff --git a/pydantic/utils.py b/pydantic/utils.py
+--- a/pydantic/utils.py
++++ b/pydantic/utils.py
+@@ -1,4 +1,5 @@
+ import warnings
++from itertools import islice
+ from types import GeneratorType
+ from typing import (
+     TYPE_CHECKING,
+@@ -22,8 +23,10 @@
+ from .version import version_info
+ 
+ if TYPE_CHECKING:
+-    from .main import BaseModel  # noqa: F401
++    from inspect import Signature
++    from .main import BaseModel, BaseConfig  # noqa: F401
+     from .typing import AbstractSetIntStr, DictIntStrAny, IntStr, ReprArgs  # noqa: F401
++    from .fields import ModelField  # noqa: F401
+     from .dataclasses import DataclassType  # noqa: F401
+ 
+ __all__ = (
+@@ -136,6 +139,51 @@ def almost_equal_floats(value_1: float, value_2: float, *, delta: float = 1e-8)
+     return abs(value_1 - value_2) <= delta
+ 
+ 
++def generate_model_signature(
++    init: Callable[..., None], fields: Dict[str, 'ModelField'], config: Type['BaseConfig']
++) -> 'Signature':
++    """
++    Generate signature for model based on its fields
++    """
++    from inspect import Parameter, Signature, signature
++
++    present_params = signature(init).parameters.values()
++    merged_params: Dict[str, Parameter] = {}
++    var_kw = None
++    use_var_kw = False
++
++    for param in islice(present_params, 1, None):  # skip self arg
++        if param.kind is param.VAR_KEYWORD:
++            var_kw = param
++            continue
++        merged_params[param.name] = param
++
++    if var_kw:  # if custom init has no var_kw, fields which are not declared in it cannot be passed through
++        allow_names = config.allow_population_by_field_name
++        for field_name, field in fields.items():
++            param_name = field.alias
++            if field_name in merged_params or param_name in merged_params:
++                continue
++            elif not param_name.isidentifier():
++                if allow_names and field_name.isidentifier():
++                    param_name = field_name
++                else:
++                    use_var_kw = True
++                    continue
++
++            # TODO: replace annotation with actual expected types once #1055 solved
++            kwargs = {'default': field.default} if not field.required else {}
++            merged_params[param_name] = Parameter(param_name, Parameter.KEYWORD_ONLY, annotation=field.type_, **kwargs)
++
++    if config.extra is config.extra.allow:
++        use_var_kw = True
++
++    if var_kw and use_var_kw:
++        merged_params[var_kw.name] = var_kw
++
++    return Signature(parameters=list(merged_params.values()), return_annotation=None)
++
++
+ def get_model(obj: Union[Type['BaseModel'], Type['DataclassType']]) -> Type['BaseModel']:
+     from .main import BaseModel  # noqa: F811
+ 

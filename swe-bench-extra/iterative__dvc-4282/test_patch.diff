@@ -1,0 +1,196 @@
+diff --git a/tests/func/test_check_ignore.py b/tests/func/test_check_ignore.py
+new file mode 100644
+--- /dev/null
++++ b/tests/func/test_check_ignore.py
+@@ -0,0 +1,109 @@
++import os
++
++import pytest
++
++from dvc.ignore import DvcIgnore
++from dvc.main import main
++
++
++@pytest.mark.parametrize(
++    "file,ret,output", [("ignored", 0, "ignored\n"), ("not_ignored", 1, "")]
++)
++def test_check_ignore(tmp_dir, dvc, file, ret, output, caplog):
++    tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "ignored")
++
++    assert main(["check-ignore", file]) == ret
++    assert output in caplog.text
++
++
++@pytest.mark.parametrize(
++    "file,ret,output",
++    [
++        ("file", 0, "{}:1:f*\tfile\n".format(DvcIgnore.DVCIGNORE_FILE)),
++        ("foo", 0, "{}:2:!foo\tfoo\n".format(DvcIgnore.DVCIGNORE_FILE)),
++        (
++            os.path.join("dir", "foobar"),
++            0,
++            "{}:1:foobar\t{}\n".format(
++                os.path.join("dir", DvcIgnore.DVCIGNORE_FILE),
++                os.path.join("dir", "foobar"),
++            ),
++        ),
++    ],
++)
++def test_check_ignore_details(tmp_dir, dvc, file, ret, output, caplog):
++    tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "f*\n!foo")
++    tmp_dir.gen({"dir": {DvcIgnore.DVCIGNORE_FILE: "foobar"}})
++
++    assert main(["check-ignore", "-d", file]) == ret
++    assert output in caplog.text
++
++
++@pytest.mark.parametrize(
++    "non_matching,output", [(["-n"], "::\tfile\n"), ([], "")]
++)
++def test_check_ignore_non_matching(tmp_dir, dvc, non_matching, output, caplog):
++    tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "other")
++
++    assert main(["check-ignore", "-d"] + non_matching + ["file"]) == 1
++    assert output in caplog.text
++
++
++def test_check_ignore_non_matching_without_details(tmp_dir, dvc):
++    tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "other")
++
++    assert main(["check-ignore", "-n", "file"]) == 255
++
++
++def test_check_ignore_details_with_quiet(tmp_dir, dvc):
++    tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "other")
++
++    assert main(["check-ignore", "-d", "-q", "file"]) == 255
++
++
++@pytest.mark.parametrize("path,ret", [({"dir": {}}, 0), ({"dir": "files"}, 1)])
++def test_check_ignore_dir(tmp_dir, dvc, path, ret):
++    tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "dir/")
++    tmp_dir.gen(path)
++
++    assert main(["check-ignore", "-q", "dir"]) == ret
++
++
++def test_check_ignore_default_dir(tmp_dir, dvc):
++    assert main(["check-ignore", "-q", ".dvc"]) == 1
++
++
++def test_check_ignore_out_side_repo(tmp_dir, dvc):
++    tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "file")
++    assert main(["check-ignore", "-q", "../file"]) == 1
++
++
++def test_check_ignore_sub_repo(tmp_dir, dvc):
++    tmp_dir.gen(
++        {DvcIgnore.DVCIGNORE_FILE: "other", "dir": {".dvc": {}, "foo": "bar"}}
++    )
++
++    assert main(["check-ignore", "-q", os.path.join("dir", "foo")]) == 1
++
++
++def test_check_sub_dir_ignore_file(tmp_dir, dvc, caplog):
++    tmp_dir.gen(
++        {
++            DvcIgnore.DVCIGNORE_FILE: "other",
++            "dir": {DvcIgnore.DVCIGNORE_FILE: "bar\nfoo", "foo": "bar"},
++        }
++    )
++
++    assert main(["check-ignore", "-d", os.path.join("dir", "foo")]) == 0
++    assert (
++        "{}:2:foo\t{}".format(
++            os.path.join("dir", DvcIgnore.DVCIGNORE_FILE),
++            os.path.join("dir", "foo"),
++        )
++        in caplog.text
++    )
++
++    sub_dir = tmp_dir / "dir"
++    with sub_dir.chdir():
++        assert main(["check-ignore", "-d", "foo"]) == 0
++        assert ".dvcignore:2:foo\tfoo" in caplog.text
+diff --git a/tests/func/test_ignore.py b/tests/func/test_ignore.py
+--- a/tests/func/test_ignore.py
++++ b/tests/func/test_ignore.py
+@@ -6,13 +6,17 @@
+ from dvc.exceptions import DvcIgnoreInCollectedDirError
+ from dvc.ignore import DvcIgnore, DvcIgnorePatterns
+ from dvc.path_info import PathInfo
+-from dvc.pathspec_math import merge_patterns
++from dvc.pathspec_math import PatternInfo, merge_patterns
+ from dvc.repo import Repo
+ from dvc.utils import relpath
+ from dvc.utils.fs import get_mtime_and_size
+ from tests.dir_helpers import TmpDir
+ 
+ 
++def _to_pattern_info_list(str_list):
++    return [PatternInfo(a, "") for a in str_list]
++
++
+ def test_ignore(tmp_dir, dvc, monkeypatch):
+     tmp_dir.gen({"dir": {"ignored": "text", "other": "text2"}})
+     tmp_dir.gen(DvcIgnore.DVCIGNORE_FILE, "dir/ignored")
+@@ -106,9 +110,9 @@ def test_ignore_collecting_dvcignores(tmp_dir, dvc, dname):
+     assert (
+         DvcIgnorePatterns(
+             *merge_patterns(
+-                [".hg/", ".git/", ".dvc/"],
++                _to_pattern_info_list([".hg/", ".git/", ".dvc/"]),
+                 os.fspath(tmp_dir),
+-                [os.path.basename(dname)],
++                _to_pattern_info_list([os.path.basename(dname)]),
+                 top_ignore_path,
+             )
+         )
+@@ -309,17 +313,24 @@ def test_pattern_trie_tree(tmp_dir, dvc):
+         os.fspath(tmp_dir / "top" / "first" / "middle" / "second" / "bottom")
+     )
+ 
+-    base_pattern = [".hg/", ".git/", ".dvc/"], os.fspath(tmp_dir)
++    base_pattern = (
++        _to_pattern_info_list([".hg/", ".git/", ".dvc/"]),
++        os.fspath(tmp_dir),
++    )
+     first_pattern = merge_patterns(
+-        *base_pattern, ["a", "b", "c"], os.fspath(tmp_dir / "top" / "first")
++        *base_pattern,
++        _to_pattern_info_list(["a", "b", "c"]),
++        os.fspath(tmp_dir / "top" / "first")
+     )
+     second_pattern = merge_patterns(
+         *first_pattern,
+-        ["d", "e", "f"],
++        _to_pattern_info_list(["d", "e", "f"]),
+         os.fspath(tmp_dir / "top" / "first" / "middle" / "second")
+     )
+     other_pattern = merge_patterns(
+-        *base_pattern, ["1", "2", "3"], os.fspath(tmp_dir / "other")
++        *base_pattern,
++        _to_pattern_info_list(["1", "2", "3"]),
++        os.fspath(tmp_dir / "other")
+     )
+ 
+     assert DvcIgnorePatterns(*base_pattern) == ignore_pattern_top
+diff --git a/tests/unit/test_pathspec_math.py b/tests/unit/test_pathspec_math.py
+--- a/tests/unit/test_pathspec_math.py
++++ b/tests/unit/test_pathspec_math.py
+@@ -1,6 +1,6 @@
+ import pytest
+ 
+-from dvc.pathspec_math import _change_dirname
++from dvc.pathspec_math import PatternInfo, _change_dirname
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -69,4 +69,6 @@
+     ],
+ )
+ def test_dvcignore_pattern_change_dir(tmp_dir, patterns, dirname, changed):
+-    assert _change_dirname(dirname, [patterns], "/") == [changed]
++    assert _change_dirname(dirname, [PatternInfo(patterns, "")], "/") == [
++        PatternInfo(changed, "")
++    ]

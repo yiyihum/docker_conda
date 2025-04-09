@@ -1,0 +1,165 @@
+diff --git a/jacquard/experiments/tests/test_smoke.py b/jacquard/experiments/tests/test_smoke.py
+new file mode 100644
+index 0000000..e9d5acb
+--- /dev/null
++++ b/jacquard/experiments/tests/test_smoke.py
+@@ -0,0 +1,61 @@
++import datetime
++import dateutil.tz
++
++from unittest.mock import Mock
++
++from jacquard.cli import main
++from jacquard.storage.dummy import DummyStore
++
++
++BRANCH_SETTINGS = {'pony': 'gravity'}
++
++DUMMY_DATA_PRE_LAUNCH = {
++    'experiments/foo': {
++        'branches': [
++            {'id': 'bar', 'settings': BRANCH_SETTINGS},
++        ],
++    },
++}
++
++DUMMY_DATA_POST_LAUNCH = {
++    'experiments/foo': {
++        'branches': [
++            {'id': 'bar', 'settings': BRANCH_SETTINGS},
++        ],
++        'launched': str(datetime.datetime.now(dateutil.tz.tzutc())),
++    },
++    'active-experiments': ['foo'],
++}
++
++
++def test_launch():
++    config = Mock()
++    config.storage = DummyStore('', data=DUMMY_DATA_PRE_LAUNCH)
++
++    main(('launch', 'foo'), config=config)
++
++    assert 'launched' in config.storage['experiments/foo']
++    assert 'concluded' not in config.storage['experiments/foo']
++    assert 'foo' in config.storage['active-experiments']
++
++
++def test_conclude_no_branch():
++    config = Mock()
++    config.storage = DummyStore('', data=DUMMY_DATA_POST_LAUNCH)
++
++    main(('conclude', 'foo', '--no-promote-branch'), config=config)
++
++    assert 'concluded' in config.storage['experiments/foo']
++    assert 'foo' not in config.storage['active-experiments']
++    assert not config.storage['defaults']
++
++
++def test_conclude_updates_defaults():
++    config = Mock()
++    config.storage = DummyStore('', data=DUMMY_DATA_POST_LAUNCH)
++
++    main(('conclude', 'foo', 'bar'), config=config)
++
++    assert 'concluded' in config.storage['experiments/foo']
++    assert 'foo' not in config.storage['active-experiments']
++    assert config.storage['defaults'] == BRANCH_SETTINGS
+diff --git a/jacquard/service/tests/test_http.py b/jacquard/service/tests/test_http.py
+new file mode 100644
+index 0000000..05aaebf
+--- /dev/null
++++ b/jacquard/service/tests/test_http.py
+@@ -0,0 +1,92 @@
++import json
++
++import datetime
++import dateutil.tz
++
++from unittest.mock import Mock
++
++from jacquard.service import get_wsgi_app
++from jacquard.storage.dummy import DummyStore
++from jacquard.directory.base import UserEntry
++from jacquard.directory.dummy import DummyDirectory
++
++import werkzeug.test
++
++
++def get_status(path):
++    config = Mock()
++    config.storage = DummyStore('', data={
++        'defaults': {'pony': 'gravity'},
++        'active-experiments': ['foo'],
++        'experiments/foo': {
++            'id': 'foo',
++            'constraints': {
++                'excluded_tags': ['excluded'],
++                'anonymous': False,
++            },
++            'branches': [{'id': 'bar', 'settings': {'pony': 'horse'}}],
++        },
++    })
++    now = datetime.datetime.now(dateutil.tz.tzutc())
++    config.directory = DummyDirectory(users=(
++        UserEntry(id=1, join_date=now, tags=('excluded',)),
++        UserEntry(id=2, join_date=now, tags=('excluded',)),
++        UserEntry(id=3, join_date=now, tags=()),
++    ))
++
++    wsgi = get_wsgi_app(config)
++    test_client = werkzeug.test.Client(wsgi)
++
++    data, status, headers = test_client.get(path)
++    all_data = b''.join(data)
++    return status, all_data
++
++
++def get(path):
++    status, all_data = get_status(path)
++    assert status == '200 OK'
++    return json.loads(all_data.decode('utf-8'))
++
++
++def test_root():
++    assert get('/') == {
++        'experiments': '/experiment',
++        'user': '/users/<user>',
++    }
++
++
++def test_user_lookup():
++    assert get('/users/1') == {
++        'user': '1',
++        'pony': 'gravity',
++    }
++
++
++def test_user_lookup_with_non_numeric_id():
++    assert get('/users/bees') == {
++        'user': 'bees',
++        'pony': 'gravity',
++    }
++
++
++def test_experiments_list():
++    # Verify no exceptions
++    assert get('/experiment') == [{
++        'id': 'foo',
++        'url': '/experiment/foo',
++        'state': 'active',
++        'name': 'foo',
++    }]
++
++
++def test_experiment_get_smoke():
++    # Verify no exceptions
++    assert get('/experiment/foo')['name'] == 'foo'
++
++
++def test_experiment_get_membership():
++    assert get('/experiment/foo')['branches']['bar'] == [3]
++
++
++def test_missing_paths_get_404():
++    assert get_status('/missing')[0] == '404 NOT FOUND'

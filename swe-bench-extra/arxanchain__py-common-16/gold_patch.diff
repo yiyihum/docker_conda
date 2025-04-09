@@ -1,0 +1,177 @@
+diff --git a/README.md b/README.md
+index 8221932..40254e2 100644
+--- a/README.md
++++ b/README.md
+@@ -21,20 +21,50 @@ $ python setup.py install # install py-common
+ 
+ ## Usage
+ 
+-**Note:** Before using the py-common in your operating system, you need to make a two-step preparation:
++**Note:** Before using the py-common in your application, you need to make the following preparations:
+ 
+-1. Build executables with sdk-go-common cryption tools. To build these tools, you may need to install **golang** package **sdk-go-common**. For more details please refer to [sdk-go-common](https://github.com/arxanchain/sdk-go-common/tree/master/crypto/tools/README.md)
++### 1.Configure your encryption and signing libraries
+ 
+-2. Copy executables **crypto-util** and **sign-util** into your py-common installation path `cryption/utils`.
++1. Build executables with sdk-go-common encryption tools. To build these executables, you need to install **golang** and download **sdk-go-common**. For more details please refer to [sdk-go-common](https://github.com/arxanchain/sdk-go-common/tree/master/crypto/tools/README.md).
+ 
+-If you have no idea where your py-common is installed, use the following command to check out.
++2. Copy the executables **crypto-util** and **sign-util** into your py-common installation path `cryption/utils`.
++
++If you have no idea where your py-common is installed, use the following command to check it out (you need to leave the py-common code repo before running this command).
+ 
+ ```sh
+ $ python -c 'import imp;print imp.find_module("cryption")[1]'
+ /usr/local/lib/python2.7/site-packages/py_common-1.5.0-py2.7.egg/cryption
+ ```
+ 
+-In this case, you should copy executables into path `/usr/local/lib/python2.7/site-packages/py_common-1.5.0-py2.7.egg/cryption/utils/`.
++In this case, you should create directory `/usr/local/lib/python2.7/site-packages/py_common-1.5.0-py2.7.egg/cryption/utils/`, and copy the executables into this path.
++
++### 2. Configure you certificates
++
++To communicate with the server, you need to download a TLS certificate, register api-key and download the corresponding private key file from your ArxanChain BaaS Chainconsole. Refer to [API cert management](http://www.arxanfintech.com/infocenter/html/chainconsole/manual.html#api) for more details.
++
++After downloading the two files, use the following command to convert your private key file into PEM format.
++
++```sh
++$ openssl ec -in apikey.key -outform PEM -out apikey.key
++```
++
++Then copy (rename as follows) your TLS certificate and PEM private key file into your py-common installation path as follows. Please pay special attention to the absolute path of your certificate `./py_common-1.5.0-py2.7.egg/cryption/ecc/certs`, which will be used to create a wallet client.
++
++```
++.
++├── py_common-1.5.0-py2.7.egg
++|   └── cryption
++|       ├── ecc
++|       |   └── certs
++|       |       ├── tls
++|       |       |   └── tls.cert
++|       |       └── users
++|       |           └── pWEzB4yMM1518346407
++|       |               └── pWEzB4yMM1518346407.key
++|       └── utils
++|           ├── sign-util
++|           └── crypto-util
++```
+ 
+ ### Run unit test
+ 
+diff --git a/rest/api/api.py b/rest/api/api.py
+index 775245b..6bdad9a 100644
+--- a/rest/api/api.py
++++ b/rest/api/api.py
+@@ -34,12 +34,15 @@ APIKEY = "pWEzB4yMM1518346407"
+ def set_body(body, apikey, cert_path):
+     """Set body encdypted.
+ 
+-    :param body: body dictionary to be encrypted
++    :param body: body dictionary or string to be encrypted
+     :param apikey: api key generated from server
+     :param cert_path: path of private key file and cert file
+     :Returns: crypted cipher text
+     """
+-    return sign_and_encrypt(json.dumps(body), apikey, cert_path)
++    if isinstance(body, dict):
++        body = json.dumps(body)
++
++    return sign_and_encrypt(body, apikey, cert_path)
+ 
+ def set_sign_body(body, secret_key, did, nonce, apikey, cert_path):
+     """Set body signed.
+@@ -69,7 +72,12 @@ def do_post(url, headers, body, files=None):
+     :param body: body dictionary
+     :Returns: response
+     """
+-    return requests.post(url, headers=headers, data=body, files=files)
++    return requests.post(
++            url,
++            headers=headers,
++            data=body,
++            files=files
++            )
+ 
+ def do_put(url, headers, body):
+     """Start POST request.
+@@ -91,7 +99,9 @@ def require_ok(resp, apikey, cert_path):
+     """
+     client_err_msg = ""
+     if resp.status_code != STATUS_CODE_OK:
+-        logging.error("Status code: {}, Client Error, body: {}".format(resp.status_code, resp.text))
++        logging.error("Status code: {}, Client Error, body: {}".format(
++                resp.status_code,
++                resp.text))
+ 
+     if len(resp.text) <= 0:
+         client_err_msg = "Respond error: Body empty"
+@@ -101,11 +111,16 @@ def require_ok(resp, apikey, cert_path):
+     result = {}
+     plain_body = ""
+     try:
+-        plain_body = decrypt_and_verify(resp.text, apikey, cert_path)
++        plain_body = decrypt_and_verify(
++                resp.text,
++                apikey,
++                cert_path
++                )
+         result = json.loads(plain_body)
+     except Exception:
+         logging.error("cannot decrypt_and_verify response body: {}".format(resp.text))
+         client_err_msg = resp.text
++
+     result["ClientErrMsg"] = client_err_msg
+     
+     return result
+@@ -120,18 +135,49 @@ def do_request(req_params, apikey, cert_path, request_func):
+     :param request_func: request function to be used
+     :Returns: time duration, response
+     """
++
+     if len(cert_path) <= 0:
+         cert_path = CERT_PATH
+     if len(apikey) <= 0:
+         apikey = APIKEY
+     beg_time = time.time()
++
+     if request_func == do_get and "body" in req_params:
+         del req_params["body"]
+     else:
+-        req_body = set_body(req_params["body"], apikey, cert_path)
++        req_body = set_body(
++                req_params["body"],
++                apikey,
++                cert_path
++                )
+         req_params["body"] = req_body
+-    resp = require_ok(request_func(**req_params),
++
++    resp = require_ok(
++            request_func(**req_params),
+             apikey, cert_path)
++
+     time_dur = time.time() - beg_time
+ 
+     return time_dur, resp
++
++def do_prepare(prepared, apikey, cert_path):
++    """ Do requst with the given request object.
++        And calculate total time used.
++
++    :param requests.PreparedRequest object used to do the request
++    :param apikey: the api key authorized by the server
++    :param cert_path: path of private key file and cert file
++    :Returns: time duration, response
++    """
++    prepared.body = set_body(prepared.body, apikey, cert_path)
++    prepared.headers['Content-Length'] = str(len(prepared.body))
++    beg_time = time.time()
++    resp = require_ok(
++            requests.session().send(prepared),
++            apikey,
++            cert_path
++            )
++    time_dur = time.time() - beg_time
++
++    return time_dur, resp
++

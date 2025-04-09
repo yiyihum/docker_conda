@@ -1,0 +1,170 @@
+diff --git a/bin/proteins-to-pathogens.py b/bin/proteins-to-pathogens.py
+index 3a3ce34..726d4a9 100755
+--- a/bin/proteins-to-pathogens.py
++++ b/bin/proteins-to-pathogens.py
+@@ -137,6 +137,12 @@ if __name__ == '__main__':
+               'contain the lengths of all reads that match proteins for a '
+               'pathogen.'))
+ 
++    parser.add_argument(
++        '--assetDir', default='out',
++        help=('The output directory where noninteractive-alignment-panel.py '
++              'puts its HTML, plots and FASTA or FASTQ files, needed for '
++              'using --html'))
++
+     args = parser.parse_args()
+ 
+     if not args.html:
+@@ -162,7 +168,8 @@ if __name__ == '__main__':
+     else:
+         proteinFastaFilenames = None
+ 
+-    grouper = ProteinGrouper(sampleNameRegex=args.sampleNameRegex,
++    grouper = ProteinGrouper(assetDir=args.assetDir,
++                             sampleNameRegex=args.sampleNameRegex,
+                              format_=args.format,
+                              proteinFastaFilenames=proteinFastaFilenames,
+                              saveReadLengths=args.showReadLengths)
+diff --git a/dark/__init__.py b/dark/__init__.py
+index 0246a07..6a59296 100644
+--- a/dark/__init__.py
++++ b/dark/__init__.py
+@@ -7,4 +7,4 @@ if sys.version_info < (2, 7):
+ # will not be found by the version() function in ../setup.py
+ #
+ # Remember to update ../CHANGELOG.md describing what's new in each version.
+-__version__ = '3.0.5'
++__version__ = '3.0.6'
+diff --git a/dark/filter.py b/dark/filter.py
+index 0665ffc..b0daa76 100644
+--- a/dark/filter.py
++++ b/dark/filter.py
+@@ -279,6 +279,23 @@ def addFASTAFilteringCommandLineOptions(parser):
+         help=('A file of (1-based) sequence numbers to retain. Numbers must '
+               'be one per line.'))
+ 
++    parser.add_argument(
++        '--idLambda', metavar='LAMBDA-FUNCTION',
++        help=('A one-argument function taking and returning a read id. '
++              'E.g., --idLambda "lambda id: id.split(\'_\')[0]" or '
++              '--idLambda "lambda id: id[:10]". If the function returns None, '
++              'the read will be filtered out.'))
++
++    parser.add_argument(
++        '--readLambda', metavar='LAMBDA-FUNCTION',
++        help=('A one-argument function taking and returning a read. '
++              'E.g., --readLambda "lambda r: Read(r.id.split(\'_\')[0], '
++              'r.sequence.strip(\'-\')". Make sure to also modify the quality '
++              'string if you change the length of a FASTQ sequence. If the '
++              'function returns None, the read will be filtered out. The '
++              'function will be passed to eval with the dark.reads classes '
++              'Read, DNARead, AARead, etc. all in scope.'))
++
+     # A mutually exclusive group for --keepSites, --keepSitesFile,
+     # --removeSites, and --removeSitesFile.
+     group = parser.add_mutually_exclusive_group()
+@@ -381,4 +398,5 @@ def parseFASTAFilteringCommandLineOptions(args, reads):
+         randomSubset=args.randomSubset, trueLength=args.trueLength,
+         sampleFraction=args.sampleFraction,
+         sequenceNumbersFile=args.sequenceNumbersFile,
++        idLambda=args.idLambda, readLambda=args.readLambda,
+         keepSites=keepSites, removeSites=removeSites)
+diff --git a/dark/proteins.py b/dark/proteins.py
+index 8e6a850..33e53eb 100644
+--- a/dark/proteins.py
++++ b/dark/proteins.py
+@@ -9,19 +9,9 @@ import numpy as np
+ from textwrap import fill
+ from collections import Counter
+ 
+-try:
+-    import matplotlib
+-    if not os.environ.get('DISPLAY'):
+-        # Use non-interactive Agg backend
+-        matplotlib.use('Agg')
+-    import matplotlib.pyplot as plt
+-except ImportError:
+-    import platform
+-    if platform.python_implementation() == 'PyPy':
+-        raise NotImplementedError(
+-            'matplotlib is not supported under pypy')
+-    else:
+-        raise
++import matplotlib
++matplotlib.use('PDF')
++import matplotlib.pyplot as plt
+ 
+ from dark.dimension import dimensionalIterator
+ from dark.fasta import FastaReads
+diff --git a/dark/reads.py b/dark/reads.py
+index 42390e4..1074f78 100644
+--- a/dark/reads.py
++++ b/dark/reads.py
+@@ -740,8 +740,9 @@ class ReadFilter(object):
+         sequence identity.
+     @param removeDuplicatesById: If C{True} remove duplicated reads based
+         only on read id.
+-    @param removeDescriptions: If C{True} remove the description part of read
+-        ids (i.e., the part following the first whitespace).
++    @param removeDescriptions: If C{True} remove the description (the part
++        following the first whitespace) from read ids. The description is
++        removed after applying the function specified by --idLambda (if any).
+     @param modifier: If not C{None}, a function that is passed a read
+         and which either returns a read or C{None}. If it returns a read,
+         that read is passed through the filter. If it returns C{None},
+@@ -791,6 +792,14 @@ class ReadFilter(object):
+         file containing (1-based) sequence numbers, in ascending order,
+         one per line. Only those sequences matching the given numbers will
+         be kept.
++    @param idLambda: If not C{None}, a C{str} Python lambda function
++        specification to use to modify read ids. The function is applied
++        before removing the description (if --removeDescriptions is also
++        specified).
++    @param readLambda: If not C{None}, a C{str} Python lambda function
++        specification to use to modify reads. The function will be passed,
++        and must return, a single Read (or one of its subclasses). This
++        function is called after the --idLambda function, if any.
+     @param keepSites: A set of C{int} 0-based sites (i.e., indices) in
+         sequences that should be kept. If C{None} (the default), all sites are
+         kept.
+@@ -819,7 +828,8 @@ class ReadFilter(object):
+                  removeDuplicates=False, removeDuplicatesById=False,
+                  removeDescriptions=False, modifier=None, randomSubset=None,
+                  trueLength=None, sampleFraction=None,
+-                 sequenceNumbersFile=None, keepSites=None, removeSites=None):
++                 sequenceNumbersFile=None, idLambda=None, readLambda=None,
++                 keepSites=None, removeSites=None):
+ 
+         if randomSubset is not None:
+             if sampleFraction is not None:
+@@ -929,6 +939,9 @@ class ReadFilter(object):
+                 sampleFraction = None
+         self.sampleFraction = sampleFraction
+ 
++        self.idLambda = eval(idLambda) if idLambda else None
++        self.readLambda = eval(readLambda) if readLambda else None
++
+     def filter(self, read):
+         """
+         Check if a read passes the filter.
+@@ -1038,6 +1051,20 @@ class ReadFilter(object):
+         elif self.removeSites is not None:
+             read = read.newFromSites(self.removeSites, exclude=True)
+ 
++        if self.idLambda:
++            newId = self.idLambda(read.id)
++            if newId is None:
++                return False
++            else:
++                read.id = newId
++
++        if self.readLambda:
++            newRead = self.readLambda(read)
++            if newRead is None:
++                return False
++            else:
++                read = newRead
++
+         if self.removeDescriptions:
+             read.id = read.id.split()[0]
+ 

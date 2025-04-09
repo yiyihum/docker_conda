@@ -1,0 +1,151 @@
+diff --git a/docs/external-links.md b/docs/external-links.md
+index fab77ec..2dc4f91 100644
+--- a/docs/external-links.md
++++ b/docs/external-links.md
+@@ -2,6 +2,7 @@
+ 
+ External links related to using Mangum.
+ 
+-- [Deploying Python web apps as AWS Lambda functions](https://til.simonwillison.net/awslambda/asgi-mangum) is a tutorial that goes through every step involved in packaging and deploying a Python web application to AWS Lambda, including how to use Mangum to wrap an ASGI application. 
++- [Deploying Python web apps as AWS Lambda functions](https://til.simonwillison.net/awslambda/asgi-mangum) is a tutorial that goes through every step involved in packaging and deploying a Python web application to AWS Lambda, including how to use Mangum to wrap an ASGI application.
++- [Deploy FastAPI applications to AWS Lambda](https://aminalaee.dev/posts/2022/fastapi-aws-lambda/) is a quick tutorial about how to deploy FastAPI and Starlette applications to AWS Lambda using Mangum, including also a suggested approach by AWS about how to manage larger applications.
+ 
+ If you're interested in contributing to this page, please reference this [issue](https://github.com/jordaneremieff/mangum/issues/104) in a PR.
+diff --git a/mangum/adapter.py b/mangum/adapter.py
+index 31d2d1f..bb99cfb 100644
+--- a/mangum/adapter.py
++++ b/mangum/adapter.py
+@@ -44,6 +44,7 @@ class Mangum:
+         api_gateway_base_path: str = "/",
+         custom_handlers: Optional[List[Type[LambdaHandler]]] = None,
+         text_mime_types: Optional[List[str]] = None,
++        exclude_headers: Optional[List[str]] = None,
+     ) -> None:
+         if lifespan not in ("auto", "on", "off"):
+             raise ConfigurationError(
+@@ -53,9 +54,11 @@ class Mangum:
+         self.app = app
+         self.lifespan = lifespan
+         self.custom_handlers = custom_handlers or []
++        exclude_headers = exclude_headers or []
+         self.config = LambdaConfig(
+             api_gateway_base_path=api_gateway_base_path or "/",
+             text_mime_types=text_mime_types or [*DEFAULT_TEXT_MIME_TYPES],
++            exclude_headers=[header.lower() for header in exclude_headers],
+         )
+ 
+     def infer(self, event: LambdaEvent, context: LambdaContext) -> LambdaHandler:
+diff --git a/mangum/handlers/alb.py b/mangum/handlers/alb.py
+index 41378ed..875c4ee 100644
+--- a/mangum/handlers/alb.py
++++ b/mangum/handlers/alb.py
+@@ -5,6 +5,7 @@ from urllib.parse import urlencode, unquote, unquote_plus
+ from mangum.handlers.utils import (
+     get_server_and_port,
+     handle_base64_response_body,
++    handle_exclude_headers,
+     maybe_encode_body,
+ )
+ from mangum.types import (
+@@ -166,8 +167,10 @@ class ALB:
+         # headers otherwise.
+         multi_value_headers_enabled = "multiValueHeaders" in self.scope["aws.event"]
+         if multi_value_headers_enabled:
+-            out["multiValueHeaders"] = multi_value_headers
++            out["multiValueHeaders"] = handle_exclude_headers(
++                multi_value_headers, self.config
++            )
+         else:
+-            out["headers"] = finalized_headers
++            out["headers"] = handle_exclude_headers(finalized_headers, self.config)
+ 
+         return out
+diff --git a/mangum/handlers/api_gateway.py b/mangum/handlers/api_gateway.py
+index bd58a7d..d9b30c0 100644
+--- a/mangum/handlers/api_gateway.py
++++ b/mangum/handlers/api_gateway.py
+@@ -4,6 +4,7 @@ from urllib.parse import urlencode
+ from mangum.handlers.utils import (
+     get_server_and_port,
+     handle_base64_response_body,
++    handle_exclude_headers,
+     handle_multi_value_headers,
+     maybe_encode_body,
+     strip_api_gateway_path,
+@@ -120,8 +121,10 @@ class APIGateway:
+ 
+         return {
+             "statusCode": response["status"],
+-            "headers": finalized_headers,
+-            "multiValueHeaders": multi_value_headers,
++            "headers": handle_exclude_headers(finalized_headers, self.config),
++            "multiValueHeaders": handle_exclude_headers(
++                multi_value_headers, self.config
++            ),
+             "body": finalized_body,
+             "isBase64Encoded": is_base64_encoded,
+         }
+diff --git a/mangum/handlers/lambda_at_edge.py b/mangum/handlers/lambda_at_edge.py
+index 6737967..89a3709 100644
+--- a/mangum/handlers/lambda_at_edge.py
++++ b/mangum/handlers/lambda_at_edge.py
+@@ -2,6 +2,7 @@ from typing import Dict, List
+ 
+ from mangum.handlers.utils import (
+     handle_base64_response_body,
++    handle_exclude_headers,
+     handle_multi_value_headers,
+     maybe_encode_body,
+ )
+@@ -88,7 +89,7 @@ class LambdaAtEdge:
+ 
+         return {
+             "status": response["status"],
+-            "headers": finalized_headers,
++            "headers": handle_exclude_headers(finalized_headers, self.config),
+             "body": response_body,
+             "isBase64Encoded": is_base64_encoded,
+         }
+diff --git a/mangum/handlers/utils.py b/mangum/handlers/utils.py
+index c1cce0b..7e3e7b3 100644
+--- a/mangum/handlers/utils.py
++++ b/mangum/handlers/utils.py
+@@ -1,8 +1,8 @@
+ import base64
+-from typing import Dict, List, Tuple, Union
++from typing import Any, Dict, List, Tuple, Union
+ from urllib.parse import unquote
+ 
+-from mangum.types import Headers
++from mangum.types import Headers, LambdaConfig
+ 
+ 
+ def maybe_encode_body(body: Union[str, bytes], *, is_base64: bool) -> bytes:
+@@ -81,3 +81,15 @@ def handle_base64_response_body(
+             is_base64_encoded = True
+ 
+     return output_body, is_base64_encoded
++
++
++def handle_exclude_headers(
++    headers: Dict[str, Any], config: LambdaConfig
++) -> Dict[str, Any]:
++    finalized_headers = {}
++    for header_key, header_value in headers.items():
++        if header_key in config["exclude_headers"]:
++            continue
++        finalized_headers[header_key] = header_value
++
++    return finalized_headers
+diff --git a/mangum/types.py b/mangum/types.py
+index b50b0b2..0ff436c 100644
+--- a/mangum/types.py
++++ b/mangum/types.py
+@@ -117,6 +117,7 @@ class Response(TypedDict):
+ class LambdaConfig(TypedDict):
+     api_gateway_base_path: str
+     text_mime_types: List[str]
++    exclude_headers: List[str]
+ 
+ 
+ class LambdaHandler(Protocol):

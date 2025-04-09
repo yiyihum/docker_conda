@@ -1,0 +1,143 @@
+diff --git a/hutch_python/load_conf.py b/hutch_python/load_conf.py
+index 92d37389..43e7e7f4 100644
+--- a/hutch_python/load_conf.py
++++ b/hutch_python/load_conf.py
+@@ -19,7 +19,7 @@ def load(filename):
+ 
+     Returns
+     -------
+-    objs: dict{str: Object}
++    objs: dict{str: object}
+         All objects defined by the file that need to make it into the
+         environment. The strings are the names that will be accessible in the
+         global namespace.
+@@ -31,16 +31,35 @@ def load(filename):
+ 
+ def read_conf(conf):
+     """
+-    Separate this from load to make it easier to test without tons of temp
+-    files.
+-
+     Parameters
+     ----------
+     conf: dict
+         dict interpretation of the original yaml file
++
++    Returns
++    ------
++    objs: dict{str: object}
++        Return value of load
+     """
+     hutch_python.clear_load()
+-    all_objects = hutch_python.objects
++    plugins = get_plugins(conf)
++    objects = run_plugins(plugins)
++    return objects
++
++
++def get_plugins(conf):
++    """
++    Parameters
++    ----------
++    conf: dict
++        dict interpretation of the original yaml file
++
++    Returns
++    -------
++    plugins: dict{int: list}
++        Mapping from priority level to list of instantiated plugins at that
++        prority.
++    """
+     plugins = defaultdict(list)
+ 
+     for plugin_name, info in conf.items():
+@@ -54,6 +73,25 @@ def read_conf(conf):
+         this_plugin = module.Plugin(info)
+         plugins[this_plugin.priority].append(this_plugin)
+ 
++    return plugins
++
++
++def run_plugins(plugins):
++    """
++    Create all of the objects, given plugin instructions.
++
++    Parameters
++    ----------
++    plugins: dict{int: list}
++        Return value from get_plugins
++
++    Returns
++    ------
++    objs: dict{str: object}
++        Return value of load
++    """
++    all_objects = hutch_python.objects
++
+     plugin_priorities = reversed(sorted(list(plugins.keys())))
+     executed_plugins = []
+ 
+diff --git a/hutch_python/log_setup.py b/hutch_python/log_setup.py
+index 2ad989cf..51f928fa 100644
+--- a/hutch_python/log_setup.py
++++ b/hutch_python/log_setup.py
+@@ -7,6 +7,7 @@ import yaml
+ logger = logging.getLogger(__name__)
+ 
+ DIR_MODULE = Path(__file__).resolve().parent.parent
++DEFAULT_YAML = DIR_MODULE / 'logging.yml'
+ DIR_LOGS = DIR_MODULE / 'hutch_python/logs'
+ 
+ 
+@@ -32,7 +33,7 @@ def setup_logging(path_yaml=None, dir_logs=None, default_level=logging.INFO):
+     """
+     # Get the yaml path
+     if path_yaml is None:
+-        path_yaml = DIR_MODULE / 'logging.yml'
++        path_yaml = DEFAULT_YAML
+     # Make sure we are using Path objects
+     else:
+         path_yaml = Path(path_yaml)
+diff --git a/hutch_python/plugins/namespace.py b/hutch_python/plugins/namespace.py
+index 0b87ce1c..49f0ca43 100644
+--- a/hutch_python/plugins/namespace.py
++++ b/hutch_python/plugins/namespace.py
+@@ -65,7 +65,7 @@ class NamespaceManager:
+         self.name = name
+ 
+     def should_include(self, name, obj):
+-        return False
++        raise NotImplementedError('Need to subclass should_include')
+ 
+     def add(self, name, obj):
+         if self.should_include(name, obj):
+diff --git a/hutch_python/utils.py b/hutch_python/utils.py
+index 57e24e64..ba201a09 100644
+--- a/hutch_python/utils.py
++++ b/hutch_python/utils.py
+@@ -27,9 +27,10 @@ def extract_objs(module_name):
+     """
+     objs = {}
+     # Allow filenames
+-    module_name = module_name.strip('.py')
+-    if '()' in module_name:
+-        module_name = module_name.strip('()')
++    if module_name.endswith('.py'):
++        module_name = module_name[:-3]
++    elif module_name.endswith('()'):
++        module_name = module_name[:-2]
+         call_me = True
+     else:
+         call_me = False
+@@ -45,8 +46,9 @@ def extract_objs(module_name):
+             else:
+                 objs[name] = my_obj
+             return objs
+-    except Exception:
+-        logger.exception('Error loading %s', module_name)
++    except Exception as exc:
++        logger.error('Error loading %s', module_name)
++        logger.debug(exc, exc_info=True)
+         return objs
+     all_kwd = getattr(module, '__all__', None)
+     if all_kwd is None:

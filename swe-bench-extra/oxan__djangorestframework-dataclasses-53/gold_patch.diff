@@ -1,0 +1,84 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 7e49293..21969f6 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -1,3 +1,7 @@
++1.1.1, TBD
++----------
++* Fix usage of PEP 585 generics with forward references (e.g. ``list["str"]``).
++
+ 1.1.0, 9 January 2021
+ ---------------------
+ Features & fixes:
+diff --git a/rest_framework_dataclasses/field_utils.py b/rest_framework_dataclasses/field_utils.py
+index 636c5e5..1a8d37b 100644
+--- a/rest_framework_dataclasses/field_utils.py
++++ b/rest_framework_dataclasses/field_utils.py
+@@ -30,9 +30,7 @@ def get_dataclass_definition(dataclass_type: type) -> DataclassDefinition:
+     Given a dataclass class, returns a dictionary mapping field names to
+     `dataclasses.Field` instances describing all fields on the dataclass.
+     """
+-    # Resolve the typehint from the dataclass fields (which can be stringified, especially with PEP 563 nowadays) to
+-    # actual type objects. Based on the discussion in https://stackoverflow.com/a/55938344.
+-    types = typing.get_type_hints(dataclass_type)
++    types = typing_utils.get_resolved_type_hints(dataclass_type)
+ 
+     # Disable PyCharm warning here, as it is wrong.
+     # noinspection PyDataclass
+diff --git a/rest_framework_dataclasses/typing_utils.py b/rest_framework_dataclasses/typing_utils.py
+index 163d06d..d2c0bcd 100644
+--- a/rest_framework_dataclasses/typing_utils.py
++++ b/rest_framework_dataclasses/typing_utils.py
+@@ -16,15 +16,16 @@ Note that there was some promising development in the `typing_inspect` module, b
+ development seems to have stalled. Maybe in the future?
+ """
+ import collections
++import sys
++import types
+ import typing
+ 
+ from .types import Final, Literal
+ 
+ # types.UnionType was added in Python 3.10 for new PEP 604 pipe union syntax
+ try:
+-    from types import UnionType
+-    UNION_TYPES = (typing.Union, UnionType)
+-except ImportError:
++    UNION_TYPES = (typing.Union, types.UnionType)
++except AttributeError:
+     UNION_TYPES = (typing.Union,)
+ 
+ # Wrappers around typing.get_origin() and typing.get_args() for Python 3.7
+@@ -45,6 +46,32 @@ except AttributeError:
+ #   if it's a type.
+ 
+ 
++def get_resolved_type_hints(tp: type) -> typing.Dict[str, type]:
++    """
++    Get the resolved type hints of an object.
++
++    Resolving the type hints means converting any stringified type hint into an actual type object. These can come from
++    either forward references (PEP 484), or postponed evaluation (PEP 563).
++    """
++    # typing.get_type_hints() does the heavy lifting for us, except when using PEP 585 generic types that contain a
++    # stringified type hint (see https://bugs.python.org/issue41370)
++    def _resolve_type(context_type: type, resolve_type: typing.Union[str, type]) -> type:
++        if isinstance(resolve_type, str):
++            globalsns = sys.modules[context_type.__module__].__dict__
++            return globalsns.get(resolve_type, resolve_type)
++        else:
++            return _resolve_type_hint(context_type, resolve_type)
++
++    def _resolve_type_hint(context_type: type, resolve_type: type) -> type:
++        if not hasattr(types, 'GenericAlias') or not isinstance(resolve_type, types.GenericAlias):
++            return resolve_type
++
++        args = tuple(_resolve_type(context_type, arg) for arg in resolve_type.__args__)
++        return types.GenericAlias(resolve_type.__origin__, args)
++
++    return {k: _resolve_type_hint(tp, v) for k, v in typing.get_type_hints(tp).items()}
++
++
+ def is_iterable_type(tp: type) -> bool:
+     """
+     Test if the given type is iterable.

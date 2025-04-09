@@ -1,0 +1,152 @@
+diff --git a/pooch/core.py b/pooch/core.py
+index 8a09770..9b3ea19 100644
+--- a/pooch/core.py
++++ b/pooch/core.py
+@@ -13,6 +13,7 @@ from .utils import (
+     parse_url,
+     get_logger,
+     make_local_storage,
++    cache_location,
+     hash_matches,
+     temporary_file,
+     os_cache,
+@@ -200,9 +201,10 @@ def retrieve(url, known_hash, fname=None, path=None, processor=None, downloader=
+         fname = unique_file_name(url)
+     # Create the local data directory if it doesn't already exist and make the
+     # path absolute.
+-    path = make_local_storage(path, env=None, version=None).resolve()
++    path = cache_location(path, env=None, version=None)
++    make_local_storage(path)
+ 
+-    full_path = path / fname
++    full_path = path.resolve() / fname
+     action, verb = download_action(full_path, known_hash)
+ 
+     if action in ("download", "update"):
+@@ -253,6 +255,12 @@ def create(
+     ``https://github.com/fatiando/pooch/raw/v0.1/data``). If the version string
+     contains ``+XX.XXXXX``, it will be interpreted as a development version.
+ 
++    Does **not** create the local data storage folder. The folder will only be
++    created the first time a download is attempted with
++    :meth:`pooch.Pooch.fetch`. This makes it safe to use this function at the
++    module level (so it's executed on ``import`` and the resulting
++    :class:`~pooch.Pooch` is a global variable).
++
+     Parameters
+     ----------
+     path : str, PathLike, list or tuple
+@@ -307,6 +315,9 @@ def create(
+     ...              registry={"data.txt": "9081wo2eb2gc0u..."})
+     >>> print(pup.path.parts)  # The path is a pathlib.Path
+     ('myproject', 'v0.1')
++    >>> # The local folder is only created when a dataset is first downloaded
++    >>> print(pup.path.exists())
++    False
+     >>> print(pup.base_url)
+     http://some.link.com/v0.1/
+     >>> print(pup.registry)
+@@ -368,7 +379,12 @@ def create(
+     if version is not None:
+         version = check_version(version, fallback=version_dev)
+         base_url = base_url.format(version=version)
+-    path = make_local_storage(path, env, version)
++    # Don't create the cache folder here! This function is usually called in
++    # the module context (at import time), so touching the file system is not
++    # recommended. It could cause crashes when multiple processes/threads try
++    # to import at the same time (which would try to create the folder several
++    # times at once).
++    path = cache_location(path, env, version)
+     pup = Pooch(path=path, base_url=base_url, registry=registry, urls=urls)
+     return pup
+ 
+@@ -545,7 +561,7 @@ class Pooch:
+         self._assert_file_in_registry(fname)
+ 
+         # Create the local data directory if it doesn't already exist
+-        os.makedirs(str(self.abspath), exist_ok=True)
++        make_local_storage(str(self.abspath))
+ 
+         url = self.get_url(fname)
+         full_path = self.abspath / fname
+diff --git a/pooch/utils.py b/pooch/utils.py
+index fa88114..93e03c9 100644
+--- a/pooch/utils.py
++++ b/pooch/utils.py
+@@ -216,11 +216,12 @@ def parse_url(url):
+     return {"protocol": protocol, "netloc": parsed_url.netloc, "path": parsed_url.path}
+ 
+ 
+-def make_local_storage(path, env=None, version=None):
++def cache_location(path, env=None, version=None):
+     """
+-    Create the local cache directory and make sure it's writable.
++    Location of the cache given a base path and optional configuration.
+ 
+-    If the directory doesn't exist, it will be created.
++    Checks for the environment variable to overwrite the path of the local
++    cache. Optionally add *version* to the path if given.
+ 
+     Parameters
+     ----------
+@@ -249,6 +250,22 @@ def make_local_storage(path, env=None, version=None):
+     if version is not None:
+         path = os.path.join(str(path), version)
+     path = os.path.expanduser(str(path))
++    return Path(path)
++
++
++def make_local_storage(path, env=None):
++    """
++    Create the local cache directory and make sure it's writable.
++
++    Parameters
++    ----------
++    path : str or PathLike
++        The path to the local data storage folder.
++    env : str or None
++        An environment variable that can be used to overwrite *path*. Only used
++        in the error message in case the folder is not writable.
++    """
++    path = str(path)
+     # Check that the data directory is writable
+     try:
+         if not os.path.exists(path):
+@@ -261,24 +278,19 @@ def make_local_storage(path, env=None, version=None):
+             action = "write to"
+             with tempfile.NamedTemporaryFile(dir=path):
+                 pass
+-    except PermissionError:
+-        # Only log an error message instead of raising an exception. The cache
+-        # is usually created at import time, so raising an exception here would
+-        # cause packages to crash immediately, even if users aren't using the
+-        # sample data at all. So issue a warning here just in case and only
+-        # crash with an exception when the user actually tries to download
+-        # data (Pooch.fetch or retrieve).
+-        message = (
+-            "Cannot %s data cache folder '%s'. "
+-            "Will not be able to download remote data files. "
+-        )
+-        args = [action, path]
++    except PermissionError as error:
++        message = [
++            str(error),
++            "| Pooch could not {} data cache folder '{}'.".format(action, path),
++            "Will not be able to download data files.",
++        ]
+         if env is not None:
+-            message += "Use environment variable '%s' to specify another directory."
+-            args += [env]
+-
+-        get_logger().warning(message, *args)
+-    return Path(path)
++            message.append(
++                "Use environment variable '{}' to specify a different location.".format(
++                    env
++                )
++            )
++        raise PermissionError(" ".join(message)) from error
+ 
+ 
+ def hash_algorithm(hash_string):
+

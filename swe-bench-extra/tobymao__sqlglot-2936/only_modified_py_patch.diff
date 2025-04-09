@@ -1,0 +1,127 @@
+diff --git a/sqlglot/dialects/duckdb.py b/sqlglot/dialects/duckdb.py
+index d7ba729c..e61ac4fd 100644
+--- a/sqlglot/dialects/duckdb.py
++++ b/sqlglot/dialects/duckdb.py
+@@ -333,6 +333,7 @@ class DuckDB(Dialect):
+         IGNORE_NULLS_IN_FUNC = True
+         JSON_PATH_BRACKETED_KEY_SUPPORTED = False
+         SUPPORTS_CREATE_TABLE_LIKE = False
++        MULTI_ARG_DISTINCT = False
+ 
+         TRANSFORMS = {
+             **generator.Generator.TRANSFORMS,
+diff --git a/sqlglot/dialects/postgres.py b/sqlglot/dialects/postgres.py
+index 0404c78f..68e2c6de 100644
+--- a/sqlglot/dialects/postgres.py
++++ b/sqlglot/dialects/postgres.py
+@@ -232,6 +232,9 @@ class Postgres(Dialect):
+         BYTE_STRINGS = [("e'", "'"), ("E'", "'")]
+         HEREDOC_STRINGS = ["$"]
+ 
++        HEREDOC_TAG_IS_IDENTIFIER = True
++        HEREDOC_STRING_ALTERNATIVE = TokenType.PARAMETER
++
+         KEYWORDS = {
+             **tokens.Tokenizer.KEYWORDS,
+             "~~": TokenType.LIKE,
+@@ -381,6 +384,7 @@ class Postgres(Dialect):
+         JSON_TYPE_REQUIRED_FOR_EXTRACTION = True
+         SUPPORTS_UNLOGGED_TABLES = True
+         LIKE_PROPERTY_INSIDE_SCHEMA = True
++        MULTI_ARG_DISTINCT = False
+ 
+         SUPPORTED_JSON_PATH_PARTS = {
+             exp.JSONPathKey,
+diff --git a/sqlglot/dialects/presto.py b/sqlglot/dialects/presto.py
+index 8691192b..609103e5 100644
+--- a/sqlglot/dialects/presto.py
++++ b/sqlglot/dialects/presto.py
+@@ -292,6 +292,7 @@ class Presto(Dialect):
+         LIMIT_ONLY_LITERALS = True
+         SUPPORTS_SINGLE_ARG_CONCAT = False
+         LIKE_PROPERTY_INSIDE_SCHEMA = True
++        MULTI_ARG_DISTINCT = False
+ 
+         PROPERTIES_LOCATION = {
+             **generator.Generator.PROPERTIES_LOCATION,
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 81af56d8..eff8aaa2 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -296,6 +296,10 @@ class Generator(metaclass=_Generator):
+     # Whether or not the LikeProperty needs to be specified inside of the schema clause
+     LIKE_PROPERTY_INSIDE_SCHEMA = False
+ 
++    # Whether or not DISTINCT can be followed by multiple args in an AggFunc. If not, it will be
++    # transpiled into a series of CASE-WHEN-ELSE, ultimately using a tuple conseisting of the args
++    MULTI_ARG_DISTINCT = True
++
+     # Whether or not the JSON extraction operators expect a value of type JSON
+     JSON_TYPE_REQUIRED_FOR_EXTRACTION = False
+ 
+@@ -2837,6 +2841,13 @@ class Generator(metaclass=_Generator):
+ 
+     def distinct_sql(self, expression: exp.Distinct) -> str:
+         this = self.expressions(expression, flat=True)
++
++        if not self.MULTI_ARG_DISTINCT and len(expression.expressions) > 1:
++            case = exp.case()
++            for arg in expression.expressions:
++                case = case.when(arg.is_(exp.null()), exp.null())
++            this = self.sql(case.else_(f"({this})"))
++
+         this = f" {this}" if this else ""
+ 
+         on = self.sql(expression, "on")
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index 87a49240..b0649578 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -504,6 +504,7 @@ class _Tokenizer(type):
+                 command_prefix_tokens={
+                     _TOKEN_TYPE_TO_INDEX[v] for v in klass.COMMAND_PREFIX_TOKENS
+                 },
++                heredoc_tag_is_identifier=klass.HEREDOC_TAG_IS_IDENTIFIER,
+             )
+             token_types = RsTokenTypeSettings(
+                 bit_string=_TOKEN_TYPE_TO_INDEX[TokenType.BIT_STRING],
+@@ -517,6 +518,7 @@ class _Tokenizer(type):
+                 semicolon=_TOKEN_TYPE_TO_INDEX[TokenType.SEMICOLON],
+                 string=_TOKEN_TYPE_TO_INDEX[TokenType.STRING],
+                 var=_TOKEN_TYPE_TO_INDEX[TokenType.VAR],
++                heredoc_string_alternative=_TOKEN_TYPE_TO_INDEX[klass.HEREDOC_STRING_ALTERNATIVE],
+             )
+             klass._RS_TOKENIZER = RsTokenizer(settings, token_types)
+         else:
+@@ -573,6 +575,12 @@ class Tokenizer(metaclass=_Tokenizer):
+     STRING_ESCAPES = ["'"]
+     VAR_SINGLE_TOKENS: t.Set[str] = set()
+ 
++    # Whether or not the heredoc tags follow the same lexical rules as unquoted identifiers
++    HEREDOC_TAG_IS_IDENTIFIER = False
++
++    # Token that we'll generate as a fallback if the heredoc prefix doesn't correspond to a heredoc
++    HEREDOC_STRING_ALTERNATIVE = TokenType.VAR
++
+     # Autofilled
+     _COMMENTS: t.Dict[str, str] = {}
+     _FORMAT_STRINGS: t.Dict[str, t.Tuple[str, TokenType]] = {}
+@@ -1249,6 +1257,18 @@ class Tokenizer(metaclass=_Tokenizer):
+             elif token_type == TokenType.BIT_STRING:
+                 base = 2
+             elif token_type == TokenType.HEREDOC_STRING:
++                if (
++                    self.HEREDOC_TAG_IS_IDENTIFIER
++                    and not self._peek.isidentifier()
++                    and not self._peek == end
++                ):
++                    if self.HEREDOC_STRING_ALTERNATIVE != token_type.VAR:
++                        self._add(self.HEREDOC_STRING_ALTERNATIVE)
++                    else:
++                        self._scan_var()
++
++                    return True
++
+                 self._advance()
+                 tag = "" if self._char == end else self._extract_string(end)
+                 end = f"{start}{tag}{end}"

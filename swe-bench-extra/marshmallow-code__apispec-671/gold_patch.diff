@@ -1,0 +1,193 @@
+diff --git a/docs/special_topics.rst b/docs/special_topics.rst
+index 892d4a0..43170a1 100644
+--- a/docs/special_topics.rst
++++ b/docs/special_topics.rst
+@@ -53,14 +53,29 @@ JSON
+ Documenting Top-level Components
+ --------------------------------
+ 
+-The ``APISpec`` object contains helpers to add top-level components.
+-
+-To add a schema (f.k.a. "definition" in OAS v2), use
+-`spec.components.schema <apispec.core.Components.schema>`.
+-
+-Likewise, parameters and responses can be added using
+-`spec.components.parameter <apispec.core.Components.parameter>` and
+-`spec.components.response <apispec.core.Components.response>`.
++The ``APISpec`` object contains helpers to add top-level components:
++
++.. list-table:: 
++   :header-rows: 1
++
++   * - Component type
++     - Helper method
++     - OpenAPI version
++   * - Schema (f.k.a. "definition" in OAS v2)
++     - `spec.components.schema <apispec.core.Components.schema>`
++     - 2, 3
++   * - Parameter
++     - `spec.components.parameter <apispec.core.Components.parameter>`
++     - 2, 3
++   * - Reponse
++     - `spec.components.response <apispec.core.Components.response>`
++     - 2, 3
++   * - Header
++     - `spec.components.response <apispec.core.Components.header>`
++     - 3
++   * - Example
++     - `spec.components.response <apispec.core.Components.example>`
++     - 3
+ 
+ To add other top-level objects, pass them to the ``APISpec`` as keyword arguments.
+ 
+@@ -134,3 +149,18 @@ to document `Security Scheme Objects <https://github.com/OAI/OpenAPI-Specificati
+     pprint(spec.to_dict()["components"]["securitySchemes"], indent=2)
+     # { 'api_key': {'in': 'header', 'name': 'X-API-Key', 'type': 'apiKey'},
+     #   'jwt': {'bearerFormat': 'JWT', 'scheme': 'bearer', 'type': 'http'}}
++
++Referencing Top-level Components
++--------------------------------
++
++On OpenAPI, top-level component are meant to be referenced using a ``$ref``,
++as in ``{$ref: '#/components/schemas/Pet'}`` (OpenAPI v3) or
++``{$ref: '#/definitions/Pet'}`` (OpenAPI v2).
++
++APISpec automatically resolves references in paths and in components themselves
++when a string is provided while a dict is expected. Passing a fully-resolved
++reference is not supported. In other words, rather than passing
++``{"schema": {$ref: '#/components/schemas/Pet'}}``, the user must pass
++``{"schema": "Pet"}``. APISpec assumes a schema reference named ``"Pet"`` has
++been defined and builds the reference using the components location
++corresponding to the OpenAPI version.
+diff --git a/src/apispec/core.py b/src/apispec/core.py
+index 54bb7e3..3aa7029 100644
+--- a/src/apispec/core.py
++++ b/src/apispec/core.py
+@@ -86,6 +86,7 @@ class Components:
+                 ret.update(plugin.schema_helper(name, component, **kwargs) or {})
+             except PluginMethodNotImplementedError:
+                 continue
++        self._resolve_refs_in_schema(ret)
+         self.schemas[name] = ret
+         return self
+ 
+@@ -110,6 +111,7 @@ class Components:
+                 ret.update(plugin.response_helper(component, **kwargs) or {})
+             except PluginMethodNotImplementedError:
+                 continue
++        self._resolve_refs_in_response(ret)
+         self.responses[component_id] = ret
+         return self
+ 
+@@ -142,6 +144,7 @@ class Components:
+                 ret.update(plugin.parameter_helper(component, **kwargs) or {})
+             except PluginMethodNotImplementedError:
+                 continue
++        self._resolve_refs_in_parameter_or_header(ret)
+         self.parameters[component_id] = ret
+         return self
+ 
+@@ -157,6 +160,7 @@ class Components:
+             raise DuplicateComponentNameError(
+                 f'Another header with name "{component_id}" is already registered.'
+             )
++        self._resolve_refs_in_parameter_or_header(component)
+         self.headers[component_id] = component
+         return self
+ 
+@@ -205,44 +209,66 @@ class Components:
+         return build_reference(obj_type, self.openapi_version.major, obj)
+ 
+     def _resolve_schema(self, obj):
+-        """Replace schema reference as string with a $ref if needed."""
+-        if not isinstance(obj, dict):
+-            return
+-        if self.openapi_version.major < 3:
+-            if "schema" in obj:
+-                obj["schema"] = self.get_ref("schema", obj["schema"])
+-        else:
+-            if "content" in obj:
+-                for content in obj["content"].values():
+-                    if "schema" in content:
+-                        content["schema"] = self.get_ref("schema", content["schema"])
++        """Replace schema reference as string with a $ref if needed
++
++        Also resolve references in the schema
++        """
++        if "schema" in obj:
++            obj["schema"] = self.get_ref("schema", obj["schema"])
++            self._resolve_refs_in_schema(obj["schema"])
+ 
+     def _resolve_examples(self, obj):
+         """Replace example reference as string with a $ref"""
+         for name, example in obj.get("examples", {}).items():
+             obj["examples"][name] = self.get_ref("example", example)
+ 
+-    def _resolve_refs_in_parameter(self, parameter):
+-        self._resolve_examples(parameter)
++    def _resolve_refs_in_schema(self, schema):
++        if "properties" in schema:
++            for key in schema["properties"]:
++                schema["properties"][key] = self.get_ref(
++                    "schema", schema["properties"][key]
++                )
++                self._resolve_refs_in_schema(schema["properties"][key])
++        if "items" in schema:
++            schema["items"] = self.get_ref("schema", schema["items"])
++            self._resolve_refs_in_schema(schema["items"])
++        for key in ("allOf", "oneOf", "anyOf"):
++            if key in schema:
++                schema[key] = [self.get_ref("schema", s) for s in schema[key]]
++                for sch in schema[key]:
++                    self._resolve_refs_in_schema(sch)
++        if "not" in schema:
++            schema["not"] = self.get_ref("schema", schema["not"])
++            self._resolve_refs_in_schema(schema["not"])
++
++    def _resolve_refs_in_parameter_or_header(self, parameter_or_header):
++        self._resolve_schema(parameter_or_header)
++        self._resolve_examples(parameter_or_header)
+ 
+     def _resolve_refs_in_request_body(self, request_body):
+-        self._resolve_schema(request_body)
++        # requestBody is OpenAPI v3+
+         for media_type in request_body["content"].values():
++            self._resolve_schema(media_type)
+             self._resolve_examples(media_type)
+ 
+     def _resolve_refs_in_response(self, response):
+-        self._resolve_schema(response)
+-        for name, header in response.get("headers", {}).items():
+-            response["headers"][name] = self.get_ref("header", header)
+-        for media_type in response.get("content", {}).values():
+-            self._resolve_examples(media_type)
++        if self.openapi_version.major < 3:
++            self._resolve_schema(response)
++        else:
++            for media_type in response.get("content", {}).values():
++                self._resolve_schema(media_type)
++                self._resolve_examples(media_type)
++            for name, header in response.get("headers", {}).items():
++                response["headers"][name] = self.get_ref("header", header)
++                self._resolve_refs_in_parameter_or_header(response["headers"][name])
++            # TODO: Resolve link refs when Components supports links
+ 
+     def _resolve_refs_in_operation(self, operation):
+         if "parameters" in operation:
+             parameters = []
+             for parameter in operation["parameters"]:
+                 parameter = self.get_ref("parameter", parameter)
+-                self._resolve_refs_in_parameter(parameter)
++                self._resolve_refs_in_parameter_or_header(parameter)
+                 parameters.append(parameter)
+             operation["parameters"] = parameters
+         if "requestBody" in operation:
+@@ -260,7 +286,7 @@ class Components:
+             parameters = []
+             for parameter in path["parameters"]:
+                 parameter = self.get_ref("parameter", parameter)
+-                self._resolve_refs_in_parameter(parameter)
++                self._resolve_refs_in_parameter_or_header(parameter)
+                 parameters.append(parameter)
+             path["parameters"] = parameters
+         for method in (

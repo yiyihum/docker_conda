@@ -1,0 +1,69 @@
+diff --git a/tests/test_client.py b/tests/test_client.py
+index 954ff06..2e39828 100644
+--- a/tests/test_client.py
++++ b/tests/test_client.py
+@@ -3,6 +3,7 @@ import concurrent
+ from unittest.mock import ANY, patch
+ 
+ import pytest
++from google.api_core import exceptions
+ from google.cloud.pubsub_v1 import SubscriberClient
+ 
+ 
+@@ -63,6 +64,21 @@ class TestPublisher:
+         )
+         mock_future.assert_called_once_with(timeout=100)
+ 
++    @patch.object(concurrent.futures.Future, "result")
++    def test_publishes_data_with_client_timeout_when_blocking_and_timeout_specified(
++        self, mock_future, publisher
++    ):
++        publisher._timeout = 100.0
++        publisher.publish(
++            topic="order-cancelled", data={"foo": "bar"}, blocking=True, timeout=50
++        )
++
++        publisher._client.publish.return_value = mock_future
++        publisher._client.publish.assert_called_with(
++            ANY, b'{"foo": "bar"}', published_at=ANY
++        )
++        mock_future.assert_called_once_with(timeout=50)
++
+ 
+ class TestSubscriber:
+     @patch.object(SubscriberClient, "create_subscription")
+@@ -92,3 +108,34 @@ class TestSubscriber:
+         _mocked_client.assert_called_once_with(
+             ack_deadline_seconds=100, name=expected_subscription, topic=expected_topic
+         )
++
++    @patch.object(
++        SubscriberClient,
++        "create_subscription",
++        side_effect=exceptions.AlreadyExists("Subscription already exists"),
++    )
++    def test_does_not_raise_when_subscription_already_exists(
++        self, _mocked_client, project_id, subscriber
++    ):
++        subscriber.create_subscription(
++            subscription="test-topic", topic=f"{project_id}-test-topic"
++        )
++
++        _mocked_client.assert_called()
++
++    @patch.object(
++        SubscriberClient,
++        "create_subscription",
++        side_effect=exceptions.NotFound("Subscription topic does not exist"),
++    )
++    def test_logs_error_when_subscription_topic_does_not_exist(
++        self, _mocked_client, project_id, subscriber, caplog
++    ):
++        subscriber.create_subscription(
++            subscription="test-topic", topic=f"{project_id}-test-topic"
++        )
++
++        _mocked_client.assert_called()
++        log = caplog.records[0]
++        assert log.message == "Cannot subscribe to a topic that does not exist."
++        assert log.levelname == "ERROR"

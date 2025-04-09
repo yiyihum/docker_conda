@@ -1,0 +1,167 @@
+diff --git a/cro/cro.py b/cro/cro.py
+index b7231dd..7c24105 100644
+--- a/cro/cro.py
++++ b/cro/cro.py
+@@ -1,15 +1,24 @@
+ #!/usr/bin/env python
+ # coding=utf-8
+ ###############################################################################
+-
+-from __future__ import division
++from __future__ import division, print_function
++import sys
++import logging
+ import numpy as np
++
++from .reef_initialization import get_reefinit_function
+ from .larvaemutation import get_larvaemutation_function
+ 
+ class CRO(object):
+     def __init__(self, Ngen, N, M, Fb, Fa, Fd, r0, k, Pd, fitness_coral, opt, L=None,
+                  ke=0.2, npolyps=1, seed=None, mode='bin', param_grid={}, verbose=False):
+         
++        # Set logging configuration
++        logging_level = logging.INFO if verbose else logging.WARNING
++        logging.basicConfig(stream=sys.stdout,
++                            format="%(message)s")
++        logging.getLogger().setLevel(logging_level)
++
+         self.Ngen = Ngen
+         self.N    = N
+         self.M    = M
+@@ -29,9 +38,11 @@ class CRO(object):
+         self.mode = mode
+         self.param_grid = param_grid
+         self.verbose = verbose
+-        
+-        print("[*Running] Initialization: ", self.opt) 
+ 
++        self.reefinit_function = get_reefinit_function(mode)
++        self.larvaemutation_function = get_larvaemutation_function(mode)
++        logging.info("Running Initialization: %s", self.opt) 
++        
+     def reefinitialization (self):   
+         """    
+         function [REEF,REEFpob]=reefinitialization(M,N,r0,L)
+@@ -45,37 +56,9 @@ class CRO(object):
+             - REEF: reef matrix
+             - REEFpob: population matrix
+         """  
+-        
+-        # print error. Maybe use other place for all arg-checks
+-        if ( (self.param_grid=={}) & (self.mode =='disc') ):
+-            print('\nThis mode (', self.mode, ') needs a param_grid as a dictionary')
+-            return -1
+- 
+-        # commom for all modes
+-        np.random.seed(seed = self.seed)
+-        O = int(np.round(self.N*self.M*self.r0)) # number of occupied reefs 
+-        
+-        # Binary mode
+-        if self.mode =='bin': 
+-            A = np.random.randint(2, size=[O, self.L])
+-            B = np.zeros([( (self.N*self.M)-O), self.L], int)          
+-            REEFpob = np.concatenate([A,B]) # Population creation
+-            REEF = np.array((REEFpob.any(axis=1)),int) 
+-            return (REEF, REEFpob)
+-        
+-        # Discrete mode
+-        elif self.mode =='disc':
+-            for key, value in self.param_grid.items():
+-                valmax = (value[1] - value[0] + 1)
+-                A = np.random.randint(valmax, size=[O, self.L]) + value[0]
+-                B = np.zeros([( (self.N*self.M)-O), self.L], int)
+-                REEFpob = np.concatenate([A,B]) # Population creation
+-                REEF = np.array((REEFpob.any(axis=1)),int) 
+-                return (REEF, REEFpob)
+-        
+-        else: 
+-            print('\nThis mode (', self.mode, ') is not available')
+-            return -1
++        np.random.seed(seed = self.seed) # commom for all modes
++        REEF, REEFpob = self.reefinit_function(self.M, self.N, self.r0, self.L, param_grid=self.param_grid)
++        return REEF, REEFpob
+ 
+     def fitness(self, REEFpob):
+         """
+@@ -163,8 +146,8 @@ class CRO(object):
+                 
+         pos = np.random.randint(brooders.shape[1], size=(npolyps, nbrooders))
+         
+-        larvaemutation_function = get_larvaemutation_function(self.mode)
+-        brooders = larvaemutation_function(brooders, pos, delta=1, param_grid=self.param_grid, seed=self.seed)
++        brooders = self.larvaemutation_function(brooders, pos, delta=1,
++                                                param_grid=self.param_grid, seed=self.seed)
+                                      
+         return brooders
+    
+@@ -384,8 +367,7 @@ class CRO(object):
+ 
+         Bestfitness.append(self.opt_multiplier*np.min(REEFfitness))
+         Meanfitness.append(self.opt_multiplier*np.mean(REEFfitness))
+-        if verbose:
+-            print('Reef initialization:', self.opt_multiplier*np.min(REEFfitness))
++        logging.info('Reef initialization: %s', self.opt_multiplier*np.min(REEFfitness))
+ 
+ 
+         for n in range(Ngen):
+@@ -413,14 +395,13 @@ class CRO(object):
+             Meanfitness.append(self.opt_multiplier*np.mean(REEFfitness))
+ 
+             if all([n%10 == 0, n != Ngen, verbose]):
+-                print('Best-fitness:', self.opt_multiplier*np.min(REEFfitness), '\n', str(n/Ngen*100) + '% completado \n' );
++                logging.info('Best-fitness: %s, (%.2f%% completado)', self.opt_multiplier*np.min(REEFfitness), n/Ngen*100)
+ 
+-        if verbose:
+-            print('Best-fitness:', self.opt_multiplier*np.min(REEFfitness), '\n', str(100) + '% completado \n' ) 
++        logging.info('Best-fitness: %s. (100%% completado)', self.opt_multiplier*np.min(REEFfitness))
+         ind_best = np.where(REEFfitness == np.min(REEFfitness))[0][0]
+ 
+         self.plot_results(Bestfitness, Meanfitness)
+         print('Best coral: ', REEFpob[ind_best, :])
+-        print('Best solution:', self.opt_multiplier*REEFfitness[ind_best])
++        print('Best solution: ', self.opt_multiplier*REEFfitness[ind_best])
+         
+         return (REEF, REEFpob, REEFfitness, ind_best, Bestfitness, Meanfitness)
+diff --git a/cro/larvaemutation.py b/cro/larvaemutation.py
+index 835e7f6..20211a7 100644
+--- a/cro/larvaemutation.py
++++ b/cro/larvaemutation.py
+@@ -87,6 +87,6 @@ def get_larvaemutation_function(mode):
+         logging.info("Using {}".format(name))
+     else:
+         name, func = mode_functions[0]
+-        logging.info("Using {} for initializing the reef".format(name))
++        logging.info("Using {} for the brooding operator".format(name))
+ 
+-    return func
+\ No newline at end of file
++    return func
+diff --git a/cro/utils.py b/cro/utils.py
+index 5ffd7ff..980e657 100644
+--- a/cro/utils.py
++++ b/cro/utils.py
+@@ -31,5 +31,3 @@ def get_module_functions(module_name):
+     """
+     current_module = sys.modules[module_name]
+     return dict(getmembers(current_module, predicate=isfunction))
+-
+-
+diff --git a/examples/example_advanced.py b/examples/example_advanced.py
+index 9b5d55b..39e1378 100644
+--- a/examples/example_advanced.py
++++ b/examples/example_advanced.py
+@@ -90,9 +90,9 @@ if __name__ == '__main__':
+                             get_prediction=lambda gbr, X: gbr.predict(X), 
+                             metric=mean_squared_error)
+     start = time.time()
+-    cro = CRO(Ngen, N, M, Fb, Fa, Fd, r0, k, Pd, fitness_coral, opt, L, verbose=True)
++    cro = CRO(Ngen, N, M, Fb, Fa, Fd, r0, k, Pd, fitness_coral, opt, L, seed=13, verbose=True)
+     (REEF, REEFpob, REEFfitness, ind_best, Bestfitness, Meanfitness) = cro.fit(X, y, gbr)
+     print("Example II: feature selection, regression (min mse): ", time.time() - start, "seconds.")
+     
+     names = np.array(['CRIM', 'ZN', 'INDUS', 'CHAS', 'NOX', 'RM', 'AGE', 'DIS', 'RAD', 'TAX', 'PTRATIO', 'B', 'LSTAT'])
+-    print(names[REEFpob[ind_best, :]>0])
+\ No newline at end of file
++    print(names[REEFpob[ind_best, :]>0])
+

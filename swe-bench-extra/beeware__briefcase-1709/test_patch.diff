@@ -1,0 +1,223 @@
+diff --git a/tests/commands/create/test_install_app_requirements.py b/tests/commands/create/test_install_app_requirements.py
+index 2a357c32..59dda9dc 100644
+--- a/tests/commands/create/test_install_app_requirements.py
++++ b/tests/commands/create/test_install_app_requirements.py
+@@ -7,6 +7,7 @@ import pytest
+ import tomli_w
+ 
+ from briefcase.commands.create import _is_local_requirement
++from briefcase.console import LogLevel
+ from briefcase.exceptions import BriefcaseCommandError, RequirementsInstallError
+ from briefcase.integrations.subprocess import Subprocess
+ 
+@@ -285,13 +286,17 @@ def test_app_packages_offline(
+     assert myapp.test_requires is None
+ 
+ 
++@pytest.mark.parametrize("logging_level", [LogLevel.INFO, LogLevel.DEEP_DEBUG])
+ def test_app_packages_install_requirements(
+     create_command,
+     myapp,
+     app_packages_path,
+     app_packages_path_index,
++    logging_level,
+ ):
+     """Requirements can be installed."""
++    # Configure logging level
++    create_command.logger.verbosity = logging_level
+ 
+     # Set up the app requirements
+     myapp.requires = ["first", "second", "third"]
+@@ -319,10 +324,9 @@ def test_app_packages_install_requirements(
+             "--upgrade",
+             "--no-user",
+             f"--target={app_packages_path}",
+-            "first",
+-            "second",
+-            "third",
+-        ],
++        ]
++        + (["-vv"] if logging_level == LogLevel.DEEP_DEBUG else [])
++        + ["first", "second", "third"],
+         check=True,
+         encoding="UTF-8",
+     )
+diff --git a/tests/commands/dev/test_install_dev_requirements.py b/tests/commands/dev/test_install_dev_requirements.py
+index b8a02705..a813a4cd 100644
+--- a/tests/commands/dev/test_install_dev_requirements.py
++++ b/tests/commands/dev/test_install_dev_requirements.py
+@@ -3,11 +3,16 @@ from subprocess import CalledProcessError
+ 
+ import pytest
+ 
++from briefcase.console import LogLevel
+ from briefcase.exceptions import RequirementsInstallError
+ 
+ 
+-def test_install_requirements_no_error(dev_command, first_app):
++@pytest.mark.parametrize("logging_level", [LogLevel.INFO, LogLevel.DEEP_DEBUG])
++def test_install_requirements_no_error(dev_command, first_app, logging_level):
+     """Ensure run is executed properly to install requirements."""
++    # Configure logging level
++    dev_command.logger.verbosity = logging_level
++
+     first_app.requires = ["package-one", "package_two", "packagethree"]
+ 
+     dev_command.install_dev_requirements(app=first_app)
+@@ -22,10 +27,9 @@ def test_install_requirements_no_error(dev_command, first_app):
+             "pip",
+             "install",
+             "--upgrade",
+-            "package-one",
+-            "package_two",
+-            "packagethree",
+-        ],
++        ]
++        + (["-vv"] if logging_level == LogLevel.DEEP_DEBUG else [])
++        + ["package-one", "package_two", "packagethree"],
+         check=True,
+         encoding="UTF-8",
+     )
+diff --git a/tests/console/test_Log.py b/tests/console/test_Log.py
+index 3515c137..e17f00fe 100644
+--- a/tests/console/test_Log.py
++++ b/tests/console/test_Log.py
+@@ -2,6 +2,7 @@ import contextlib
+ import datetime
+ import logging
+ from io import TextIOBase
++from pathlib import Path
+ from unittest.mock import MagicMock, PropertyMock, call
+ 
+ import pytest
+@@ -162,7 +163,7 @@ def test_save_log_to_file_do_not_log(command):
+     assert len(logger.stacktraces) == 0
+ 
+ 
+-def test_save_log_to_file_no_exception(mock_now, command, tmp_path):
++def test_save_log_to_file_no_exception(mock_now, command, tmp_path, monkeypatch):
+     """Log file contains everything printed to log; env vars are sanitized; no
+     stacktrace if one is not captured."""
+     command.tools.os.environ = {
+@@ -203,13 +204,18 @@ def test_save_log_to_file_no_exception(mock_now, command, tmp_path):
+         with command.tools.input.wait_bar("abort message..."):
+             raise KeyboardInterrupt
+ 
++    project_root = tmp_path / "project_root"
++    project_root.mkdir(exist_ok=True)
++    monkeypatch.chdir(project_root)
++    with open("pyproject.toml", "w", encoding="utf-8") as f:
++        f.writelines(["[section]\n", "name = 'project'\n\n\n\n\n"])
++
+     logger.save_log_to_file(command=command)
+ 
+     log_filepath = tmp_path / "logs/briefcase.2022_06_25-16_12_29.dev.log"
+ 
+     assert log_filepath.exists()
+-    with open(log_filepath, encoding="utf-8") as log:
+-        log_contents = log.read()
++    log_contents = log_filepath.read_text(encoding="utf-8")
+ 
+     assert log_contents.startswith("Date/Time:       2022-06-25 16:12:29")
+     assert "this is debug output" in log_contents
+@@ -235,6 +241,7 @@ def test_save_log_to_file_no_exception(mock_now, command, tmp_path):
+     assert "wait message... done" in log_contents
+     assert "abort message... started" in log_contents
+     assert "abort message... aborted" in log_contents
++    assert "pyproject.toml:\n[section]\nname = 'project'\n\nBriefcase" in log_contents
+ 
+     assert TRACEBACK_HEADER not in log_contents
+     assert EXTRA_HEADER not in log_contents
+@@ -253,8 +260,7 @@ def test_save_log_to_file_with_exception(mock_now, command, tmp_path):
+     log_filepath = tmp_path / "logs/briefcase.2022_06_25-16_12_29.dev.log"
+ 
+     assert log_filepath.exists()
+-    with open(log_filepath, encoding="utf-8") as log:
+-        log_contents = log.read()
++    log_contents = log_filepath.read_text(encoding="utf-8")
+ 
+     assert len(logger.stacktraces) == 1
+     assert log_contents.startswith("Date/Time:       2022-06-25 16:12:29")
+@@ -277,8 +283,7 @@ def test_save_log_to_file_with_multiple_exceptions(mock_now, command, tmp_path):
+     log_filepath = tmp_path / "logs/briefcase.2022_06_25-16_12_29.dev.log"
+ 
+     assert log_filepath.exists()
+-    with open(log_filepath, encoding="utf-8") as log:
+-        log_contents = log.read()
++    log_contents = log_filepath.read_text(encoding="utf-8")
+ 
+     assert len(logger.stacktraces) == 4
+     assert log_contents.startswith("Date/Time:       2022-06-25 16:12:29")
+@@ -306,8 +311,7 @@ def test_save_log_to_file_extra(mock_now, command, tmp_path):
+         logger.add_log_file_extra(extra)
+     logger.save_log_to_file(command=command)
+     log_filepath = tmp_path / "logs/briefcase.2022_06_25-16_12_29.dev.log"
+-    with open(log_filepath, encoding="utf-8") as log:
+-        log_contents = log.read()
++    log_contents = log_filepath.read_text(encoding="utf-8")
+ 
+     assert EXTRA_HEADER in log_contents
+     assert "Log extra 1" in log_contents
+@@ -334,6 +338,25 @@ def test_save_log_to_file_extra_interrupted(mock_now, command, tmp_path):
+     assert log_filepath.stat().st_size == 0
+ 
+ 
++def test_save_log_to_file_missing_pyproject(mock_now, command, tmp_path, monkeypatch):
++    """Log file contains pyproject read exception if it's missing."""
++    logger = Log()
++    logger.save_log = True
++
++    # ensure in a directory without a pyproject.toml
++    monkeypatch.chdir(tmp_path)
++    Path(tmp_path / "pyproject.toml").unlink(missing_ok=True)
++
++    logger.save_log_to_file(command=command)
++
++    log_filepath = tmp_path / "logs/briefcase.2022_06_25-16_12_29.dev.log"
++
++    assert log_filepath.exists()
++    log_contents = log_filepath.read_text(encoding="utf-8")
++
++    assert "pyproject.toml:\n[Errno 2] No such file or directory" in log_contents
++
++
+ def test_save_log_to_file_fail_to_make_logs_dir(
+     mock_now,
+     command,
+diff --git a/tests/platforms/web/static/test_build.py b/tests/platforms/web/static/test_build.py
+index 72f3f5c7..b4927ecc 100644
+--- a/tests/platforms/web/static/test_build.py
++++ b/tests/platforms/web/static/test_build.py
+@@ -10,7 +10,7 @@ else:  # pragma: no-cover-if-gte-py311
+ 
+ import pytest
+ 
+-from briefcase.console import Console, Log
++from briefcase.console import Console, Log, LogLevel
+ from briefcase.exceptions import BriefcaseCommandError, BriefcaseConfigError
+ from briefcase.integrations.subprocess import Subprocess
+ from briefcase.platforms.web.static import StaticWebBuildCommand
+@@ -32,8 +32,12 @@ def build_command(tmp_path):
+     return command
+ 
+ 
+-def test_build_app(build_command, first_app_generated, tmp_path):
++@pytest.mark.parametrize("logging_level", [LogLevel.INFO, LogLevel.DEEP_DEBUG])
++def test_build_app(build_command, first_app_generated, logging_level, tmp_path):
+     """An app can be built."""
++    # Configure logging level
++    build_command.logger.verbosity = logging_level
++
+     bundle_path = tmp_path / "base_path/build/first-app/web/static"
+ 
+     # Invoking build will create wheels as a side effect.
+@@ -110,7 +114,8 @@ def test_build_app(build_command, first_app_generated, tmp_path):
+                 bundle_path / "www/static/wheels",
+                 "-r",
+                 bundle_path / "requirements.txt",
+-            ],
++            ]
++            + (["-vv"] if logging_level == LogLevel.DEEP_DEBUG else []),
+             check=True,
+             encoding="UTF-8",
+         ),

@@ -1,0 +1,195 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index ffa7937..6811dc4 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,7 +5,13 @@ Changelog of threedi-modelchecker
+ 0.8 (unreleased)
+ ----------------
+ 
+-- Nothing changed yet.
++- Removed threedigrid from requirements.
++
++- Configured extra checks: Pumpstation.lower_stop_level > Manhole.bottom_level.
++
++- Configured extra checks: Pipe.invert_level >= .Manhole.bottom_level.
++
++- Added additional check type: QueryCheck.
+ 
+ 
+ 0.7 (2019-07-18)
+diff --git a/requirements.txt b/requirements.txt
+index b1441aa..d5ce1cd 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,4 @@
+ GeoAlchemy2==0.6.1
+ SQLAlchemy==1.3.1
+-threedigrid==1.0.10
+ Click==7.0
+ psycopg2
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+index 494f0e1..7f260cc 100644
+--- a/setup.py
++++ b/setup.py
+@@ -8,7 +8,6 @@ install_requires = [
+     "Click",
+     "GeoAlchemy2>=0.6",
+     "SQLAlchemy>=0.8",
+-    "threedigrid",
+ ]
+ 
+ tests_require = [
+diff --git a/threedi_modelchecker/checks/base.py b/threedi_modelchecker/checks/base.py
+index 37fdce2..addf0f0 100644
+--- a/threedi_modelchecker/checks/base.py
++++ b/threedi_modelchecker/checks/base.py
+@@ -76,7 +76,7 @@ class GeneralCheck(BaseCheck):
+ 
+     Either specify what is valid with `criterion_valid` or what is invalid
+     with `criterion_invalid`.
+-    The criterion should be  a sqlalchemy.sql.expression.BinaryExpression (https://docs.sqlalchemy.org/en/13/core/sqlelement.html#sqlalchemy.sql.expression.BinaryExpression)  # noqa
++    The criterion should be a sqlalchemy.sql.expression.BinaryExpression (https://docs.sqlalchemy.org/en/13/core/sqlelement.html#sqlalchemy.sql.expression.BinaryExpression)  # noqa
+     with operators being operators being column within `self.table.columns`
+     """
+ 
+@@ -143,6 +143,25 @@ class ConditionalCheck(BaseCheck):
+         )
+ 
+ 
++class QueryCheck(BaseCheck):
++    """Specify a sqlalchemy.orm.Query object to return invalid instances
++
++    Provides more freedom than the GeneralCheck where you need to specify a
++    sqlalchemy.sql.expression.BinaryExpression. For example, QueryCheck allows joins
++    on multiple tables"""
++
++    def __init__(self, column, invalid, message):
++        super().__init__(column)
++        self.invalid = invalid
++        self.message = message
++
++    def get_invalid(self, session):
++        return list(self.invalid.with_session(session))
++
++    def description(self):
++        return self.message
++
++
+ class ForeignKeyCheck(BaseCheck):
+     """Check all values in `column` are in `reference_column`.
+ 
+diff --git a/threedi_modelchecker/config.py b/threedi_modelchecker/config.py
+index e4c0908..e98d55e 100644
+--- a/threedi_modelchecker/config.py
++++ b/threedi_modelchecker/config.py
+@@ -2,8 +2,9 @@ from sqlalchemy import Integer
+ from sqlalchemy import and_
+ from sqlalchemy import cast
+ from sqlalchemy import or_
++from sqlalchemy.orm import Query
+ 
+-from .checks.base import ConditionalCheck
++from .checks.base import ConditionalCheck, QueryCheck
+ from .checks.base import GeneralCheck
+ from .checks.base import NotNullCheck
+ from .checks.factories import generate_enum_checks
+@@ -172,6 +173,22 @@ RANGE_CHECKS = [
+         column=models.Weir.friction_value,
+         criterion_valid=models.Weir.friction_value >= 0,
+     ),
++    GeneralCheck(
++        column=models.Manhole.bottom_level,
++        criterion_valid=models.Manhole.bottom_level >= models.Manhole.surface_level,
++    ),
++    GeneralCheck(
++        column=models.Manhole.bottom_level,
++        criterion_valid=models.Manhole.bottom_level >= models.Manhole.drain_level,
++    ),
++    GeneralCheck(
++        column=models.GlobalSetting.maximum_sim_time_step,
++        criterion_valid=models.GlobalSetting.maximum_sim_time_step >= models.GlobalSetting.sim_time_step,  # noqa: E501
++    ),
++    GeneralCheck(
++        column=models.GlobalSetting.sim_time_step,
++        criterion_valid=models.GlobalSetting.sim_time_step >= models.GlobalSetting.minimum_sim_time_step,  # noqa: E501
++    ),
+ ]
+ 
+ OTHER_CHECKS = [
+@@ -321,6 +338,58 @@ CONDITIONAL_CHECKS = [
+             ])
+         )
+     ),
++    QueryCheck(
++        column=models.Pumpstation.lower_stop_level,
++        invalid=Query(models.Pumpstation).join(
++            models.ConnectionNode,
++            models.Pumpstation.connection_node_start_id == models.ConnectionNode.id
++        ).join(
++            models.Manhole
++        ).filter(
++            models.Pumpstation.lower_stop_level <= models.Manhole.bottom_level,
++        ),
++        message="Pumpstation.lower_stop_level should be higher than "
++                "Manhole.bottom_level"
++    ),
++    QueryCheck(
++        column=models.Pumpstation.lower_stop_level,
++        invalid=Query(models.Pumpstation).join(
++            models.ConnectionNode,
++            models.Pumpstation.connection_node_end_id == models.ConnectionNode.id
++        ).join(
++            models.Manhole
++        ).filter(
++            models.Pumpstation.lower_stop_level <= models.Manhole.bottom_level,
++        ),
++        message="Pumpstation.lower_stop_level should be higher than "
++                "Manhole.bottom_level"
++    ),
++    QueryCheck(
++        column=models.Pipe.invert_level_end_point,
++        invalid=Query(models.Pipe).join(
++            models.ConnectionNode,
++            models.Pipe.connection_node_end_id == models.ConnectionNode.id
++        ).join(
++            models.Manhole
++        ).filter(
++            models.Pipe.invert_level_end_point < models.Manhole.bottom_level,
++        ),
++        message="Pipe.invert_level_end_point should be higher or equal than "
++                "Manhole.bottom_level"
++    ),
++    QueryCheck(
++        column=models.Pipe.invert_level_start_point,
++        invalid=Query(models.Pipe).join(
++            models.ConnectionNode,
++            models.Pipe.connection_node_start_id == models.ConnectionNode.id
++        ).join(
++            models.Manhole
++        ).filter(
++            models.Pipe.invert_level_start_point < models.Manhole.bottom_level,  # noqa: E501
++        ),
++        message="Pipe.invert_level_start_point should be higher or equal than "
++                "Manhole.bottom_level"
++    )
+ ]
+ 
+ 
+diff --git a/threedi_modelchecker/threedi_model/models.py b/threedi_modelchecker/threedi_model/models.py
+index 63ce372..8d27a29 100644
+--- a/threedi_modelchecker/threedi_model/models.py
++++ b/threedi_modelchecker/threedi_model/models.py
+@@ -325,9 +325,9 @@ class Manhole(Base):
+     shape = Column(String(4))
+     width = Column(Float)
+     length = Column(Float)
+-    surface_level = Column(Float)
+-    bottom_level = Column(Float)
+-    drain_level = Column(Float)
++    surface_level = Column(Float, nullable=False)
++    bottom_level = Column(Float, nullable=False)
++    drain_level = Column(Float, nullable=False)
+     sediment_level = Column(Float)
+     manhole_indicator = Column(Integer)
+     calculation_type = Column(IntegerEnum(constants.CalculationTypeNode))

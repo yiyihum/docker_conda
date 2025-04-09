@@ -1,0 +1,213 @@
+diff --git a/README.md b/README.md
+index 4b159c3..e96ce8c 100644
+--- a/README.md
++++ b/README.md
+@@ -14,6 +14,38 @@ for common BOUT++ analysis and plotting tasks.
+ Currently only in alpha (until 1.0 released) so please report any bugs,
+ and feel free to raise issues asking questions or making suggestions.
+ 
++ 
++### Installation
++
++xBOUT is not currently on pip or conda. Therefore to install xBOUT on 
++your system you must first clone the repository using:
++
++```bash
++git clone git@github.com:boutproject/xBOUT.git
++```
++or
++```bash
++git clone https://github.com/boutproject/xBOUT.git
++```
++
++Once cloned navigate to the xBOUT directory and run the following command:
++
++```bash
++pip3 install --user ./
++```
++or
++```bash
++python3 setup.py install
++```
++
++You can run the tests by navigating to the `/xBOUT/` directory and
++entering `pytest`.
++
++xBOUT requires other python packages, which will be installed when you 
++run one of the above install commands if they are not already installed on 
++your system.
++
++
+ ### Loading your data
+ 
+ The function `open_boutdataset()` uses xarray & dask to collect BOUT++
+@@ -93,24 +125,6 @@ There is included an example of a
+ extra calculated quantities which are specific to the STORM module.
+ 
+ 
+-
+-### Installation
+-
+-Currently not on pip or conda, so you will need to clone this repo and
+-install using `python setup.py`
+-You can run the tests by navigating to the `/xBOUT/` directory and
+-entering `pytest`.
+-
+-Requires xarray v0.12.2 or later.
+-
+-You will also need to install [dask](https://dask.org/),
+-as described in the xarray documentation
+-[here](http://xarray.pydata.org/en/stable/installing.html#for-parallel-computing),
+-as well as [natsort](https://github.com/SethMMorton/natsort)
+-and [animatplot](https://github.com/t-makaro/animatplot).
+-
+-
+-
+ ### Contributing
+ 
+ Feel free to raise issues about anything, or submit pull requests,
+diff --git a/xbout/boutdataset.py b/xbout/boutdataset.py
+index ce85d23..bf267d0 100644
+--- a/xbout/boutdataset.py
++++ b/xbout/boutdataset.py
+@@ -169,7 +169,7 @@ class BoutDatasetAccessor:
+ 
+     def animate_list(self, variables, animate_over='t', save_as=None, show=False, fps=10,
+                      nrows=None, ncols=None, poloidal_plot=False, subplots_adjust=None,
+-                     vmin=None, vmax=None, logscale=None, **kwargs):
++                     vmin=None, vmax=None, logscale=None, titles=None, **kwargs):
+         """
+         Parameters
+         ----------
+@@ -207,6 +207,9 @@ class BoutDatasetAccessor:
+             linthresh=min(abs(vmin),abs(vmax))*logscale, defaults to 1e-5 if True is
+             passed.
+             Per variable if sequence is given.
++        titles : sequence of str or None, optional
++            Custom titles for each plot. Pass None in the sequence to use the default for
++            a certain variable
+         **kwargs : dict, optional
+             Additional keyword arguments are passed on to each animation function
+         """
+@@ -248,12 +251,14 @@ class BoutDatasetAccessor:
+         vmin = _expand_list_arg(vmin, 'vmin')
+         vmax = _expand_list_arg(vmax, 'vmax')
+         logscale = _expand_list_arg(logscale, 'logscale')
++        titles = _expand_list_arg(titles, 'titles')
+ 
+         blocks = []
+         for subplot_args in zip(variables, axes, poloidal_plot, vmin, vmax,
+-                                logscale):
++                                logscale, titles):
+ 
+-            v, ax, this_poloidal_plot, this_vmin, this_vmax, this_logscale = subplot_args
++            (v, ax, this_poloidal_plot, this_vmin, this_vmax, this_logscale,
++             this_title) = subplot_args
+ 
+             divider = make_axes_locatable(ax)
+             cax = divider.append_axes("right", size="5%", pad=0.1)
+@@ -296,6 +301,10 @@ class BoutDatasetAccessor:
+                 raise ValueError("Unsupported number of dimensions "
+                                  + str(ndims) + ". Dims are " + str(v.dims))
+ 
++            if this_title is not None:
++                # Replace default title with user-specified one
++                ax.set_title(this_title)
++
+         timeline = amp.Timeline(np.arange(v.sizes[animate_over]), fps=fps)
+         anim = amp.Animation(blocks, timeline)
+         anim.controls(timeline_slider_args={'text': animate_over})
+diff --git a/xbout/load.py b/xbout/load.py
+index 4d8a2e3..52ce633 100644
+--- a/xbout/load.py
++++ b/xbout/load.py
+@@ -40,7 +40,7 @@ except ValueError:
+ def open_boutdataset(datapath='./BOUT.dmp.*.nc', inputfilepath=None,
+                      geometry=None, gridfilepath=None, chunks={},
+                      keep_xboundaries=True, keep_yboundaries=False,
+-                     run_name=None, info=True):
++                     run_name=None, info=True, drop_variables=None):
+     """
+     Load a dataset from a set of BOUT output files, including the input options
+     file. Can also load from a grid file.
+@@ -85,6 +85,9 @@ def open_boutdataset(datapath='./BOUT.dmp.*.nc', inputfilepath=None,
+         Useful if you are going to open multiple simulations and compare the
+         results.
+     info : bool, optional
++    drop_variables : sequence, optional
++        Drop variables in this list before merging. Allows user to ignore variables from
++        a particular physics model that are not consistent between processors.
+ 
+     Returns
+     -------
+@@ -98,7 +101,8 @@ def open_boutdataset(datapath='./BOUT.dmp.*.nc', inputfilepath=None,
+         # Gather pointers to all numerical data from BOUT++ output files
+         ds = _auto_open_mfboutdataset(datapath=datapath, chunks=chunks,
+                                       keep_xboundaries=keep_xboundaries,
+-                                      keep_yboundaries=keep_yboundaries)
++                                      keep_yboundaries=keep_yboundaries,
++                                      drop_variables=drop_variables)
+     else:
+         # Its a grid file
+         ds = _open_grid(datapath, chunks=chunks,
+@@ -245,7 +249,12 @@ def collect(varname, xind=None, yind=None, zind=None, tind=None,
+     if selection:
+         ds = ds.isel(selection)
+ 
+-    return ds[varname].values
++    result = ds[varname].values
++
++    # Close netCDF files to ensure they are not locked if collect is called again
++    ds.close()
++
++    return result
+ 
+ 
+ def _is_dump_files(datapath):
+@@ -266,7 +275,8 @@ def _is_dump_files(datapath):
+ 
+ 
+ def _auto_open_mfboutdataset(datapath, chunks={}, info=True,
+-                             keep_xboundaries=False, keep_yboundaries=False):
++                             keep_xboundaries=False, keep_yboundaries=False,
++                             drop_variables=None):
+     filepaths, filetype = _expand_filepaths(datapath)
+ 
+     # Open just one file to read processor splitting
+@@ -277,7 +287,7 @@ def _auto_open_mfboutdataset(datapath, chunks={}, info=True,
+     _preprocess = partial(_trim, guards={'x': mxg, 'y': myg},
+                           keep_boundaries={'x': keep_xboundaries,
+                                            'y': keep_yboundaries},
+-                          nxpe=nxpe, nype=nype)
++                          nxpe=nxpe, nype=nype, drop_variables=drop_variables)
+ 
+     ds = xr.open_mfdataset(paths_grid, concat_dim=concat_dims, combine='nested',
+                            data_vars='minimal', preprocess=_preprocess, engine=filetype,
+@@ -313,7 +323,7 @@ def _expand_wildcards(path):
+     """Return list of filepaths matching wildcard"""
+ 
+     # Find first parent directory which does not contain a wildcard
+-    base_dir = next(parent for parent in path.parents if '*' not in str(parent))
++    base_dir = Path(path.root)
+ 
+     # Find path relative to parent
+     search_pattern = str(path.relative_to(base_dir))
+@@ -424,7 +434,7 @@ def _arrange_for_concatenation(filepaths, nxpe=1, nype=1):
+     return paths_grid, concat_dims
+ 
+ 
+-def _trim(ds, *, guards, keep_boundaries, nxpe, nype):
++def _trim(ds, *, guards, keep_boundaries, nxpe, nype, drop_variables):
+     """
+     Trims all guard (and optionally boundary) cells off a single dataset read from a
+     single BOUT dump file, to prepare for concatenation.
+@@ -462,6 +472,9 @@ def _trim(ds, *, guards, keep_boundaries, nxpe, nype):
+         selection[dim] = slice(lower, upper)
+     trimmed_ds = ds.isel(**selection)
+ 
++    if drop_variables is not None:
++        trimmed_ds = trimmed_ds.drop(drop_variables, errors='ignore')
++
+     # Ignore FieldPerps for now
+     for name in trimmed_ds:
+         if (trimmed_ds[name].dims == ('x', 'z')

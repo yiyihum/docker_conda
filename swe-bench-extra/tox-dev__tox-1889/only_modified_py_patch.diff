@@ -1,0 +1,96 @@
+diff --git a/src/tox/config/loader/ini/__init__.py b/src/tox/config/loader/ini/__init__.py
+index 54eb51fa..a8867c02 100644
+--- a/src/tox/config/loader/ini/__init__.py
++++ b/src/tox/config/loader/ini/__init__.py
+@@ -1,4 +1,5 @@
+ import inspect
++import re
+ from concurrent.futures import Future
+ from configparser import ConfigParser, SectionProxy
+ from contextlib import contextmanager
+@@ -30,11 +31,21 @@ class IniLoader(StrConvert, Loader[str]):
+ 
+     def load_raw(self, key: str, conf: Optional[Config], env_name: Optional[str]) -> str:
+         value = self._section[key]
+-        collapsed_newlines = value.replace("\\\r\n", "").replace("\\\n", "")  # collapse explicit new-line escape
++        collapsed_newlines = value.replace("\r", "").replace("\\\n", "")  # collapse explicit new-line escape
++        # strip comments
++        strip_comments = "\n".join(
++            no_comment
++            for no_comment in (
++                re.sub(r"(\s)*(?<!\\)#.*", "", line)
++                for line in collapsed_newlines.split("\n")
++                if not line.startswith("#")
++            )
++            if no_comment.strip()
++        )
+         if conf is None:  # conf is None when we're loading the global tox configuration file for the CLI
+-            factor_filtered = collapsed_newlines  # we don't support factor and replace functionality there
++            factor_filtered = strip_comments  # we don't support factor and replace functionality there
+         else:
+-            factor_filtered = filter_for_env(collapsed_newlines, env_name)  # select matching factors
++            factor_filtered = filter_for_env(strip_comments, env_name)  # select matching factors
+         return factor_filtered
+ 
+     @contextmanager
+diff --git a/src/tox/config/sets.py b/src/tox/config/sets.py
+index 6e31a664..2cd735b9 100644
+--- a/src/tox/config/sets.py
++++ b/src/tox/config/sets.py
+@@ -1,4 +1,3 @@
+-from collections import OrderedDict
+ from pathlib import Path
+ from typing import (
+     TYPE_CHECKING,
+@@ -36,7 +35,8 @@ class ConfigSet:
+         self._conf = conf
+         self.loaders: List[Loader[Any]] = []
+         self._defined: Dict[str, ConfigDefinition[Any]] = {}
+-        self._keys: Dict[str, None] = OrderedDict()
++        self._keys: Dict[str, None] = {}
++        self._alias: Dict[str, str] = {}
+ 
+     def add_config(
+         self,
+@@ -76,6 +76,8 @@ class ConfigSet:
+                 raise ValueError(f"config {key} already defined")
+         else:
+             self._keys[key] = None
++            for item in keys:
++                self._alias[item] = key
+             for key in keys:
+                 self._defined[key] = definition
+         return definition
+@@ -101,6 +103,9 @@ class ConfigSet:
+     def __iter__(self) -> Iterator[str]:
+         return iter(self._keys.keys())
+ 
++    def __contains__(self, item: str) -> bool:
++        return item in self._alias
++
+     def unused(self) -> List[str]:
+         """Return a list of keys present in the config source but not used"""
+         found: Set[str] = set()
+@@ -109,6 +114,9 @@ class ConfigSet:
+         found -= self._defined.keys()
+         return list(sorted(found))
+ 
++    def primary_key(self, key: str) -> str:
++        return self._alias[key]
++
+ 
+ class CoreConfigSet(ConfigSet):
+     def __init__(self, conf: "Config", root: Path) -> None:
+diff --git a/src/tox/session/cmd/show_config.py b/src/tox/session/cmd/show_config.py
+index 3711866f..934b5038 100644
+--- a/src/tox/session/cmd/show_config.py
++++ b/src/tox/session/cmd/show_config.py
+@@ -99,6 +99,7 @@ def print_conf(is_colored: bool, conf: ConfigSet, keys: Iterable[str]) -> None:
+     for key in keys if keys else conf:
+         if key not in conf:
+             continue
++        key = conf.primary_key(key)
+         try:
+             value = conf[key]
+             as_str, multi_line = stringify(value)
+

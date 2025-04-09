@@ -1,0 +1,260 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e61e039..29a1296 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,15 @@ beta releases are not included in this history. For a full list of all releases,
+ 
+ [//]: # (begin_release_notes)
+ 
++7.16.0 (2021-05-26)
++===================
++
++Features
++--------
++
++- Targets modified: MultiTech mDot. (#20210526050235)
++
++
+ 7.15.0 (2021-05-15)
+ ===================
+ 
+diff --git a/news/20210524113403.bugfix b/news/20210524113403.bugfix
+new file mode 100644
+index 0000000..2f178f5
+--- /dev/null
++++ b/news/20210524113403.bugfix
+@@ -0,0 +1,1 @@
++Fix issue with memory region overrides being ignored.
+diff --git a/src/mbed_tools/build/_internal/cmake_file.py b/src/mbed_tools/build/_internal/cmake_file.py
+index 09d507c..d6b550b 100644
+--- a/src/mbed_tools/build/_internal/cmake_file.py
++++ b/src/mbed_tools/build/_internal/cmake_file.py
+@@ -5,6 +5,8 @@
+ """Module in charge of CMake file generation."""
+ import pathlib
+ 
++from typing import Any
++
+ import jinja2
+ 
+ from mbed_tools.build._internal.config.config import Config
+@@ -25,7 +27,13 @@ def render_mbed_config_cmake_template(config: Config, toolchain_name: str, targe
+         The rendered mbed_config template.
+     """
+     env = jinja2.Environment(loader=jinja2.PackageLoader("mbed_tools.build", str(TEMPLATES_DIRECTORY)),)
++    env.filters["to_hex"] = to_hex
+     template = env.get_template(TEMPLATE_NAME)
+     config["supported_c_libs"] = [x for x in config["supported_c_libs"][toolchain_name.lower()]]
+     context = {"target_name": target_name, "toolchain_name": toolchain_name, **config}
+     return template.render(context)
++
++
++def to_hex(s: Any) -> str:
++    """Filter to convert integers to hex."""
++    return hex(int(s, 0))
+diff --git a/src/mbed_tools/build/_internal/config/config.py b/src/mbed_tools/build/_internal/config/config.py
+index bb493f2..7f96862 100644
+--- a/src/mbed_tools/build/_internal/config/config.py
++++ b/src/mbed_tools/build/_internal/config/config.py
+@@ -8,7 +8,7 @@ import logging
+ from collections import UserDict
+ from typing import Any, Iterable, Hashable, Callable, List
+ 
+-from mbed_tools.build._internal.config.source import Memory, Override, ConfigSetting
++from mbed_tools.build._internal.config.source import Override, ConfigSetting
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -18,15 +18,13 @@ class Config(UserDict):
+ 
+     This object understands how to populate the different 'config sections' which all have different rules for how the
+     settings are collected.
+-    Applies overrides, appends macros, updates memories, and updates config settings.
++    Applies overrides, appends macros, and updates config settings.
+     """
+ 
+     def __setitem__(self, key: Hashable, item: Any) -> None:
+         """Set an item based on its key."""
+         if key == CONFIG_SECTION:
+             self._update_config_section(item)
+-        elif key == MEMORIES_SECTION:
+-            self._update_memories_section(item)
+         elif key == OVERRIDES_SECTION:
+             self._handle_overrides(item)
+         elif key == MACROS_SECTION:
+@@ -69,20 +67,6 @@ class Config(UserDict):
+ 
+         self.data[CONFIG_SECTION] = self.data.get(CONFIG_SECTION, []) + config_settings
+ 
+-    def _update_memories_section(self, memories: List[Memory]) -> None:
+-        defined_memories = self.data.get(MEMORIES_SECTION, [])
+-        for memory in memories:
+-            logger.debug(f"Adding memory settings `{memory.name}: start={memory.start} size={memory.size}`")
+-            prev_defined = next((mem for mem in defined_memories if mem.name == memory.name), None)
+-            if prev_defined is None:
+-                defined_memories.append(memory)
+-            else:
+-                logger.warning(
+-                    f"You are attempting to redefine `{memory.name}` from {prev_defined.namespace}.\n"
+-                    f"The values from `{memory.namespace}` will be ignored"
+-                )
+-        self.data[MEMORIES_SECTION] = defined_memories
+-
+     def _find_first_config_setting(self, predicate: Callable) -> Any:
+         """Find first config setting based on `predicate`.
+ 
+@@ -105,7 +89,6 @@ class Config(UserDict):
+ 
+ CONFIG_SECTION = "config"
+ MACROS_SECTION = "macros"
+-MEMORIES_SECTION = "memories"
+ OVERRIDES_SECTION = "overrides"
+ 
+ 
+diff --git a/src/mbed_tools/build/_internal/config/source.py b/src/mbed_tools/build/_internal/config/source.py
+index 59d01df..54008bc 100644
+--- a/src/mbed_tools/build/_internal/config/source.py
++++ b/src/mbed_tools/build/_internal/config/source.py
+@@ -28,7 +28,7 @@ def prepare(
+ ) -> dict:
+     """Prepare a config source for entry into the Config object.
+ 
+-    Extracts memory, config and override settings from the source. Flattens these nested dictionaries out into
++    Extracts config and override settings from the source. Flattens these nested dictionaries out into
+     lists of objects which are namespaced in the way the Mbed config system expects.
+ 
+     Args:
+@@ -46,11 +46,6 @@ def prepare(
+     for key in data:
+         data[key] = _sanitise_value(data[key])
+ 
+-    memories = _extract_memories(namespace, data)
+-
+-    if memories:
+-        data["memories"] = memories
+-
+     if "config" in data:
+         data["config"] = _extract_config_settings(namespace, data["config"])
+ 
+@@ -83,31 +78,6 @@ class ConfigSetting:
+         self.value = _sanitise_value(self.value)
+ 
+ 
+-@dataclass
+-class Memory:
+-    """Representation of a defined RAM/ROM region."""
+-
+-    name: str
+-    namespace: str
+-    start: str
+-    size: str
+-
+-    def __post_init__(self) -> None:
+-        """Convert start and size to hex format strings."""
+-        try:
+-            self.start = hex(int(self.start, 0))
+-        except ValueError:
+-            raise ValueError(
+-                f"Value of MBED_{self.name}_START in {self.namespace}, {self.start} is invalid: must be an integer"
+-            )
+-        try:
+-            self.size = hex(int(self.size, 0))
+-        except ValueError:
+-            raise ValueError(
+-                f"Value of MBED_{self.name}_SIZE in {self.namespace}, {self.size} is invalid: must be an integer"
+-            )
+-
+-
+ @dataclass
+ class Override:
+     """Representation of a config override.
+@@ -158,27 +128,6 @@ def _extract_config_settings(namespace: str, config_data: dict) -> List[ConfigSe
+     return settings
+ 
+ 
+-def _extract_memories(namespace: str, data: dict) -> List[Memory]:
+-    memories = []
+-    for mem in ["rom", "ram"]:
+-        start_attr = f"mbed_{mem}_start"
+-        size_attr = f"mbed_{mem}_size"
+-        start = data.get(start_attr)
+-        size = data.get(size_attr)
+-
+-        if size is not None and start is not None:
+-            logger.debug(f"Extracting MBED_{mem.upper()} definitions in {namespace}: _START={start}, _SIZE={size}.")
+-
+-            memory = Memory(mem.upper(), namespace, start, size)
+-            memories.append(memory)
+-        elif start is not None or size is not None:
+-            raise ValueError(
+-                f"{size_attr.upper()} and {start_attr.upper()} must be defined together. Only "
+-                f"{'START' if start is not None else 'SIZE'} is defined in the lib {namespace}."
+-            )
+-    return memories
+-
+-
+ def _extract_target_overrides(
+     namespace: str, override_data: dict, allowed_target_labels: Iterable[str]
+ ) -> List[Override]:
+diff --git a/src/mbed_tools/build/_internal/templates/mbed_config.tmpl b/src/mbed_tools/build/_internal/templates/mbed_config.tmpl
+index 7fadeb1..89308ac 100644
+--- a/src/mbed_tools/build/_internal/templates/mbed_config.tmpl
++++ b/src/mbed_tools/build/_internal/templates/mbed_config.tmpl
+@@ -54,6 +54,18 @@ set(MBED_TARGET_DEFINITIONS{% for component in components %}
+ {% for form_factor in supported_form_factors %}
+     TARGET_FF_{{form_factor}}
+ {%- endfor %}
++{% if mbed_rom_start is defined %}
++    MBED_ROM_START={{ mbed_rom_start | to_hex }}
++{%- endif %}
++{% if mbed_rom_size is defined %}
++    MBED_ROM_SIZE={{ mbed_rom_size | to_hex }}
++{%- endif %}
++{% if mbed_ram_start is defined %}
++    MBED_RAM_START={{ mbed_ram_start | to_hex }}
++{%- endif %}
++{% if mbed_ram_size is defined %}
++    MBED_RAM_SIZE={{ mbed_ram_size | to_hex }}
++{%- endif %}
+     TARGET_LIKE_MBED
+     __MBED__=1
+ )
+@@ -75,10 +87,6 @@ set(MBED_CONFIG_DEFINITIONS
+     "-D{{setting_name}}={{value}}"
+     {% endif -%}
+ {%- endfor -%}
+-{% for memory in memories %}
+-    "-DMBED_{{memory.name}}_START={{memory.start}}"
+-    "-DMBED_{{memory.name}}_SIZE={{memory.size}}"
+-{%- endfor -%}
+ {% for macro in macros %}
+     "{{macro|replace("\"", "\\\"")}}"
+ {%- endfor %}
+diff --git a/src/mbed_tools/targets/_internal/data/board_database_snapshot.json b/src/mbed_tools/targets/_internal/data/board_database_snapshot.json
+index 6b81247..6ef01a2 100644
+--- a/src/mbed_tools/targets/_internal/data/board_database_snapshot.json
++++ b/src/mbed_tools/targets/_internal/data/board_database_snapshot.json
+@@ -4921,7 +4921,6 @@
+         "slug": "MTS-mDot-F411",
+         "build_variant": [],
+         "mbed_os_support": [
+-            "Mbed OS 2",
+             "Mbed OS 5.10",
+             "Mbed OS 5.11",
+             "Mbed OS 5.12",
+@@ -4935,7 +4934,14 @@
+             "Mbed OS 5.8",
+             "Mbed OS 5.9",
+             "Mbed OS 6.0",
+-            "Mbed OS 6.1"
++            "Mbed OS 6.1",
++            "Mbed OS 6.2",
++            "Mbed OS 6.3",
++            "Mbed OS 6.4",
++            "Mbed OS 6.5",
++            "Mbed OS 6.6",
++            "Mbed OS 6.7",
++            "Mbed OS 6.8"
+         ],
+         "mbed_enabled": [
+             "Baseline"

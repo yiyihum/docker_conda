@@ -1,0 +1,319 @@
+diff --git a/aqt/helper.py b/aqt/helper.py
+index 2e3b74f..ecb98eb 100644
+--- a/aqt/helper.py
++++ b/aqt/helper.py
+@@ -79,7 +79,7 @@ def getUrl(url: str, timeout) -> str:
+     return result
+ 
+ 
+-def downloadBinaryFile(url: str, out: str, hash_algo: str, exp: bytes, timeout):
++def downloadBinaryFile(url: str, out: Path, hash_algo: str, exp: bytes, timeout):
+     logger = getLogger("aqt.helper")
+     filename = Path(url).name
+     with requests.Session() as session:
+@@ -114,7 +114,7 @@ def downloadBinaryFile(url: str, out: str, hash_algo: str, exp: bytes, timeout):
+                 raise ArchiveChecksumError(
+                     f"Downloaded file {filename} is corrupted! Detect checksum error.\n"
+                     f"Expect {exp.hex()}: {url}\n"
+-                    f"Actual {hash.digest().hex()}: {out}"
++                    f"Actual {hash.digest().hex()}: {out.name}"
+                 )
+ 
+ 
+@@ -305,6 +305,14 @@ class SettingsClass:
+                 result = record["modules"]
+         return result
+ 
++    @property
++    def archive_download_location(self):
++        return self.config.get("aqt", "archive_download_location", fallback=".")
++
++    @property
++    def always_keep_archives(self):
++        return self.config.getboolean("aqt", "always_keep_archives", fallback=False)
++
+     @property
+     def concurrency(self):
+         """concurrency configuration.
+diff --git a/aqt/installer.py b/aqt/installer.py
+index cc42402..64d295e 100644
+--- a/aqt/installer.py
++++ b/aqt/installer.py
+@@ -33,6 +33,8 @@ import sys
+ import time
+ from logging import getLogger
+ from logging.handlers import QueueHandler
++from pathlib import Path
++from tempfile import TemporaryDirectory
+ from typing import Any, Callable, List, Optional
+ 
+ import aqt
+@@ -219,6 +221,24 @@ class Cli:
+             getLogger("aqt.installer").info(f"Resolved spec '{qt_version_or_spec}' to {version}")
+             return version
+ 
++    @staticmethod
++    def choose_archive_dest(archive_dest: Optional[str], keep: bool, temp_dir: str) -> Path:
++        """
++        Choose archive download destination, based on context.
++
++        There are three potential behaviors here:
++        1. By default, return a temp directory that will be removed on program exit.
++        2. If the user has asked to keep archives, but has not specified a destination,
++            we return Settings.archive_download_location ("." by default).
++        3. If the user has asked to keep archives and specified a destination,
++            we create the destination dir if it doesn't exist, and return that directory.
++        """
++        if not archive_dest:
++            return Path(Settings.archive_download_location if keep else temp_dir)
++        dest = Path(archive_dest)
++        dest.mkdir(parents=True, exist_ok=True)
++        return dest
++
+     def run_install_qt(self, args):
+         """Run install subcommand"""
+         start_time = time.perf_counter()
+@@ -235,7 +255,8 @@ class Cli:
+         else:
+             qt_version: str = args.qt_version
+             Cli._validate_version_str(qt_version)
+-        keep = args.keep
++        keep: bool = args.keep or Settings.always_keep_archives
++        archive_dest: Optional[str] = args.archive_dest
+         output_dir = args.outputdir
+         if output_dir is None:
+             base_dir = os.getcwd()
+@@ -295,7 +316,9 @@ class Cli:
+             base,
+         )
+         target_config = qt_archives.get_target_config()
+-        run_installer(qt_archives.get_packages(), base_dir, sevenzip, keep)
++        with TemporaryDirectory() as temp_dir:
++            _archive_dest = Cli.choose_archive_dest(archive_dest, keep, temp_dir)
++            run_installer(qt_archives.get_packages(), base_dir, sevenzip, keep, _archive_dest)
+         if not nopatch:
+             Updater.update(target_config, base_dir)
+         self.logger.info("Finished installation")
+@@ -320,7 +343,8 @@ class Cli:
+             base_dir = os.getcwd()
+         else:
+             base_dir = output_dir
+-        keep = args.keep
++        keep: bool = args.keep or Settings.always_keep_archives
++        archive_dest: Optional[str] = args.archive_dest
+         if args.base is not None:
+             base = args.base
+         else:
+@@ -353,7 +377,9 @@ class Cli:
+             ),
+             base,
+         )
+-        run_installer(srcdocexamples_archives.get_packages(), base_dir, sevenzip, keep)
++        with TemporaryDirectory() as temp_dir:
++            _archive_dest = Cli.choose_archive_dest(archive_dest, keep, temp_dir)
++            run_installer(srcdocexamples_archives.get_packages(), base_dir, sevenzip, keep, _archive_dest)
+         self.logger.info("Finished installation")
+ 
+     def run_install_src(self, args):
+@@ -405,7 +431,8 @@ class Cli:
+         version = getattr(args, "version", None)
+         if version is not None:
+             Cli._validate_version_str(version, allow_minus=True)
+-        keep = args.keep
++        keep: bool = args.keep or Settings.always_keep_archives
++        archive_dest: Optional[str] = args.archive_dest
+         if args.base is not None:
+             base = args.base
+         else:
+@@ -442,7 +469,9 @@ class Cli:
+                 ),
+                 base,
+             )
+-            run_installer(tool_archives.get_packages(), base_dir, sevenzip, keep)
++            with TemporaryDirectory() as temp_dir:
++                _archive_dest = Cli.choose_archive_dest(archive_dest, keep, temp_dir)
++                run_installer(tool_archives.get_packages(), base_dir, sevenzip, keep, _archive_dest)
+         self.logger.info("Finished installation")
+         self.logger.info("Time elapsed: {time:.8f} second".format(time=time.perf_counter() - start_time))
+ 
+@@ -767,6 +796,13 @@ class Cli:
+             action="store_true",
+             help="Keep downloaded archive when specified, otherwise remove after install",
+         )
++        subparser.add_argument(
++            "-d",
++            "--archive-dest",
++            type=str,
++            default=None,
++            help="Set the destination path for downloaded archives (temp directory by default).",
++        )
+ 
+     def _set_module_options(self, subparser):
+         subparser.add_argument("-m", "--modules", nargs="*", help="Specify extra modules to install")
+@@ -838,14 +874,14 @@ class Cli:
+             return function(fallback_url)
+ 
+ 
+-def run_installer(archives: List[QtPackage], base_dir: str, sevenzip: Optional[str], keep: bool):
++def run_installer(archives: List[QtPackage], base_dir: str, sevenzip: Optional[str], keep: bool, archive_dest: Path):
+     queue = multiprocessing.Manager().Queue(-1)
+     listener = MyQueueListener(queue)
+     listener.start()
+     #
+     tasks = []
+     for arc in archives:
+-        tasks.append((arc, base_dir, sevenzip, queue, keep))
++        tasks.append((arc, base_dir, sevenzip, queue, archive_dest, keep))
+     ctx = multiprocessing.get_context("spawn")
+     pool = ctx.Pool(Settings.concurrency, init_worker_sh)
+ 
+@@ -896,6 +932,7 @@ def installer(
+     base_dir: str,
+     command: Optional[str],
+     queue: multiprocessing.Queue,
++    archive_dest: Path,
+     keep: bool = False,
+     response_timeout: Optional[int] = None,
+ ):
+@@ -906,7 +943,7 @@ def installer(
+     name = qt_archive.name
+     url = qt_archive.archive_url
+     hashurl = qt_archive.hashurl
+-    archive = qt_archive.archive
++    archive: Path = archive_dest / qt_archive.archive
+     start_time = time.perf_counter()
+     # set defaults
+     Settings.load_settings()
+@@ -943,10 +980,10 @@ def installer(
+                 "-bd",
+                 "-y",
+                 "-o{}".format(base_dir),
+-                archive,
++                str(archive),
+             ]
+         else:
+-            command_args = [command, "x", "-aoa", "-bd", "-y", archive]
++            command_args = [command, "x", "-aoa", "-bd", "-y", str(archive)]
+         try:
+             proc = subprocess.run(command_args, stdout=subprocess.PIPE, check=True)
+             logger.debug(proc.stdout)
+@@ -955,7 +992,7 @@ def installer(
+             raise ArchiveExtractionError(msg) from cpe
+     if not keep:
+         os.unlink(archive)
+-    logger.info("Finished installation of {} in {:.8f}".format(archive, time.perf_counter() - start_time))
++    logger.info("Finished installation of {} in {:.8f}".format(archive.name, time.perf_counter() - start_time))
+     qh.flush()
+     qh.close()
+     logger.removeHandler(qh)
+diff --git a/aqt/settings.ini b/aqt/settings.ini
+index 4748cee..d165c08 100644
+--- a/aqt/settings.ini
++++ b/aqt/settings.ini
+@@ -5,6 +5,8 @@ concurrency: 4
+ baseurl: https://download.qt.io
+ 7zcmd: 7z
+ print_stacktrace_on_error: False
++always_keep_archives: False
++archive_download_location: .
+ 
+ [requests]
+ connection_timeout: 3.5
+diff --git a/docs/cli.rst b/docs/cli.rst
+index b29db53..463a0fc 100644
+--- a/docs/cli.rst
++++ b/docs/cli.rst
+@@ -239,7 +239,20 @@ are described here:
+ 
+ .. option:: --keep, -k
+ 
+-    Keep downloaded archive when specified, otherwise remove after install
++    Keep downloaded archive when specified, otherwise remove after install.
++    Use ``--archive-dest <path>`` to choose where aqt will place these files.
++    If you do not specify a download destination, aqt will place these files in
++    the current working directory.
++
++.. option:: --archive-dest <path>
++
++    Set the destination path for downloaded archives (temp directory by default).
++    All downloaded archives will be automatically deleted unless you have
++    specified the ``--keep`` option above, or ``aqt`` crashes.
++
++    Note that this option refers to the intermediate ``.7z`` archives that ``aqt``
++    downloads and then extracts to ``--outputdir``.
++    Most users will not need to keep these files.
+ 
+ .. option:: --modules, -m (<list of modules> | all)
+ 
+@@ -295,6 +308,7 @@ install-qt command
+         [-E | --external <7zip command>]
+         [--internal]
+         [-k | --keep]
++        [-d | --archive-dest] <path>
+         [-m | --modules (all | <module> [<module>...])]
+         [--archives <archive> [<archive>...]]
+         [--noarchives]
+@@ -368,6 +382,7 @@ install-src command
+         [-E | --external <7zip command>]
+         [--internal]
+         [-k | --keep]
++        [-d | --archive-dest] <path>
+         [-m | --modules (all | <module> [<module>...])]
+         [--archives <archive> [<archive>...]]
+         [--kde]
+@@ -425,6 +440,7 @@ install-doc command
+         [-E | --external <7zip command>]
+         [--internal]
+         [-k | --keep]
++        [-d | --archive-dest] <path>
+         [-m | --modules (all | <module> [<module>...])]
+         [--archives <archive> [<archive>...]]
+         <host> <target> (<Qt version> | <spec>)
+@@ -473,6 +489,7 @@ install-example command
+         [-E | --external <7zip command>]
+         [--internal]
+         [-k | --keep]
++        [-d | --archive-dest] <path>
+         [-m | --modules (all | <module> [<module>...])]
+         [--archives <archive> [<archive>...]]
+         <host> <target> (<Qt version> | <spec>)
+@@ -525,6 +542,7 @@ install-tool command
+         [-E | --external <7zip command>]
+         [--internal]
+         [-k | --keep]
++        [-d | --archive-dest] <path>
+         <host> <target> <tool name> [<tool variant name>]
+ 
+ Install tools like QtIFW, mingw, Cmake, Conan, and vcredist.
+diff --git a/docs/configuration.rst b/docs/configuration.rst
+index 9cb9572..f9dba17 100644
+--- a/docs/configuration.rst
++++ b/docs/configuration.rst
+@@ -20,6 +20,8 @@ A file is like as follows:
+     baseurl: https://download.qt.io
+     7zcmd: 7z
+     print_stacktrace_on_error: False
++    always_keep_archives: False
++    archive_download_location: .
+ 
+     [requests]
+     connection_timeout: 3.5
+@@ -71,6 +73,18 @@ print_stacktrace_on_error:
+     The ``False`` setting will hide the stack trace, unless an unhandled
+     exception occurs.
+ 
++always_keep_archives:
++    This is either ``True`` or ``False``.
++    The ``True`` setting turns on the ``--keep`` option every time you run aqt,
++    and cannot be overridden by command line options.
++    The ``False`` setting will require you to set ``--keep`` manually every time
++    you run aqt, unless you don't want to keep ``.7z`` archives.
++
++archive_download_location:
++    This is the relative or absolute path to the location in which ``.7z`` archives
++    will be downloaded, when ``--keep`` is turned on.
++    You can override this location with the ``--archives-dest`` option.
++
+ 
+ The ``[requests]`` section controls the way that ``aqt`` makes network requests.
+ 

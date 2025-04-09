@@ -1,0 +1,137 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 92fc808..faf5c10 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -49,3 +49,12 @@ def client_context(ca):
+     client_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+     ca.configure_trust(client_context)
+     return client_context
++
++
++@pytest.fixture
++def asyncio_event_loop():
++    loop = asyncio.DefaultEventLoopPolicy().new_event_loop()
++    asyncio.set_event_loop(loop)
++    yield loop
++    asyncio.set_event_loop(None)
++    loop.close()
+diff --git a/tests/test_debugging.py b/tests/test_debugging.py
+index 19a9179..80af499 100644
+--- a/tests/test_debugging.py
++++ b/tests/test_debugging.py
+@@ -53,9 +53,7 @@ async def test_get_running_tasks():
+ 
+ 
+ @pytest.mark.filterwarnings('ignore:"@coroutine" decorator is deprecated:DeprecationWarning')
+-def test_wait_generator_based_task_blocked():
+-    from asyncio import DefaultEventLoopPolicy, Event, coroutine, set_event_loop
+-
++def test_wait_generator_based_task_blocked(asyncio_event_loop):
+     async def native_coro_part():
+         await wait_all_tasks_blocked()
+         assert not gen_task._coro.gi_running
+@@ -66,19 +64,13 @@ def test_wait_generator_based_task_blocked():
+ 
+         event.set()
+ 
+-    @coroutine
++    @asyncio.coroutine
+     def generator_part():
+         yield from event.wait()
+ 
+-    loop = DefaultEventLoopPolicy().new_event_loop()
+-    try:
+-        set_event_loop(loop)
+-        event = Event()
+-        gen_task = loop.create_task(generator_part())
+-        loop.run_until_complete(native_coro_part())
+-    finally:
+-        set_event_loop(None)
+-        loop.close()
++    event = asyncio.Event()
++    gen_task = asyncio_event_loop.create_task(generator_part())
++    asyncio_event_loop.run_until_complete(native_coro_part())
+ 
+ 
+ @pytest.mark.parametrize('anyio_backend', ['asyncio'])
+diff --git a/tests/test_from_thread.py b/tests/test_from_thread.py
+index d169b80..c596cb1 100644
+--- a/tests/test_from_thread.py
++++ b/tests/test_from_thread.py
+@@ -1,4 +1,5 @@
+ import threading
++import time
+ from concurrent.futures import CancelledError
+ from contextlib import suppress
+ 
+@@ -53,7 +54,14 @@ class TestRunAsyncFromThread:
+         # The thread should not exist after the event loop has been closed
+         initial_count = threading.active_count()
+         run(main, backend='asyncio')
+-        assert threading.active_count() == initial_count
++
++        for _ in range(10):
++            if threading.active_count() == initial_count:
++                return
++
++            time.sleep(0.1)
++
++        pytest.fail('Worker thread did not exit within 1 second')
+ 
+     async def test_run_async_from_thread_exception(self):
+         async def add(a, b):
+diff --git a/tests/test_to_thread.py b/tests/test_to_thread.py
+index c538b95..e39c052 100644
+--- a/tests/test_to_thread.py
++++ b/tests/test_to_thread.py
+@@ -84,6 +84,7 @@ async def test_cancel_worker_thread(cancellable, expected_last_active):
+ 
+     """
+     def thread_worker():
++        print('thread worker:', threading.current_thread(), flush=True)
+         nonlocal last_active
+         from_thread.run_sync(sleep_event.set)
+         time.sleep(0.2)
+@@ -110,14 +111,40 @@ async def test_cancel_worker_thread(cancellable, expected_last_active):
+ 
+ 
+ @pytest.mark.parametrize('anyio_backend', ['asyncio'])
+-async def test_cancel_asyncio_native_task():
++async def test_asyncio_cancel_native_task():
+     async def run_in_thread():
+         nonlocal task
+         task = current_task()
+-        await to_thread.run_sync(time.sleep, 1, cancellable=True)
++        await to_thread.run_sync(time.sleep, 0.2, cancellable=True)
+ 
+     task = None
+     async with create_task_group() as tg:
+         tg.start_soon(run_in_thread)
+         await wait_all_tasks_blocked()
+         task.cancel()
++
++
++def test_asyncio_no_root_task(asyncio_event_loop):
++    """
++    Regression test for #264.
++
++    Ensures that to_thread.run_sync() does not raise an error when there is no root task, but
++    instead tries to find the top most parent task by traversing the cancel scope tree, or failing
++    that, uses the current task to set up a shutdown callback.
++
++    """
++    async def run_in_thread():
++        try:
++            await to_thread.run_sync(time.sleep, 0)
++        finally:
++            asyncio_event_loop.call_soon(asyncio_event_loop.stop)
++
++    task = asyncio_event_loop.create_task(run_in_thread())
++    asyncio_event_loop.run_forever()
++    task.result()
++
++    # Wait for worker threads to exit
++    for t in threading.enumerate():
++        if t.name == 'AnyIO worker thread':
++            t.join(2)
++            assert not t.is_alive()

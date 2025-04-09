@@ -1,0 +1,300 @@
+diff --git a/docs/quickstart.rst b/docs/quickstart.rst
+index 90ec480..00b31f6 100644
+--- a/docs/quickstart.rst
++++ b/docs/quickstart.rst
+@@ -116,7 +116,7 @@ data yet.
+ 
+ .. code-block:: console
+ 
+-    $ septentrion --target-version 1.0 show-migrations
++    $ septentrion show-migrations
+ 
+     Current version is None
+     Target version is 1.0
+@@ -129,21 +129,16 @@ Great, we can now run it for real:
+ 
+ .. code-block:: console
+ 
+-    $ septentrion --target-version 1.0 migrate
++    $ septentrion migrate
+ 
+     Applying migrations
+     Version 1.0
+ 
+ 
+-
+ .. note::
+ 
+     You should run *septentrion* in your root directory, where your ``migrations`` folder is.
+ 
+-.. note::
+-
+-    The ``--target-version`` flag is a required option (it might change in the future).
+-
+ 
+ If something is not working as it should be, you probably want to check the
+ :ref:`troubleshooting guide <troubleshoot>`
+@@ -214,7 +209,7 @@ We launch the migration.
+ 
+ .. code-block:: console
+ 
+-    $ septentrion --target-version 2.0 migrate
++    $ septentrion migrate
+ 
+     Applying migrations
+     Version 1.0
+diff --git a/septentrion/cli.py b/septentrion/cli.py
+index 8fed1d0..043510e 100644
+--- a/septentrion/cli.py
++++ b/septentrion/cli.py
+@@ -43,9 +43,11 @@ CONTEXT_SETTINGS = {
+     "max_content_width": 120,
+ }
+ 
++LATEST_VERSION = "latest"
++
+ 
+ def validate_version(ctx: click.Context, param: Any, value: str):
+-    if value is None:
++    if value == LATEST_VERSION:
+         return None
+     try:
+         version = versions.Version.from_string(value)
+@@ -138,13 +140,14 @@ class CommaSeparatedMultipleString(StringParamType):
+ @click.option(
+     "--target-version",
+     help="Desired final version of the Database (env: SEPTENTRION_TARGET_VERSION)",
++    default=LATEST_VERSION,
+     callback=validate_version,
+-    required=True,
+ )
+ @click.option(
+     "--schema-version",
+     help="Version of the initial schema (if not specified, the most recent schema "
+     "will be used) (env: SEPTENTRION_SCHEMA_VERSION)",
++    default=LATEST_VERSION,
+     callback=validate_version,
+ )
+ @click.option(
+diff --git a/septentrion/configuration.py b/septentrion/configuration.py
+index 2c3d6d3..e7bd35c 100644
+--- a/septentrion/configuration.py
++++ b/septentrion/configuration.py
+@@ -40,6 +40,8 @@ DEFAULTS = {
+     "fixtures_template": "fixtures_{}.sql",
+     "non_transactional_keyword": ["CONCURRENTLY", "ALTER TYPE", "VACUUM"],
+     "ignore_symlinks": False,
++    "schema_version": None,
++    "target_version": None,
+     # Values that don't have an explicit default need to be present too
+     "verbosity": 0,
+     "host": None,
+@@ -47,7 +49,6 @@ DEFAULTS = {
+     "username": None,
+     "password": False,
+     "dbname": None,
+-    "schema_version": None,
+     "additional_schema_file": [],
+     "before_schema_file": [],
+     "after_schema_file": [],
+@@ -146,13 +147,17 @@ class Settings:
+             migrations_root = pathlib.Path(migrations_root)
+         return migrations_root
+ 
+-    def clean_schema_version(self, version: Union[str, versions.Version]):
++    def clean_schema_version(
++        self, version: Union[None, str, versions.Version]
++    ) -> Optional[versions.Version]:
+         if isinstance(version, str):
+             version = versions.Version.from_string(version)
+ 
+         return version
+ 
+-    def clean_target_version(self, version: Union[str, versions.Version]):
++    def clean_target_version(
++        self, version: Union[None, str, versions.Version]
++    ) -> Optional[versions.Version]:
+         if isinstance(version, str):
+             version = versions.Version.from_string(version)
+ 
+diff --git a/septentrion/core.py b/septentrion/core.py
+index 6da08c8..ec77f8a 100644
+--- a/septentrion/core.py
++++ b/septentrion/core.py
+@@ -39,7 +39,7 @@ def get_applied_versions(
+ # not force_version
+ def get_closest_version(
+     settings: configuration.Settings,
+-    target_version: versions.Version,
++    target_version: Optional[versions.Version],
+     sql_tpl: str,
+     existing_files: Iterable[str],
+     force_version: Optional[versions.Version] = None,
+@@ -52,13 +52,16 @@ def get_closest_version(
+     known_versions = files.get_known_versions(settings=settings)
+     # find target version
+ 
+-    try:
+-        previous_versions = list(utils.until(known_versions, target_version))
+-    except ValueError:
+-        raise ValueError(
+-            "settings.TARGET_VERSION is improperly configured: "
+-            "version {} not found.".format(target_version)
+-        )
++    if not target_version:
++        previous_versions = known_versions
++    else:
++        try:
++            previous_versions = list(utils.until(known_versions, target_version))
++        except ValueError:
++            raise ValueError(
++                "settings.TARGET_VERSION is improperly configured: "
++                "version {} not found.".format(target_version)
++            )
+ 
+     # should we set a version from settings ?
+     if force_version:
+@@ -107,7 +110,7 @@ def get_best_schema_version(settings: configuration.Settings) -> versions.Versio
+ 
+ 
+ def get_fixtures_version(
+-    settings: configuration.Settings, target_version: versions.Version
++    settings: configuration.Settings, target_version: Optional[versions.Version]
+ ) -> versions.Version:
+     """
+     Get the closest fixtures to use to init a new DB
+@@ -129,7 +132,7 @@ def get_fixtures_version(
+ 
+ 
+ def build_migration_plan(
+-    settings: configuration.Settings, schema_version: versions.Version
++    settings: configuration.Settings, from_version: versions.Version
+ ) -> Iterable[Dict[str, Any]]:
+     """
+     Return the list of migrations by version,
+@@ -137,18 +140,21 @@ def build_migration_plan(
+     """
+     # get known versions
+     known_versions = files.get_known_versions(settings=settings)
++    target_version = settings.TARGET_VERSION
+ 
+     # get all versions to apply
+-    try:
+-        versions_to_apply = list(utils.until(known_versions, settings.TARGET_VERSION))
+-    except ValueError:
+-        raise ValueError(
+-            "settings.TARGET_VERSION is improperly configured: "
+-            "version {} not found.".format(settings.TARGET_VERSION)
+-        )
++    if not target_version:
++        versions_to_apply = known_versions
++    else:
++        try:
++            versions_to_apply = list(utils.until(known_versions, target_version))
++        except ValueError:
++            raise ValueError(
++                "settings.TARGET_VERSION is improperly configured: "
++                "version {} not found.".format(target_version)
++            )
+ 
+-    if schema_version:
+-        versions_to_apply = list(utils.since(versions_to_apply, schema_version))
++    versions_to_apply = list(utils.since(versions_to_apply, from_version))
+ 
+     # get plan for each version to apply
+     for version in versions_to_apply:
+@@ -179,22 +185,26 @@ def describe_migration_plan(
+     settings: configuration.Settings, stylist: style.Stylist = style.noop_stylist
+ ) -> None:
+ 
+-    schema_version = get_best_schema_version(settings=settings)
+-    with stylist.activate("title") as echo:
+-        echo("Schema file version is {}".format(schema_version))
++    if not db.is_schema_initialized(settings=settings):
++        from_version = get_best_schema_version(settings=settings)
++        with stylist.activate("title") as echo:
++            echo("Schema file version is {}".format(from_version))
++    else:
++        _from_version = db.get_current_schema_version(settings=settings)
++        assert _from_version  # mypy shenanigans
++        from_version = _from_version
++        with stylist.activate("title") as echo:
++            echo("Current version is {}".format(from_version))
+ 
+-    with stylist.activate("subtitle") as echo:
+-        echo("  Migrations will start after {}".format(schema_version))
++    target_version = settings.TARGET_VERSION
+ 
+-    current_version = db.get_current_schema_version(settings=settings)
+     with stylist.activate("title") as echo:
+-        echo("Current version is {}".format(current_version))
++        echo("Migrations will start from {}".format(from_version))
+ 
+-    target_version = settings.TARGET_VERSION
+     with stylist.activate("title") as echo:
+-        echo("Target version is {}".format(target_version))
++        echo(f"Target version is {target_version or 'latest'}")
+ 
+-    for plan in build_migration_plan(settings=settings, schema_version=schema_version):
++    for plan in build_migration_plan(settings=settings, from_version=from_version):
+         version = plan["version"]
+         migrations = plan["plan"]
+ 
+diff --git a/septentrion/files.py b/septentrion/files.py
+index a9da1de..49c41ad 100644
+--- a/septentrion/files.py
++++ b/septentrion/files.py
+@@ -23,7 +23,7 @@ def iter_files(
+         yield f
+ 
+ 
+-def get_known_versions(settings: configuration.Settings) -> Iterable[versions.Version]:
++def get_known_versions(settings: configuration.Settings) -> List[versions.Version]:
+     """
+     Return the list of the known versions defined in migration repository,
+     ordered.
+diff --git a/septentrion/migration.py b/septentrion/migration.py
+index 268acdd..b3580b1 100644
+--- a/septentrion/migration.py
++++ b/septentrion/migration.py
+@@ -26,20 +26,22 @@ def migrate(
+ 
+     logger.info("Starting migrations")
+ 
+-    schema_version = core.get_best_schema_version(settings=settings)
+-
+     if not db.is_schema_initialized(settings=settings):
+         logger.info("Migration table is empty, loading a schema")
+         # schema not inited
++        schema_version = core.get_best_schema_version(settings=settings)
+         init_schema(settings=settings, init_version=schema_version, stylist=stylist)
++        from_version = schema_version
++    else:
++        _from_version = db.get_current_schema_version(settings=settings)
++        assert _from_version  # mypy shenanigans
++        from_version = _from_version
+ 
+     # play migrations
+     with stylist.activate("title") as echo:
+         echo("Applying migrations")
+ 
+-    for plan in core.build_migration_plan(
+-        settings=settings, schema_version=schema_version
+-    ):
++    for plan in core.build_migration_plan(settings=settings, from_version=from_version):
+         version = plan["version"]
+         logger.info("Processing version %s", version)
+         with stylist.activate("subtitle") as echo:
+diff --git a/setup.cfg b/setup.cfg
+index 37b5391..863c5dc 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -100,7 +100,7 @@ testpaths =
+     tests/integration
+     tests/acceptance
+ 
+-[mypy-setuptools.*,colorama.*,psycopg2.*,sqlparse.*,importlib_metadata.*]
++[mypy]
+ ignore_missing_imports = True
+ 
+ [coverage:report]

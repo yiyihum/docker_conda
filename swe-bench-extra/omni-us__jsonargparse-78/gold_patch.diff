@@ -1,0 +1,80 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 5cfda88..3230abe 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -23,6 +23,7 @@ Fixed
+ - Don't ignore ``KeyError`` in call to instantiate_classes #81.
+ - Optional subcommands fail with a KeyError #68.
+ - Conflicting namespace for subclass key in subcommand.
++- ``instantiate_classes`` not working for subcommand keys #70.
+ 
+ Changed
+ ^^^^^^^
+diff --git a/jsonargparse/actions.py b/jsonargparse/actions.py
+index ac3b78a..6cedc61 100644
+--- a/jsonargparse/actions.py
++++ b/jsonargparse/actions.py
+@@ -733,14 +733,10 @@ class _ActionSubCommands(_SubParsersAction):
+ 
+ 
+     @staticmethod
+-    def handle_subcommands(parser, cfg, env, defaults, prefix='', fail_no_subcommand=True):
+-        """Adds sub-command dest if missing and parses defaults and environment variables."""
++    def get_subcommand(parser, cfg_dict:dict, prefix:str='', fail_no_subcommand:bool=True):
++        """Returns the sub-command name and corresponding subparser."""
+         if parser._subparsers is None:
+-            return
+-
+-        cfg_dict = cfg.__dict__ if isinstance(cfg, Namespace) else cfg
+-        cfg_keys = set(vars(_dict_to_flat_namespace(cfg)).keys())
+-        cfg_keys = cfg_keys.union(set(cfg_dict.keys()))
++            return None, None
+ 
+         # Get subcommands action
+         for action in parser._actions:
+@@ -760,11 +756,27 @@ class _ActionSubCommands(_SubParsersAction):
+             cfg_dict[dest] = subcommand
+ 
+         if subcommand is None and not (fail_no_subcommand and action._required):
+-            return
++            return None, None
+         if action._required and subcommand not in action._name_parser_map:
+             raise KeyError('Sub-command "'+dest+'" is required but not given or its value is None.')
+ 
+-        subparser = action._name_parser_map[subcommand]
++        subparser = action._name_parser_map.get(subcommand)
++
++        return subcommand, subparser
++
++
++    @staticmethod
++    def handle_subcommands(parser, cfg, env, defaults, prefix='', fail_no_subcommand=True):
++        """Adds sub-command dest if missing and parses defaults and environment variables."""
++
++        cfg_dict = cfg.__dict__ if isinstance(cfg, Namespace) else cfg
++
++        subcommand, subparser = _ActionSubCommands.get_subcommand(parser, cfg_dict, prefix=prefix, fail_no_subcommand=fail_no_subcommand)
++        if subcommand is None:
++            return
++
++        cfg_keys = set(vars(_dict_to_flat_namespace(cfg)).keys())
++        cfg_keys = cfg_keys.union(set(cfg_dict.keys()))
+ 
+         # merge environment variable values and default values
+         subnamespace = None
+diff --git a/jsonargparse/core.py b/jsonargparse/core.py
+index 89d3790..b78ca77 100644
+--- a/jsonargparse/core.py
++++ b/jsonargparse/core.py
+@@ -1117,6 +1117,11 @@ class ArgumentParser(_ActionsContainer, argparse.ArgumentParser, LoggerProperty)
+                 component.instantiate_class(component, cfg)
+                 _ActionLink.apply_instantiation_links(self, cfg, component.dest)
+ 
++        cfg_dict = cfg.__dict__ if isinstance(cfg, Namespace) else cfg
++        subcommand, subparser = _ActionSubCommands.get_subcommand(self, cfg_dict, fail_no_subcommand=False)
++        if subcommand:
++            cfg[subcommand] = subparser.instantiate_classes(cfg[subcommand], instantiate_groups=instantiate_groups)
++
+         return cfg
+ 
+ 

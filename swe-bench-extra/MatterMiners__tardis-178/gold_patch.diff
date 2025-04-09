@@ -1,0 +1,163 @@
+diff --git a/.github/workflows/verification.yml b/.github/workflows/verification.yml
+new file mode 100644
+index 0000000..de6e1a3
+--- /dev/null
++++ b/.github/workflows/verification.yml
+@@ -0,0 +1,23 @@
++name: Static Checks
++
++on: [push, pull_request]
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++    - uses: actions/checkout@v2
++    - name: Set up Python
++      uses: actions/setup-python@v2
++      with:
++        python-version: '3.9'
++    - name: Install dependencies
++      run: |
++        python -m pip install --upgrade pip
++        pip install .[contrib]
++    - name: Lint with flake8
++      run: |
++        flake8 tardis tests setup.py
++    - name: Format with black
++      run: |
++        black tardis tests setup.py --diff --check --target-version py36
+diff --git a/.travis.yml b/.travis.yml
+deleted file mode 100644
+index d7679cc..0000000
+--- a/.travis.yml
++++ /dev/null
+@@ -1,37 +0,0 @@
+-language: python
+-
+-python:
+-  - "3.6"
+-  - "3.7"
+-  - "3.8"
+-  - "3.9"
+-  - "nightly" # currently points to 3.8-dev
+-  - "pypy3"
+-
+-os:
+-  - linux
+-
+-matrix:
+-  allow_failures:
+-  - python: "nightly"
+-  - python: "pypy3"
+-  include:
+-    - python: 3.7
+-      name: Style
+-      dist: xenial
+-      script:
+-        - python -m flake8 tardis tests setup.py
+-        - python -m black --target-version py36 --check tardis/ tests/ setup.py
+-  fast_finish: true
+-
+-install:
+-  - pip install codecov
+-  - pip install coverage
+-  - pip install .[contrib]
+-  - pip install git+https://github.com/MatterMiners/cobald.git
+-
+-script: coverage run setup.py test
+-
+-after_success:
+-  - coverage report
+-  - codecov
+diff --git a/README.md b/README.md
+index 880d4f7..256ddd3 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,5 @@
+-[![Build Status](https://travis-ci.org/MatterMiners/tardis.svg?branch=master)](https://travis-ci.org/MatterMiners/tardis)
++[![Build Status](https://github.com/MatterMiners/tardis/actions/workflows/unittests.yml/badge.svg)](https://github.com/MatterMiners/tardis/actions/workflows/unittests.yml)
++[![Verification](https://github.com/MatterMiners/tardis/actions/workflows/verification.yml/badge.svg)](https://github.com/MatterMiners/tardis/actions/workflows/verification.yml)
+ [![codecov](https://codecov.io/gh/MatterMiners/tardis/branch/master/graph/badge.svg)](https://codecov.io/gh/MatterMiners/tardis)
+ [![Documentation Status](https://readthedocs.org/projects/cobald-tardis/badge/?version=latest)](https://cobald-tardis.readthedocs.io/en/latest/?badge=latest)
+ [![Development and Help Chat](https://badges.gitter.im/MatterMiners.png)](https://gitter.im/MatterMiners/community)
+diff --git a/docs/source/changelog.rst b/docs/source/changelog.rst
+index 1f95158..c8aad5a 100644
+--- a/docs/source/changelog.rst
++++ b/docs/source/changelog.rst
+@@ -1,4 +1,4 @@
+-.. Created by changelog.py at 2021-03-23, command
++.. Created by changelog.py at 2021-03-24, command
+    '/Users/giffler/.cache/pre-commit/repor6pnmwlm/py_env-python3.9/bin/changelog docs/source/changes compile --output=docs/source/changelog.rst'
+    based on the format of 'https://keepachangelog.com/'
+ 
+@@ -6,7 +6,7 @@
+ CHANGELOG
+ #########
+ 
+-[Unreleased] - 2021-03-23
++[Unreleased] - 2021-03-24
+ =========================
+ 
+ Added
+@@ -17,6 +17,7 @@ Added
+ Fixed
+ -----
+ 
++* Fixes a bug that get_resource_ratios raised a ValueError
+ * Fixes a bug that the drone_minimum_lifetime parameter is not working as described in the documentation
+ * Fixes a bug in the HTCondor Site Adapter which leads to wrong requirements when using non HTCondor OBS
+ 
+diff --git a/docs/source/changes/175.fix_resource_ratios.yaml b/docs/source/changes/175.fix_resource_ratios.yaml
+new file mode 100644
+index 0000000..1ba3409
+--- /dev/null
++++ b/docs/source/changes/175.fix_resource_ratios.yaml
+@@ -0,0 +1,10 @@
++category: fixed
++summary: "Fixes a bug that get_resource_ratios raised a ValueError"
++description: |
++    In case one of the resource ratios is `undefined` or even has the value `error`
++    a `ValueError` or `TypeError` could occur. In case one of those errors occurs,
++    an empty list is returned.
++pull requests:
++  - 175
++issues:
++  - 168
+diff --git a/setup.py b/setup.py
+index 615818b..3a46a9c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -68,7 +68,8 @@ setup(
+     extras_require={
+         "docs": ["sphinx", "sphinx_rtd_theme", "sphinxcontrib-contentui"],
+         "test": TESTS_REQUIRE,
+-        "contrib": ["flake8", "flake8-bugbear", "black"] + TESTS_REQUIRE,
++        "contrib": ["flake8", "flake8-bugbear", "black; implementation_name=='cpython'"]
++        + TESTS_REQUIRE,
+     },
+     tests_require=TESTS_REQUIRE,
+     zip_safe=False,
+diff --git a/tardis/adapters/batchsystems/htcondor.py b/tardis/adapters/batchsystems/htcondor.py
+index 0bb702b..67ec25b 100644
+--- a/tardis/adapters/batchsystems/htcondor.py
++++ b/tardis/adapters/batchsystems/htcondor.py
+@@ -172,14 +172,13 @@ class HTCondorAdapter(BatchSystemAdapter):
+         await self._htcondor_status.update_status()
+         try:
+             htcondor_status = self._htcondor_status[drone_uuid]
+-        except KeyError:
+-            return {}
+-        else:
+-            return (
++            return [
+                 float(value)
+                 for key, value in htcondor_status.items()
+                 if key in self.ratios.keys()
+-            )
++            ]
++        except (KeyError, ValueError, TypeError):
++            return []
+ 
+     async def get_allocation(self, drone_uuid: str) -> float:
+         """

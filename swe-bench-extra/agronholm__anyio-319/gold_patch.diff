@@ -1,0 +1,70 @@
+diff --git a/docs/versionhistory.rst b/docs/versionhistory.rst
+index 57e4e92..509bd8b 100644
+--- a/docs/versionhistory.rst
++++ b/docs/versionhistory.rst
+@@ -10,6 +10,8 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
+   synchronous context manager)
+ - Fixed ``to_thread.run_sync()`` hanging on the second call on asyncio when used with
+   ``loop.run_until_complete()``
++- Fixed ``to_thread.run_sync()`` prematurely marking a worker thread inactive when a task await on
++  the result is cancelled
+ - Changed the default value of the ``use_uvloop`` asyncio backend option to ``False`` to prevent
+   unsafe event loop policy changes in different threads
+ - Fixed the type annotation of ``open_signal_receiver()`` as a synchronous context manager
+diff --git a/src/anyio/_backends/_asyncio.py b/src/anyio/_backends/_asyncio.py
+index 11bee85..556c2b9 100644
+--- a/src/anyio/_backends/_asyncio.py
++++ b/src/anyio/_backends/_asyncio.py
+@@ -712,6 +712,16 @@ class WorkerThread(Thread):
+         self.queue: Queue[Union[Tuple[Callable, tuple, asyncio.Future], None]] = Queue(2)
+         self.idle_since = current_time()
+ 
++    def _report_result(self, future: asyncio.Future, result: Any,
++                       exc: Optional[BaseException]) -> None:
++        self.idle_since = current_time()
++        self.idle_workers.append(self)
++        if not future.cancelled():
++            if exc is not None:
++                future.set_exception(exc)
++            else:
++                future.set_result(result)
++
+     def run(self) -> None:
+         with claim_worker_thread('asyncio'):
+             threadlocals.loop = self.loop
+@@ -723,14 +733,16 @@ class WorkerThread(Thread):
+ 
+                 func, args, future = item
+                 if not future.cancelled():
++                    result = None
++                    exception: Optional[BaseException] = None
+                     try:
+                         result = func(*args)
+                     except BaseException as exc:
+-                        if not self.loop.is_closed() and not future.cancelled():
+-                            self.loop.call_soon_threadsafe(future.set_exception, exc)
+-                    else:
+-                        if not self.loop.is_closed() and not future.cancelled():
+-                            self.loop.call_soon_threadsafe(future.set_result, result)
++                        exception = exc
++
++                    if not self.loop.is_closed():
++                        self.loop.call_soon_threadsafe(
++                            self._report_result, future, result, exception)
+ 
+                 self.queue.task_done()
+ 
+@@ -785,12 +797,7 @@ async def run_sync_in_worker_thread(
+                     worker.stop()
+ 
+             worker.queue.put_nowait((func, args, future))
+-            try:
+-                return await future
+-            finally:
+-                assert worker.is_alive()
+-                worker.idle_since = current_time()
+-                idle_workers.append(worker)
++            return await future
+ 
+ 
+ def run_sync_from_thread(func: Callable[..., T_Retval], *args: object,

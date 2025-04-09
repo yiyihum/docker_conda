@@ -1,0 +1,157 @@
+diff --git a/cmd2/argparse_completer.py b/cmd2/argparse_completer.py
+index ac65185b..edfaeec4 100644
+--- a/cmd2/argparse_completer.py
++++ b/cmd2/argparse_completer.py
+@@ -667,7 +667,7 @@ class AutoCompleter(object):
+ 
+                 if callable(arg_choices[0]):
+                     completer = arg_choices[0]
+-                elif isinstance(arg_choices[0], str) and callable(getattr(self._cmd2_app, arg_choices[0])):
++                else:
+                     completer = getattr(self._cmd2_app, arg_choices[0])
+ 
+                 # extract the positional and keyword arguments from the tuple
+@@ -678,19 +678,16 @@ class AutoCompleter(object):
+                         list_args = arg_choices[index]
+                     elif isinstance(arg_choices[index], dict):
+                         kw_args = arg_choices[index]
+-                try:
+-                    # call the provided function differently depending on the provided positional and keyword arguments
+-                    if list_args is not None and kw_args is not None:
+-                        return completer(text, line, begidx, endidx, *list_args, **kw_args)
+-                    elif list_args is not None:
+-                        return completer(text, line, begidx, endidx, *list_args)
+-                    elif kw_args is not None:
+-                        return completer(text, line, begidx, endidx, **kw_args)
+-                    else:
+-                        return completer(text, line, begidx, endidx)
+-                except TypeError:
+-                    # assume this is due to an incorrect function signature, return nothing.
+-                    return []
++
++                # call the provided function differently depending on the provided positional and keyword arguments
++                if list_args is not None and kw_args is not None:
++                    return completer(text, line, begidx, endidx, *list_args, **kw_args)
++                elif list_args is not None:
++                    return completer(text, line, begidx, endidx, *list_args)
++                elif kw_args is not None:
++                    return completer(text, line, begidx, endidx, **kw_args)
++                else:
++                    return completer(text, line, begidx, endidx)
+             else:
+                 return self._cmd2_app.basic_complete(text, line, begidx, endidx,
+                                                      self._resolve_choices_for_arg(action, used_values))
+@@ -704,32 +701,17 @@ class AutoCompleter(object):
+             # is the argument a string? If so, see if we can find an attribute in the
+             # application matching the string.
+             if isinstance(args, str):
+-                try:
+-                    args = getattr(self._cmd2_app, args)
+-                except AttributeError:
+-                    # Couldn't find anything matching the name
+-                    return []
++                args = getattr(self._cmd2_app, args)
+ 
+             # is the provided argument a callable. If so, call it
+             if callable(args):
+                 try:
+-                    try:
+-                        args = args(self._cmd2_app)
+-                    except TypeError:
+-                        args = args()
++                    args = args(self._cmd2_app)
+                 except TypeError:
+-                    return []
+-
+-            try:
+-                iter(args)
+-            except TypeError:
+-                pass
+-            else:
+-                # filter out arguments we already used
+-                args = [arg for arg in args if arg not in used_values]
++                    args = args()
+ 
+-                if len(args) > 0:
+-                    return args
++            # filter out arguments we already used
++            return [arg for arg in args if arg not in used_values]
+ 
+         return []
+ 
+diff --git a/cmd2/cmd2.py b/cmd2/cmd2.py
+index a7b60b1a..3c1c8d2c 100644
+--- a/cmd2/cmd2.py
++++ b/cmd2/cmd2.py
+@@ -1362,16 +1362,13 @@ class Cmd(cmd.Cmd):
+             # Display matches using actual display function. This also redraws the prompt and line.
+             orig_pyreadline_display(matches_to_display)
+ 
+-    # -----  Methods which override stuff in cmd -----
+-
+-    def complete(self, text: str, state: int) -> Optional[str]:
+-        """Override of command method which returns the next possible completion for 'text'.
++    def _complete_worker(self, text: str, state: int) -> Optional[str]:
++        """The actual worker function for tab completion which is called by complete() and returns
++        the next possible completion for 'text'.
+ 
+         If a command has not been entered, then complete against command list.
+         Otherwise try to call complete_<command> to get list of completions.
+ 
+-        This method gets called directly by readline because it is set as the tab-completion function.
+-
+         This completer function is called as complete(text, state), for state in 0, 1, 2, …, until it returns a
+         non-string value. It should return the next possible completion starting with text.
+ 
+@@ -1581,6 +1578,24 @@ class Cmd(cmd.Cmd):
+         except IndexError:
+             return None
+ 
++    def complete(self, text: str, state: int) -> Optional[str]:
++        """Override of cmd2's complete method which returns the next possible completion for 'text'
++
++        This method gets called directly by readline. Since readline suppresses any exception raised
++        in completer functions, they can be difficult to debug. Therefore this function wraps the
++        actual tab completion logic and prints to stderr any exception that occurs before returning
++        control to readline.
++
++        :param text: the current word that user is typing
++        :param state: non-negative integer
++        """
++        # noinspection PyBroadException
++        try:
++            return self._complete_worker(text, state)
++        except Exception as e:
++            self.perror(e)
++            return None
++
+     def _autocomplete_default(self, text: str, line: str, begidx: int, endidx: int,
+                               argparser: argparse.ArgumentParser) -> List[str]:
+         """Default completion function for argparse commands."""
+diff --git a/examples/tab_autocomp_dynamic.py b/examples/tab_autocomp_dynamic.py
+index bedc9d4b..93b72442 100755
+--- a/examples/tab_autocomp_dynamic.py
++++ b/examples/tab_autocomp_dynamic.py
+@@ -69,7 +69,7 @@ class TabCompleteExample(cmd2.Cmd):
+         setattr(director_action, argparse_completer.ACTION_ARG_CHOICES, TabCompleteExample.static_list_directors)
+         setattr(actor_action, argparse_completer.ACTION_ARG_CHOICES, 'instance_query_actors')
+ 
+-        # tag the file property with a custom completion function 'delimeter_complete' provided by cmd2.
++        # tag the file property with a custom completion function 'delimiter_complete' provided by cmd2.
+         setattr(vid_movie_file_action, argparse_completer.ACTION_ARG_CHOICES,
+                 ('delimiter_complete',
+                  {'delimiter': '/',
+diff --git a/examples/tab_autocompletion.py b/examples/tab_autocompletion.py
+index aa28fc10..3f06a274 100755
+--- a/examples/tab_autocompletion.py
++++ b/examples/tab_autocompletion.py
+@@ -255,7 +255,7 @@ class TabCompleteExample(cmd2.Cmd):
+     setattr(director_action, argparse_completer.ACTION_ARG_CHOICES, static_list_directors)
+     setattr(actor_action, argparse_completer.ACTION_ARG_CHOICES, 'instance_query_actors')
+ 
+-    # tag the file property with a custom completion function 'delimeter_complete' provided by cmd2.
++    # tag the file property with a custom completion function 'delimiter_complete' provided by cmd2.
+     setattr(vid_movie_file_action, argparse_completer.ACTION_ARG_CHOICES,
+             ('delimiter_complete',
+              {'delimiter': '/',
+

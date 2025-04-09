@@ -1,0 +1,182 @@
+diff --git a/planet/cli/cli.py b/planet/cli/cli.py
+index 41cf057..d75eb33 100644
+--- a/planet/cli/cli.py
++++ b/planet/cli/cli.py
+@@ -27,20 +27,17 @@ LOGGER = logging.getLogger(__name__)
+ 
+ @click.group()
+ @click.pass_context
+-@click.option('--verbosity',
+-              default="warning",
+-              help=("Optional: set verbosity level to warning, info, or debug.\
+-                  Defaults to warning."))
+ @click.option('--quiet',
+               is_flag=True,
+               default=False,
+               help='Disable ANSI control output.')
+ @click.version_option(version=planet.__version__)
++@click.option('--verbosity',
++              default="warning",
++              help=("Optional: set verbosity level to warning, info, or debug.\
++                  Defaults to warning."))
+ def main(ctx, verbosity, quiet):
+-    """Planet API Client
+-    Parameters:
+-        ctx -- context object
+-        verbosity -- user input for verbosity."""
++    """Planet SDK for Python CLI"""
+     _configure_logging(verbosity)
+ 
+     # ensure that ctx.obj exists and is a dict (in case `cli()` is called
+diff --git a/planet/cli/data.py b/planet/cli/data.py
+index 5f13850..1abdcde 100644
+--- a/planet/cli/data.py
++++ b/planet/cli/data.py
+@@ -19,6 +19,7 @@ import click
+ 
+ from planet import data_filter, DataClient
+ from planet.clients.data import SEARCH_SORT, SEARCH_SORT_DEFAULT, STATS_INTERVAL
++from planet.specs import get_item_types
+ 
+ from . import types
+ from .cmds import coro, translate_exceptions
+@@ -26,6 +27,9 @@ from .io import echo_json
+ from .options import limit, pretty
+ from .session import CliSession
+ 
++ALL_ITEM_TYPES = get_item_types()
++valid_item_string = "Valid entries for ITEM_TYPES: " + "|".join(ALL_ITEM_TYPES)
++
+ 
+ @asynccontextmanager
+ async def data_client(ctx):
+@@ -43,7 +47,7 @@ async def data_client(ctx):
+               default=None,
+               help='Assign custom base Orders API URL.')
+ def data(ctx, base_url):
+-    '''Commands for interacting with the Orders API'''
++    '''Commands for interacting with the Data API'''
+     ctx.obj['AUTH'] = None
+     ctx.obj['BASE_URL'] = base_url
+ 
+@@ -58,6 +62,17 @@ def assets_to_filter(ctx, param, assets: List[str]) -> Optional[dict]:
+     return data_filter.asset_filter(assets) if assets else None
+ 
+ 
++def check_item_types(ctx, param, item_types) -> Optional[List[dict]]:
++    # Set difference between given item types and all item types
++    set_diff = set([item.lower() for item in item_types]) - set(
++        [a.lower() for a in ALL_ITEM_TYPES])
++    if set_diff:
++        raise click.BadParameter(
++            f'{item_types} should be one of {ALL_ITEM_TYPES}')
++    else:
++        return item_types
++
++
+ def date_range_to_filter(ctx, param, values) -> Optional[List[dict]]:
+ 
+     def _func(obj):
+@@ -226,11 +241,13 @@ def filter(ctx,
+         echo_json(filt, pretty)
+ 
+ 
+-@data.command()
++@data.command(epilog=valid_item_string)
+ @click.pass_context
+ @translate_exceptions
+ @coro
+-@click.argument("item_types", type=types.CommaSeparatedString())
++@click.argument("item_types",
++                type=types.CommaSeparatedString(),
++                callback=check_item_types)
+ @click.argument("filter", type=types.JSON(), default="-", required=False)
+ @limit
+ @click.option('--name', type=str, help='Name of the saved search.')
+@@ -264,12 +281,14 @@ async def search(ctx, item_types, filter, limit, name, sort, pretty):
+             echo_json(item, pretty)
+ 
+ 
+-@data.command()
++@data.command(epilog=valid_item_string)
+ @click.pass_context
+ @translate_exceptions
+ @coro
+ @click.argument('name')
+-@click.argument("item_types", type=types.CommaSeparatedString())
++@click.argument("item_types",
++                type=types.CommaSeparatedString(),
++                callback=check_item_types)
+ @click.argument("filter", type=types.JSON(), default="-", required=False)
+ @click.option('--daily-email',
+               is_flag=True,
+@@ -296,11 +315,13 @@ async def search_create(ctx, name, item_types, filter, daily_email, pretty):
+         echo_json(items, pretty)
+ 
+ 
+-@data.command()
++@data.command(epilog=valid_item_string)
+ @click.pass_context
+ @translate_exceptions
+ @coro
+-@click.argument("item_types", type=types.CommaSeparatedString())
++@click.argument("item_types",
++                type=types.CommaSeparatedString(),
++                callback=check_item_types)
+ @click.argument('interval', type=click.Choice(STATS_INTERVAL))
+ @click.argument("filter", type=types.JSON(), default="-", required=False)
+ async def stats(ctx, item_types, interval, filter):
+diff --git a/planet/cli/subscriptions.py b/planet/cli/subscriptions.py
+index 3f465a0..95b7f9e 100644
+--- a/planet/cli/subscriptions.py
++++ b/planet/cli/subscriptions.py
+@@ -13,6 +13,7 @@ from planet.clients.subscriptions import SubscriptionsClient
+ @click.group()
+ @click.pass_context
+ def subscriptions(ctx):
++    '''Commands for interacting with the Subscriptions API'''
+     # None means that order of precedence is 1) environment variable,
+     # 2) secret file.
+     ctx.obj['AUTH'] = None
+diff --git a/planet/specs.py b/planet/specs.py
+index f3971ab..0f8c155 100644
+--- a/planet/specs.py
++++ b/planet/specs.py
+@@ -93,10 +93,10 @@ def get_match(test_entry, spec_entries):
+     is hard to remember but must be exact otherwise the API throws an
+     exception.'''
+     try:
+-        match = next(t for t in spec_entries
+-                     if t.lower() == test_entry.lower())
++        match = next(e for e in spec_entries
++                     if e.lower() == test_entry.lower())
+     except (StopIteration):
+-        raise NoMatchException
++        raise NoMatchException('{test_entry} should be one of {spec_entries}')
+ 
+     return match
+ 
+@@ -107,10 +107,19 @@ def get_product_bundles():
+     return spec['bundles'].keys()
+ 
+ 
+-def get_item_types(product_bundle):
+-    '''Get item types supported by Orders API for the given product bundle.'''
++def get_item_types(product_bundle=None):
++    '''If given product bundle, get specific item types supported by Orders
++    API. Otherwise, get all item types supported by Orders API.'''
+     spec = _get_product_bundle_spec()
+-    return spec['bundles'][product_bundle]['assets'].keys()
++    if product_bundle:
++        item_types = spec['bundles'][product_bundle]['assets'].keys()
++    else:
++        product_bundle = get_product_bundles()
++        all_item_types = []
++        for bundle in product_bundle:
++            all_item_types += [*spec['bundles'][bundle]['assets'].keys()]
++        item_types = set(all_item_types)
++    return item_types
+ 
+ 
+ def _get_product_bundle_spec():
+

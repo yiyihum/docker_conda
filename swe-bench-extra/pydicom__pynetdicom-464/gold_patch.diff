@@ -1,0 +1,183 @@
+diff --git a/docs/changelog/v1.5.0.rst b/docs/changelog/v1.5.0.rst
+index e2b19920d..de9d57f1d 100644
+--- a/docs/changelog/v1.5.0.rst
++++ b/docs/changelog/v1.5.0.rst
+@@ -23,6 +23,7 @@ Fixes
+ * Fixed the association acceptor selecting the first matching proposed
+   transfer syntax rather than the first matching supported transfer syntax
+   during presentation context negotiation (:issue:`445`)
++* Fixed incorrect Pending status value for Modality Worklist (:issue:`462`)
+ 
+ 
+ Enhancements
+@@ -54,9 +55,14 @@ Enhancements
+ * Added ability to pass optional extra arguments to event handlers by using
+   ``(evt.EVT_NAME, handler, ['list', 'of', 'args'])``. (:issue:`447`)
+ * Added :meth:`~pynetdicom.ae.AE.make_server` (:issue:`453`).
+-* Added `request_handler` keyword parameter to :class:`~pynetdicom.transport.AssociationServer` (:issue:`453`)
++* Added `request_handler` keyword parameter to
++  :class:`~pynetdicom.transport.AssociationServer` (:issue:`453`)
+ * Added hook in :class:`~pynetdicom.ae.AE` for creating
+   :class:`~pynetdicom.transport.AssociationSocket` objects (:issue:`455`)
++* Python 3 only: Added a customisable :class:`~pynetdicom.status.Status`
++  convenience class for comparing, returning and yielding status values
++  (:issue:`454`)
++
+ 
+ Changes
+ .......
+diff --git a/docs/reference/status.rst b/docs/reference/status.rst
+index 04b76182e..0bbc41d7a 100644
+--- a/docs/reference/status.rst
++++ b/docs/reference/status.rst
+@@ -72,3 +72,4 @@ codes are used internally within pynetdicom to help aid in debugging.
+ 
+    code_to_category
+    code_to_status
++   Status
+diff --git a/docs/user/association.rst b/docs/user/association.rst
+index 6873f681f..3b67cac9c 100644
+--- a/docs/user/association.rst
++++ b/docs/user/association.rst
+@@ -87,28 +87,25 @@ also acting as a Storage SCP), plus a *User Identity Negotiation* item:
+ 
+ ::
+ 
+-    from pynetdicom import (
+-        AE,
+-        StoragePresentationContexts,
+-        QueryRetrievePresentationContexts,
+-        build_role
+-    )
++    from pynetdicom import AE, StoragePresentationContexts, build_role
+     from pynetdicom.pdu_primitives import UserIdentityNegotiation
++    from pynetdicom.sop_class import PatientRootQueryRetrieveInformationModelGet
+ 
+     ae = AE()
+-    # Contexts proposed as a QR SCU
+-    ae.requested_contexts = QueryRetrievePresentationContexts
+     # Contexts supported as a Storage SCP - requires Role Selection
+-    ae.requested_contexts = StoragePresentationContexts
++    #   Note that we are limited to a maximum of 128 contexts so we
++    #   only include 127 to make room for the QR Get context
++    ae.requested_contexts = StoragePresentationContexts[:127]
++    # Contexts proposed as a QR SCU
++    ae.add_requested_context = PatientRootQueryRetrieveInformationModelGet
+ 
+-    # Add role selection items for the storage contexts we will be supporting
+-    #   as an SCP
++    # Add role selection items for the contexts we will be supporting as an SCP
+     negotiation_items = []
+-    for context in StoragePresentationContexts:
++    for context in StoragePresentationContexts[:127]:
+         role = build_role(context.abstract_syntax, scp_role=True)
+         negotiation_items.append(role)
+ 
+-    # Add user identity negotiation request
++    # Add user identity negotiation request - passwords are sent in the clear!
+     user_identity = UserIdentityNegotiation()
+     user_identity.user_identity_type = 2
+     user_identity.primary_field = b'username'
+diff --git a/pynetdicom/status.py b/pynetdicom/status.py
+index 74552e2e6..1147737e7 100644
+--- a/pynetdicom/status.py
++++ b/pynetdicom/status.py
+@@ -1,5 +1,11 @@
+ """Implementation of the DIMSE Status values."""
+ 
++try:
++    from enum import IntEnum
++    HAS_ENUM = True
++except ImportError:
++    HAS_ENUM = False
++
+ from pydicom.dataset import Dataset
+ 
+ from pynetdicom._globals import (
+@@ -180,7 +186,7 @@ MODALITY_WORKLIST_SERVICE_CLASS_STATUS = {
+               "Matches are continuing - current match is supplied and any "
+               "Optional Keys were supported in the same manner as Required "
+               "Keys"),
+-    0xFE00 : (STATUS_PENDING,
++    0xFF01 : (STATUS_PENDING,
+               "Matches are continuing - warning that one or more Optional "
+               "Keys were not supported for existence for this Identifier"),
+ }
+@@ -469,3 +475,59 @@ def code_to_category(code):
+         return STATUS_UNKNOWN
+     else:
+         raise ValueError("'code' must be a positive integer.")
++
++
++if HAS_ENUM:
++    class Status(IntEnum):
++        """Constants for common status codes.
++
++        .. versionadded:: 1.5
++        .. warning::
++
++            Only available with Python 3
++
++        New constants can be added with the ``Status.add(name, code)`` method but
++        the documentation for it is missing due to a bug in Sphinx. `name` is
++        the variable name of the constant to add as a :class:`str` and `code` is
++        the corresponding status code as an :class:`int`.
++
++        Examples
++        --------
++
++        ::
++
++            from pynetdicom.status import Status
++
++            # Customise the class
++            Status.add('UNABLE_TO_PROCESS', 0xC000)
++
++            def handle_store(event):
++                try:
++                    event.dataset.save_as('temp.dcm')
++                except:
++                    return Status.UNABLE_TO_PROCESS
++
++                return Status.SUCCESS
++
++        """
++        SUCCESS = 0x0000
++        """``0x0000`` - Success"""
++        CANCEL = 0xFE00
++        """``0xFE00`` - Operation terminated"""
++        PENDING = 0xFF00
++        """``0xFF00`` - Matches or sub-operations are continuing"""
++        MOVE_DESTINATION_UNKNOWN = 0xA801
++        """``0xA801`` - Move destination unknown"""
++
++        @classmethod
++        def add(cls, name, code):
++            """Add a new constant to `Status`.
++
++            Parameters
++            ----------
++            name : str
++                The name of the constant to add.
++            code : int
++                The status code corresponding to the name.
++            """
++            setattr(cls, name, code)
+diff --git a/requirements.txt b/requirements.txt
+index 79e1efb59..c0961707b 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,1 +1,1 @@
+-pydicom>=1.2.1
++pydicom>=1.4.2
+diff --git a/setup.py b/setup.py
+index 808081c88..4c1abb0cc 100644
+--- a/setup.py
++++ b/setup.py
+@@ -47,5 +47,5 @@ setup(
+         "Topic :: Scientific/Engineering :: Medical Science Apps.",
+         "Topic :: Software Development :: Libraries",
+     ],
+-    install_requires = ["pydicom>=1.4.0"],
++    install_requires = ["pydicom>=1.4.2"],
+ )

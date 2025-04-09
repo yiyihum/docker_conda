@@ -1,0 +1,164 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e7d9b3a..8a30399 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,5 @@
++1.1.3 - Support git submodules
++
+ 1.1.2 - Support different local folder naming strategy (project path/name), support CA bundles, 
+ 
+ 1.1.1 - Added concurrency, fix for pattern matching filtering out parents with relevant children, fix Gitlab groups API change not returning subgroups 
+diff --git a/README.rst b/README.rst
+index 553dbb7..aa78f8c 100644
+--- a/README.rst
++++ b/README.rst
+@@ -79,6 +79,8 @@ Usage
+ 
+ * To see how to use glob patterns and regex to filter tree nodes see `globre project page <https://pypi.org/project/globre/>`_ .
+ 
++* Cloning submodules: use the `-r` flag to recurse git submodules, uses the `--recursive` for cloning and utilizes `GitPython's smart update method <https://github.com/gitpython-developers/GitPython/blob/20f4a9d49b466a18f1af1fdfb480bc4520a4cdc2/git/objects/submodule/root.py#L67>`__ for upading cloned repositories
++
+ * Printed Usage:
+ 
+ .. code-block:: bash
+@@ -110,6 +112,7 @@ Usage
+                             comma delimited list of glob patterns of paths to projects or groups to clone/pull
+     -x csv, --exclude csv
+                             comma delimited list of glob patterns of paths to projects or groups to exclude from clone/pull
++    -r, --recursive       clone/pull git submodules recursively
+     --version             print the version
+ 
+     examples:
+@@ -151,4 +154,4 @@ Known Limitations
+ * Cloning vs Pulling: when running Gitlabber consecutively with same parameters it will scan the local tree structure, if the project directory exists and is a valid git repository (has .git folder in it) gitlabber will perform a git pull in the directory, otherwise the project directory will be created and the gitlab project will be cloned into it. 
+ * Project Renaming: Gitlabber doesn't maintain local state and will not rename local projects but rather clone them into new directories
+ * Folder Naming Strategy: consecutively running gitlabber with different values for the `-n` parameter will produce undesirable results, keep the same value as previous runs or simply don't change it from the default (project name)
+-* When using gitlab.com observe `rate limits <https://docs.gitlab.com/ee/user/gitlab_com/index.html#gitlabcom-specific-rate-limits/>`__ when cloning large number of projects and the `ones <https://docs.gitlab.com/ee/security/rate_limits.html>`__ for on-premise installations
+\ No newline at end of file
++* When using gitlab.com observe `rate limits <https://docs.gitlab.com/ee/user/gitlab_com/index.html#gitlabcom-specific-rate-limits/>`__ when cloning large number of projects and the `ones <https://docs.gitlab.com/ee/security/rate_limits.html>`__ for on-premise installations
+diff --git a/gitlabber/__init__.py b/gitlabber/__init__.py
+index 7b344ec..7bb021e 100644
+--- a/gitlabber/__init__.py
++++ b/gitlabber/__init__.py
+@@ -1,1 +1,1 @@
+-__version__ = '1.1.2'
++__version__ = '1.1.3'
+diff --git a/gitlabber/cli.py b/gitlabber/cli.py
+index 350f022..9f94687 100644
+--- a/gitlabber/cli.py
++++ b/gitlabber/cli.py
+@@ -32,7 +32,7 @@ def main():
+     includes=split(args.include)
+     excludes=split(args.exclude)
+     tree = GitlabTree(args.url, args.token, args.method, args.naming, includes,
+-                      excludes, args.file, args.concurrency, args.verbose)
++                      excludes, args.file, args.concurrency, args.recursive, args.verbose)
+     log.debug("Reading projects tree from gitlab at [%s]", args.url)
+     tree.load_tree()
+ 
+@@ -161,6 +161,12 @@ def parse_args(argv=None):
+         metavar=('csv'),
+         default=os.environ.get('GITLABBER_EXCLUDE', ""),
+         help='comma delimited list of glob patterns of paths to projects or groups to exclude from clone/pull')
++    parser.add_argument(
++        '-r',
++        '--recursive',
++        action='store_true',
++        default=False,
++        help='clone/pull git submodules recursively')
+     parser.add_argument(
+         '--version',
+         action='store_true',
+diff --git a/gitlabber/git.py b/gitlabber/git.py
+index 74e7df8..5da1f09 100644
+--- a/gitlabber/git.py
++++ b/gitlabber/git.py
+@@ -12,30 +12,31 @@ progress = ProgressBar('* syncing projects')
+ 
+ 
+ class GitAction:
+-    def __init__(self, node, path):
++    def __init__(self, node, path, recursive=False):
+         self.node = node
+         self.path = path
++        self.recursive = recursive
+ 
+-def sync_tree(root, dest, concurrency=1, disable_progress=False):
++def sync_tree(root, dest, concurrency=1, disable_progress=False, recursive=False):
+     if not disable_progress:
+         progress.init_progress(len(root.leaves))
+-    actions = get_git_actions(root, dest)
++    actions = get_git_actions(root, dest, recursive)
+     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+         executor.map(clone_or_pull_project, actions)
+     elapsed = progress.finish_progress()
+     log.debug("Syncing projects took [%s]", elapsed)
+ 
+ 
+-def get_git_actions(root, dest):
++def get_git_actions(root, dest, recursive):
+     actions = []
+     for child in root.children:
+         path = "%s%s" % (dest, child.root_path)
+         if not os.path.exists(path):
+             os.makedirs(path)
+         if child.is_leaf:
+-            actions.append(GitAction(child, path))            
++            actions.append(GitAction(child, path, recursive))            
+         if not child.is_leaf:
+-            actions.extend(get_git_actions(child, dest))
++            actions.extend(get_git_actions(child, dest, recursive))
+     return actions
+ 
+ 
+@@ -57,6 +58,8 @@ def clone_or_pull_project(action):
+         try:
+             repo = git.Repo(action.path)
+             repo.remotes.origin.pull()
++            if(action.recursive): 
++                repo.submodule_update(recursive=True)
+         except KeyboardInterrupt:
+             log.fatal("User interrupted")
+             sys.exit(0)
+@@ -69,7 +72,10 @@ def clone_or_pull_project(action):
+         log.debug("cloning new project %s", action.path)
+         progress.show_progress(action.node.name, 'clone')
+         try:
+-            git.Repo.clone_from(action.node.url, action.path)
++            if(action.recursive):
++                git.Repo.clone_from(action.node.url, action.path, multi_options='--recursive')
++            else:
++                git.Repo.clone_from(action.node.url, action.path)
+         except KeyboardInterrupt:
+             log.fatal("User interrupted")
+             sys.exit(0)
+diff --git a/gitlabber/gitlab_tree.py b/gitlabber/gitlab_tree.py
+index 350fa1e..b07bb29 100644
+--- a/gitlabber/gitlab_tree.py
++++ b/gitlabber/gitlab_tree.py
+@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
+ 
+ class GitlabTree:
+ 
+-    def __init__(self, url, token, method, naming, includes=[], excludes=[], in_file=None, concurrency=1, disable_progress=False):
++    def __init__(self, url, token, method, naming, includes=[], excludes=[], in_file=None, concurrency=1, recursive=False, disable_progress=False):
+         self.includes = includes
+         self.excludes = excludes
+         self.url = url
+@@ -26,6 +26,7 @@ class GitlabTree:
+         self.naming = naming
+         self.in_file = in_file
+         self.concurrency = concurrency
++        self.recursive = recursive
+         self.disable_progress = disable_progress
+         self.progress = ProgressBar('* loading tree', disable_progress)
+ 
+@@ -177,7 +178,7 @@ class GitlabTree:
+         log.debug("Going to clone/pull [%s] groups and [%s] projects" %
+                   (len(self.root.descendants) - len(self.root.leaves), len(self.root.leaves)))
+         sync_tree(self.root, dest, concurrency=self.concurrency,
+-                  disable_progress=self.disable_progress)
++                  disable_progress=self.disable_progress, recursive=self.recursive)
+ 
+     def is_empty(self):
+         return self.root.height < 1

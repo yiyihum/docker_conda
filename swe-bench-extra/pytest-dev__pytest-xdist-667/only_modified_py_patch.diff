@@ -1,0 +1,105 @@
+diff --git a/src/xdist/plugin.py b/src/xdist/plugin.py
+index 1eba32b..12b3a0e 100644
+--- a/src/xdist/plugin.py
++++ b/src/xdist/plugin.py
+@@ -1,17 +1,21 @@
+ import os
+ import uuid
++import sys
+ 
+ import py
+ import pytest
+ 
++_sys_path = list(sys.path)  # freeze a copy of sys.path at interpreter startup
+ 
+-def pytest_xdist_auto_num_workers():
++
++def pytest_xdist_auto_num_workers(config):
+     try:
+         import psutil
+     except ImportError:
+         pass
+     else:
+-        count = psutil.cpu_count(logical=False) or psutil.cpu_count()
++        use_logical = config.option.numprocesses == "logical"
++        count = psutil.cpu_count(logical=use_logical) or psutil.cpu_count()
+         if count:
+             return count
+     try:
+@@ -36,8 +40,8 @@ def pytest_xdist_auto_num_workers():
+ 
+ 
+ def parse_numprocesses(s):
+-    if s == "auto":
+-        return "auto"
++    if s in ("auto", "logical"):
++        return s
+     elif s is not None:
+         return int(s)
+ 
+@@ -51,9 +55,10 @@ def pytest_addoption(parser):
+         metavar="numprocesses",
+         action="store",
+         type=parse_numprocesses,
+-        help="shortcut for '--dist=load --tx=NUM*popen', "
+-        "you can use 'auto' here for auto detection CPUs number on "
+-        "host system and it will be 0 when used with --pdb",
++        help="Shortcut for '--dist=load --tx=NUM*popen'. With 'auto', attempt "
++        "to detect physical CPU count. With 'logical', detect logical CPU "
++        "count. If physical CPU count cannot be found, falls back to logical "
++        "count. This will be 0 when used with --pdb.",
+     )
+     group.addoption(
+         "--maxprocesses",
+@@ -190,7 +195,7 @@ def pytest_configure(config):
+ @pytest.mark.tryfirst
+ def pytest_cmdline_main(config):
+     usepdb = config.getoption("usepdb", False)  # a core option
+-    if config.option.numprocesses == "auto":
++    if config.option.numprocesses in ("auto", "logical"):
+         if usepdb:
+             config.option.numprocesses = 0
+             config.option.dist = "no"
+diff --git a/src/xdist/remote.py b/src/xdist/remote.py
+index 7f95b5c..d79f0b3 100644
+--- a/src/xdist/remote.py
++++ b/src/xdist/remote.py
+@@ -219,12 +219,14 @@ if __name__ == "__channelexec__":
+     channel = channel  # noqa
+     workerinput, args, option_dict, change_sys_path = channel.receive()
+ 
+-    if change_sys_path:
++    if change_sys_path is None:
+         importpath = os.getcwd()
+         sys.path.insert(0, importpath)
+         os.environ["PYTHONPATH"] = (
+             importpath + os.pathsep + os.environ.get("PYTHONPATH", "")
+         )
++    else:
++        sys.path = change_sys_path
+ 
+     os.environ["PYTEST_XDIST_TESTRUNUID"] = workerinput["testrunuid"]
+     os.environ["PYTEST_XDIST_WORKER"] = workerinput["workerid"]
+diff --git a/src/xdist/workermanage.py b/src/xdist/workermanage.py
+index 8fed077..2c4f1a6 100644
+--- a/src/xdist/workermanage.py
++++ b/src/xdist/workermanage.py
+@@ -9,6 +9,7 @@ import pytest
+ import execnet
+ 
+ import xdist.remote
++from xdist.plugin import _sys_path
+ 
+ 
+ def parse_spec_config(config):
+@@ -261,7 +262,8 @@ class WorkerController:
+         remote_module = self.config.hook.pytest_xdist_getremotemodule()
+         self.channel = self.gateway.remote_exec(remote_module)
+         # change sys.path only for remote workers
+-        change_sys_path = not self.gateway.spec.popen
++        # restore sys.path from a frozen copy for local workers
++        change_sys_path = _sys_path if self.gateway.spec.popen else None
+         self.channel.send((self.workerinput, args, option_dict, change_sys_path))
+ 
+         if self.putevent:
+

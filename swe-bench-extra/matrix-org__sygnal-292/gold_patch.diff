@@ -1,0 +1,176 @@
+diff --git a/changelog.d/285.doc b/changelog.d/285.doc
+new file mode 100644
+index 0000000..fa45471
+--- /dev/null
++++ b/changelog.d/285.doc
+@@ -0,0 +1,1 @@
++Document the use of an iOS Notification Service Extension and the Push Gateway API as a workaround to trigger VoIP notifications on iOS.
+\ No newline at end of file
+diff --git a/changelog.d/292.bugfix b/changelog.d/292.bugfix
+new file mode 100644
+index 0000000..ef41c7e
+--- /dev/null
++++ b/changelog.d/292.bugfix
+@@ -0,0 +1,1 @@
++Fix a bug introduced in Sygnal 0.7.0 where a malformed `default_payload` could cause an internal server error.
+diff --git a/docs/applications.md b/docs/applications.md
+index b102d84..53eeaf1 100644
+--- a/docs/applications.md
++++ b/docs/applications.md
+@@ -175,6 +175,40 @@ An example `data` dictionary to specify on `POST /_matrix/client/r0/pushers/set`
+ [APNs documentation]: https://developer.apple.com/library/archive/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/CreatingtheNotificationPayload.html
+ 
+ 
++#### VoIP (voice calls and video calls) notifications on iOS
++
++iOS is capable of displaying an on-screen call notification (with answer/deny buttons)
++and playing a ringtone.
++
++However, this requires sending a special kind of push notification.
++Sygnal is not able to send this type of push notification because a VoIP call may
++begin as a result of an encrypted message, so Sygnal has no way to know that a given
++message should initiate a VoIP call.
++
++
++##### Recent iOS (≥ 14.5) versions
++
++As of iOS 14.5, your iOS application can register a Notification Service Extension that,
++upon receiving a relevant VoIP notification, calls [`reportNewIncomingVoIPPushPayload`][iOSReportVoIP]
++to trigger a VoIP notification display on the device.
++
++[iOSReportVoIP]: https://developer.apple.com/documentation/callkit/cxprovider/3727263-reportnewincomingvoippushpayload
++
++
++##### Old iOS (< 14.5) versions
++
++For old iOS versions, a workaround is for your iOS application to register a Notification Service Extension
++that, upon receiving a relevant VoIP notification, makes an HTTP request to Sygnal's
++[`/_matrix/push/v1/notify`](https://spec.matrix.org/latest/push-gateway-api/#post_matrixpushv1notify)
++endpoint in order to trigger the correct type of notification.
++(There was no interface to do this on-device.)
++
++The Notification Service Extension of *Element iOS*, [available here][ElementNSE],
++may be useful for reference.
++
++[ElementNSE]: https://github.com/vector-im/element-ios/blob/034e253fb19092ef16b5262293d5c32db96aec22/RiotNSE/NotificationService.swift
++
++
+ ### Firebase Cloud Messaging
+ 
+ The client will receive a message with an FCM `data` payload with this structure:
+diff --git a/sygnal/apnspushkin.py b/sygnal/apnspushkin.py
+index c7abf26..c4d495b 100644
+--- a/sygnal/apnspushkin.py
++++ b/sygnal/apnspushkin.py
+@@ -283,10 +283,22 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
+         with self.sygnal.tracer.start_span(
+             "apns_dispatch", tags=span_tags, child_of=context.opentracing_span
+         ) as span_parent:
++            # Before we build the payload, check that the default_payload is not
++            # malformed and reject the pushkey if it is
++
++            default_payload = {}
++
++            if device.data:
++                default_payload = device.data.get("default_payload", {})
++                if not isinstance(default_payload, dict):
++                    log.error(
++                        "default_payload is malformed, this value must be a dict."
++                    )
++                    return [device.pushkey]
+ 
+             if n.event_id and not n.type:
+                 payload: Optional[Dict[str, Any]] = self._get_payload_event_id_only(
+-                    n, device
++                    n, default_payload
+                 )
+             else:
+                 payload = self._get_payload_full(n, device, log)
+@@ -336,7 +348,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
+             raise NotificationDispatchException("Retried too many times.")
+ 
+     def _get_payload_event_id_only(
+-        self, n: Notification, device: Device
++        self, n: Notification, default_payload: Dict[str, Any]
+     ) -> Dict[str, Any]:
+         """
+         Constructs a payload for a notification where we know only the event ID.
+@@ -350,8 +362,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
+         """
+         payload = {}
+ 
+-        if device.data:
+-            payload.update(device.data.get("default_payload", {}))
++        payload.update(default_payload)
+ 
+         if n.room_id:
+             payload["room_id"] = n.room_id
+diff --git a/sygnal/gcmpushkin.py b/sygnal/gcmpushkin.py
+index e895489..ca68d68 100644
+--- a/sygnal/gcmpushkin.py
++++ b/sygnal/gcmpushkin.py
+@@ -18,7 +18,7 @@ import json
+ import logging
+ import time
+ from io import BytesIO
+-from typing import TYPE_CHECKING, Any, AnyStr, Dict, List, Tuple
++from typing import TYPE_CHECKING, Any, AnyStr, Dict, List, Optional, Tuple
+ 
+ from opentracing import Span, logs, tags
+ from prometheus_client import Counter, Gauge, Histogram
+@@ -347,16 +347,21 @@ class GcmPushkin(ConcurrencyLimitedPushkin):
+         with self.sygnal.tracer.start_span(
+             "gcm_dispatch", tags=span_tags, child_of=context.opentracing_span
+         ) as span_parent:
++            # TODO: Implement collapse_key to queue only one message per room.
++            failed: List[str] = []
++
+             data = GcmPushkin._build_data(n, device)
++
++            # Reject pushkey if default_payload is misconfigured
++            if data is None:
++                failed.append(device.pushkey)
++
+             headers = {
+                 "User-Agent": ["sygnal"],
+                 "Content-Type": ["application/json"],
+                 "Authorization": ["key=%s" % (self.api_key,)],
+             }
+ 
+-            # TODO: Implement collapse_key to queue only one message per room.
+-            failed: List[str] = []
+-
+             body = self.base_request_body.copy()
+             body["data"] = data
+             body["priority"] = "normal" if n.prio == "low" else "high"
+@@ -409,7 +414,7 @@ class GcmPushkin(ConcurrencyLimitedPushkin):
+             return failed
+ 
+     @staticmethod
+-    def _build_data(n: Notification, device: Device) -> Dict[str, Any]:
++    def _build_data(n: Notification, device: Device) -> Optional[Dict[str, Any]]:
+         """
+         Build the payload data to be sent.
+         Args:
+@@ -418,12 +423,19 @@ class GcmPushkin(ConcurrencyLimitedPushkin):
+             will be sent.
+ 
+         Returns:
+-            JSON-compatible dict
++            JSON-compatible dict or None if the default_payload is misconfigured
+         """
+         data = {}
+ 
+         if device.data:
+-            data.update(device.data.get("default_payload", {}))
++            default_payload = device.data.get("default_payload", {})
++            if isinstance(default_payload, dict):
++                data.update(default_payload)
++            else:
++                logger.error(
++                    "default_payload was misconfigured, this value must be a dict."
++                )
++                return None
+ 
+         for attr in [
+             "event_id",

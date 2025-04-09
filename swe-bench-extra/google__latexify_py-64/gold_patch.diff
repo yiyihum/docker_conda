@@ -1,0 +1,174 @@
+diff --git a/src/latexify/frontend.py b/src/latexify/frontend.py
+index 380a200..5894b82 100644
+--- a/src/latexify/frontend.py
++++ b/src/latexify/frontend.py
+@@ -11,25 +11,32 @@ from typing import Any
+ import dill
+ 
+ from latexify import latexify_visitor
++from latexify.transformers.identifier_replacer import IdentifierReplacer
+ 
+ 
+ def get_latex(
+     fn: Callable[..., Any],
+     *,
++    identifiers: dict[str, str] | None = None,
++    reduce_assignments: bool = False,
+     use_math_symbols: bool = False,
+     use_raw_function_name: bool = False,
+-    reduce_assignments: bool = False,
+ ) -> str:
+     """Obtains LaTeX description from the function's source.
+ 
+     Args:
+         fn: Reference to a function to analyze.
++        identifiers: If set, the mapping to replace identifier names in the function.
++            Keys are the original names of the identifiers, and corresponding values are
++            the replacements.
++            Both keys and values have to represent valid Python identifiers:
++            ^[A-Za-z_][A-Za-z0-9_]*$
++        reduce_assignments: If True, assignment statements are used to synthesize
++            the final expression.
+         use_math_symbols: Whether to convert identifiers with a math symbol surface
+             (e.g., "alpha") to the LaTeX symbol (e.g., "\\alpha").
+         use_raw_function_name: Whether to keep underscores "_" in the function name,
+             or convert it to subscript.
+-        reduce_assignments: If True, assignment statements are used to synthesize
+-            the final expression.
+ 
+     Returns:
+         Generatee LaTeX description.
+@@ -45,6 +52,9 @@ def get_latex(
+ 
+     tree = ast.parse(source)
+ 
++    if identifiers is not None:
++        tree = IdentifierReplacer(identifiers).visit(tree)
++
+     visitor = latexify_visitor.LatexifyVisitor(
+         use_math_symbols=use_math_symbols,
+         use_raw_function_name=use_raw_function_name,
+diff --git a/src/latexify/latexify_visitor.py b/src/latexify/latexify_visitor.py
+index d271457..476d1ef 100644
+--- a/src/latexify/latexify_visitor.py
++++ b/src/latexify/latexify_visitor.py
+@@ -23,19 +23,19 @@ class LatexifyVisitor(node_visitor_base.NodeVisitorBase):
+     def __init__(
+         self,
+         *,
++        reduce_assignments: bool = True,
+         use_math_symbols: bool = False,
+         use_raw_function_name: bool = False,
+-        reduce_assignments: bool = True,
+     ):
+         """Initializer.
+ 
+         Args:
++            reduce_assignments: If True, assignment statements are used to synthesize
++                the final expression.
+             use_math_symbols: Whether to convert identifiers with a math symbol surface
+                 (e.g., "alpha") to the LaTeX symbol (e.g., "\\alpha").
+             use_raw_function_name: Whether to keep underscores "_" in the function name,
+                 or convert it to subscript.
+-            reduce_assignments: If True, assignment statements are used to synthesize
+-                the final expression.
+         """
+         self._math_symbol_converter = math_symbols.MathSymbolConverter(
+             enabled=use_math_symbols
+diff --git a/src/latexify/transformers/__init__.py b/src/latexify/transformers/__init__.py
+new file mode 100644
+index 0000000..005a0d2
+--- /dev/null
++++ b/src/latexify/transformers/__init__.py
+@@ -0,0 +1,1 @@
++"""Package latexify.transformers."""
+diff --git a/src/latexify/transformers/identifier_replacer.py b/src/latexify/transformers/identifier_replacer.py
+new file mode 100644
+index 0000000..3e7f903
+--- /dev/null
++++ b/src/latexify/transformers/identifier_replacer.py
+@@ -0,0 +1,84 @@
++"""Transformer to replace user symbols."""
++
++from __future__ import annotations
++
++import ast
++import re
++import sys
++from typing import ClassVar
++
++
++class IdentifierReplacer(ast.NodeTransformer):
++    """NodeTransformer to replace identifier names.
++
++    This class defines a rule to replace identifiers in AST with specified names.
++
++    Example:
++        def foo(bar):
++            return baz
++
++        IdentifierReplacer({"foo": "x", "bar": "y", "baz": "z"}) will modify the AST of
++        the function above to below:
++
++        def x(y):
++            return z
++    """
++
++    _IDENTIFIER_PATTERN: ClassVar[re.Pattern] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
++
++    def __init__(self, mapping: dict[str, str]):
++        """Initializer.
++
++        Args:
++            mapping: User defined mapping of names. Keys are the original names of the
++                identifiers, and corresponding values are the replacements.
++                Both keys and values have to represent valid Python identifiers:
++                ^[A-Za-z_][A-Za-z0-9_]*$
++        """
++        self._mapping = mapping
++
++        for k, v in self._mapping.items():
++            if not self._IDENTIFIER_PATTERN.match(k):
++                raise ValueError(f"'{k}' is not an identifier name.")
++            if not self._IDENTIFIER_PATTERN.match(v):
++                raise ValueError(f"'{v}' is not an identifier name.")
++
++    def _replace_args(self, args: list[ast.arg]) -> list[ast.arg]:
++        """Helper function to replace arg names."""
++        return [ast.arg(arg=self._mapping.get(a.arg, a.arg)) for a in args]
++
++    def _visit_children(self, children: list[ast.AST]) -> list[ast.AST]:
++        """Helper function to visit all children."""
++        return [self.visit(child) for child in children]
++
++    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
++        """Visitor of FunctionDef."""
++        if sys.version_info.minor < 8:
++            args = ast.arguments(
++                args=self._replace_args(node.args.args),
++                kwonlyargs=self._replace_args(node.args.kwonlyargs),
++                kw_defaults=self._visit_children(node.args.kw_defaults),
++                defaults=self._visit_children(node.args.defaults),
++            )
++        else:
++            args = ast.arguments(
++                posonlyargs=self._replace_args(node.args.posonlyargs),  # from 3.8
++                args=self._replace_args(node.args.args),
++                kwonlyargs=self._replace_args(node.args.kwonlyargs),
++                kw_defaults=self._visit_children(node.args.kw_defaults),
++                defaults=self._visit_children(node.args.defaults),
++            )
++
++        return ast.FunctionDef(
++            name=self._mapping.get(node.name, node.name),
++            args=args,
++            body=self._visit_children(node.body),
++            decorator_list=self._visit_children(node.decorator_list),
++        )
++
++    def visit_Name(self, node: ast.Name) -> ast.Name:
++        """Visitor of Name."""
++        return ast.Name(
++            id=self._mapping.get(node.id, node.id),
++            ctx=node.ctx,
++        )

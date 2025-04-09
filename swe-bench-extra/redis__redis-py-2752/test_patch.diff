@@ -1,0 +1,221 @@
+diff --git a/tests/test_asyncio/test_commands.py b/tests/test_asyncio/test_commands.py
+index 409934c..955b9d4 100644
+--- a/tests/test_asyncio/test_commands.py
++++ b/tests/test_asyncio/test_commands.py
+@@ -1,9 +1,11 @@
+ """
+ Tests async overrides of commands from their mixins
+ """
++import asyncio
+ import binascii
+ import datetime
+ import re
++import sys
+ from string import ascii_letters
+ 
+ import pytest
+@@ -18,6 +20,11 @@ from tests.conftest import (
+     skip_unless_arch_bits,
+ )
+ 
++if sys.version_info >= (3, 11, 3):
++    from asyncio import timeout as async_timeout
++else:
++    from async_timeout import timeout as async_timeout
++
+ REDIS_6_VERSION = "5.9.0"
+ 
+ 
+@@ -446,6 +453,14 @@ class TestRedisCommands:
+         with pytest.raises(exceptions.RedisError):
+             await r.client_pause(timeout="not an integer")
+ 
++    @skip_if_server_version_lt("7.2.0")
++    @pytest.mark.onlynoncluster
++    async def test_client_no_touch(self, r: redis.Redis):
++        assert await r.client_no_touch("ON") == b"OK"
++        assert await r.client_no_touch("OFF") == b"OK"
++        with pytest.raises(TypeError):
++            await r.client_no_touch()
++
+     async def test_config_get(self, r: redis.Redis):
+         data = await r.config_get()
+         assert "maxmemory" in data
+@@ -3008,6 +3023,37 @@ class TestRedisCommands:
+         for x in await r.module_list():
+             assert isinstance(x, dict)
+ 
++    @pytest.mark.onlynoncluster
++    async def test_interrupted_command(self, r: redis.Redis):
++        """
++        Regression test for issue #1128:  An Un-handled BaseException
++        will leave the socket with un-read response to a previous
++        command.
++        """
++        ready = asyncio.Event()
++
++        async def helper():
++            with pytest.raises(asyncio.CancelledError):
++                # blocking pop
++                ready.set()
++                await r.brpop(["nonexist"])
++            # If the following is not done, further Timout operations will fail,
++            # because the timeout won't catch its Cancelled Error if the task
++            # has a pending cancel.  Python documentation probably should reflect this.
++            if sys.version_info >= (3, 11):
++                asyncio.current_task().uncancel()
++            # if all is well, we can continue.  The following should not hang.
++            await r.set("status", "down")
++
++        task = asyncio.create_task(helper())
++        await ready.wait()
++        await asyncio.sleep(0.01)
++        # the task is now sleeping, lets send it an exception
++        task.cancel()
++        # If all is well, the task should finish right away, otherwise fail with Timeout
++        async with async_timeout(0.1):
++            await task
++
+ 
+ @pytest.mark.onlynoncluster
+ class TestBinarySave:
+diff --git a/tests/test_asyncio/test_connection.py b/tests/test_asyncio/test_connection.py
+index e2d77fc..158b854 100644
+--- a/tests/test_asyncio/test_connection.py
++++ b/tests/test_asyncio/test_connection.py
+@@ -184,7 +184,7 @@ async def test_connection_parse_response_resume(r: redis.Redis):
+     conn._parser._stream = MockStream(message, interrupt_every=2)
+     for i in range(100):
+         try:
+-            response = await conn.read_response()
++            response = await conn.read_response(disconnect_on_error=False)
+             break
+         except MockStream.TestError:
+             pass
+@@ -271,3 +271,9 @@ async def test_connection_disconect_race(parser_class):
+ 
+     vals = await asyncio.gather(do_read(), do_close())
+     assert vals == [b"Hello, World!", None]
++
++
++@pytest.mark.onlynoncluster
++def test_create_single_connection_client_from_url():
++    client = Redis.from_url("redis://localhost:6379/0?", single_connection_client=True)
++    assert client.single_connection_client is True
+diff --git a/tests/test_asyncio/test_cwe_404.py b/tests/test_asyncio/test_cwe_404.py
+index d3a0666..21f2ddd 100644
+--- a/tests/test_asyncio/test_cwe_404.py
++++ b/tests/test_asyncio/test_cwe_404.py
+@@ -128,7 +128,6 @@ async def test_standalone(delay, master_host):
+                 assert await r.get("foo") == b"foo"
+ 
+ 
+-@pytest.mark.xfail(reason="cancel does not cause disconnect")
+ @pytest.mark.onlynoncluster
+ @pytest.mark.parametrize("delay", argvalues=[0.05, 0.5, 1, 2])
+ async def test_standalone_pipeline(delay, master_host):
+diff --git a/tests/test_commands.py b/tests/test_commands.py
+index 2b769be..c71e347 100644
+--- a/tests/test_commands.py
++++ b/tests/test_commands.py
+@@ -1,9 +1,12 @@
+ import binascii
+ import datetime
+ import re
++import threading
+ import time
++from asyncio import CancelledError
+ from string import ascii_letters
+ from unittest import mock
++from unittest.mock import patch
+ 
+ import pytest
+ 
+@@ -693,6 +696,14 @@ class TestRedisCommands:
+         with pytest.raises(TypeError):
+             r.client_no_evict()
+ 
++    @pytest.mark.onlynoncluster
++    @skip_if_server_version_lt("7.2.0")
++    def test_client_no_touch(self, r):
++        assert r.client_no_touch("ON") == b"OK"
++        assert r.client_no_touch("OFF") == b"OK"
++        with pytest.raises(TypeError):
++            r.client_no_touch()
++
+     @pytest.mark.onlynoncluster
+     @skip_if_server_version_lt("3.2.0")
+     def test_client_reply(self, r, r_timeout):
+@@ -861,6 +872,8 @@ class TestRedisCommands:
+         # make sure other attributes are typed correctly
+         assert isinstance(slowlog[0]["start_time"], int)
+         assert isinstance(slowlog[0]["duration"], int)
++        assert isinstance(slowlog[0]["client_address"], bytes)
++        assert isinstance(slowlog[0]["client_name"], bytes)
+ 
+         # Mock result if we didn't get slowlog complexity info.
+         if "complexity" not in slowlog[0]:
+@@ -4741,6 +4754,38 @@ class TestRedisCommands:
+         res = r2.psync(r2.client_id(), 1)
+         assert b"FULLRESYNC" in res
+ 
++    @pytest.mark.onlynoncluster
++    def test_interrupted_command(self, r: redis.Redis):
++        """
++        Regression test for issue #1128:  An Un-handled BaseException
++        will leave the socket with un-read response to a previous
++        command.
++        """
++
++        ok = False
++
++        def helper():
++            with pytest.raises(CancelledError):
++                # blocking pop
++                with patch.object(
++                    r.connection._parser, "read_response", side_effect=CancelledError
++                ):
++                    r.brpop(["nonexist"])
++            # if all is well, we can continue.
++            r.set("status", "down")  # should not hang
++            nonlocal ok
++            ok = True
++
++        thread = threading.Thread(target=helper)
++        thread.start()
++        thread.join(0.1)
++        try:
++            assert not thread.is_alive()
++            assert ok
++        finally:
++            # disconnect here so that fixture cleanup can proceed
++            r.connection.disconnect()
++
+ 
+ @pytest.mark.onlynoncluster
+ class TestBinarySave:
+diff --git a/tests/test_connection.py b/tests/test_connection.py
+index 25b4118..31268a9 100644
+--- a/tests/test_connection.py
++++ b/tests/test_connection.py
+@@ -160,7 +160,7 @@ def test_connection_parse_response_resume(r: redis.Redis, parser_class):
+         conn._parser._sock = mock_socket
+     for i in range(100):
+         try:
+-            response = conn.read_response()
++            response = conn.read_response(disconnect_on_error=False)
+             break
+         except MockSocket.TestError:
+             pass
+@@ -205,3 +205,11 @@ def test_pack_command(Class):
+ 
+     actual = Class().pack_command(*cmd)[0]
+     assert actual == expected, f"actual = {actual}, expected = {expected}"
++
++
++@pytest.mark.onlynoncluster
++def test_create_single_connection_client_from_url():
++    client = redis.Redis.from_url(
++        "redis://localhost:6379/0?", single_connection_client=True
++    )
++    assert client.connection is not None

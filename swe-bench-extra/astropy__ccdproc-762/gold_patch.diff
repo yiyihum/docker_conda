@@ -1,0 +1,158 @@
+diff --git a/AUTHORS.rst b/AUTHORS.rst
+index f067a45..8f9d29a 100644
+--- a/AUTHORS.rst
++++ b/AUTHORS.rst
+@@ -24,6 +24,7 @@ Alphabetical list of contributors
+ * Mihai Cara (@mcara)
+ * James Davenport (@jradavenport)
+ * Christoph Deil (@cdeil)
++* Timothy P. Ellsworth-Bowers (@tbowers7)
+ * Carlos Gomez (@carlgogo)
+ * Hans Moritz Günther (@hamogu)
+ * Forrest Gasdia (@EP-Guy)
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d21f3a1..4205d74 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -4,6 +4,9 @@
+ New Features
+ ^^^^^^^^^^^^
+ 
++- Improve integration of ``ImageFileCollection`` with image combination
++  and document that integration [#762]
++
+ Other Changes and Additions
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ - Add memory_profiler as a test requirement [#739]
+@@ -14,10 +17,14 @@ Bug Fixes
+ ^^^^^^^^^
+ 
+ - ``test_image_collection.py`` in the test suite no longer produces
+- permanent files on disk and cleans up after itself. [#738]
++  permanent files on disk and cleans up after itself. [#738]
+ 
+ - Change ``Combiner`` to allow accepting either a list or a generator [#757]
+ 
++- ``ImageFileCollection`` now correctly returns an empty collection when
++  an existing collection is filtered restrictively enough to remove all
++  files.  [#750]
++
+ 2.1.0 (2019-12-24)
+ ------------------
+ 
+diff --git a/ccdproc/combiner.py b/ccdproc/combiner.py
+index 39f3e28..d85c55e 100644
+--- a/ccdproc/combiner.py
++++ b/ccdproc/combiner.py
+@@ -676,8 +676,12 @@ def combine(img_list, output_file=None,
+         elif isinstance(img_list, str) and (',' in img_list):
+             img_list = img_list.split(',')
+         else:
+-            raise ValueError(
+-                "unrecognised input for list of images to combine.")
++            try:
++                # Maybe the input can be made into a list, so try that
++                img_list = list(img_list)
++            except TypeError:
++                raise ValueError(
++                    "unrecognised input for list of images to combine.")
+ 
+     # Select Combine function to call in Combiner
+     if method == 'average':
+diff --git a/ccdproc/image_collection.py b/ccdproc/image_collection.py
+index 6fd9f6b..ff58c46 100644
+--- a/ccdproc/image_collection.py
++++ b/ccdproc/image_collection.py
+@@ -448,7 +448,9 @@ class ImageFileCollection:
+             else:
+                 files = self._filenames
+         else:
+-            files = self._fits_files_in_directory()
++            # Check if self.location is set, otherwise proceed with empty list
++            if self.location != '':
++                files = self._fits_files_in_directory()
+ 
+             if self.glob_include is not None:
+                 files = fnmatch.filter(files, self.glob_include)
+diff --git a/docs/image_combination.rst b/docs/image_combination.rst
+index 0922d21..012fa5b 100644
+--- a/docs/image_combination.rst
++++ b/docs/image_combination.rst
+@@ -4,9 +4,13 @@ Combining images and generating masks from clipping
+ ===================================================
+ 
+ .. note::
+-    No attempt has been made yet to optimize memory usage in
+-    `~ccdproc.Combiner`. A copy is made, and a mask array
+-    constructed, for each input image.
++    There are currently two interfaces to image combination. One is through
++    the `~ccdproc.Combiner` class, the other through the `~ccdproc.combine`
++    function. They offer *almost* identical capabilities. The primary
++    difference is that `~ccdproc.combine` allows you to place an upper
++    limit on the amount of memory used.
++
++    Work to improve the performance of image combination is ongoing.
+ 
+ 
+ The first step in combining a set of images is creating a
+@@ -133,6 +137,48 @@ using `~ccdproc.Combiner.average_combine` or
+ `~ccdproc.Combiner.median_combine`).
+ 
+ 
++.. _combination_with_IFC
++Image combination using `~ccdproc.ImageFileCollection`
++------------------------------------------------------
++
++There are a couple of ways that image combination can be done if you are using
++`~ccdproc.ImageFileCollection` to
++:ref:`manage a folder of images <image_management>`.
++
++For this example, a temporary folder with images in it is created:
++
++    >>> from tempfile import mkdtemp
++    >>> from pathlib import Path
++    >>> import numpy as np
++    >>> from astropy.nddata import CCDData
++    >>> from ccdproc import ImageFileCollection, Combiner, combine
++    >>>
++    >>> ccd = CCDData(np.ones([5, 5]), unit='adu')
++    >>>
++    >>> # Make a temporary folder as a path object
++    >>> image_folder = Path(mkdtemp())
++    >>> # Put several copies ccd in the temporary folder
++    >>> _ = [ccd.write(image_folder / f"ccd-{i}.fits") for i in range(3)]
++    >>> ifc = ImageFileCollection(image_folder)
++
++To combine images using the `~ccdproc.Combiner` class you can use the ``ccds``
++method of the `~ccdproc.ImageFileCollection`:
++
++    >>> c = Combiner(ifc.ccds())
++    >>> avg_combined = c.average_combine()
++
++There two ways combine images using the `~ccdproc.combine` function. If the
++images are large enough to combine in memory, then use the file names as the argument to `~ccdproc.combine`, like this:
++
++    >>> avg_combo_mem_lim = combine(ifc.files_filtered(include_path=True),
++    ...                             mem_limit=1e9)
++
++If memory use is not an issue, then the ``ccds`` method can be used here too:
++
++    >>> avg_combo = combine(ifc.ccds())
++
++
++
+ .. _reprojection:
+ 
+ Combination with image transformation and alignment
+diff --git a/setup.cfg b/setup.cfg
+index fac559b..827bd83 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -4,6 +4,7 @@ minversion = 2.2
+ testpaths = "ccdproc" "docs"
+ norecursedirs = build docs/_build
+ doctest_plus = enabled
++addopts = --doctest-rst
+ markers =
+     data_size(N): set dimension of square data array for ccd_data fixture
+     data_scale(s): set the scale of the normal distribution used to generate data

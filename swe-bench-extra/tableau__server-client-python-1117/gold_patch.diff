@@ -1,0 +1,143 @@
+diff --git a/samples/create_group.py b/samples/create_group.py
+index 50d84a1..d5cf712 100644
+--- a/samples/create_group.py
++++ b/samples/create_group.py
+@@ -46,7 +46,7 @@ def main():
+     logging.basicConfig(level=logging_level)
+ 
+     tableau_auth = TSC.PersonalAccessTokenAuth(args.token_name, args.token_value, site_id=args.site)
+-    server = TSC.Server(args.server, use_server_version=True)
++    server = TSC.Server(args.server, use_server_version=True, http_options={"verify": False})
+     with server.auth.sign_in(tableau_auth):
+         # this code shows 3 different error codes that mean "resource is already in collection"
+         # 409009: group already exists on server
+diff --git a/tableauserverclient/server/endpoint/endpoint.py b/tableauserverclient/server/endpoint/endpoint.py
+index 378c847..a7b3306 100644
+--- a/tableauserverclient/server/endpoint/endpoint.py
++++ b/tableauserverclient/server/endpoint/endpoint.py
+@@ -11,9 +11,12 @@ from .exceptions import (
+     NonXMLResponseError,
+     EndpointUnavailableError,
+ )
+-from .. import endpoint
+ from ..query import QuerySet
+ from ... import helpers
++from ..._version import get_versions
++
++__TSC_VERSION__ = get_versions()["version"]
++del get_versions
+ 
+ logger = logging.getLogger("tableau.endpoint")
+ 
+@@ -22,34 +25,25 @@ Success_codes = [200, 201, 202, 204]
+ XML_CONTENT_TYPE = "text/xml"
+ JSON_CONTENT_TYPE = "application/json"
+ 
++USERAGENT_HEADER = "User-Agent"
++
+ if TYPE_CHECKING:
+     from ..server import Server
+     from requests import Response
+ 
+ 
+-_version_header: Optional[str] = None
+-
+-
+ class Endpoint(object):
+     def __init__(self, parent_srv: "Server"):
+-        global _version_header
+         self.parent_srv = parent_srv
+ 
+     @staticmethod
+     def _make_common_headers(auth_token, content_type):
+-        global _version_header
+-
+-        if not _version_header:
+-            from ..server import __TSC_VERSION__
+-
+-            _version_header = __TSC_VERSION__
+-
+         headers = {}
+         if auth_token is not None:
+             headers["x-tableau-auth"] = auth_token
+         if content_type is not None:
+             headers["content-type"] = content_type
+-        headers["User-Agent"] = "Tableau Server Client/{}".format(_version_header)
++        headers["User-Agent"] = "Tableau Server Client/{}".format(__TSC_VERSION__)
+         return headers
+ 
+     def _make_request(
+@@ -62,9 +56,9 @@ class Endpoint(object):
+         parameters: Optional[Dict[str, Any]] = None,
+     ) -> "Response":
+         parameters = parameters or {}
+-        parameters.update(self.parent_srv.http_options)
+         if "headers" not in parameters:
+             parameters["headers"] = {}
++        parameters.update(self.parent_srv.http_options)
+         parameters["headers"].update(Endpoint._make_common_headers(auth_token, content_type))
+ 
+         if content is not None:
+diff --git a/tableauserverclient/server/server.py b/tableauserverclient/server/server.py
+index c82f4a6..18f5834 100644
+--- a/tableauserverclient/server/server.py
++++ b/tableauserverclient/server/server.py
+@@ -37,11 +37,6 @@ from .exceptions import NotSignedInError
+ from ..namespace import Namespace
+ 
+ 
+-from .._version import get_versions
+-
+-__TSC_VERSION__ = get_versions()["version"]
+-del get_versions
+-
+ _PRODUCT_TO_REST_VERSION = {
+     "10.0": "2.3",
+     "9.3": "2.2",
+@@ -51,7 +46,6 @@ _PRODUCT_TO_REST_VERSION = {
+ }
+ minimum_supported_server_version = "2.3"
+ default_server_version = "2.3"
+-client_version_header = "X-TableauServerClient-Version"
+ 
+ 
+ class Server(object):
+@@ -98,23 +92,29 @@ class Server(object):
+         # must set this before calling use_server_version, because that's a server call
+         if http_options:
+             self.add_http_options(http_options)
+-            self.add_http_version_header()
+ 
+         if use_server_version:
+             self.use_server_version()
+ 
+-    def add_http_options(self, options_dict):
+-        self._http_options.update(options_dict)
+-        if options_dict.get("verify") == False:
++    def add_http_options(self, option_pair: dict):
++        if not option_pair:
++            # log debug message
++            return
++        if len(option_pair) != 1:
++            raise ValueError(
++                "Update headers one at a time. Expected type: ",
++                {"key": 12}.__class__,
++                "Actual type: ",
++                option_pair,
++                option_pair.__class__,
++            )
++        self._http_options.update(option_pair)
++        if "verify" in option_pair.keys() and self._http_options.get("verify") is False:
+             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+-
+-    def add_http_version_header(self):
+-        if not self._http_options[client_version_header]:
+-            self._http_options.update({client_version_header: __TSC_VERSION__})
++            # would be nice if you could turn them back on
+ 
+     def clear_http_options(self):
+         self._http_options = dict()
+-        self.add_http_version_header()
+ 
+     def _clear_auth(self):
+         self._site_id = None

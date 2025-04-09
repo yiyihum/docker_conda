@@ -1,0 +1,144 @@
+diff --git a/docs/examples/types_constrained.py b/docs/examples/types_constrained.py
+--- a/docs/examples/types_constrained.py
++++ b/docs/examples/types_constrained.py
+@@ -22,9 +22,11 @@
+ 
+ 
+ class Model(BaseModel):
++    lower_bytes: conbytes(to_lower=True)
+     short_bytes: conbytes(min_length=2, max_length=10)
+     strip_bytes: conbytes(strip_whitespace=True)
+ 
++    lower_str: constr(to_lower=True)
+     short_str: constr(min_length=2, max_length=10)
+     regex_str: constr(regex=r'^apple (pie|tart|sandwich)$')
+     strip_str: constr(strip_whitespace=True)
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -106,6 +106,7 @@ class Extra(str, Enum):
+ 
+ class BaseConfig:
+     title = None
++    anystr_lower = False
+     anystr_strip_whitespace = False
+     min_anystr_length = None
+     max_anystr_length = None
+diff --git a/pydantic/types.py b/pydantic/types.py
+--- a/pydantic/types.py
++++ b/pydantic/types.py
+@@ -30,6 +30,7 @@
+ from .validators import (
+     bytes_validator,
+     constr_length_validator,
++    constr_lower,
+     constr_strip_whitespace,
+     decimal_validator,
+     float_validator,
+@@ -138,6 +139,7 @@ def _registered(typ: Union[Type[T], 'ConstrainedNumberMeta']) -> Union[Type[T],
+ 
+ class ConstrainedBytes(bytes):
+     strip_whitespace = False
++    to_lower = False
+     min_length: OptionalInt = None
+     max_length: OptionalInt = None
+     strict: bool = False
+@@ -150,6 +152,7 @@ def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+     def __get_validators__(cls) -> 'CallableGenerator':
+         yield strict_bytes_validator if cls.strict else bytes_validator
+         yield constr_strip_whitespace
++        yield constr_lower
+         yield constr_length_validator
+ 
+ 
+@@ -157,9 +160,11 @@ class StrictBytes(ConstrainedBytes):
+     strict = True
+ 
+ 
+-def conbytes(*, strip_whitespace: bool = False, min_length: int = None, max_length: int = None) -> Type[bytes]:
++def conbytes(
++    *, strip_whitespace: bool = False, to_lower: bool = False, min_length: int = None, max_length: int = None
++) -> Type[bytes]:
+     # use kwargs then define conf in a dict to aid with IDE type hinting
+-    namespace = dict(strip_whitespace=strip_whitespace, min_length=min_length, max_length=max_length)
++    namespace = dict(strip_whitespace=strip_whitespace, to_lower=to_lower, min_length=min_length, max_length=max_length)
+     return _registered(type('ConstrainedBytesValue', (ConstrainedBytes,), namespace))
+ 
+ 
+@@ -246,6 +251,7 @@ def conset(item_type: Type[T], *, min_items: int = None, max_items: int = None)
+ 
+ class ConstrainedStr(str):
+     strip_whitespace = False
++    to_lower = False
+     min_length: OptionalInt = None
+     max_length: OptionalInt = None
+     curtail_length: OptionalInt = None
+@@ -262,6 +268,7 @@ def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+     def __get_validators__(cls) -> 'CallableGenerator':
+         yield strict_str_validator if cls.strict else str_validator
+         yield constr_strip_whitespace
++        yield constr_lower
+         yield constr_length_validator
+         yield cls.validate
+ 
+@@ -280,6 +287,7 @@ def validate(cls, value: Union[str]) -> Union[str]:
+ def constr(
+     *,
+     strip_whitespace: bool = False,
++    to_lower: bool = False,
+     strict: bool = False,
+     min_length: int = None,
+     max_length: int = None,
+@@ -289,6 +297,7 @@ def constr(
+     # use kwargs then define conf in a dict to aid with IDE type hinting
+     namespace = dict(
+         strip_whitespace=strip_whitespace,
++        to_lower=to_lower,
+         strict=strict,
+         min_length=min_length,
+         max_length=max_length,
+diff --git a/pydantic/validators.py b/pydantic/validators.py
+--- a/pydantic/validators.py
++++ b/pydantic/validators.py
+@@ -201,6 +201,10 @@ def anystr_strip_whitespace(v: 'StrBytes') -> 'StrBytes':
+     return v.strip()
+ 
+ 
++def anystr_lower(v: 'StrBytes') -> 'StrBytes':
++    return v.lower()
++
++
+ def ordered_dict_validator(v: Any) -> 'AnyOrderedDict':
+     if isinstance(v, OrderedDict):
+         return v
+@@ -479,6 +483,13 @@ def constr_strip_whitespace(v: 'StrBytes', field: 'ModelField', config: 'BaseCon
+     return v
+ 
+ 
++def constr_lower(v: 'StrBytes', field: 'ModelField', config: 'BaseConfig') -> 'StrBytes':
++    lower = field.type_.to_lower or config.anystr_lower
++    if lower:
++        v = v.lower()
++    return v
++
++
+ def validate_json(v: Any, config: 'BaseConfig') -> Any:
+     if v is None:
+         # pass None through to other validators
+@@ -555,6 +566,7 @@ def check(self, config: Type['BaseConfig']) -> bool:
+         [
+             str_validator,
+             IfConfig(anystr_strip_whitespace, 'anystr_strip_whitespace'),
++            IfConfig(anystr_lower, 'anystr_lower'),
+             IfConfig(anystr_length_validator, 'min_anystr_length', 'max_anystr_length'),
+         ],
+     ),
+@@ -563,6 +575,7 @@ def check(self, config: Type['BaseConfig']) -> bool:
+         [
+             bytes_validator,
+             IfConfig(anystr_strip_whitespace, 'anystr_strip_whitespace'),
++            IfConfig(anystr_lower, 'anystr_lower'),
+             IfConfig(anystr_length_validator, 'min_anystr_length', 'max_anystr_length'),
+         ],
+     ),
+

@@ -1,0 +1,167 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 76fb3117a..a6305e842 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ - Added `switch` attribute to `Switch` events https://github.com/Textualize/textual/pull/1940
+ - Breaking change: Added `toggle_button` attribute to RadioButton and Checkbox events, replaces `input` https://github.com/Textualize/textual/pull/1940
+ 
++### Fixed
++
++- Fixed bug that prevented app pilot to press some keys https://github.com/Textualize/textual/issues/1815
++
+ ## [0.13.0] - 2023-03-02
+ 
+ ### Added
+diff --git a/src/textual/_xterm_parser.py b/src/textual/_xterm_parser.py
+index fc4258390..d232c5a9d 100644
+--- a/src/textual/_xterm_parser.py
++++ b/src/textual/_xterm_parser.py
+@@ -8,7 +8,7 @@ from . import events, messages
+ from ._ansi_sequences import ANSI_SEQUENCES_KEYS
+ from ._parser import Awaitable, Parser, TokenCallback
+ from ._types import MessageTarget
+-from .keys import KEY_NAME_REPLACEMENTS
++from .keys import KEY_NAME_REPLACEMENTS, _character_to_key
+ 
+ # When trying to determine whether the current sequence is a supported/valid
+ # escape sequence, at which length should we give up and consider our search
+@@ -241,12 +241,7 @@ class XTermParser(Parser[events.Event]):
+         elif len(sequence) == 1:
+             try:
+                 if not sequence.isalnum():
+-                    name = (
+-                        _unicode_name(sequence)
+-                        .lower()
+-                        .replace("-", "_")
+-                        .replace(" ", "_")
+-                    )
++                    name = _character_to_key(sequence)
+                 else:
+                     name = sequence
+                 name = KEY_NAME_REPLACEMENTS.get(name, name)
+diff --git a/src/textual/app.py b/src/textual/app.py
+index a17a5825b..e7785379a 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -70,7 +70,12 @@ from .features import FeatureFlag, parse_features
+ from .file_monitor import FileMonitor
+ from .filter import LineFilter, Monochrome
+ from .geometry import Offset, Region, Size
+-from .keys import REPLACED_KEYS, _get_key_display
++from .keys import (
++    REPLACED_KEYS,
++    _character_to_key,
++    _get_key_display,
++    _get_unicode_name_from_key,
++)
+ from .messages import CallbackType
+ from .reactive import Reactive
+ from .renderables.blank import Blank
+@@ -865,16 +870,11 @@ class App(Generic[ReturnType], DOMNode):
+                 await asyncio.sleep(float(wait_ms) / 1000)
+             else:
+                 if len(key) == 1 and not key.isalnum():
+-                    key = (
+-                        unicodedata.name(key)
+-                        .lower()
+-                        .replace("-", "_")
+-                        .replace(" ", "_")
+-                    )
++                    key = _character_to_key(key)
+                 original_key = REPLACED_KEYS.get(key, key)
+                 char: str | None
+                 try:
+-                    char = unicodedata.lookup(original_key.upper().replace("_", " "))
++                    char = unicodedata.lookup(_get_unicode_name_from_key(original_key))
+                 except KeyError:
+                     char = key if len(key) == 1 else None
+                 print(f"press {key!r} (char={char!r})")
+diff --git a/src/textual/keys.py b/src/textual/keys.py
+index 1c5fe219d..ef32404d1 100644
+--- a/src/textual/keys.py
++++ b/src/textual/keys.py
+@@ -211,6 +211,37 @@ KEY_NAME_REPLACEMENTS = {
+ }
+ REPLACED_KEYS = {value: key for key, value in KEY_NAME_REPLACEMENTS.items()}
+ 
++# Convert the friendly versions of character key Unicode names
++# back to their original names.
++# This is because we go from Unicode to friendly by replacing spaces and dashes
++# with underscores, which cannot be undone by replacing underscores with spaces/dashes.
++KEY_TO_UNICODE_NAME = {
++    "exclamation_mark": "EXCLAMATION MARK",
++    "quotation_mark": "QUOTATION MARK",
++    "number_sign": "NUMBER SIGN",
++    "dollar_sign": "DOLLAR SIGN",
++    "percent_sign": "PERCENT SIGN",
++    "left_parenthesis": "LEFT PARENTHESIS",
++    "right_parenthesis": "RIGHT PARENTHESIS",
++    "plus_sign": "PLUS SIGN",
++    "hyphen_minus": "HYPHEN-MINUS",
++    "full_stop": "FULL STOP",
++    "less_than_sign": "LESS-THAN SIGN",
++    "equals_sign": "EQUALS SIGN",
++    "greater_than_sign": "GREATER-THAN SIGN",
++    "question_mark": "QUESTION MARK",
++    "commercial_at": "COMMERCIAL AT",
++    "left_square_bracket": "LEFT SQUARE BRACKET",
++    "reverse_solidus": "REVERSE SOLIDUS",
++    "right_square_bracket": "RIGHT SQUARE BRACKET",
++    "circumflex_accent": "CIRCUMFLEX ACCENT",
++    "low_line": "LOW LINE",
++    "grave_accent": "GRAVE ACCENT",
++    "left_curly_bracket": "LEFT CURLY BRACKET",
++    "vertical_line": "VERTICAL LINE",
++    "right_curly_bracket": "RIGHT CURLY BRACKET",
++}
++
+ # Some keys have aliases. For example, if you press `ctrl+m` on your keyboard,
+ # it's treated the same way as if you press `enter`. Key handlers `key_ctrl_m` and
+ # `key_enter` are both valid in this case.
+@@ -235,6 +266,14 @@ KEY_DISPLAY_ALIASES = {
+ }
+ 
+ 
++def _get_unicode_name_from_key(key: str) -> str:
++    """Get the best guess for the Unicode name of the char corresponding to the key.
++
++    This function can be seen as a pseudo-inverse of the function `_character_to_key`.
++    """
++    return KEY_TO_UNICODE_NAME.get(key, key.upper())
++
++
+ def _get_key_aliases(key: str) -> list[str]:
+     """Return all aliases for the given key, including the key itself"""
+     return [key] + KEY_ALIASES.get(key, [])
+@@ -249,22 +288,24 @@ def _get_key_display(key: str) -> str:
+         return display_alias
+ 
+     original_key = REPLACED_KEYS.get(key, key)
+-    upper_original = original_key.upper().replace("_", " ")
++    tentative_unicode_name = _get_unicode_name_from_key(original_key)
+     try:
+-        unicode_character = unicodedata.lookup(upper_original)
++        unicode_character = unicodedata.lookup(tentative_unicode_name)
+     except KeyError:
+-        return upper_original
++        return tentative_unicode_name
+ 
+     # Check if printable. `delete` for example maps to a control sequence
+     # which we don't want to write to the terminal.
+     if unicode_character.isprintable():
+         return unicode_character
+-    return upper_original
++    return tentative_unicode_name
+ 
+ 
+ def _character_to_key(character: str) -> str:
+-    """Convert a single character to a key value."""
+-    assert len(character) == 1
++    """Convert a single character to a key value.
++
++    This transformation can be undone by the function `_get_unicode_name_from_key`.
++    """
+     if not character.isalnum():
+         key = unicodedata.name(character).lower().replace("-", "_").replace(" ", "_")
+     else:

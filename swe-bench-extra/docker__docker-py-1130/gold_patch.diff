@@ -1,0 +1,182 @@
+diff --git a/docker/api/container.py b/docker/api/container.py
+index 9cc14dbd..b8507d85 100644
+--- a/docker/api/container.py
++++ b/docker/api/container.py
+@@ -15,12 +15,18 @@ class ContainerApiMixin(object):
+             'logs': logs and 1 or 0,
+             'stdout': stdout and 1 or 0,
+             'stderr': stderr and 1 or 0,
+-            'stream': stream and 1 or 0,
++            'stream': stream and 1 or 0
+         }
++
++        headers = {
++            'Connection': 'Upgrade',
++            'Upgrade': 'tcp'
++        }
++
+         u = self._url("/containers/{0}/attach", container)
+-        response = self._post(u, params=params, stream=stream)
++        response = self._post(u, headers=headers, params=params, stream=stream)
+ 
+-        return self._get_result(container, stream, response)
++        return self._read_from_socket(response, stream)
+ 
+     @utils.check_resource
+     def attach_socket(self, container, params=None, ws=False):
+@@ -34,9 +40,18 @@ class ContainerApiMixin(object):
+         if ws:
+             return self._attach_websocket(container, params)
+ 
++        headers = {
++            'Connection': 'Upgrade',
++            'Upgrade': 'tcp'
++        }
++
+         u = self._url("/containers/{0}/attach", container)
+-        return self._get_raw_response_socket(self.post(
+-            u, None, params=self._attach_params(params), stream=True))
++        return self._get_raw_response_socket(
++            self.post(
++                u, None, params=self._attach_params(params), stream=True,
++                headers=headers
++            )
++        )
+ 
+     @utils.check_resource
+     def commit(self, container, repository=None, tag=None, message=None,
+diff --git a/docker/api/exec_api.py b/docker/api/exec_api.py
+index f0e4afa6..6e499960 100644
+--- a/docker/api/exec_api.py
++++ b/docker/api/exec_api.py
+@@ -56,8 +56,6 @@ class ExecApiMixin(object):
+     def exec_start(self, exec_id, detach=False, tty=False, stream=False,
+                    socket=False):
+         # we want opened socket if socket == True
+-        if socket:
+-            stream = True
+         if isinstance(exec_id, dict):
+             exec_id = exec_id.get('Id')
+ 
+@@ -66,10 +64,18 @@ class ExecApiMixin(object):
+             'Detach': detach
+         }
+ 
++        headers = {} if detach else {
++            'Connection': 'Upgrade',
++            'Upgrade': 'tcp'
++        }
++
+         res = self._post_json(
+-            self._url('/exec/{0}/start', exec_id), data=data, stream=stream
++            self._url('/exec/{0}/start', exec_id),
++            headers=headers,
++            data=data,
++            stream=True
+         )
+ 
+         if socket:
+             return self._get_raw_response_socket(res)
+-        return self._get_result_tty(stream, res, tty)
++        return self._read_from_socket(res, stream)
+diff --git a/docker/client.py b/docker/client.py
+index b96a78ce..6ca9e57a 100644
+--- a/docker/client.py
++++ b/docker/client.py
+@@ -29,6 +29,7 @@ from .ssladapter import ssladapter
+ from .tls import TLSConfig
+ from .transport import UnixAdapter
+ from .utils import utils, check_resource, update_headers, kwargs_from_env
++from .utils.socket import frames_iter
+ try:
+     from .transport import NpipeAdapter
+ except ImportError:
+@@ -305,6 +306,14 @@ class Client(
+         for out in response.iter_content(chunk_size=1, decode_unicode=True):
+             yield out
+ 
++    def _read_from_socket(self, response, stream):
++        socket = self._get_raw_response_socket(response)
++
++        if stream:
++            return frames_iter(socket)
++        else:
++            return six.binary_type().join(frames_iter(socket))
++
+     def _disable_socket_timeout(self, socket):
+         """ Depending on the combination of python version and whether we're
+         connecting over http or https, we might need to access _sock, which
+diff --git a/docker/utils/socket.py b/docker/utils/socket.py
+new file mode 100644
+index 00000000..ed343507
+--- /dev/null
++++ b/docker/utils/socket.py
+@@ -0,0 +1,68 @@
++import errno
++import os
++import select
++import struct
++
++import six
++
++
++class SocketError(Exception):
++    pass
++
++
++def read(socket, n=4096):
++    """
++    Reads at most n bytes from socket
++    """
++    recoverable_errors = (errno.EINTR, errno.EDEADLK, errno.EWOULDBLOCK)
++
++    # wait for data to become available
++    select.select([socket], [], [])
++
++    try:
++        if hasattr(socket, 'recv'):
++            return socket.recv(n)
++        return os.read(socket.fileno(), n)
++    except EnvironmentError as e:
++        if e.errno not in recoverable_errors:
++            raise
++
++
++def read_exactly(socket, n):
++    """
++    Reads exactly n bytes from socket
++    Raises SocketError if there isn't enough data
++    """
++    data = six.binary_type()
++    while len(data) < n:
++        next_data = read(socket, n - len(data))
++        if not next_data:
++            raise SocketError("Unexpected EOF")
++        data += next_data
++    return data
++
++
++def next_frame_size(socket):
++    """
++    Returns the size of the next frame of data waiting to be read from socket,
++    according to the protocol defined here:
++
++    https://docs.docker.com/engine/reference/api/docker_remote_api_v1.24/#/attach-to-a-container
++    """
++    try:
++        data = read_exactly(socket, 8)
++    except SocketError:
++        return 0
++
++    _, actual = struct.unpack('>BxxxL', data)
++    return actual
++
++
++def frames_iter(socket):
++    """
++    Returns a generator of frames read from socket
++    """
++    n = next_frame_size(socket)
++    while n > 0:
++        yield read(socket, n)
++        n = next_frame_size(socket)

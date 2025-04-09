@@ -1,0 +1,85 @@
+diff --git a/docs/history/hatch.md b/docs/history/hatch.md
+index 51be6673..966196ab 100644
+--- a/docs/history/hatch.md
++++ b/docs/history/hatch.md
+@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ 
+ - Fix displaying the version with the `version` command when the version is static and build dependencies are unmet
+ - Fix build environments for the `virtual` environment type when storing within a relative path
++- Work around System Integrity Protection on macOS when running commands
+ - Support boolean values for the `config set` command
+ 
+ ## [1.6.3](https://github.com/pypa/hatch/releases/tag/hatch-v1.6.3) - 2022-10-24 ## {: #hatch-v1.6.3 }
+diff --git a/docs/plugins/environment/virtual.md b/docs/plugins/environment/virtual.md
+index d662645b..7fecf9dc 100644
+--- a/docs/plugins/environment/virtual.md
++++ b/docs/plugins/environment/virtual.md
+@@ -39,3 +39,16 @@ The [location](../../cli/reference.md#hatch-env-find) of environments is determi
+ 3. Otherwise, environments are stored within the configured `virtual` [environment directory](../../config/hatch.md#environments) in a deeply nested structure in order to support multiple projects
+ 
+ Additionally, when the `path` option is not used, the name of the directory for the `default` environment will be the normalized project name to provide a more meaningful default [shell](../../cli/reference.md#hatch-shell) prompt.
++
++## Troubleshooting
++
++### macOS SIP
++
++If you need to set linker environment variables like those starting with `DYLD_` or `LD_`, any executable secured by [System Integrity Protection](https://en.wikipedia.org/wiki/System_Integrity_Protection) that is invoked when [running commands](../../environment.md#command-execution) will not see those environment variable modifications as macOS strips those.
++
++Hatch interprets such commands as shell commands but deliberately ignores such paths to protected shells. This workaround suffices for the majority of use cases but there are 2 situations in which it may not:
++
++1. There are no unprotected `sh`, `bash`, `zsh`, nor `fish` executables found along PATH.
++2. The desired executable is a project's [script](../../config/metadata.md#cli), and the [location](#location) of environments contains spaces or is longer than 124[^1] characters. In this case `pip` and other installers will create such an entry point with a shebang pointing to `/bin/sh` (which is protected) to avoid shebang limitations.
++
++[^1]: The shebang length limit is [usually](https://web.archive.org/web/20221231220856/https://www.in-ulm.de/~mascheck/various/shebang/#length) 127 but 3 characters surround the executable path: `#!<EXE_PATH>\n`
+diff --git a/src/hatch/utils/platform.py b/src/hatch/utils/platform.py
+index 1cda416a..83dc5f76 100644
+--- a/src/hatch/utils/platform.py
++++ b/src/hatch/utils/platform.py
+@@ -95,6 +95,7 @@ class Platform:
+         if self.displaying_status and not kwargs.get('capture_output'):
+             return self._run_command_integrated(command, shell=shell, **kwargs)
+ 
++        self.populate_default_popen_kwargs(kwargs, shell=shell)
+         return self.modules.subprocess.run(self.format_for_subprocess(command, shell=shell), shell=shell, **kwargs)
+ 
+     def check_command(self, command: str | list[str], *, shell: bool = False, **kwargs: Any) -> CompletedProcess:
+@@ -130,6 +131,7 @@ class Platform:
+         with all output captured by `stdout` and the command first being
+         [properly formatted](utilities.md#hatch.utils.platform.Platform.format_for_subprocess).
+         """
++        self.populate_default_popen_kwargs(kwargs, shell=shell)
+         return self.modules.subprocess.Popen(
+             self.format_for_subprocess(command, shell=shell),
+             shell=shell,
+@@ -138,6 +140,31 @@ class Platform:
+             **kwargs,
+         )
+ 
++    def populate_default_popen_kwargs(self, kwargs: dict[str, Any], *, shell: bool) -> None:
++        # https://support.apple.com/en-us/HT204899
++        # https://en.wikipedia.org/wiki/System_Integrity_Protection
++        if (
++            'executable' not in kwargs
++            and self.macos
++            and shell
++            and any(env_var.startswith(('DYLD_', 'LD_')) for env_var in os.environ)
++        ):
++            default_paths = os.environ.get('PATH', os.defpath).split(os.pathsep)
++            unprotected_paths = []
++            for path in default_paths:
++                normalized_path = os.path.normpath(path)
++                if not normalized_path.startswith(('/System', '/usr', '/bin', '/sbin', '/var')):
++                    unprotected_paths.append(path)
++                elif normalized_path.startswith('/usr/local'):
++                    unprotected_paths.append(path)
++
++            search_path = os.pathsep.join(unprotected_paths)
++            for exe_name in ('sh', 'bash', 'zsh', 'fish'):
++                executable = self.modules.shutil.which(exe_name, path=search_path)
++                if executable:
++                    kwargs['executable'] = executable
++                    break
++
+     @staticmethod
+     def stream_process_output(process: Popen) -> Iterable[str]:
+         # To avoid blocking never use a pipe's file descriptor iterator. See https://bugs.python.org/issue3907

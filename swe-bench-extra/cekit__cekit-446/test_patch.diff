@@ -1,0 +1,288 @@
+diff --git a/cekit/test/runner.py b/cekit/test/behave_runner.py
+similarity index 75%
+rename from cekit/test/runner.py
+rename to cekit/test/behave_runner.py
+index e43c2db..3fc5ef6 100644
+--- a/cekit/test/runner.py
++++ b/cekit/test/behave_runner.py
+@@ -1,27 +1,34 @@
+ import getpass
+ import logging
+ import os
+-import subprocess
+ 
+ from cekit.errors import CekitError
+ from cekit.tools import Chdir
+ 
++try:
++    from behave.__main__ import main as behave_main
++except ImportError:
++    pass
++
+ logger = logging.getLogger('cekit')
+ 
+ 
+-class TestRunner(object):
++class BehaveTestRunner(object):
+     def __init__(self, target):
+-        """Check if behave and docker is installed properly"""
+         self.target = os.path.abspath(target)
+-        try:
+-            # check that we have behave installed
+-            from behave.__main__ import main as behave_main
+-        except subprocess.CalledProcessError as ex:
+-            raise CekitError("Test Runner needs 'behave' installed, '%s'" %
+-                             ex.output)
+-        except Exception as ex:
+-            raise CekitError(
+-                "Test Runner needs behave installed!", ex)
++
++    @staticmethod
++    def dependencies():
++        deps = {}
++
++        deps['python-behave'] = {
++            'library': 'behave',
++            'package': 'python2-behave',
++            'fedora': {
++                'package': 'python3-behave'}
++        }
++
++        return deps
+ 
+     def run(self, image, run_tags, test_names):
+         """Run test suite"""
+@@ -57,8 +64,6 @@ class TestRunner(object):
+                 args.append("~ci ")
+ 
+         try:
+-            from behave.__main__ import main as behave_main
+-
+             with Chdir(os.path.join(self.target, 'test')):
+                 logger.debug("behave args: {}".format(args))
+                 if behave_main(args) != 0:
+diff --git a/cekit/test/behave.py b/cekit/test/behave_tester.py
+similarity index 68%
+rename from cekit/test/behave.py
+rename to cekit/test/behave_tester.py
+index cf71059..e7aef6b 100644
+--- a/cekit/test/behave.py
++++ b/cekit/test/behave_tester.py
+@@ -3,15 +3,15 @@ import os
+ 
+ from cekit.builder import Command
+ from cekit.generator.base import Generator
+-from cekit.test.collector import TestCollector
+-from cekit.test.runner import TestRunner
++from cekit.test.collector import BehaveTestCollector
++from cekit.test.behave_runner import BehaveTestRunner
+ 
+ LOGGER = logging.getLogger('cekit')
+ 
+ 
+ class BehaveTester(Command):
+     """
+-    Tested implementation for the Behave framework
++    Tester implementation for the Behave framework
+     """
+ 
+     def __init__(self, common_params, params):
+@@ -21,8 +21,9 @@ class BehaveTester(Command):
+         self.params = params
+         self.collected = False
+ 
+-        self.test_collector = TestCollector(os.path.dirname(self.common_params.descriptor),
++        self.test_collector = BehaveTestCollector(os.path.dirname(self.common_params.descriptor),
+                                             self.common_params.target)
++        self.test_runner = BehaveTestRunner(self.common_params.target)
+ 
+         self.generator = None
+ 
+@@ -43,8 +44,10 @@ class BehaveTester(Command):
+ 
+         if self.collected:
+             # Handle test dependencies, if any
+-            LOGGER.debug("Checking CEKit test dependencies...")
++            LOGGER.debug("Checking CEKit test collector dependencies...")
+             self.dependency_handler.handle(self.test_collector)
++            LOGGER.debug("Checking CEKit test runner dependencies...")
++            self.dependency_handler.handle(self.test_runner)
+ 
+     def run(self):
+         if not self.collected:
+@@ -57,6 +60,10 @@ class BehaveTester(Command):
+         if self.params.wip:
+             test_tags = ['@wip']
+ 
+-        runner = TestRunner(self.common_params.target)
+-        runner.run(self.params.image, test_tags,
+-                   test_names=self.params.names)
++        image = self.params.image
++
++        if not image:
++            image = self.generator.get_tags()[0]
++
++        self.test_runner.run(image, test_tags,
++                             test_names=self.params.names)
+diff --git a/cekit/test/collector.py b/cekit/test/collector.py
+index db71fdc..6514939 100644
+--- a/cekit/test/collector.py
++++ b/cekit/test/collector.py
+@@ -7,7 +7,7 @@ import sys
+ logger = logging.getLogger('cekit')
+ 
+ 
+-class TestCollector(object):
++class BehaveTestCollector(object):
+     def __init__(self, descriptor_dir, target_dir):
+         self.collected = False
+         self.descriptor_dir = os.path.abspath(descriptor_dir)
+diff --git a/tests/test_integ_test_behave.py b/tests/test_integ_test_behave.py
+new file mode 100644
+index 0000000..b429772
+--- /dev/null
++++ b/tests/test_integ_test_behave.py
+@@ -0,0 +1,72 @@
++# -*- encoding: utf-8 -*-
++
++import os
++import shutil
++import tempfile
++
++import pytest
++import yaml
++
++from click.testing import CliRunner
++
++from cekit.cli import cli
++from cekit.tools import Chdir
++
++
++image_descriptor = {
++    'schema_version': 1,
++    'from': 'alpine:3.9',
++    'name': 'test/image',
++    'version': '1.0',
++    'labels': [{'name': 'foo', 'value': 'bar'}, {'name': 'labela', 'value': 'a'}],
++    'envs': [{'name': 'baz', 'value': 'qux'}, {'name': 'enva', 'value': 'a'}],
++    'run': {'cmd': ['tail', '-f', '/dev/null']},
++}
++
++
++@pytest.fixture(scope="module", name="test_image_dir")
++def build_test_image_dir():
++    image_dir = tempfile.mkdtemp(prefix="tmp-cekit-test")
++
++    with open(os.path.join(image_dir, 'image.yaml'), 'w') as fd:
++        yaml.dump(image_descriptor, fd, default_flow_style=False)
++
++    with Chdir(image_dir):
++        result = CliRunner().invoke(cli, ["-v", "build", "docker"], catch_exceptions=False)
++
++    assert result.exit_code == 0
++
++    return image_dir
++
++
++@pytest.fixture(autouse=True)
++def clean_target_directory(test_image_dir):
++    shutil.rmtree(os.path.join(test_image_dir, 'target'), ignore_errors=True)
++
++
++def test_execute_simple_behave_test(test_image_dir):
++    feature = """@test
++Feature: Basic tests
++
++  Scenario: Check that the labels are correctly set
++    Given image is built
++    Then the image should contain label foo with value bar
++     And the image should contain label labela with value a
++    """
++
++    features_dir = os.path.join(test_image_dir, 'tests', 'features')
++
++    os.makedirs(features_dir)
++
++    with open(os.path.join(features_dir, 'basic.feature'), 'w') as fd:
++        fd.write(feature)
++
++    with Chdir(test_image_dir):
++        result = CliRunner().invoke(cli, ["-v", "test", "behave"], catch_exceptions=False)
++
++    print(result.output)
++
++    assert result.exit_code == 0
++    assert "1 feature passed, 0 failed, 0 skipped" in result.output
++    assert "1 scenario passed, 0 failed, 0 skipped" in result.output
++    assert "3 steps passed, 0 failed, 0 skipped, 0 undefined" in result.output
+diff --git a/tests/test_unit_args.py b/tests/test_unit_args.py
+index 96611c3..5488bc5 100644
+--- a/tests/test_unit_args.py
++++ b/tests/test_unit_args.py
+@@ -118,7 +118,7 @@ def get_class_by_name(clazz):
+     ),
+     (
+         ['test', '--image', 'image:1.0', 'behave'],
+-        'cekit.test.behave.BehaveTester',
++        'cekit.test.behave_tester.BehaveTester',
+         {
+             'descriptor': 'image.yaml', 'verbose': False, 'work_dir': '~/.cekit', 'config': '~/.cekit/config', 'redhat': False, 'target': 'target'
+         },
+diff --git a/tests/test_unit_collector.py b/tests/test_unit_collector.py
+index 599b317..8877f35 100644
+--- a/tests/test_unit_collector.py
++++ b/tests/test_unit_collector.py
+@@ -2,7 +2,7 @@ import os
+ import shutil
+ import pytest
+ 
+-from cekit.test.collector import TestCollector
++from cekit.test.collector import BehaveTestCollector
+ 
+ desc_dir = "/tmp/desc"
+ target_dir = "/tmp/target_dir"
+@@ -19,8 +19,8 @@ def prepare_dirs():
+ 
+ 
+ def test_collect_test_from_image_repo(prepare_dirs, mocker):
+-    mocker.patch.object(TestCollector, '_fetch_steps')
+-    collector = TestCollector(desc_dir, target_dir)
++    mocker.patch.object(BehaveTestCollector, '_fetch_steps')
++    collector = BehaveTestCollector(desc_dir, target_dir)
+ 
+     features_file = os.path.join(desc_dir,
+                                  'tests',
+@@ -41,8 +41,8 @@ def test_collect_test_from_image_repo(prepare_dirs, mocker):
+ 
+ 
+ def test_collect_test_from_repository_root(prepare_dirs, mocker):
+-    mocker.patch.object(TestCollector, '_fetch_steps')
+-    collector = TestCollector(desc_dir, target_dir)
++    mocker.patch.object(BehaveTestCollector, '_fetch_steps')
++    collector = BehaveTestCollector(desc_dir, target_dir)
+ 
+     features_file = os.path.join(target_dir,
+                                  'repo',
+@@ -65,8 +65,8 @@ def test_collect_test_from_repository_root(prepare_dirs, mocker):
+ 
+ 
+ def test_collect_test_from_module(prepare_dirs, mocker):
+-    mocker.patch.object(TestCollector, '_fetch_steps')
+-    collector = TestCollector(desc_dir, target_dir)
++    mocker.patch.object(BehaveTestCollector, '_fetch_steps')
++    collector = BehaveTestCollector(desc_dir, target_dir)
+ 
+     features_file = os.path.join(target_dir,
+                                  'image',
+@@ -90,9 +90,9 @@ def test_collect_test_from_module(prepare_dirs, mocker):
+ 
+ 
+ def test_collect_return_false(prepare_dirs, mocker):
+-    mocker.patch.object(TestCollector, '_fetch_steps')
++    mocker.patch.object(BehaveTestCollector, '_fetch_steps')
+ 
+-    collector = TestCollector(desc_dir, target_dir)
++    collector = BehaveTestCollector(desc_dir, target_dir)
+ 
+     assert not collector.collect('1', steps_url)
+ 

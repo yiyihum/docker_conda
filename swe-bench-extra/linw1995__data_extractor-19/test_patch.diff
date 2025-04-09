@@ -1,0 +1,142 @@
+diff --git a/tests/test_exceptions.py b/tests/test_exceptions.py
+index 7f8cbe9..747a944 100644
+--- a/tests/test_exceptions.py
++++ b/tests/test_exceptions.py
+@@ -1,5 +1,4 @@
+ # Standard Library
+-import inspect
+ import textwrap
+ 
+ # Third Party Library
+@@ -9,7 +8,6 @@ import pytest
+ from data_extractor.exceptions import ExtractError
+ from data_extractor.item import Field, Item
+ from data_extractor.json import JSONExtractor
+-from data_extractor.lxml import XPathExtractor
+ 
+ 
+ def test_exception_trace(json0):
+@@ -17,7 +15,7 @@ def test_exception_trace(json0):
+ 
+     class User(Item):
+         uid = Field(JSONExtractor("id"))
+-        name = Field(JSONExtractor("name"))
++        username = Field(JSONExtractor("name"), name="name")
+         gender = Field(JSONExtractor("gender"))
+ 
+     class UserResponse(Item):
+@@ -41,25 +39,11 @@ def test_exception_trace(json0):
+         str(exc.args[0])
+         == textwrap.dedent(
+             """
+-            ExtractError(Field(JSONExtractor('gender'), default=sentinel, is_many=False), element={'id': 3, 'name': 'Janine Gross'})
+-            |-UserResponse(JSONExtractor('data'), default=sentinel, is_many=False)
+-              |-User(JSONExtractor('users[*]'), default=sentinel, is_many=True)
+-                |-Field(JSONExtractor('gender'), default=sentinel, is_many=False)
++            ExtractError(Field(JSONExtractor('gender')), element={'id': 3, 'name': 'Janine Gross'})
++            |-UserResponse(JSONExtractor('data'))
++              |-User(JSONExtractor('users[*]'), is_many=True)
++                |-Field(JSONExtractor('gender'))
+                   |-{'id': 3, 'name': 'Janine Gross'}
+             """
+         ).strip()
+     )
+-
+-
+-def test_field_name_overwrite_item_parameter():
+-    with pytest.raises(SyntaxError) as catch:
+-
+-        class Parameter(Item):
+-            name = Field(XPathExtractor("./span[@class='name']"))
+-            default = Field(XPathExtractor("./span[@class='default']"))
+-
+-    exc = catch.value
+-    assert exc.filename == __file__
+-    assert exc.lineno == inspect.currentframe().f_lineno - 4
+-    assert exc.offset == 12
+-    assert exc.text == "default = Field(XPathExtractor(\"./span[@class='default']\"))"
+diff --git a/tests/test_item.py b/tests/test_item.py
+index 8181efb..13fe5a7 100644
+--- a/tests/test_item.py
++++ b/tests/test_item.py
+@@ -1,4 +1,6 @@
+ # Standard Library
++import inspect
++
+ from pathlib import Path
+ 
+ # Third Party Library
+@@ -277,7 +279,7 @@ def test_complex_item_extract_json_data(json0):
+ 
+     class User(Item):
+         uid = Field(JSONExtractor("id"))
+-        name = Field(JSONExtractor("name"))
++        username = Field(JSONExtractor("name"), name="name")
+         gender = Field(JSONExtractor("gender"), default=None)
+ 
+     class UserResponse(Item):
+@@ -312,3 +314,64 @@ def test_misplacing():
+ 
+     with pytest.raises(ValueError):
+         Field(extractor=ComplexExtractor(extractor=JSONExtractor("users[*]")))
++
++
++def test_field_name_overwrite_item_parameter():
++    with pytest.raises(SyntaxError) as catch:
++
++        class User(Item):
++            uid = Field(JSONExtractor("id"))
++            name = Field(JSONExtractor("name"))
++
++    exc = catch.value
++    assert exc.filename == __file__
++    assert exc.lineno == inspect.currentframe().f_lineno - 4
++    assert exc.offset == 12
++    assert exc.text == 'name = Field(JSONExtractor("name"))'
++
++
++def test_avoid_field_name_overwriting_item_parameter(json0):
++    data = json0
++
++    with pytest.raises(SyntaxError):
++
++        class User(Item):
++            uid = Field(JSONExtractor("id"))
++            name = Field(JSONExtractor("name"))
++
++    class User(Item):  # noqa
++        uid = Field(JSONExtractor("id"))
++        username = Field(JSONExtractor("name"), name="name")
++
++    assert User(JSONExtractor("data.users[*]")).extract(data) == {
++        "uid": 0,
++        "name": "Vang Stout",
++    }
++
++
++def test_special_field_name(json0):
++    data = json0
++
++    class User(Item):
++        uid = Field(JSONExtractor("id"))
++        username = Field(JSONExtractor("name"), name="user.name")
++
++    assert User(JSONExtractor("data.users[*]")).extract(data) == {
++        "uid": 0,
++        "user.name": "Vang Stout",
++    }
++
++
++def test_special_field_name_in_the_nested_class_definition(json0):
++    data = json0
++
++    class User(Item):
++        uid = Field(JSONExtractor("id"))
++        username = Field(JSONExtractor("name"), name="name")
++
++    class UserResponse(Item):
++        _ = User(JSONExtractor("users[*]"), name="data")
++
++    first_row = {"uid": 0, "name": "Vang Stout"}
++    assert User(JSONExtractor("data.users[*]")).extract(data) == first_row
++    assert UserResponse(JSONExtractor("data")).extract(data) == {"data": first_row}

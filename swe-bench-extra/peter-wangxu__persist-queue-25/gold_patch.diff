@@ -1,0 +1,96 @@
+diff --git a/persistqueue/__init__.py b/persistqueue/__init__.py
+index c066e10..ef321ef 100644
+--- a/persistqueue/__init__.py
++++ b/persistqueue/__init__.py
+@@ -1,7 +1,7 @@
+ # coding=utf-8
+ __author__ = 'Peter Wang'
+ __license__ = 'BSD License'
+-__version__ = '0.3.0'
++__version__ = '0.3.1'
+ 
+ from .exceptions import Empty, Full  # noqa
+ from .pdict import PDict  # noqa
+diff --git a/persistqueue/sqlbase.py b/persistqueue/sqlbase.py
+index 22bdfe6..48955f7 100644
+--- a/persistqueue/sqlbase.py
++++ b/persistqueue/sqlbase.py
+@@ -27,15 +27,17 @@ def commit_ignore_error(conn):
+     """Ignore the error of no transaction is active.
+ 
+     The transaction may be already committed by user's task_done call.
+-    It's safe to to ignore all errors of this kind.
++    It's safe to ignore all errors of this kind.
+     """
+     try:
+         conn.commit()
+     except sqlite3.OperationalError as ex:
+         if 'no transaction is active' in str(ex):
+-            log.warning(
++            log.debug(
+                 'Not able to commit the transaction, '
+                 'may already be committed.')
++        else:
++            raise
+ 
+ 
+ class SQLiteBase(object):
+@@ -50,17 +52,23 @@ class SQLiteBase(object):
+     _MEMORY = ':memory:'  # flag indicating store DB in memory
+ 
+     def __init__(self, path, name='default', multithreading=False,
+-                 timeout=10.0, auto_commit=False):
++                 timeout=10.0, auto_commit=True):
+         """Initiate a queue in sqlite3 or memory.
+ 
+         :param path: path for storing DB file.
++        :param name: the suffix for the table name,
++                     table name would be ${_TABLE_NAME}_${name}
+         :param multithreading: if set to True, two db connections will be,
+                                one for **put** and one for **get**.
+         :param timeout: timeout in second waiting for the database lock.
+         :param auto_commit: Set to True, if commit is required on every
+-                            INSERT/UPDATE action.
++                            INSERT/UPDATE action, otherwise False, whereas
++                            a **task_done** is required to persist changes
++                            after **put**.
++
+ 
+         """
++        self.memory_sql = False
+         self.path = path
+         self.name = name
+         self.timeout = timeout
+@@ -71,19 +79,27 @@ class SQLiteBase(object):
+ 
+     def _init(self):
+         """Initialize the tables in DB."""
+-        if not os.path.exists(self.path):
++        if self.path == self._MEMORY:
++            self.memory_sql = True
++            log.debug("Initializing Sqlite3 Queue in memory.")
++        elif not os.path.exists(self.path):
+             os.makedirs(self.path)
+-        log.debug('Initializing Sqlite3 Queue with path {}'.format(self.path))
++            log.debug(
++                'Initializing Sqlite3 Queue with path {}'.format(self.path))
+ 
+         self._conn = self._new_db_connection(
+             self.path, self.multithreading, self.timeout)
+         self._getter = self._conn
+         self._putter = self._conn
+-        if self.multithreading:
+-            self._putter = self._new_db_connection(
+-                self.path, self.multithreading, self.timeout)
++
+         self._conn.execute(self._sql_create)
+         self._conn.commit()
++        # Setup another session only for disk-based queue.
++        if self.multithreading:
++            if not self.memory_sql:
++                self._putter = self._new_db_connection(
++                    self.path, self.multithreading, self.timeout)
++
+         # SQLite3 transaction lock
+         self.tran_lock = threading.Lock()
+         self.put_event = threading.Event()

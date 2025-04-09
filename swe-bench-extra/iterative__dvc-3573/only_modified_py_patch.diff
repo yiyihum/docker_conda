@@ -1,0 +1,278 @@
+diff --git a/dvc/cli.py b/dvc/cli.py
+--- a/dvc/cli.py
++++ b/dvc/cli.py
+@@ -23,6 +23,7 @@
+     ls,
+     lock,
+     metrics,
++    params,
+     move,
+     pipeline,
+     remote,
+@@ -62,6 +63,7 @@
+     remote,
+     cache,
+     metrics,
++    params,
+     install,
+     root,
+     ls,
+diff --git a/dvc/command/metrics.py b/dvc/command/metrics.py
+--- a/dvc/command/metrics.py
++++ b/dvc/command/metrics.py
+@@ -114,21 +114,9 @@ def run(self):
+ 
+ 
+ def _show_diff(diff):
+-    from texttable import Texttable
++    from dvc.utils.diff import table
+ 
+-    if not diff:
+-        return ""
+-
+-    table = Texttable()
+-
+-    # disable automatic formatting
+-    table.set_cols_dtype(["t", "t", "t", "t"])
+-
+-    # remove borders to make it easier for users to copy stuff
+-    table.set_chars(("", "", "", ""))
+-    table.set_deco(0)
+-
+-    rows = [["Path", "Metric", "Value", "Change"]]
++    rows = []
+     for fname, mdiff in diff.items():
+         for metric, change in mdiff.items():
+             rows.append(
+@@ -139,8 +127,8 @@ def _show_diff(diff):
+                     change.get("diff", "diff not supported"),
+                 ]
+             )
+-    table.add_rows(rows)
+-    return table.draw()
++
++    return table(["Path", "Metric", "Value", "Change"], rows)
+ 
+ 
+ class CmdMetricsDiff(CmdBase):
+@@ -160,7 +148,9 @@ def run(self):
+ 
+                 logger.info(json.dumps(diff))
+             else:
+-                logger.info(_show_diff(diff))
++                table = _show_diff(diff)
++                if table:
++                    logger.info(table)
+ 
+         except DvcException:
+             logger.exception("failed to show metrics diff")
+diff --git a/dvc/dependency/param.py b/dvc/dependency/param.py
+--- a/dvc/dependency/param.py
++++ b/dvc/dependency/param.py
+@@ -52,7 +52,7 @@ def status(self):
+             return status
+ 
+         status = defaultdict(dict)
+-        info = self._get_info()
++        info = self.read_params()
+         for param in self.params:
+             if param not in info.keys():
+                 st = "deleted"
+@@ -74,11 +74,11 @@ def dumpd(self):
+             self.PARAM_PARAMS: self.info or self.params,
+         }
+ 
+-    def _get_info(self):
++    def read_params(self):
+         if not self.exists:
+             return {}
+ 
+-        with open(fspath_py35(self.path_info), "r") as fobj:
++        with self.repo.tree.open(fspath_py35(self.path_info), "r") as fobj:
+             try:
+                 config = yaml.safe_load(fobj)
+             except yaml.YAMLError as exc:
+@@ -88,11 +88,14 @@ def _get_info(self):
+ 
+         ret = {}
+         for param in self.params:
+-            ret[param] = dpath.util.get(config, param, separator=".")
++            try:
++                ret[param] = dpath.util.get(config, param, separator=".")
++            except KeyError:
++                pass
+         return ret
+ 
+     def save_info(self):
+-        info = self._get_info()
++        info = self.read_params()
+ 
+         missing_params = set(self.params) - set(info.keys())
+         if missing_params:
+diff --git a/dvc/remote/local.py b/dvc/remote/local.py
+--- a/dvc/remote/local.py
++++ b/dvc/remote/local.py
+@@ -76,10 +76,9 @@ def get(self, md5):
+ 
+         return self.checksum_to_path_info(md5).url
+ 
+-    @staticmethod
+-    def exists(path_info):
++    def exists(self, path_info):
+         assert path_info.scheme == "local"
+-        return os.path.lexists(fspath_py35(path_info))
++        return self.repo.tree.exists(fspath_py35(path_info))
+ 
+     def makedirs(self, path_info):
+         makedirs(path_info, exist_ok=True, mode=self._dir_mode)
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -67,6 +67,7 @@ def __init__(self, root_dir=None):
+         from dvc.cache import Cache
+         from dvc.data_cloud import DataCloud
+         from dvc.repo.metrics import Metrics
++        from dvc.repo.params import Params
+         from dvc.scm.tree import WorkingTree
+         from dvc.repo.tag import Tag
+         from dvc.utils.fs import makedirs
+@@ -102,6 +103,7 @@ def __init__(self, root_dir=None):
+         self.cloud = DataCloud(self)
+ 
+         self.metrics = Metrics(self)
++        self.params = Params(self)
+         self.tag = Tag(self)
+ 
+         self._ignore()
+diff --git a/dvc/repo/metrics/diff.py b/dvc/repo/metrics/diff.py
+--- a/dvc/repo/metrics/diff.py
++++ b/dvc/repo/metrics/diff.py
+@@ -1,80 +1,7 @@
+-import json
+-from collections import defaultdict
+-
+-from flatten_json import flatten
+-
++import dvc.utils.diff
+ from dvc.exceptions import NoMetricsError
+ 
+ 
+-def _parse(raw):
+-    if raw is None or isinstance(raw, (dict, list, int, float)):
+-        return raw
+-
+-    assert isinstance(raw, str)
+-    try:
+-        return json.loads(raw)
+-    except json.JSONDecodeError:
+-        return raw
+-
+-
+-def _diff_vals(old, new):
+-    if (
+-        isinstance(new, list)
+-        and isinstance(old, list)
+-        and len(old) == len(new) == 1
+-    ):
+-        return _diff_vals(old[0], new[0])
+-
+-    if old == new:
+-        return {}
+-
+-    res = {"old": old, "new": new}
+-    if isinstance(new, (int, float)) and isinstance(old, (int, float)):
+-        res["diff"] = new - old
+-    return res
+-
+-
+-def _flatten(d):
+-    if not d:
+-        return defaultdict(lambda: None)
+-
+-    if isinstance(d, dict):
+-        return defaultdict(lambda: None, flatten(d, "."))
+-
+-    return defaultdict(lambda: "unable to parse")
+-
+-
+-def _diff_dicts(old_dict, new_dict):
+-    new = _flatten(new_dict)
+-    old = _flatten(old_dict)
+-
+-    res = defaultdict(dict)
+-
+-    xpaths = set(old.keys())
+-    xpaths.update(set(new.keys()))
+-    for xpath in xpaths:
+-        old_val = old[xpath]
+-        new_val = new[xpath]
+-        val_diff = _diff_vals(old_val, new_val)
+-        if val_diff:
+-            res[xpath] = val_diff
+-    return dict(res)
+-
+-
+-def _diff(old_raw, new_raw):
+-    old = _parse(old_raw)
+-    new = _parse(new_raw)
+-
+-    if isinstance(new, dict) or isinstance(old, dict):
+-        return _diff_dicts(old, new)
+-
+-    val_diff = _diff_vals(old, new)
+-    if val_diff:
+-        return {"": val_diff}
+-
+-    return {}
+-
+-
+ def _get_metrics(repo, *args, rev=None, **kwargs):
+     try:
+         metrics = repo.metrics.show(
+@@ -89,12 +16,4 @@ def diff(repo, *args, a_rev=None, b_rev=None, **kwargs):
+     old = _get_metrics(repo, *args, **kwargs, rev=(a_rev or "HEAD"))
+     new = _get_metrics(repo, *args, **kwargs, rev=b_rev)
+ 
+-    paths = set(old.keys())
+-    paths.update(set(new.keys()))
+-
+-    res = defaultdict(dict)
+-    for path in paths:
+-        path_diff = _diff(old.get(path), new.get(path))
+-        if path_diff:
+-            res[path] = path_diff
+-    return dict(res)
++    return dvc.utils.diff.diff(old, new)
+diff --git a/dvc/scm/tree.py b/dvc/scm/tree.py
+--- a/dvc/scm/tree.py
++++ b/dvc/scm/tree.py
+@@ -47,7 +47,7 @@ def open(self, path, mode="r", encoding="utf-8"):
+ 
+     def exists(self, path):
+         """Test whether a path exists."""
+-        return os.path.exists(path)
++        return os.path.lexists(path)
+ 
+     def isdir(self, path):
+         """Return true if the pathname refers to an existing directory."""
+diff --git a/dvc/stage.py b/dvc/stage.py
+--- a/dvc/stage.py
++++ b/dvc/stage.py
+@@ -309,7 +309,7 @@ def _changed_deps(self):
+         for dep in self.deps:
+             status = dep.status()
+             if status:
+-                logger.warning(
++                logger.debug(
+                     "Dependency '{dep}' of '{stage}' changed because it is "
+                     "'{status}'.".format(
+                         dep=dep, stage=self.relpath, status=status[str(dep)]
+@@ -323,7 +323,7 @@ def _changed_outs(self):
+         for out in self.outs:
+             status = out.status()
+             if status:
+-                logger.warning(
++                logger.debug(
+                     "Output '{out}' of '{stage}' changed because it is "
+                     "'{status}'".format(
+                         out=out, stage=self.relpath, status=status[str(out)]

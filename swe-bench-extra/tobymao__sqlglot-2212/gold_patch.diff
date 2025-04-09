@@ -1,0 +1,131 @@
+diff --git a/sqlglot/dialects/mysql.py b/sqlglot/dialects/mysql.py
+index 121698af..025e66fd 100644
+--- a/sqlglot/dialects/mysql.py
++++ b/sqlglot/dialects/mysql.py
+@@ -130,6 +130,7 @@ class MySQL(Dialect):
+             "ENUM": TokenType.ENUM,
+             "FORCE": TokenType.FORCE,
+             "IGNORE": TokenType.IGNORE,
++            "LOCK TABLES": TokenType.COMMAND,
+             "LONGBLOB": TokenType.LONGBLOB,
+             "LONGTEXT": TokenType.LONGTEXT,
+             "MEDIUMBLOB": TokenType.MEDIUMBLOB,
+@@ -142,6 +143,7 @@ class MySQL(Dialect):
+             "START": TokenType.BEGIN,
+             "SIGNED": TokenType.BIGINT,
+             "SIGNED INTEGER": TokenType.BIGINT,
++            "UNLOCK TABLES": TokenType.COMMAND,
+             "UNSIGNED": TokenType.UBIGINT,
+             "UNSIGNED INTEGER": TokenType.UBIGINT,
+             "YEAR": TokenType.YEAR,
+@@ -373,7 +375,7 @@ class MySQL(Dialect):
+                 self._match_texts({"INDEX", "KEY"})
+ 
+             this = self._parse_id_var(any_token=False)
+-            type_ = self._match(TokenType.USING) and self._advance_any() and self._prev.text
++            index_type = self._match(TokenType.USING) and self._advance_any() and self._prev.text
+             schema = self._parse_schema()
+ 
+             options = []
+@@ -413,7 +415,7 @@ class MySQL(Dialect):
+                 this=this,
+                 schema=schema,
+                 kind=kind,
+-                type=type_,
++                index_type=index_type,
+                 options=options,
+             )
+ 
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index 98afddc8..3b39efb8 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -1321,7 +1321,13 @@ class GeneratedAsIdentityColumnConstraint(ColumnConstraintKind):
+ 
+ # https://dev.mysql.com/doc/refman/8.0/en/create-table.html
+ class IndexColumnConstraint(ColumnConstraintKind):
+-    arg_types = {"this": False, "schema": True, "kind": False, "type": False, "options": False}
++    arg_types = {
++        "this": False,
++        "schema": True,
++        "kind": False,
++        "index_type": False,
++        "options": False,
++    }
+ 
+ 
+ class InlineLengthColumnConstraint(ColumnConstraintKind):
+@@ -1354,7 +1360,7 @@ class TitleColumnConstraint(ColumnConstraintKind):
+ 
+ 
+ class UniqueColumnConstraint(ColumnConstraintKind):
+-    arg_types = {"this": False}
++    arg_types = {"this": False, "index_type": False}
+ 
+ 
+ class UppercaseColumnConstraint(ColumnConstraintKind):
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 399b48bc..d086e8ab 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -705,7 +705,9 @@ class Generator:
+     def uniquecolumnconstraint_sql(self, expression: exp.UniqueColumnConstraint) -> str:
+         this = self.sql(expression, "this")
+         this = f" {this}" if this else ""
+-        return f"UNIQUE{this}"
++        index_type = expression.args.get("index_type")
++        index_type = f" USING {index_type}" if index_type else ""
++        return f"UNIQUE{this}{index_type}"
+ 
+     def createable_sql(self, expression: exp.Create, locations: t.DefaultDict) -> str:
+         return self.sql(expression, "this")
+@@ -2740,13 +2742,13 @@ class Generator:
+         kind = f"{kind} INDEX" if kind else "INDEX"
+         this = self.sql(expression, "this")
+         this = f" {this}" if this else ""
+-        type_ = self.sql(expression, "type")
+-        type_ = f" USING {type_}" if type_ else ""
++        index_type = self.sql(expression, "index_type")
++        index_type = f" USING {index_type}" if index_type else ""
+         schema = self.sql(expression, "schema")
+         schema = f" {schema}" if schema else ""
+         options = self.expressions(expression, key="options", sep=" ")
+         options = f" {options}" if options else ""
+-        return f"{kind}{this}{type_}{schema}{options}"
++        return f"{kind}{this}{index_type}{schema}{options}"
+ 
+     def nvl2_sql(self, expression: exp.Nvl2) -> str:
+         if self.NVL2_SUPPORTED:
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index a3dcc493..a4b2a015 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -848,6 +848,8 @@ class Parser(metaclass=_Parser):
+     WINDOW_BEFORE_PAREN_TOKENS = {TokenType.OVER}
+     WINDOW_SIDES = {"FOLLOWING", "PRECEDING"}
+ 
++    FETCH_TOKENS = ID_VAR_TOKENS - {TokenType.ROW, TokenType.ROWS, TokenType.PERCENT}
++
+     ADD_CONSTRAINT_TOKENS = {TokenType.CONSTRAINT, TokenType.PRIMARY_KEY, TokenType.FOREIGN_KEY}
+ 
+     DISTINCT_TOKENS = {TokenType.DISTINCT}
+@@ -2984,7 +2986,7 @@ class Parser(metaclass=_Parser):
+             direction = self._match_set((TokenType.FIRST, TokenType.NEXT))
+             direction = self._prev.text if direction else "FIRST"
+ 
+-            count = self._parse_number()
++            count = self._parse_field(tokens=self.FETCH_TOKENS)
+             percent = self._match(TokenType.PERCENT)
+ 
+             self._match_set((TokenType.ROW, TokenType.ROWS))
+@@ -3815,7 +3817,9 @@ class Parser(metaclass=_Parser):
+     def _parse_unique(self) -> exp.UniqueColumnConstraint:
+         self._match_text_seq("KEY")
+         return self.expression(
+-            exp.UniqueColumnConstraint, this=self._parse_schema(self._parse_id_var(any_token=False))
++            exp.UniqueColumnConstraint,
++            this=self._parse_schema(self._parse_id_var(any_token=False)),
++            index_type=self._match(TokenType.USING) and self._advance_any() and self._prev.text,
+         )
+ 
+     def _parse_key_constraint_options(self) -> t.List[str]:

@@ -1,0 +1,191 @@
+diff --git a/cekit/template_helper.py b/cekit/template_helper.py
+index 9e61cd0..d0eccc9 100644
+--- a/cekit/template_helper.py
++++ b/cekit/template_helper.py
+@@ -10,6 +10,25 @@ class TemplateHelper(object):
+     def module(self, to_install):
+         return self._module_registry.get_module(to_install.name, to_install.version)
+ 
++    def packages_to_install(self, image):
++        """
++        Method that returns list of packages to be installed by any of
++        modules or directly in the image
++        """
++        all_modules = []
++        packages = []
++
++        if 'modules' in image and 'install' in image.modules:
++            all_modules += [self.module(m) for m in image.modules.install]
++
++        all_modules.append(image)
++
++        for module in all_modules:
++            if 'packages' in module and 'install' in module.packages:
++                packages += module.packages.install
++
++        return packages
++
+     def filename(self, source):
+         """Simple helper to return the file specified name"""
+ 
+diff --git a/cekit/templates/template.jinja b/cekit/templates/template.jinja
+index 1da28a0..dd5870f 100644
+--- a/cekit/templates/template.jinja
++++ b/cekit/templates/template.jinja
+@@ -22,11 +22,65 @@ rm{% for repo in repositories %} /etc/yum.repos.d/{{ repo.filename }}{% endfor %
+     && rpm -q{% for package in packages %} {{ package }}{% endfor %}
+     {% endif %}
+ {%- endmacro %}
++{% macro repo_make_cache(pkg_manager) -%}
++    {% if pkg_manager in ['microdnf', 'yum'] %}
++{{ pkg_manager }} makecache
++    {% endif %}
++{%- endmacro %}
+ {% macro repo_clear_cache(pkg_manager) -%}
+     {% if pkg_manager in ['microdnf', 'yum'] %}
+ {{ pkg_manager }} clean all && [ ! -d /var/cache/yum ] || rm -rf /var/cache/yum
+     {% endif %}
+ {%- endmacro %}
++{% macro process_module(module) %}
++# begin {{ module.name }}:{{ module.version }}
++{% if module.packages and module.packages.install %}
++
++# Install required RPMs and ensure that the packages were installed
++USER root
++RUN {{ pkg_install(pkg_manager, module.packages.install) }}
++{% endif %}
++{% if helper.envs(module.envs)|length > 0 %}
++
++# Environment variables
++ENV \
++    {% for env in helper.envs(module.envs)|sort(attribute='name') %}
++    {{ env.name }}="{{ env.value }}" {% if loop.index < loop.length %}\{% endif %}
++
++    {% endfor %}
++{% endif %}
++{% if module.labels|length > 0 %}
++
++# Labels
++LABEL \
++      {% for label in module.labels|sort(attribute='name') %}
++      {{ label.name }}="{{ label.value }}" {% if loop.index < loop.length %} \{% endif %}
++
++      {% endfor %}
++{% endif %}
++{% if helper.ports(module.ports)|length > 0 %}
++
++# Exposed ports
++EXPOSE {%- for port in helper.ports(module.ports) %} {{ port }}{% endfor %}
++{% endif %}
++{%- if module.execute|length > 0 %}
++
++# Custom scripts
++{% for exec in module.execute %}
++USER {{ exec.user }}
++RUN [ "bash", "-x", "/tmp/scripts/{{ exec.directory }}/{{ exec.script }}" ]
++{% endfor %}
++{% endif %}
++{%- if module.volumes|length > 0 %}
++
++# Volumes
++{% for volume in module.volumes %}
++VOLUME ["{{ volume['path'] }}"]
++{% endfor %}
++{% endif %}
++
++# end {{ module.name }}:{{ module.version }}
++{%- endmacro %}
+ 
+ # Copyright 2017 Red Hat
+ #
+@@ -62,9 +116,9 @@ RUN {{ repo_install(pkg_manager, repo.rpm) }}
+ {% endif %}
+ {% endfor %}
+ {% endif %}
+-{% if packages.repositories_injected or packages.repositories %}
+ 
+-RUN yum makecache
++{% if helper.packages_to_install(image) %}
++RUN {{ repo_make_cache(pkg_manager) }}
+ {% endif %}
+ 
+ # Add scripts used to configure the image
+@@ -78,55 +132,7 @@ COPY \
+     {% endfor %}
+     /tmp/artifacts/
+ {% endif %}
+-{% macro process_module(module) %}
+-# begin {{ module.name }}:{{ module.version }}
+-{% if module.packages and module.packages.install %}
+-
+-# Install required RPMs and ensure that the packages were installed
+-USER root
+-RUN {{ pkg_install(pkg_manager, module.packages.install) }}
+-{% endif %}
+-{% if helper.envs(module.envs)|length > 0 %}
+-
+-# Environment variables
+-ENV \
+-    {% for env in helper.envs(module.envs)|sort(attribute='name') %}
+-    {{ env.name }}="{{ env.value }}" {% if loop.index < loop.length %}\{% endif %}
+-
+-    {% endfor %}
+-{% endif %}
+-{% if module.labels|length > 0 %}
+-
+-# Labels
+-LABEL \
+-      {% for label in module.labels|sort(attribute='name') %}
+-      {{ label.name }}="{{ label.value }}" {% if loop.index < loop.length %} \{% endif %}
+-
+-      {% endfor %}
+-{% endif %}
+-{% if helper.ports(module.ports)|length > 0 %}
+-
+-# Exposed ports
+-EXPOSE {%- for port in helper.ports(module.ports) %} {{ port }}{% endfor %}
+-{% endif %}
+-{%- if module.execute|length > 0 %}
+-
+-# Custom scripts
+-{% for exec in module.execute %}
+-USER {{ exec.user }}
+-RUN [ "bash", "-x", "/tmp/scripts/{{ exec.directory }}/{{ exec.script }}" ]
+-{% endfor %}
+-{% endif %}
+-{%- if module.volumes|length > 0 %}
+-
+-# Volumes
+-{% for volume in module.volumes %}
+-VOLUME ["{{ volume['path'] }}"]
+-{% endfor %}
+-{% endif %}
+ 
+-# end {{ module.name }}:{{ module.version }}
+-{% endmacro %}
+ {% for to_install in image.modules.install %}
+ {{ process_module(helper.module(to_install)) }}
+ {% endfor %}
+@@ -135,16 +141,18 @@ VOLUME ["{{ volume['path'] }}"]
+ USER root
+ RUN [ ! -d /tmp/scripts ] || rm -rf /tmp/scripts
+ RUN [ ! -d /tmp/artifacts ] || rm -rf /tmp/artifacts
+-{% if packages.repositories_injected or packages.repositories %}
++
++{% if helper.packages_to_install(image) %}
++# Clear package manager metadata
+ RUN {{ repo_clear_cache(pkg_manager) }}
+-{% if packages.repositories_injected %}
++{% endif %}
+ 
++{% if packages.repositories_injected %}
+ # Remove custom repo files
+ RUN {{ repo_remove(pkg_manager, packages.repositories_injected) }}
+ {% endif %}
+-{% endif %}
+ 
+-# run user
++# Run user
+ USER {{ run['user'] }}
+ {% if 'workdir' in run %}
+ 

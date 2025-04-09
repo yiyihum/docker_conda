@@ -1,0 +1,297 @@
+diff --git a/sqlglot/dialects/redshift.py b/sqlglot/dialects/redshift.py
+index a41b6ea8..70066677 100644
+--- a/sqlglot/dialects/redshift.py
++++ b/sqlglot/dialects/redshift.py
+@@ -171,6 +171,8 @@ class Redshift(Postgres):
+             ),
+             exp.SortKeyProperty: lambda self,
+             e: f"{'COMPOUND ' if e.args['compound'] else ''}SORTKEY({self.format_args(*e.this)})",
++            exp.StartsWith: lambda self,
++            e: f"{self.sql(e.this)} LIKE {self.sql(e.expression)} || '%'",
+             exp.TableSample: no_tablesample_sql,
+             exp.TsOrDsAdd: date_delta_sql("DATEADD"),
+             exp.TsOrDsDiff: date_delta_sql("DATEDIFF"),
+diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
+index da206544..0cbaf20e 100644
+--- a/sqlglot/expressions.py
++++ b/sqlglot/expressions.py
+@@ -2394,13 +2394,7 @@ class OutputModelProperty(Property):
+ 
+ 
+ class IsolatedLoadingProperty(Property):
+-    arg_types = {
+-        "no": False,
+-        "concurrent": False,
+-        "for_all": False,
+-        "for_insert": False,
+-        "for_none": False,
+-    }
++    arg_types = {"no": False, "concurrent": False, "target": False}
+ 
+ 
+ class JournalProperty(Property):
+@@ -2608,6 +2602,11 @@ class UnloggedProperty(Property):
+     arg_types = {}
+ 
+ 
++# https://learn.microsoft.com/en-us/sql/t-sql/statements/create-view-transact-sql?view=sql-server-ver16
++class ViewAttributeProperty(Property):
++    arg_types = {"this": True}
++
++
+ class VolatileProperty(Property):
+     arg_types = {"this": False}
+ 
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 804df019..721efb61 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -46,9 +46,11 @@ class Generator(metaclass=_Generator):
+             'safe': Only quote identifiers that are case insensitive.
+         normalize: Whether to normalize identifiers to lowercase.
+             Default: False.
+-        pad: The pad size in a formatted string.
++        pad: The pad size in a formatted string. For example, this affects the indentation of
++            a projection in a query, relative to its nesting level.
+             Default: 2.
+-        indent: The indentation size in a formatted string.
++        indent: The indentation size in a formatted string. For example, this affects the
++            indentation of subqueries and filters under a `WHERE` clause.
+             Default: 2.
+         normalize_functions: How to normalize function names. Possible values are:
+             "upper" or True (default): Convert names to uppercase.
+@@ -141,6 +143,7 @@ class Generator(metaclass=_Generator):
+         exp.UppercaseColumnConstraint: lambda *_: "UPPERCASE",
+         exp.UnloggedProperty: lambda *_: "UNLOGGED",
+         exp.VarMap: lambda self, e: self.func("MAP", e.args["keys"], e.args["values"]),
++        exp.ViewAttributeProperty: lambda self, e: f"WITH {self.sql(e, 'this')}",
+         exp.VolatileProperty: lambda *_: "VOLATILE",
+         exp.WithJournalTableProperty: lambda self, e: f"WITH JOURNAL TABLE={self.sql(e, 'this')}",
+         exp.WithOperator: lambda self, e: f"{self.sql(e, 'this')} WITH {self.sql(e, 'op')}",
+@@ -451,6 +454,7 @@ class Generator(metaclass=_Generator):
+         exp.TransformModelProperty: exp.Properties.Location.POST_SCHEMA,
+         exp.MergeTreeTTL: exp.Properties.Location.POST_SCHEMA,
+         exp.UnloggedProperty: exp.Properties.Location.POST_CREATE,
++        exp.ViewAttributeProperty: exp.Properties.Location.POST_SCHEMA,
+         exp.VolatileProperty: exp.Properties.Location.POST_CREATE,
+         exp.WithDataProperty: exp.Properties.Location.POST_EXPRESSION,
+         exp.WithJournalTableProperty: exp.Properties.Location.POST_NAME,
+@@ -1442,15 +1446,9 @@ class Generator(metaclass=_Generator):
+         no = " NO" if no else ""
+         concurrent = expression.args.get("concurrent")
+         concurrent = " CONCURRENT" if concurrent else ""
+-
+-        for_ = ""
+-        if expression.args.get("for_all"):
+-            for_ = " FOR ALL"
+-        elif expression.args.get("for_insert"):
+-            for_ = " FOR INSERT"
+-        elif expression.args.get("for_none"):
+-            for_ = " FOR NONE"
+-        return f"WITH{no}{concurrent} ISOLATED LOADING{for_}"
++        target = self.sql(expression, "target")
++        target = f" {target}" if target else ""
++        return f"WITH{no}{concurrent} ISOLATED LOADING{target}"
+ 
+     def partitionboundspec_sql(self, expression: exp.PartitionBoundSpec) -> str:
+         if isinstance(expression.this, list):
+@@ -3221,7 +3219,7 @@ class Generator(metaclass=_Generator):
+         num_sqls = len(expressions)
+ 
+         # These are calculated once in case we have the leading_comma / pretty option set, correspondingly
+-        pad = " " * self.pad
++        pad = " " * len(sep)
+         stripped_sep = sep.strip()
+ 
+         result_sqls = []
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index b33af74a..be0b1084 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -1026,6 +1026,8 @@ class Parser(metaclass=_Parser):
+         ),
+     }
+ 
++    ISOLATED_LOADING_OPTIONS: OPTIONS_TYPE = {"FOR": ("ALL", "INSERT", "NONE")}
++
+     USABLES: OPTIONS_TYPE = dict.fromkeys(("ROLE", "WAREHOUSE", "DATABASE", "SCHEMA"), tuple())
+ 
+     CAST_ACTIONS: OPTIONS_TYPE = dict.fromkeys(("RENAME", "ADD"), ("FIELDS",))
+@@ -1041,6 +1043,8 @@ class Parser(metaclass=_Parser):
+ 
+     TABLE_INDEX_HINT_TOKENS = {TokenType.FORCE, TokenType.IGNORE, TokenType.USE}
+ 
++    VIEW_ATTRIBUTES = {"ENCRYPTION", "SCHEMABINDING", "VIEW_METADATA"}
++
+     WINDOW_ALIAS_TOKENS = ID_VAR_TOKENS - {TokenType.ROWS}
+     WINDOW_BEFORE_PAREN_TOKENS = {TokenType.OVER}
+     WINDOW_SIDES = {"FOLLOWING", "PRECEDING"}
+@@ -1798,15 +1802,16 @@ class Parser(metaclass=_Parser):
+ 
+         return prop
+ 
+-    def _parse_with_property(
+-        self,
+-    ) -> t.Optional[exp.Expression] | t.List[exp.Expression]:
++    def _parse_with_property(self) -> t.Optional[exp.Expression] | t.List[exp.Expression]:
+         if self._match(TokenType.L_PAREN, advance=False):
+             return self._parse_wrapped_properties()
+ 
+         if self._match_text_seq("JOURNAL"):
+             return self._parse_withjournaltable()
+ 
++        if self._match_texts(self.VIEW_ATTRIBUTES):
++            return self.expression(exp.ViewAttributeProperty, this=self._prev.text.upper())
++
+         if self._match_text_seq("DATA"):
+             return self._parse_withdata(no=False)
+         elif self._match_text_seq("NO", "DATA"):
+@@ -1954,20 +1959,18 @@ class Parser(metaclass=_Parser):
+             autotemp=autotemp,
+         )
+ 
+-    def _parse_withisolatedloading(self) -> exp.IsolatedLoadingProperty:
++    def _parse_withisolatedloading(self) -> t.Optional[exp.IsolatedLoadingProperty]:
++        index = self._index
+         no = self._match_text_seq("NO")
+         concurrent = self._match_text_seq("CONCURRENT")
+-        self._match_text_seq("ISOLATED", "LOADING")
+-        for_all = self._match_text_seq("FOR", "ALL")
+-        for_insert = self._match_text_seq("FOR", "INSERT")
+-        for_none = self._match_text_seq("FOR", "NONE")
++
++        if not self._match_text_seq("ISOLATED", "LOADING"):
++            self._retreat(index)
++            return None
++
++        target = self._parse_var_from_options(self.ISOLATED_LOADING_OPTIONS, raise_unmatched=False)
+         return self.expression(
+-            exp.IsolatedLoadingProperty,
+-            no=no,
+-            concurrent=concurrent,
+-            for_all=for_all,
+-            for_insert=for_insert,
+-            for_none=for_none,
++            exp.IsolatedLoadingProperty, no=no, concurrent=concurrent, target=target
+         )
+ 
+     def _parse_locking(self) -> exp.LockingProperty:
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index 824ebe74..1ba8b2ad 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -565,8 +565,7 @@ class Tokenizer(metaclass=_Tokenizer):
+         "~": TokenType.TILDA,
+         "?": TokenType.PLACEHOLDER,
+         "@": TokenType.PARAMETER,
+-        # used for breaking a var like x'y' but nothing else
+-        # the token type doesn't matter
++        # Used for breaking a var like x'y' but nothing else the token type doesn't matter
+         "'": TokenType.QUOTE,
+         "`": TokenType.IDENTIFIER,
+         '"': TokenType.IDENTIFIER,
+@@ -892,7 +891,7 @@ class Tokenizer(metaclass=_Tokenizer):
+ 
+     COMMAND_PREFIX_TOKENS = {TokenType.SEMICOLON, TokenType.BEGIN}
+ 
+-    # handle numeric literals like in hive (3L = BIGINT)
++    # Handle numeric literals like in hive (3L = BIGINT)
+     NUMERIC_LITERALS: t.Dict[str, str] = {}
+ 
+     COMMENTS = ["--", ("/*", "*/")]
+@@ -965,8 +964,7 @@ class Tokenizer(metaclass=_Tokenizer):
+         while self.size and not self._end:
+             current = self._current
+ 
+-            # skip spaces inline rather than iteratively call advance()
+-            # for performance reasons
++            # Skip spaces here rather than iteratively calling advance() for performance reasons
+             while current < self.size:
+                 char = self.sql[current]
+ 
+@@ -975,12 +973,10 @@ class Tokenizer(metaclass=_Tokenizer):
+                 else:
+                     break
+ 
+-            n = current - self._current
+-            self._start = current
+-            self._advance(n if n > 1 else 1)
++            offset = current - self._current if current > self._current else 1
+ 
+-            if self._char is None:
+-                break
++            self._start = current
++            self._advance(offset)
+ 
+             if not self._char.isspace():
+                 if self._char.isdigit():
+@@ -1008,12 +1004,9 @@ class Tokenizer(metaclass=_Tokenizer):
+     def _advance(self, i: int = 1, alnum: bool = False) -> None:
+         if self.WHITE_SPACE.get(self._char) is TokenType.BREAK:
+             # Ensures we don't count an extra line if we get a \r\n line break sequence
+-            if self._char == "\r" and self._peek == "\n":
+-                i = 2
+-                self._start += 1
+-
+-            self._col = 1
+-            self._line += 1
++            if not (self._char == "\r" and self._peek == "\n"):
++                self._col = 1
++                self._line += 1
+         else:
+             self._col += i
+ 
+diff --git a/sqlglotrs/src/tokenizer.rs b/sqlglotrs/src/tokenizer.rs
+index 2c90a650..881417e5 100644
+--- a/sqlglotrs/src/tokenizer.rs
++++ b/sqlglotrs/src/tokenizer.rs
+@@ -118,8 +118,27 @@ impl<'a> TokenizerState<'a> {
+ 
+     fn scan(&mut self, until_peek_char: Option<char>) -> Result<(), TokenizerError> {
+         while self.size > 0 && !self.is_end {
+-            self.start = self.current;
+-            self.advance(1)?;
++            let mut current = self.current;
++
++            // Skip spaces here rather than iteratively calling advance() for performance reasons
++            while current < self.size {
++                let ch = self.char_at(current)?;
++
++                if ch == ' ' || ch == '\t' {
++                    current += 1;
++                } else {
++                    break;
++                }
++            }
++
++            let offset = if current > self.current {
++                current - self.current
++            } else {
++                1
++            };
++
++            self.start = current;
++            self.advance(offset as isize)?;
+ 
+             if self.current_char == '\0' {
+                 break;
+@@ -153,16 +172,12 @@ impl<'a> TokenizerState<'a> {
+     }
+ 
+     fn advance(&mut self, i: isize) -> Result<(), TokenizerError> {
+-        let mut i = i;
+         if Some(&self.token_types.break_) == self.settings.white_space.get(&self.current_char) {
+             // Ensures we don't count an extra line if we get a \r\n line break sequence.
+-            if self.current_char == '\r' && self.peek_char == '\n' {
+-                i = 2;
+-                self.start += 1;
++            if ! (self.current_char == '\r' && self.peek_char == '\n') {
++                self.column = 1;
++                self.line += 1;
+             }
+-
+-            self.column = 1;
+-            self.line += 1;
+         } else {
+             self.column = self.column.wrapping_add_signed(i);
+         }

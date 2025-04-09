@@ -1,0 +1,410 @@
+diff --git a/HISTORY.rst b/HISTORY.rst
+index 6a0161c..1d261d2 100644
+--- a/HISTORY.rst
++++ b/HISTORY.rst
+@@ -2,11 +2,13 @@
+ History
+ =======
+ 
++
+ In progress
+ -----------
+ 
+ * Allow networkx 2+ to be used
+ * Add NameResolver application
++* Add enum for connector relation types
+ 
+ 
+ 0.2.0 (2018-05-30)
+diff --git a/catpy/__init__.py b/catpy/__init__.py
+index 7365394..b05b812 100644
+--- a/catpy/__init__.py
++++ b/catpy/__init__.py
+@@ -1,6 +1,6 @@
+ # -*- coding: utf-8 -*-
+ 
+-from catpy.client import CatmaidClient, CoordinateTransformer, CatmaidUrl
++from catpy.client import CatmaidClient, CoordinateTransformer, CatmaidUrl, ConnectorRelation  # noqa
+ from catpy.version import __version__, __version_info__  # noqa
+ from catpy.author import __author__, __email__  # noqa
+ from catpy import image
+diff --git a/catpy/applications/export.py b/catpy/applications/export.py
+index 7067a36..bfb42d6 100644
+--- a/catpy/applications/export.py
++++ b/catpy/applications/export.py
+@@ -7,6 +7,8 @@ import networkx as nx
+ from networkx.readwrite import json_graph
+ 
+ from catpy.applications.base import CatmaidClientApplication
++from catpy.applications.relation_identifier import RelationIdentifier
++from catpy.client import ConnectorRelation
+ 
+ 
+ NX_VERSION_INFO = tuple(int(i) for i in nx.__version__.split('.'))
+@@ -189,8 +191,10 @@ class ExportWidget(CatmaidClientApplication):
+         -------
+         dict
+         """
++        rel_id = self.get_relation_identifier()
+ 
+         skeletons = dict()
++        warnings = set()
+ 
+         for skeleton_id in skeleton_ids:
+ 
+@@ -207,19 +211,36 @@ class ExportWidget(CatmaidClientApplication):
+                 }
+ 
+             for connector in data[1]:
+-                if connector[2] not in [0, 1]:
++                try:
++                    relation = rel_id.from_id(connector[2])
++                except ValueError as e:
++                    msg = str(e)
++                    if " is not a valid " in msg:
++                        warnings.add(str(e))
++                        continue
++                    else:
++                        raise e
++
++                if not relation.is_synaptic:
+                     continue
+ 
+                 conn_id = int(connector[1])
+                 if conn_id not in skeleton["connectors"]:
+                     skeleton["connectors"][conn_id] = {
+-                        "presynaptic_to": [], "postsynaptic_to": []
++                        r.name: [] for r in ConnectorRelation if r.is_synaptic
+                     }
+ 
+                 skeleton["connectors"][conn_id]["location"] = connector[3:6]
+-                relation = "postsynaptic_to" if connector[2] == 1 else "presynaptic_to"
+-                skeleton["connectors"][conn_id][relation].append(connector[0])
++                skeleton["connectors"][conn_id][relation.name].append(connector[0])
+ 
+             skeletons[int(skeleton_id)] = skeleton
+ 
++        warn(
++            "Skeleton representations contained some unknown treenode->connector relation IDs:\n\t"
++            "\n\t".join(sorted(warnings))
++        )
++
+         return {"skeletons": skeletons}
++
++    def get_relation_identifier(self):
++        return RelationIdentifier(self._catmaid)
+diff --git a/catpy/applications/relation_identifier.py b/catpy/applications/relation_identifier.py
+new file mode 100644
+index 0000000..376fa61
+--- /dev/null
++++ b/catpy/applications/relation_identifier.py
+@@ -0,0 +1,88 @@
++from collections import defaultdict
++
++from catpy.client import ConnectorRelation
++from catpy.applications import CatmaidClientApplication
++
++
++class RelationIdentifier(CatmaidClientApplication):
++    """Class to convert connector relation IDs to ConnectorRelation enums and back.
++
++    The mappings are cached on the class, and so do not need to be re-fetched for new instances.
++
++    The mappings are retrieved on a per-project basis.
++    """
++    id_to_relation = defaultdict(dict)
++    relation_to_id = defaultdict(dict)
++
++    def _check_pid(self):
++        if self.project_id is None:
++            raise RuntimeError("No project ID defined; cannot get relation name-id mappings")
++        else:
++            return self.project_id
++
++    def _fetch_mappings(self, project_id):
++        return self.get((project_id, 'connectors', 'types'))
++
++    def populate_mappings(self, project_id):
++        """Populate the id-relation mappings cache for the given project"""
++        if isinstance(self, type):
++            raise ValueError("Cannot populate relation ID mappings as a class method")
++
++        id_to_rel = dict()
++        rel_to_id = dict()
++        for obj in self._fetch_mappings(project_id):
++            rel = ConnectorRelation[obj["relation"]]
++            rel_id = obj["relation_id"]
++
++            id_to_rel[rel_id] = rel
++            rel_to_id[rel] = rel_id
++
++        type(self).id_to_relation[project_id] = id_to_rel
++        type(self).relation_to_id[project_id] = rel_to_id
++
++    def _get_dict(self, is_relation, project_id):
++        project_id = project_id or self._check_pid()
++        d = (self.id_to_relation, self.relation_to_id)[is_relation]
++        if project_id not in d:
++            self.populate_mappings(project_id)
++        return d[project_id]
++
++    def from_id(self, relation_id, project_id=None):
++        """
++        Return the ConnectorRelation for the given relation ID.
++        If ``project_id`` is given and you know this project's mappings are already populated
++        (possibly via a different instance),
++        this can be used as a class method.
++
++        Parameters
++        ----------
++        relation_id
++        project_id
++
++        Returns
++        -------
++        ConnectorRelation
++        """
++        if relation_id == -1:
++            return ConnectorRelation.other
++        return self._get_dict(False, project_id)[relation_id]
++
++    def to_id(self, relation, project_id=None):
++        """
++        Return the integer ID for the given ConnectorRelation.
++        If ``project_id`` is given and you know this project's mappings are already populated,
++        (possibly via a different instance
++        this can be used as a class method.
++
++        Parameters
++        ----------
++        relation
++        project_id
++
++        Returns
++        -------
++        int
++        """
++        if relation == ConnectorRelation.other:
++            return -1
++        return self._get_dict(True, project_id)[relation]
+diff --git a/catpy/client.py b/catpy/client.py
+index 10379e5..385a9ce 100644
+--- a/catpy/client.py
++++ b/catpy/client.py
+@@ -8,22 +8,97 @@ from abc import ABCMeta, abstractmethod
+ from warnings import warn
+ 
+ from six import string_types, add_metaclass
+-from enum import IntEnum
++from enum import IntEnum, Enum
+ import requests
+ import numpy as np
+ 
+ 
++class ConnectorRelationType(Enum):
++    SYNAPTIC = "Synaptic"
++    GAP_JUNCTION = "Gap junction"
++    ABUTTING = "Abutting"
++    ATTACHMENT = "Attachment"
++    SPATIAL = "Spatial"
++    OTHER = ""
++
++    @classmethod
++    def from_relation(cls, relation):
++        return {
++            ConnectorRelation.presynaptic_to: cls.SYNAPTIC,
++            ConnectorRelation.postsynaptic_to: cls.SYNAPTIC,
++            ConnectorRelation.gapjunction_with: cls.GAP_JUNCTION,
++            ConnectorRelation.abutting: cls.ABUTTING,
++            ConnectorRelation.attached_to: cls.ATTACHMENT,
++            ConnectorRelation.close_to: cls.SPATIAL,
++            ConnectorRelation.other: cls.OTHER
++        }[relation]
++
++
++class ConnectorRelation(Enum):
++    """Enum describing the link between a treenode and connector, i.e. the treenode is ____ to the connector.
++
++    The enum's ``name`` is CATMAID's concept of "relation name":
++    what is returned in the ``relation`` field of the <pid>/connectors/types/ response.
++
++    The enum's ``value`` is the ``name`` field of the <pid>/connectors/types/ response.
++
++    The mappings from relation name to relation ID are project-specific and must be fetched from CATMAID.
++    """
++    other = ""
++    presynaptic_to = "Presynaptic"
++    postsynaptic_to = "Postsynaptic"
++    gapjunction_with = "Gap junction"
++    abutting = "Abutting"
++    attached_to = "Attachment"
++    close_to = "Close to"
++
++    @property
++    def type(self):
++        return ConnectorRelationType.from_relation(self)
++
++    @property
++    def is_synaptic(self):
++        return self.type == ConnectorRelationType.SYNAPTIC
++
++    def __str__(self):
++        return self.value
++
++
+ class StackOrientation(IntEnum):
++    """Can be iterated over or indexed like the lower-case string representation of the orientation"""
+     XY = 0
+     XZ = 1
+     ZY = 2
+ 
++    def __str__(self):
++        return self.name.lower()
++
++    @classmethod
++    def from_str(cls, s):
++        return {o.name: o for o in StackOrientation}[s.upper()]
+ 
+-orientation_strs = {
+-    StackOrientation.XY: 'xy',
+-    StackOrientation.XZ: 'xz',
+-    StackOrientation.ZY: 'zy'
+-}
++    @classmethod
++    def from_value(cls, value, default='xy'):
++        """Convert an int, str or StackOrientation into a StackOrientation.
++        A NoneType ``value`` will use the default orientation."""
++        if value is None:
++            value = default
++
++        if isinstance(value, string_types):
++            return cls.from_str(value)
++        elif isinstance(value, int):
++            return cls(value)
++        else:
++            raise TypeError("Cannot create a StackOrientation from {}".format(type(value).__name__))
++
++    def __iter__(self):
++        return iter(str(self))
++
++    def __getitem__(self, item):
++        return str(self)[item]
++
++    def __contains__(self, item):
++        return item in str(self)
+ 
+ 
+ def make_url(base_url, *args):
+@@ -334,7 +409,7 @@ class CoordinateTransformer(object):
+                 StackOrientation
+                 int corresponding to StackOrientation
+                 'xy', 'xz', or 'zy'
+-                None (reverts to default)
++                None (reverts to default 'xy')
+             Default StackOrientation.XY
+         scale_z : bool
+             Whether or not to scale z coordinates when using stack_to_scaled* methods. Default False is recommended, but
+@@ -349,7 +424,7 @@ class CoordinateTransformer(object):
+         self.translation = {dim: translation.get(dim, 0) for dim in 'zyx'}
+         self.scale_z = scale_z
+ 
+-        self.orientation = self._validate_orientation(orientation)
++        self.orientation = StackOrientation.from_value(orientation)
+         self.depth_dim = [dim for dim in 'zyx' if dim not in self.orientation][0]
+ 
+         # mapping of project dimension to stack dimension, based on orientation
+@@ -361,16 +436,6 @@ class CoordinateTransformer(object):
+         # mapping of stack dimension to project dimension, based on orientation
+         self._p2s = {value: key for key, value in self._s2p.items()}
+ 
+-    def _validate_orientation(self, orientation):
+-        if orientation is None:
+-            orientation = StackOrientation.XY
+-        orientation = orientation_strs.get(orientation, orientation)
+-        lower = orientation.lower()
+-        if lower not in orientation_strs.values():
+-            raise ValueError("orientation must be a StackOrientation, 'xy', 'xz', or 'zy'")
+-
+-        return lower
+-
+     @classmethod
+     def from_catmaid(cls, catmaid_client, stack_id):
+         """
+diff --git a/catpy/image.py b/catpy/image.py
+index cd25378..fe3e27c 100644
+--- a/catpy/image.py
++++ b/catpy/image.py
+@@ -23,7 +23,7 @@ import requests
+ from requests_futures.sessions import FuturesSession
+ 
+ from catpy import CoordinateTransformer
+-
++from catpy.client import StackOrientation
+ 
+ logger = logging.getLogger()
+ 
+@@ -96,11 +96,28 @@ DEFAULT_ROI_MODE = ROIMode.STACK
+ 
+ 
+ class TileSourceType(IntEnum):
++    """https://catmaid.readthedocs.io/en/stable/tile_sources.html"""
+     FILE_BASED = 1
++    REQUEST_QUERY = 2
++    HDF5 = 3
+     FILE_BASED_WITH_ZOOM_DIRS = 4
+     DIR_BASED = 5
++    DVID_IMAGEBLK = 6
+     RENDER_SERVICE = 7
++    DVID_IMAGETILE = 8
+     FLIXSERVER = 9
++    H2N5_TILES = 10
++
++    def format(self, **kwargs):
++        try:
++            format_url = format_urls[self]
++        except KeyError:
++            raise ValueError(
++                "{} is not supported by TileFetcher, supported types are below:\n\t{}".format(
++                    self, '\n\t'.join(str(k) for k in sorted(format_urls))
++                )
++            )
++        return format_url.format(**kwargs)
+ 
+ 
+ format_urls = {
+@@ -267,7 +284,7 @@ class StackMirror(object):
+         self.title = str(title)
+         self.position = int(position)
+ 
+-        self.format_url = format_urls[self.tile_source_type].format(**self.__dict__)
++        self.format_url = self.tile_source_type.format(**self.__dict__)
+ 
+     def generate_url(self, tile_index):
+         """
+@@ -421,7 +438,7 @@ class ProjectStack(Stack):
+         super(ProjectStack, self).__init__(dimension, broken_slices, canary_location)
+         self.translation = translation
+         self.resolution = resolution
+-        self.orientation = orientation
++        self.orientation = StackOrientation.from_value(orientation)
+ 
+     @classmethod
+     def from_stack_info(cls, stack_info):
+@@ -438,7 +455,7 @@ class ProjectStack(Stack):
+         """
+         stack = cls(
+             stack_info['dimension'], stack_info['translation'], stack_info['resolution'],
+-            cls.orientation_choices[stack_info['orientation']], stack_info['broken_slices'],
++            stack_info['orientation'], stack_info['broken_slices'],
+             stack_info['canary_location']
+         )
+         mirrors = [StackMirror.from_dict(d) for d in stack_info['mirrors']]
+@@ -865,7 +882,7 @@ class ImageFetcher(object):
+         if roi_mode == ROIMode.PROJECT:
+             if not isinstance(self.stack, ProjectStack):
+                 raise ValueError("ImageFetcher's stack is not related to a project, cannot use ROIMode.PROJECT")
+-            if self.stack.orientation.lower() != 'xy':
++            if self.stack.orientation != StackOrientation.XY:
+                 warn("Stack orientation differs from project: returned array's orientation will reflect"
+                      "stack orientation, not project orientation")
+             roi_tgt = self.coord_trans.project_to_stack_array(roi_tgt, dims=self.target_orientation)

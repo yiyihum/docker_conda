@@ -1,0 +1,171 @@
+diff --git a/dvc/cache/__init__.py b/dvc/cache/__init__.py
+--- a/dvc/cache/__init__.py
++++ b/dvc/cache/__init__.py
+@@ -36,7 +36,13 @@ class Cache:
+     """
+ 
+     CACHE_DIR = "cache"
+-    CLOUD_SCHEMES = [Schemes.S3, Schemes.GS, Schemes.SSH, Schemes.HDFS]
++    CLOUD_SCHEMES = [
++        Schemes.S3,
++        Schemes.GS,
++        Schemes.SSH,
++        Schemes.HDFS,
++        Schemes.WEBHDFS,
++    ]
+ 
+     def __init__(self, repo):
+         self.repo = repo
+diff --git a/dvc/config.py b/dvc/config.py
+--- a/dvc/config.py
++++ b/dvc/config.py
+@@ -149,6 +149,7 @@ class RelPath(str):
+         "s3": str,
+         "gs": str,
+         "hdfs": str,
++        "webhdfs": str,
+         "ssh": str,
+         "azure": str,
+         # This is for default local cache
+@@ -195,6 +196,13 @@ class RelPath(str):
+                     **REMOTE_COMMON,
+                 },
+                 "hdfs": {"user": str, **REMOTE_COMMON},
++                "webhdfs": {
++                    "hdfscli_config": str,
++                    "webhdfs_token": str,
++                    "user": str,
++                    "webhdfs_alias": str,
++                    **REMOTE_COMMON,
++                },
+                 "azure": {"connection_string": str, **REMOTE_COMMON},
+                 "oss": {
+                     "oss_key_id": str,
+diff --git a/dvc/dependency/__init__.py b/dvc/dependency/__init__.py
+--- a/dvc/dependency/__init__.py
++++ b/dvc/dependency/__init__.py
+@@ -13,6 +13,7 @@
+ from dvc.dependency.ssh import SSHDependency
+ from dvc.dependency.webdav import WebDAVDependency
+ from dvc.dependency.webdavs import WebDAVSDependency
++from dvc.dependency.webhdfs import WebHDFSDependency
+ from dvc.output.base import BaseOutput
+ from dvc.scheme import Schemes
+ 
+@@ -28,7 +29,8 @@
+     S3Dependency,
+     SSHDependency,
+     WebDAVDependency,
+-    WebDAVSDependency
++    WebDAVSDependency,
++    WebHDFSDependency,
+     # NOTE: LocalDependency is the default choice
+ ]
+ 
+@@ -43,6 +45,7 @@
+     Schemes.HTTPS: HTTPSDependency,
+     Schemes.WEBDAV: WebDAVDependency,
+     Schemes.WEBDAVS: WebDAVSDependency,
++    Schemes.WEBHDFS: WebHDFSDependency,
+ }
+ 
+ 
+diff --git a/dvc/output/__init__.py b/dvc/output/__init__.py
+--- a/dvc/output/__init__.py
++++ b/dvc/output/__init__.py
+@@ -11,18 +11,21 @@
+ from dvc.output.local import LocalOutput
+ from dvc.output.s3 import S3Output
+ from dvc.output.ssh import SSHOutput
++from dvc.output.webhdfs import WebHDFSOutput
+ from dvc.scheme import Schemes
+ 
+ from ..tree import get_cloud_tree
+ from ..tree.hdfs import HDFSTree
+ from ..tree.local import LocalTree
+ from ..tree.s3 import S3Tree
++from ..tree.webhdfs import WebHDFSTree
+ 
+ OUTS = [
+     HDFSOutput,
+     S3Output,
+     GSOutput,
+     SSHOutput,
++    WebHDFSOutput,
+     # NOTE: LocalOutput is the default choice
+ ]
+ 
+@@ -32,6 +35,7 @@
+     Schemes.GS: GSOutput,
+     Schemes.SSH: SSHOutput,
+     Schemes.LOCAL: LocalOutput,
++    Schemes.WEBHDFS: WebHDFSOutput,
+ }
+ 
+ CHECKSUM_SCHEMA = Any(
+@@ -52,6 +56,7 @@
+     LocalTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
+     S3Tree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
+     HDFSTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
++    WebHDFSTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
+ }
+ 
+ SCHEMA = CHECKSUMS_SCHEMA.copy()
+diff --git a/dvc/scheme.py b/dvc/scheme.py
+--- a/dvc/scheme.py
++++ b/dvc/scheme.py
+@@ -1,6 +1,7 @@
+ class Schemes:
+     SSH = "ssh"
+     HDFS = "hdfs"
++    WEBHDFS = "webhdfs"
+     S3 = "s3"
+     AZURE = "azure"
+     HTTP = "http"
+diff --git a/dvc/tree/__init__.py b/dvc/tree/__init__.py
+--- a/dvc/tree/__init__.py
++++ b/dvc/tree/__init__.py
+@@ -13,6 +13,7 @@
+ from .ssh import SSHTree
+ from .webdav import WebDAVTree
+ from .webdavs import WebDAVSTree
++from .webhdfs import WebHDFSTree
+ 
+ TREES = [
+     AzureTree,
+@@ -26,6 +27,7 @@
+     OSSTree,
+     WebDAVTree,
+     WebDAVSTree,
++    WebHDFSTree
+     # NOTE: LocalTree is the default
+ ]
+ 
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -98,13 +98,14 @@ def run(self):
+ 
+ # Remove the env marker if/when pyarrow is available for Python3.9
+ hdfs = ["pyarrow>=2.0.0;  python_version < '3.9'"]
++webhdfs = ["hdfs==2.5.8"]
+ webdav = ["webdavclient3>=3.14.5"]
+ # gssapi should not be included in all_remotes, because it doesn't have wheels
+ # for linux and mac, so it will fail to compile if user doesn't have all the
+ # requirements, including kerberos itself. Once all the wheels are available,
+ # we can start shipping it by default.
+ ssh_gssapi = ["paramiko[invoke,gssapi]>=2.7.0"]
+-all_remotes = gs + s3 + azure + ssh + oss + gdrive + hdfs + webdav
++all_remotes = gs + s3 + azure + ssh + oss + gdrive + hdfs + webhdfs + webdav
+ 
+ # Extra dependecies to run tests
+ tests_requirements = [
+@@ -173,6 +174,7 @@ def run(self):
+         "ssh": ssh,
+         "ssh_gssapi": ssh_gssapi,
+         "hdfs": hdfs,
++        "webhdfs": webhdfs,
+         "webdav": webdav,
+         "tests": tests_requirements,
+     },
+

@@ -1,0 +1,123 @@
+diff --git a/statemachine/callbacks.py b/statemachine/callbacks.py
+index 85a0e17..f10122b 100644
+--- a/statemachine/callbacks.py
++++ b/statemachine/callbacks.py
+@@ -19,6 +19,7 @@ class CallbackWrapper:
+         self.suppress_errors = suppress_errors
+         self.cond = Callbacks(factory=ConditionWrapper).add(cond)
+         self._callback = None
++        self._resolver_id = None
+ 
+     def __repr__(self):
+         return f"{type(self).__name__}({self.func!r})"
+@@ -27,7 +28,7 @@ class CallbackWrapper:
+         return getattr(self.func, "__name__", self.func)
+ 
+     def __eq__(self, other):
+-        return self.func == getattr(other, "func", other)
++        return self.func == other.func and self._resolver_id == other._resolver_id
+ 
+     def __hash__(self):
+         return id(self)
+@@ -45,6 +46,7 @@ class CallbackWrapper:
+         """
+         self.cond.setup(resolver)
+         try:
++            self._resolver_id = getattr(resolver, "id", id(resolver))
+             self._callback = resolver(self.func)
+             return True
+         except AttrNotFound:
+@@ -144,15 +146,15 @@ class Callbacks:
+         return all(condition(*args, **kwargs) for condition in self)
+ 
+     def _add(self, func, resolver=None, prepend=False, **kwargs):
+-        if func in self.items:
+-            return
+-
+         resolver = resolver or self._resolver
+ 
+         callback = self.factory(func, **kwargs)
+         if resolver is not None and not callback.setup(resolver):
+             return
+ 
++        if callback in self.items:
++            return
++
+         if prepend:
+             self.items.insert(0, callback)
+         else:
+diff --git a/statemachine/dispatcher.py b/statemachine/dispatcher.py
+index d96a3f2..83c9b49 100644
+--- a/statemachine/dispatcher.py
++++ b/statemachine/dispatcher.py
+@@ -37,6 +37,28 @@ def _get_func_by_attr(attr, *configs):
+     return func, config.obj
+ 
+ 
++def _build_attr_wrapper(attr: str, obj):
++    # if `attr` is not callable, then it's an attribute or property,
++    # so `func` contains it's current value.
++    # we'll build a method that get's the fresh value for each call
++    getter = attrgetter(attr)
++
++    def wrapper(*args, **kwargs):
++        return getter(obj)
++
++    return wrapper
++
++
++def _build_sm_event_wrapper(func):
++    "Events already have the 'machine' parameter defined."
++
++    def wrapper(*args, **kwargs):
++        kwargs.pop("machine", None)
++        return func(*args, **kwargs)
++
++    return wrapper
++
++
+ def ensure_callable(attr, *objects):
+     """Ensure that `attr` is a callable, if not, tries to retrieve one from any of the given
+     `objects`.
+@@ -56,24 +78,10 @@ def ensure_callable(attr, *objects):
+     func, obj = _get_func_by_attr(attr, *configs)
+ 
+     if not callable(func):
+-        # if `attr` is not callable, then it's an attribute or property,
+-        # so `func` contains it's current value.
+-        # we'll build a method that get's the fresh value for each call
+-        getter = attrgetter(attr)
+-
+-        def wrapper(*args, **kwargs):
+-            return getter(obj)
+-
+-        return wrapper
++        return _build_attr_wrapper(attr, obj)
+ 
+     if getattr(func, "_is_sm_event", False):
+-        "Events already have the 'machine' parameter defined."
+-
+-        def wrapper(*args, **kwargs):
+-            kwargs.pop("machine")
+-            return func(*args, **kwargs)
+-
+-        return wrapper
++        return _build_sm_event_wrapper(func)
+ 
+     return SignatureAdapter.wrap(func)
+ 
+@@ -81,8 +89,13 @@ def ensure_callable(attr, *objects):
+ def resolver_factory(*objects):
+     """Factory that returns a configured resolver."""
+ 
++    objects = [ObjectConfig.from_obj(obj) for obj in objects]
++
+     @wraps(ensure_callable)
+     def wrapper(attr):
+         return ensure_callable(attr, *objects)
+ 
++    resolver_id = ".".join(str(id(obj.obj)) for obj in objects)
++    wrapper.id = resolver_id
++
+     return wrapper
+

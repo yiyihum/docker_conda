@@ -1,0 +1,210 @@
+diff --git a/doc/usage.rst b/doc/usage.rst
+index 5a94d9e..841924c 100644
+--- a/doc/usage.rst
++++ b/doc/usage.rst
+@@ -145,6 +145,9 @@ data files based on the given version string. The remote URL will also be update
+ Notice that there is a format specifier ``{version}`` in the URL that Pooch substitutes
+ for you.
+ 
++Versioning is optional and can be ignored by omitting the ``version`` and
++``version_dev`` arguments or setting them to ``None``.
++
+ 
+ User-defined paths
+ -------------------
+@@ -245,3 +248,66 @@ fictitious project from the command-line:
+ .. code:: bash
+ 
+    $ python -c "import pooch; pooch.make_registry('data', 'plumbus/registry.txt')"
++
++
++Multiple URLs
++-------------
++
++You can set a custom download URL for individual files with the ``urls`` argument of
++:func:`pooch.create` or :class:`pooch.Pooch`. It should be a dictionary with the file
++names as keys and the URLs for downloading the files as values. For example, say we have
++a ``citadel.csv`` file that we want to download from
++``https://www.some-data-hosting-site.com`` instead:
++
++.. code:: python
++
++    # The basic setup is the same and we must include citadel.csv in the registry.
++    GOODBOY = pooch.create(
++        path=pooch.os_cache("plumbus"),
++        base_url="https://github.com/rick/plumbus/raw/{version}/data/",
++        version=version,
++        version_dev="master",
++        registry={
++            "c137.csv": "19uheidhlkjdwhoiwuhc0uhcwljchw9ochwochw89dcgw9dcgwc",
++            "cronen.csv": "1upodh2ioduhw9celdjhlfvhksgdwikdgcowjhcwoduchowjg8w",
++            "citadel.csv": "893yprofwjndcwhx9c0ehp3ue9gcwoscjwdfgh923e0hwhcwiyc",
++        },
++        # Now specify custom URLs for some of the files in the registry.
++        urls={
++            "citadel.csv": "https://www.some-data-hosting-site.com/files/citadel.csv",
++        },
++    )
++
++Notice that versioning of custom URLs is not supported (since they are assumed to be
++data files independent of your project) and the file name will not be appended
++automatically to the URL (in case you want to change the file name in local storage).
++
++Custom URLs can be used along side ``base_url`` or you can omit ``base_url`` entirely by
++setting it to an empty string (``base_url=""``). However, doing so requires setting a
++custom URL for every file in the registry.
++
++You can also include custom URLs in a registry file by adding the URL for a file to end
++of the line (separated by a space):
++
++.. code-block:: none
++
++    c137.csv 19uheidhlkjdwhoiwuhc0uhcwljchw9ochwochw89dcgw9dcgwc
++    cronen.csv 1upodh2ioduhw9celdjhlfvhksgdwikdgcowjhcwoduchowjg8w
++    citadel.csv 893yprofwjndcwhx9c0ehp3ue9gcwoscjwdfgh923e0hwhcwiyc https://www.some-data-hosting-site.com/files/citadel.csv
++
++:meth:`pooch.Pooch.load_registry` will automatically populate the ``urls`` attribute.
++This way, custom URLs don't need to be set in the code. In fact, the module code doesn't
++change at all:
++
++.. code:: python
++
++    # Define the Pooch exactly the same (urls is None by default)
++    GOODBOY = pooch.create(
++        path=pooch.os_cache("plumbus"),
++        base_url="https://github.com/rick/plumbus/raw/{version}/data/",
++        version=version,
++        version_dev="master",
++        registry=None,
++    )
++    # If custom URLs are present in the registry file, they will be set automatically
++    GOODBOY.load_registry(os.path.join(os.path.dirname(__file__), "registry.txt"))
+diff --git a/pooch/core.py b/pooch/core.py
+index 5d2c3ef..8a2bc11 100644
+--- a/pooch/core.py
++++ b/pooch/core.py
+@@ -18,7 +18,15 @@ if sys.version_info[0] < 3:
+     PermissionError = OSError  # pylint: disable=redefined-builtin,invalid-name
+ 
+ 
+-def create(path, base_url, version=None, version_dev="master", env=None, registry=None):
++def create(
++    path,
++    base_url,
++    version=None,
++    version_dev="master",
++    env=None,
++    registry=None,
++    urls=None,
++):
+     """
+     Create a new :class:`~pooch.Pooch` with sensible defaults to fetch data files.
+ 
+@@ -55,11 +63,16 @@ def create(path, base_url, version=None, version_dev="master", env=None, registr
+         An environment variable that can be used to overwrite *path*. This allows users
+         to control where they want the data to be stored. We'll append *version* to the
+         end of this value as well.
+-    registry : dict
++    registry : dict or None
+         A record of the files that are managed by this Pooch. Keys should be the file
+         names and the values should be their SHA256 hashes. Only files in the registry
+         can be fetched from the local storage. Files in subdirectories of *path* **must
+         use Unix-style separators** (``'/'``) even on Windows.
++    urls : dict or None
++        Custom URLs for downloading individual files in the registry. A dictionary with
++        the file names as keys and the custom URLs as values. Not all files in
++        *registry* need an entry in *urls*. If a file has an entry in *urls*, the
++        *base_url* will be ignored when downloading it in favor of ``urls[fname]``.
+ 
+ 
+     Returns
+@@ -160,9 +173,7 @@ def create(path, base_url, version=None, version_dev="master", env=None, registr
+                 )
+             )
+         warn(message)
+-    if registry is None:
+-        registry = dict()
+-    pup = Pooch(path=Path(path), base_url=base_url, registry=registry)
++    pup = Pooch(path=Path(path), base_url=base_url, registry=registry, urls=urls)
+     return pup
+ 
+ 
+@@ -178,18 +189,28 @@ class Pooch:
+     base_url : str
+         Base URL for the remote data source. All requests will be made relative to this
+         URL.
+-    registry : dict
++    registry : dict or None
+         A record of the files that are managed by this good boy. Keys should be the file
+         names and the values should be their SHA256 hashes. Only files in the registry
+         can be fetched from the local storage. Files in subdirectories of *path* **must
+         use Unix-style separators** (``'/'``) even on Windows.
++    urls : dict or None
++        Custom URLs for downloading individual files in the registry. A dictionary with
++        the file names as keys and the custom URLs as values. Not all files in
++        *registry* need an entry in *urls*. If a file has an entry in *urls*, the
++        *base_url* will be ignored when downloading it in favor of ``urls[fname]``.
+ 
+     """
+ 
+-    def __init__(self, path, base_url, registry):
++    def __init__(self, path, base_url, registry=None, urls=None):
+         self.path = path
+         self.base_url = base_url
++        if registry is None:
++            registry = dict()
+         self.registry = dict(registry)
++        if urls is None:
++            urls = dict()
++        self.urls = dict(urls)
+ 
+     @property
+     def abspath(self):
+@@ -245,6 +266,8 @@ class Pooch:
+         """
+         Download a file from the remote data storage to the local storage.
+ 
++        Used by :meth:`~pooch.Pooch.fetch` to do the actual downloading.
++
+         Parameters
+         ----------
+         fname : str
+@@ -258,7 +281,7 @@ class Pooch:
+ 
+         """
+         destination = self.abspath / fname
+-        source = "".join([self.base_url, fname])
++        source = self.urls.get(fname, "".join([self.base_url, fname]))
+         # Stream the file to a temporary so that we can safely check its hash before
+         # overwriting the original
+         with tempfile.NamedTemporaryFile(delete=False) as fout:
+@@ -288,7 +311,8 @@ class Pooch:
+         Use this if you are managing many files.
+ 
+         Each line of the file should have file name and its SHA256 hash separate by a
+-        space. Only one file per line is allowed.
++        space. Only one file per line is allowed. Custom download URLs for individual
++        files can be specified as a third element on the line.
+ 
+         Parameters
+         ----------
+@@ -299,11 +323,15 @@ class Pooch:
+         with open(fname) as fin:
+             for linenum, line in enumerate(fin):
+                 elements = line.strip().split()
+-                if len(elements) != 2:
+-                    raise ValueError(
+-                        "Expected 2 elements in line {} but got {}.".format(
++                if len(elements) > 3 or len(elements) < 2:
++                    raise IOError(
++                        "Expected 2 or 3 elements in line {} but got {}.".format(
+                             linenum, len(elements)
+                         )
+                     )
+-                file_name, file_sha256 = elements
++                file_name = elements[0]
++                file_sha256 = elements[1]
++                if len(elements) == 3:
++                    file_url = elements[2]
++                    self.urls[file_name] = file_url
+                 self.registry[file_name] = file_sha256

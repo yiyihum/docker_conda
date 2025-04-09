@@ -1,0 +1,277 @@
+diff --git a/test/jsonld/test_localsuite.py b/test/jsonld/test_localsuite.py
+index 8088e07c..117efe8c 100644
+--- a/test/jsonld/test_localsuite.py
++++ b/test/jsonld/test_localsuite.py
+@@ -8,7 +8,7 @@ from rdflib.term import URIRef
+ 
+ from . import runner
+ 
+-TC_BASE = "http://rdflib.net/rdflib-jsonld/local-testsuite/"
++TC_BASE = "https://rdflib.github.io/rdflib-jsonld/local-testsuite/"
+ 
+ 
+ testsuite_dir = p.join(p.abspath(p.dirname(__file__)), "local-suite")
+diff --git a/test/test_dataset/test_dataset.py b/test/test_dataset/test_dataset.py
+index f09bcb61..577e289c 100644
+--- a/test/test_dataset/test_dataset.py
++++ b/test/test_dataset/test_dataset.py
+@@ -7,7 +7,7 @@ from test.data import context1, likes, pizza, tarek
+ import pytest
+ 
+ from rdflib import URIRef, plugin
+-from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Dataset
++from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Dataset, Graph, Namespace
+ 
+ # Will also run SPARQLUpdateStore tests against local SPARQL1.1 endpoint if
+ # available. This assumes SPARQL1.1 query/update endpoints running locally at
+@@ -231,3 +231,38 @@ def test_iter(get_dataset):
+         i_new += 1
+ 
+     assert i_new == i_trad  # both should be 3
++
++
++EGSCHEMA = Namespace("example:")
++
++
++def test_subgraph_without_identifier() -> None:
++    """
++    Graphs with no identifies assigned are identified by Skolem IRIs with a
++    prefix that is bound to `genid`.
++
++    TODO: This is somewhat questionable and arbitrary behaviour and should be
++    reviewed at some point.
++    """
++
++    dataset = Dataset()
++
++    nman = dataset.namespace_manager
++
++    genid_prefix = URIRef("https://rdflib.github.io/.well-known/genid/rdflib/")
++
++    namespaces = set(nman.namespaces())
++    assert (
++        next((namespace for namespace in namespaces if namespace[0] == "genid"), None)
++        is None
++    )
++
++    subgraph: Graph = dataset.graph()
++    subgraph.add((EGSCHEMA["subject"], EGSCHEMA["predicate"], EGSCHEMA["object"]))
++
++    namespaces = set(nman.namespaces())
++    assert next(
++        (namespace for namespace in namespaces if namespace[0] == "genid"), None
++    ) == ("genid", genid_prefix)
++
++    assert f"{subgraph.identifier}".startswith(genid_prefix)
+diff --git a/test/test_graph/test_graph_http.py b/test/test_graph/test_graph_http.py
+index 1ef2fea8..1ae203d0 100644
+--- a/test/test_graph/test_graph_http.py
++++ b/test/test_graph/test_graph_http.py
+@@ -1,12 +1,15 @@
+ import re
+ from http.server import BaseHTTPRequestHandler
++from test.data import TEST_DATA_DIR
+ from test.utils import GraphHelper
++from test.utils.graph import cached_graph
+ from test.utils.httpservermock import (
+     MethodName,
+     MockHTTPResponse,
+     ServedBaseHTTPServerMock,
+     ctx_http_server,
+ )
++from typing import Generator
+ from urllib.error import HTTPError
+ 
+ import pytest
+@@ -227,3 +230,37 @@ class TestGraphHTTP:
+                 graph.parse(location=url, format="turtle")
+ 
+             assert raised.value.code == 500
++
++
++@pytest.fixture(scope="module")
++def module_httpmock() -> Generator[ServedBaseHTTPServerMock, None, None]:
++    with ServedBaseHTTPServerMock() as httpmock:
++        yield httpmock
++
++
++@pytest.fixture(scope="function")
++def httpmock(
++    module_httpmock: ServedBaseHTTPServerMock,
++) -> Generator[ServedBaseHTTPServerMock, None, None]:
++    module_httpmock.reset()
++    yield module_httpmock
++
++
++def test_iri_source(httpmock: ServedBaseHTTPServerMock) -> None:
++    diverse_triples_path = TEST_DATA_DIR / "variants/diverse_triples.ttl"
++
++    httpmock.responses[MethodName.GET].append(
++        MockHTTPResponse(
++            200,
++            "OK",
++            diverse_triples_path.read_bytes(),
++            {"Content-Type": ["text/turtle"]},
++        )
++    )
++    g = Graph()
++    g.parse(f"{httpmock.url}/resource/Almería")
++    assert httpmock.call_count == 1
++    GraphHelper.assert_triple_sets_equals(cached_graph((diverse_triples_path,)), g)
++
++    req = httpmock.requests[MethodName.GET].pop(0)
++    assert req.path == "/resource/Almer%C3%ADa"
+diff --git a/test/test_graph/test_skolemization.py b/test/test_graph/test_skolemization.py
+index f045bf8d..aee86bae 100644
+--- a/test/test_graph/test_skolemization.py
++++ b/test/test_graph/test_skolemization.py
+@@ -22,10 +22,15 @@ base_triples = {
+     [
+         (URIRef("http://example.com"), None),
+         (Literal("some string in here ..."), None),
+-        (BNode("GMeng4V7"), "http://rdlib.net/.well-known/genid/rdflib/GMeng4V7"),
++        (
++            BNode("GMeng4V7"),
++            "https://rdflib.github.io/.well-known/genid/rdflib/GMeng4V7",
++        ),
+         (
+             BNode(),
+-            re.compile("^" + re.escape("http://rdlib.net/.well-known/genid/rdflib/")),
++            re.compile(
++                "^" + re.escape("https://rdflib.github.io/.well-known/genid/rdflib/")
++            ),
+         ),
+     ],
+ )
+@@ -61,9 +66,9 @@ def test_skolemization(
+     [
+         ("http://example.com", None),
+         ("http://example.com/not/.well-known/genid/1", None),
+-        ("http://rdlib.net/not/.well-known/genid/1", None),
++        ("https://rdflib.github.io/not/.well-known/genid/1", None),
+         ("http://example.com/.well-known/genid/1", re.compile("^N")),
+-        ("http://rdlib.net/.well-known/genid/rdflib/GMeng4V7", "GMeng4V7"),
++        ("https://rdflib.github.io/.well-known/genid/rdflib/GMeng4V7", "GMeng4V7"),
+     ],
+ )
+ def test_deskolemization(
+diff --git a/test/test_skolem_genid.py b/test/test_skolem_genid.py
+index 7123fba4..ee88f5a8 100644
+--- a/test/test_skolem_genid.py
++++ b/test/test_skolem_genid.py
+@@ -4,7 +4,7 @@ from rdflib.term import Genid, RDFLibGenid
+ 
+ def test_skolem_genid_and_rdflibgenid():
+     rdflib_genid = URIRef(
+-        "http://rdflib.net/.well-known/genid/rdflib/N97c39b957bc444949a82793519348dc2"
++        "https://rdflib.github.io/.well-known/genid/rdflib/N97c39b957bc444949a82793519348dc2"
+     )
+     custom_genid = URIRef(
+         "http://example.com/.well-known/genid/example/Ne864c0e3684044f381d518fdac652f2e"
+diff --git a/test/test_util.py b/test/test_util.py
+index 16ecbcb3..3ca54270 100644
+--- a/test/test_util.py
++++ b/test/test_util.py
+@@ -15,7 +15,7 @@ from rdflib import XSD, util
+ from rdflib.graph import ConjunctiveGraph, Graph, QuotedGraph
+ from rdflib.namespace import RDF, RDFS
+ from rdflib.term import BNode, IdentifiedNode, Literal, Node, URIRef
+-from rdflib.util import _coalesce, find_roots, get_tree
++from rdflib.util import _coalesce, _iri2uri, find_roots, get_tree
+ 
+ n3source = """\
+ @prefix : <http://www.w3.org/2000/10/swap/Primer#>.
+@@ -547,3 +547,80 @@ def test_get_tree(
+         assert catcher.value is not None
+     else:
+         assert expected_result == result
++
++
++@pytest.mark.parametrize(
++    ["iri", "expected_result"],
++    [
++        (
++            "https://example.com/resource/Almería",
++            {
++                "https://example.com/resource/Almer%C3%ADa",
++            },
++        ),
++        (
++            "https://example.com/resource/Almeria",
++            {
++                "https://example.com/resource/Almeria",
++            },
++        ),
++        (
++            "https://åæø.example.com/",
++            {
++                "https://xn--5cac8c.example.com/",
++            },
++        ),
++        (
++            # Note: expected result is the same because the function only works
++            # for http and https.
++            "example:é",
++            {
++                "example:é",
++            },
++        ),
++        (
++            # Note: expected result is the same because the function only works
++            # for http and https.
++            "urn:example:é",
++            {
++                "urn:example:é",
++            },
++        ),
++        (
++            "http://example.com/?é=1",
++            {
++                "http://example.com/?%C3%A9=1",
++                "http://example.com/?%C3%A9%3D1",
++            },
++        ),
++        (
++            "http://example.com/#é",
++            {
++                "http://example.com/#%C3%A9",
++            },
++        ),
++        (
++            "http://example.com/é#",
++            {
++                "http://example.com/%C3%A9#",
++            },
++        ),
++    ],
++)
++def test_iri2uri(iri: str, expected_result: Union[Set[str], Type[Exception]]) -> None:
++    """
++    Tests that
++    """
++    catcher: Optional[pytest.ExceptionInfo[Exception]] = None
++
++    with ExitStack() as xstack:
++        if isinstance(expected_result, type) and issubclass(expected_result, Exception):
++            catcher = xstack.enter_context(pytest.raises(expected_result))
++        result = _iri2uri(iri)
++        logging.debug("result = %s", result)
++    if catcher is not None:
++        assert catcher is not None
++        assert catcher.value is not None
++    else:
++        assert isinstance(expected_result, set)
++        assert result in expected_result
+diff --git a/test/test_w3c_spec/test_rdfxml_w3c.py b/test/test_w3c_spec/test_rdfxml_w3c.py
+index 9a5a4c6a..cfd940d2 100644
+--- a/test/test_w3c_spec/test_rdfxml_w3c.py
++++ b/test/test_w3c_spec/test_rdfxml_w3c.py
+@@ -230,7 +230,7 @@ FOAF = Namespace("http://xmlns.com/foaf/0.1/")
+ results = Graph()
+ 
+ system = BNode("system")
+-results.add((system, FOAF["homepage"], URIRef("http://rdflib.net/")))
++results.add((system, FOAF["homepage"], URIRef("https://rdflib.github.io/")))
+ results.add((system, RDFS.label, Literal("RDFLib")))
+ results.add((system, RDFS.comment, Literal("")))
+ 

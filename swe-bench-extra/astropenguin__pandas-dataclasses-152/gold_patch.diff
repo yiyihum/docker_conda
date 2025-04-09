@@ -1,0 +1,255 @@
+diff --git a/pandas_dataclasses/__init__.py b/pandas_dataclasses/__init__.py
+index 590fca2..a5d2e9d 100644
+--- a/pandas_dataclasses/__init__.py
++++ b/pandas_dataclasses/__init__.py
+@@ -7,6 +7,7 @@ __all__ = [
+     "Column",
+     "Data",
+     "Index",
++    "Multiple",
+     "Spec",
+     "Tag",
+     "asdataframe",
+diff --git a/pandas_dataclasses/core/api.py b/pandas_dataclasses/core/api.py
+index 5a7d400..a449087 100644
+--- a/pandas_dataclasses/core/api.py
++++ b/pandas_dataclasses/core/api.py
+@@ -3,7 +3,7 @@ __all__ = ["asframe", "aspandas", "asseries"]
+ 
+ # standard library
+ from types import FunctionType
+-from typing import Any, Callable, Dict, Hashable, List, Optional, overload
++from typing import Any, Callable, Dict, Hashable, Optional, overload
+ 
+ 
+ # dependencies
+@@ -12,7 +12,7 @@ import pandas as pd
+ from pandas.api.types import is_list_like
+ from typing_extensions import get_origin
+ from .specs import Spec
+-from .typing import P, DataClass, PandasClass, TFrame, TPandas, TSeries
++from .typing import P, DataClass, PandasClass, TFrame, TPandas, TSeries, Tag
+ 
+ 
+ # runtime functions
+@@ -206,18 +206,21 @@ def ensure(data: Any, dtype: Optional[str]) -> Any:
+ 
+ def get_attrs(spec: Spec) -> Dict[Hashable, Any]:
+     """Derive attributes from a specification."""
+-    attrs: Dict[Hashable, Any] = {}
++    data: Dict[Hashable, Any] = {}
+ 
+-    for field in spec.fields.of_attr:
+-        attrs[field.name] = field.default
++    for field in spec.fields.of(Tag.ATTR):
++        if field.has(Tag.MULTIPLE):
++            data.update(field.default)
++        else:
++            data[field.name] = field.default
+ 
+-    return attrs
++    return data
+ 
+ 
+ def get_columns(spec: Spec) -> Optional[pd.Index]:
+     """Derive columns from a specification."""
+-    names = [field.name for field in spec.fields.of_column]
+-    elems = [field.name for field in spec.fields.of_data]
++    names = [field.name for field in spec.fields.of(Tag.COLUMN)]
++    elems = [field.name for field in spec.fields.of(Tag.DATA)]
+ 
+     if len(names) == 0:
+         return None
+@@ -231,25 +234,40 @@ def get_data(spec: Spec) -> Dict[Hashable, Any]:
+     """Derive data from a specification."""
+     data: Dict[Hashable, Any] = {}
+ 
+-    for field in spec.fields.of_data:
+-        data[field.name] = ensure(field.default, field.dtype)
++    for field in spec.fields.of(Tag.DATA):
++        if field.has(Tag.MULTIPLE):
++            items = field.default.items()
++        else:
++            items = {field.name: field.default}.items()
++
++        for name, default in items:
++            data[name] = ensure(default, field.dtype)
+ 
+     return data
+ 
+ 
+ def get_index(spec: Spec) -> Optional[pd.Index]:
+     """Derive index from a specification."""
+-    names: List[Hashable] = []
+-    elems: List[Any] = []
++    data: Dict[Hashable, Any] = {}
+ 
+-    for field in spec.fields.of_index:
+-        names.append(field.name)
+-        elems.append(ensure(field.default, field.dtype))
++    for field in spec.fields.of(Tag.INDEX):
++        if field.has(Tag.MULTIPLE):
++            items = field.default.items()
++        else:
++            items = {field.name: field.default}.items()
+ 
+-    if len(names) == 0:
++        for name, default in items:
++            data[name] = ensure(default, field.dtype)
++
++    if len(data) == 0:
+         return None
+-    if len(names) == 1:
+-        return pd.Index(elems[0], name=names[0])
++    if len(data) == 1:
++        return pd.Index(
++            list(data.values())[0],
++            name=list(data.keys())[0],
++        )
+     else:
+-        elems = np.broadcast_arrays(*elems)
+-        return pd.MultiIndex.from_arrays(elems, names=names)
++        return pd.MultiIndex.from_arrays(
++            np.broadcast_arrays(*data.values()),
++            names=list(data.keys()),
++        )
+diff --git a/pandas_dataclasses/core/specs.py b/pandas_dataclasses/core/specs.py
+index 4a85b17..09c0285 100644
+--- a/pandas_dataclasses/core/specs.py
++++ b/pandas_dataclasses/core/specs.py
+@@ -42,6 +42,10 @@ class Field:
+     default: Any = None
+     """Default value of the field data."""
+ 
++    def has(self, tag: Tag) -> bool:
++        """Check if the specification has a tag."""
++        return bool(tag & Tag.union(self.tags))
++
+     def update(self, obj: Any) -> "Field":
+         """Update the specification by an object."""
+         return replace(
+@@ -52,31 +56,11 @@ class Field:
+ 
+ 
+ class Fields(List[Field]):
+-    """List of field specifications (with selectors)."""
+-
+-    @property
+-    def of_attr(self) -> "Fields":
+-        """Select only attribute field specifications."""
+-        return self.filter(lambda f: Tag.ATTR in Tag.union(f.tags))
+-
+-    @property
+-    def of_column(self) -> "Fields":
+-        """Select only column field specifications."""
+-        return self.filter(lambda f: Tag.COLUMN in Tag.union(f.tags))
+-
+-    @property
+-    def of_data(self) -> "Fields":
+-        """Select only data field specifications."""
+-        return self.filter(lambda f: Tag.DATA in Tag.union(f.tags))
+-
+-    @property
+-    def of_index(self) -> "Fields":
+-        """Select only index field specifications."""
+-        return self.filter(lambda f: Tag.INDEX in Tag.union(f.tags))
+-
+-    def filter(self, condition: Callable[[Field], bool]) -> "Fields":
+-        """Select only fields that make a condition True."""
+-        return type(self)(filter(condition, self))
++    """List of field specifications with selectors."""
++
++    def of(self, tag: Tag) -> "Fields":
++        """Select only fields that have a tag."""
++        return type(self)(filter(lambda field: field.has(tag), self))
+ 
+     def update(self, obj: Any) -> "Fields":
+         """Update the specifications by an object."""
+diff --git a/pandas_dataclasses/core/typing.py b/pandas_dataclasses/core/typing.py
+index 4769684..7ec0ba5 100644
+--- a/pandas_dataclasses/core/typing.py
++++ b/pandas_dataclasses/core/typing.py
+@@ -1,4 +1,4 @@
+-__all__ = ["Attr", "Column", "Data", "Index", "Tag"]
++__all__ = ["Attr", "Column", "Data", "Index", "Multiple", "Tag"]
+ 
+ 
+ # standard library
+@@ -28,7 +28,7 @@ from typing import (
+ # dependencies
+ import pandas as pd
+ from pandas.api.types import pandas_dtype
+-from typing_extensions import Annotated, ParamSpec, get_args, get_origin
++from typing_extensions import Annotated, ParamSpec, TypeGuard, get_args, get_origin
+ 
+ 
+ # type hints (private)
+@@ -77,22 +77,22 @@ class Tag(Flag):
+     DTYPE = auto()
+     """Tag for a type specifying a data type."""
+ 
++    MULTIPLE = auto()
++    """Tag for a type specifying a multiple-item field."""
++
+     FIELD = ATTR | COLUMN | DATA | INDEX
+     """Union of field-related tags."""
+ 
+-    ANY = FIELD | DTYPE
++    ANY = FIELD | DTYPE | MULTIPLE
+     """Union of all tags."""
+ 
+     def annotates(self, tp: Any) -> bool:
+         """Check if the tag annotates a type hint."""
+-        return any(map(self.covers, get_args(tp)))
+-
+-    def covers(self, obj: Any) -> bool:
+-        """Check if the tag is superset of an object."""
+-        return type(self).creates(obj) and obj in self
++        tags = filter(type(self).creates, get_args(tp))
++        return bool(self & type(self).union(tags))
+ 
+     @classmethod
+-    def creates(cls, obj: Any) -> bool:
++    def creates(cls, obj: Any) -> TypeGuard["Tag"]:
+         """Check if Tag is the type of an object."""
+         return isinstance(obj, cls)
+ 
+@@ -102,12 +102,12 @@ class Tag(Flag):
+         return reduce(or_, tags, Tag(0))
+ 
+     def __repr__(self) -> str:
+-        """Return the hashtag-style string of the tag."""
++        """Return the bracket-style string of the tag."""
+         return str(self)
+ 
+     def __str__(self) -> str:
+-        """Return the hashtag-style string of the tag."""
+-        return f"#{str(self.name).lower()}"
++        """Return the bracket-style string of the tag."""
++        return f"<{str(self.name).lower()}>"
+ 
+ 
+ # type hints (public)
+@@ -123,6 +123,9 @@ Data = Annotated[Collection[Annotated[T, Tag.DTYPE]], Tag.DATA]
+ Index = Annotated[Collection[Annotated[T, Tag.DTYPE]], Tag.INDEX]
+ """Type hint for index fields (``Index[T]``)."""
+ 
++Multiple = Dict[str, Annotated[T, Tag.MULTIPLE]]
++"""Type hint for multiple-item fields (``Multiple[T]``)."""
++
+ 
+ # runtime functions
+ def gen_annotated(tp: Any) -> Iterable[Any]:
+@@ -158,10 +161,10 @@ def get_nontags(tp: Any, bound: Tag = Tag.ANY) -> List[Any]:
+ 
+ def get_dtype(tp: Any) -> Optional[str]:
+     """Extract a data type of NumPy or pandas from a type hint."""
+-    if (tagged := get_tagged(tp, Tag.DATA | Tag.INDEX)) is None:
++    if (tp := get_tagged(tp, Tag.DATA | Tag.INDEX, True)) is None:
+         return None
+ 
+-    if (dtype := get_tagged(tagged, Tag.DTYPE)) is None:
++    if (dtype := get_tagged(tp, Tag.DTYPE)) is None:
+         return None
+ 
+     if dtype is Any or dtype is type(None):

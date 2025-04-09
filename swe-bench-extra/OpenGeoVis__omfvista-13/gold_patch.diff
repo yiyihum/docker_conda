@@ -1,0 +1,445 @@
+diff --git a/omfvista/lineset.py b/omfvista/lineset.py
+index 5461ea6..2b978dc 100644
+--- a/omfvista/lineset.py
++++ b/omfvista/lineset.py
+@@ -7,15 +7,13 @@ __all__ = [
+ 
+ __displayname__ = 'Line Set'
+ 
+-import vtk
+-from vtk.util import numpy_support as nps
+-import pyvista
+-
+ import numpy as np
++import pyvista
+ 
+ from omfvista.utilities import add_data
+ 
+-def line_set_to_vtk(lse):
++
++def line_set_to_vtk(lse, origin=(0.0, 0.0, 0.0)):
+     """Convert the line set to a :class:`pyvista.PolyData` data object.
+ 
+     Args:
+@@ -24,46 +22,23 @@ def line_set_to_vtk(lse):
+     Return:
+         :class:`pyvista.PolyData`
+     """
++    ids = np.array(lse.geometry.segments).reshape(-1, 2).astype(np.int_)
++    lines = np.c_[np.full(len(ids), 2, dtype=np.int_), ids]
++
++    output = pyvista.PolyData()
++    output.points = np.array(lse.geometry.vertices)
++    output.lines = lines
+ 
+-    output = vtk.vtkPolyData()
+-    cells = vtk.vtkCellArray()
+-    pts = vtk.vtkPoints()
+-
+-    # Make a data array for grouping the line segments
+-    indexArr = vtk.vtkIntArray()
+-    indexArr.SetNumberOfValues(lse.geometry.num_cells)
+-    indexArr.SetName('Line Index')
+-
+-    # Generate VTK Points from the vertices
+-    pts.SetNumberOfPoints(lse.geometry.num_nodes)
+-    pts.SetData(nps.numpy_to_vtk(lse.geometry.vertices))
+-
+-    last = lse.geometry.segments[0][0]
+-    segi = 0
+-    for i in range(len(lse.geometry.segments)):
+-        # Create a VTK Line cell for each segment
+-        seg = lse.geometry.segments[i]
+-        aLine = vtk.vtkLine()
+-        aLine.GetPointIds().SetId(0, seg[0])
+-        aLine.GetPointIds().SetId(1, seg[1])
+-        cells.InsertNextCell(aLine)
+-        # Group segments by connectivity:
+-        if seg[0] != last:
+-            segi += 1
+-        last = seg[1]
+-        indexArr.SetValue(i, segi)
+-
+-    # Generate the output
+-    output.SetPoints(pts)
+-    output.SetLines(cells)
+-    output.GetCellData().AddArray(indexArr)
++    indices = output.connectivity().cell_arrays['RegionId']
++    output['Line Index'] = indices
+ 
+     # Now add data to lines:
+     add_data(output, lse.data)
+ 
+     # TODO: if subtype is borehole make a tube
+ 
+-    return pyvista.wrap(output)
++    output.points += np.array(origin)
++    return output
+ 
+ 
+ line_set_to_vtk.__displayname__ = 'Line Set to VTK'
+diff --git a/omfvista/pointset.py b/omfvista/pointset.py
+index 487ec77..60ea4c8 100644
+--- a/omfvista/pointset.py
++++ b/omfvista/pointset.py
+@@ -7,16 +7,13 @@ __all__ = [
+ 
+ __displayname__ = 'Point Set'
+ 
+-import vtk
+-from vtk.util import numpy_support as nps
+-import pyvista
+-
+ import numpy as np
++import pyvista
+ 
+ from omfvista.utilities import add_data, add_textures
+ 
+ 
+-def point_set_to_vtk(pse):
++def point_set_to_vtk(pse, origin=(0.0, 0.0, 0.0)):
+     """Convert the point set to a :class:`pyvista.PolyData` data object.
+ 
+     Args:
+@@ -25,34 +22,16 @@ def point_set_to_vtk(pse):
+     Return:
+         :class:`pyvista.PolyData`
+     """
+-
+-    points = pse.geometry.vertices
+-    npoints = pse.geometry.num_nodes
+-
+-    # Make VTK cells array
+-    cells = np.hstack((np.ones((npoints, 1)),
+-                       np.arange(npoints).reshape(-1, 1)))
+-    cells = np.ascontiguousarray(cells, dtype=np.int64)
+-    cells = np.reshape(cells, (2*npoints))
+-    vtkcells = vtk.vtkCellArray()
+-    vtkcells.SetCells(npoints, nps.numpy_to_vtk(cells, deep=True, array_type=vtk.VTK_ID_TYPE))
+-
+-    # Convert points to vtk object
+-    pts = vtk.vtkPoints()
+-    pts.SetNumberOfPoints(pse.geometry.num_nodes)
+-    pts.SetData(nps.numpy_to_vtk(points))
+-
+-    # Create polydata
+-    output = vtk.vtkPolyData()
+-    output.SetPoints(pts)
+-    output.SetVerts(vtkcells)
++    points = np.array(pse.geometry.vertices)
++    output = pyvista.PolyData(points)
+ 
+     # Now add point data:
+     add_data(output, pse.data)
+ 
+     add_textures(output, pse.textures, pse.name)
+ 
+-    return pyvista.wrap(output)
++    output.points += np.array(origin)
++    return output
+ 
+ 
+ point_set_to_vtk.__displayname__ = 'Point Set to VTK'
+diff --git a/omfvista/surface.py b/omfvista/surface.py
+index 8d9ab01..a860a08 100644
+--- a/omfvista/surface.py
++++ b/omfvista/surface.py
+@@ -9,51 +9,31 @@ __all__ = [
+ 
+ __displayname__ = 'Surface'
+ 
+-import vtk
+-from vtk.util import numpy_support as nps
+-import pyvista
+-import omf
+-
+-
+ import numpy as np
++import omf
++import pyvista
+ 
+ from omfvista.utilities import check_orientation, check_orthogonal
+ from omfvista.utilities import add_data, add_textures
+ 
+-def surface_geom_to_vtk(surfgeom):
+-    """Convert the triangulated surface to a :class:`pyvista.UnstructuredGrid`
++
++def surface_geom_to_vtk(surfgeom, origin=(0.0, 0.0, 0.0)):
++    """Convert the triangulated surface to a :class:`pyvista.PolyData`
+     object
+ 
+     Args:
+         surfgeom (:class:`omf.surface.SurfaceGeometry`): the surface geomotry to
+             convert
+     """
+-
+-    output = vtk.vtkUnstructuredGrid()
+-    pts = vtk.vtkPoints()
+-    cells = vtk.vtkCellArray()
+-
+-    # Generate the points
+-    pts.SetNumberOfPoints(surfgeom.num_nodes)
+-    pts.SetData(nps.numpy_to_vtk(surfgeom.vertices))
+-
+-    # Generate the triangle cells
+-    cellConn = surfgeom.triangles.array
+-    cellsMat = np.concatenate(
+-        (np.ones((cellConn.shape[0], 1), dtype=np.int64)*cellConn.shape[1], cellConn),
+-        axis=1).ravel()
+-    cells = vtk.vtkCellArray()
+-    cells.SetNumberOfCells(cellConn.shape[0])
+-    cells.SetCells(cellConn.shape[0],
+-            nps.numpy_to_vtk(cellsMat, deep=True, array_type=vtk.VTK_ID_TYPE))
+-
+-    # Add to output
+-    output.SetPoints(pts)
+-    output.SetCells(vtk.VTK_TRIANGLE, cells)
+-    return pyvista.wrap(output)
++    pts = np.array(surfgeom.vertices)
++    tris = np.array(surfgeom.triangles.array)
++    faces = np.c_[np.full(len(tris), 3), tris]
++    output = pyvista.PolyData(pts, faces)
++    output.points += np.array(origin)
++    return output
+ 
+ 
+-def surface_grid_geom_to_vtk(surfgridgeom):
++def surface_grid_geom_to_vtk(surfgridgeom, origin=(0.0, 0.0, 0.0)):
+     """Convert the 2D grid to a :class:`pyvista.StructuredGrid` object.
+ 
+     Args:
+@@ -63,8 +43,6 @@ def surface_grid_geom_to_vtk(surfgridgeom):
+     """
+     surfgridgeom._validate_mesh()
+ 
+-    output = vtk.vtkStructuredGrid()
+-
+     axis_u = np.array(surfgridgeom.axis_u)
+     axis_v = np.array(surfgridgeom.axis_v)
+     axis_w = np.cross(axis_u, axis_v)
+@@ -81,8 +59,6 @@ def surface_grid_geom_to_vtk(surfgridgeom):
+ 
+     z = np.array([oz])
+ 
+-    output.SetDimensions(len(x), len(y), len(z))
+-
+     # Build out all nodes in the mesh
+     xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
+     xx, yy, zz, = xx.ravel('F'), yy.ravel('F'), zz.ravel('F')
+@@ -92,16 +68,16 @@ def surface_grid_geom_to_vtk(surfgridgeom):
+     # Rotate the points based on the axis orientations
+     points = points.dot(rotation_mtx)
+ 
+-    # Convert points to vtk object
+-    pts = vtk.vtkPoints()
+-    pts.SetNumberOfPoints(len(points))
+-    pts.SetData(nps.numpy_to_vtk(points))
+     # Now build the output
+-    output.SetPoints(pts)
++    output = pyvista.StructuredGrid()
++    output.points = points
++    output.dimensions = len(x), len(y), len(z)
++
++    output.points += np.array(origin)
++    return output
+ 
+-    return pyvista.wrap(output)
+ 
+-def surface_to_vtk(surfel):
++def surface_to_vtk(surfel, origin=(0.0, 0.0, 0.0)):
+     """Convert the surface to a its appropriate VTK data object type.
+ 
+     Args:
+@@ -116,7 +92,7 @@ def surface_to_vtk(surfel):
+     elif isinstance(geom, omf.surface.SurfaceGridGeometry):
+         builder = surface_grid_geom_to_vtk
+ 
+-    output = builder(geom)
++    output = builder(geom, origin=origin)
+ 
+     # Now add point data:
+     add_data(output, surfel.data)
+diff --git a/omfvista/utilities.py b/omfvista/utilities.py
+index 0f7490d..30148b0 100644
+--- a/omfvista/utilities.py
++++ b/omfvista/utilities.py
+@@ -7,8 +7,6 @@ __all__ = [
+ 
+ 
+ import numpy as np
+-import vtk
+-from vtk.util import numpy_support as nps
+ import pyvista
+ from PIL import Image
+ 
+@@ -42,14 +40,7 @@ def check_orthogonal(axis_u, axis_v, axis_w):
+ def add_data(output, data):
+     """Adds data arrays to an output VTK data object"""
+     for d in data:
+-        arr = d.array.array
+-        c = nps.numpy_to_vtk(num_array=arr)
+-        c.SetName(d.name)
+-        loc = d.location
+-        if loc == 'vertices':
+-            output.GetPointData().AddArray(c)
+-        else:
+-            output.GetCellData().AddArray(c)
++        output[d.name] = np.array(d.array.array)
+     return output
+ 
+ 
+@@ -60,14 +51,8 @@ def add_textures(output, textures, elname):
+ 
+     for i, tex in enumerate(textures):
+         # Now map the coordinates for the texture
+-        m = vtk.vtkTextureMapToPlane()
+-        m.SetInputDataObject(output)
+-        m.SetOrigin(tex.origin)
+-        m.SetPoint1(tex.origin + tex.axis_u)
+-        m.SetPoint2(tex.origin + tex.axis_v)
+-        m.Update()
++        tmp = output.texture_map_to_plane(origin=tex.origin, point_u=tex.origin + tex.axis_u, point_v=tex.origin + tex.axis_v)
+         # Grab the texture coordinates
+-        tmp = m.GetOutputDataObject(0)
+         tcoord = tmp.GetPointData().GetTCoords()
+         name = tex.name
+         if name is None or name == '':
+diff --git a/omfvista/volume.py b/omfvista/volume.py
+index e1176de..7334a1b 100644
+--- a/omfvista/volume.py
++++ b/omfvista/volume.py
+@@ -8,21 +8,18 @@ __all__ = [
+ 
+ __displayname__ = 'Volume'
+ 
+-import vtk
+-from vtk.util import numpy_support as nps
++import numpy as np
+ import pyvista
+ 
+ from omfvista.utilities import check_orientation, check_orthogonal
+ 
+-import numpy as np
+-
+ 
+ def get_volume_shape(vol):
+     """Returns the shape of a gridded volume"""
+     return ( len(vol.tensor_u), len(vol.tensor_v), len(vol.tensor_w))
+ 
+ 
+-def volume_grid_geom_to_vtk(volgridgeom):
++def volume_grid_geom_to_vtk(volgridgeom, origin=(0.0, 0.0, 0.0)):
+     """Convert the 3D gridded volume to a :class:`pyvista.StructuredGrid`
+     (or a :class:`pyvista.RectilinearGrid` when apprropriate) object contatining
+     the 2D surface.
+@@ -45,17 +42,9 @@ def volume_grid_geom_to_vtk(volgridgeom):
+ 
+     # If axis orientations are standard then use a vtkRectilinearGrid
+     if check_orientation(volgridgeom.axis_u, volgridgeom.axis_v, volgridgeom.axis_w):
+-        output = vtk.vtkRectilinearGrid()
+-        output.SetDimensions(len(x), len(y), len(z)) # note this subtracts 1
+-        output.SetXCoordinates(nps.numpy_to_vtk(num_array=x))
+-        output.SetYCoordinates(nps.numpy_to_vtk(num_array=y))
+-        output.SetZCoordinates(nps.numpy_to_vtk(num_array=z))
+-        return pyvista.wrap(output)
++        return pyvista.RectilinearGrid(x + origin[0], y + origin[1], z + origin[2])
+ 
+     # Otherwise use a vtkStructuredGrid
+-    output = vtk.vtkStructuredGrid()
+-    output.SetDimensions(len(x), len(y), len(z)) # note this subtracts 1
+-
+     # Build out all nodes in the mesh
+     xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
+     points = np.c_[xx.ravel('F'), yy.ravel('F'), zz.ravel('F')]
+@@ -64,17 +53,14 @@ def volume_grid_geom_to_vtk(volgridgeom):
+     rotation_mtx = np.array([volgridgeom.axis_u, volgridgeom.axis_v, volgridgeom.axis_w])
+     points = points.dot(rotation_mtx)
+ 
+-    # Convert points to vtk object
+-    pts = vtk.vtkPoints()
+-    pts.SetNumberOfPoints(len(points))
+-    pts.SetData(nps.numpy_to_vtk(points))
+-    # Now build the output
+-    output.SetPoints(pts)
+-
+-    return pyvista.wrap(output)
++    output = pyvista.StructuredGrid()
++    output.points = points
++    output.dimensions = len(x), len(y), len(z)
++    output.points += np.array(origin)
++    return output
+ 
+ 
+-def volume_to_vtk(volelement):
++def volume_to_vtk(volelement, origin=(0.0, 0.0, 0.0)):
+     """Convert the volume element to a VTK data object.
+ 
+     Args:
+@@ -82,20 +68,14 @@ def volume_to_vtk(volelement):
+             convert
+ 
+     """
+-    output = volume_grid_geom_to_vtk(volelement.geometry)
++    output = volume_grid_geom_to_vtk(volelement.geometry, origin=origin)
+     shp = get_volume_shape(volelement.geometry)
+     # Add data to output
+     for data in volelement.data:
+         arr = data.array.array
+         arr = np.reshape(arr, shp).flatten(order='F')
+-        c = nps.numpy_to_vtk(num_array=arr, deep=True)
+-        c.SetName(data.name)
+-        loc = data.location
+-        if loc == 'vertices':
+-            output.GetPointData().AddArray(c)
+-        else:
+-            output.GetCellData().AddArray(c)
+-    return pyvista.wrap(output)
++        output[data.name] = arr
++    return output
+ 
+ 
+ # Now set up the display names for the docs
+diff --git a/omfvista/wrapper.py b/omfvista/wrapper.py
+index 5566a16..e5c2147 100644
+--- a/omfvista/wrapper.py
++++ b/omfvista/wrapper.py
+@@ -50,12 +50,14 @@ __all__ = [
+ 
+ __displayname__ = 'Wrapper'
+ 
++import numpy as np
+ import omf
+-import omfvista
+ import pyvista
+ 
++import omfvista
++
+ 
+-def wrap(data):
++def wrap(data, origin=(0.0, 0.0, 0.0)):
+     """Wraps the OMF data object/project as a VTK data object. This is the
+     primary function that an end user will harness.
+ 
+@@ -100,7 +102,10 @@ def wrap(data):
+     # get the class name
+     key = data.__class__.__name__
+     try:
+-        return wrappers[key](data)
++        if key != 'Project':
++            return wrappers[key](data, origin=origin)
++        else:
++            return wrappers[key](data)
+     except KeyError:
+         raise RuntimeError('Data of type ({}) is not supported currently.'.format(key))
+ 
+@@ -111,8 +116,9 @@ def project_to_vtk(project):
+     """
+     # Iterate over the elements and add converted VTK objects a MultiBlock
+     data = pyvista.MultiBlock()
++    origin = np.array(project.origin)
+     for i, e in enumerate(project.elements):
+-        d = omfvista.wrap(e)
++        d = omfvista.wrap(e, origin=origin)
+         data[i, e.name] = d
+     return data
+ 

@@ -1,0 +1,187 @@
+diff --git a/src/streamlink/plugins/atresplayer.py b/src/streamlink/plugins/atresplayer.py
+index 45702cfb..b0c4f15d 100644
+--- a/src/streamlink/plugins/atresplayer.py
++++ b/src/streamlink/plugins/atresplayer.py
+@@ -1,38 +1,56 @@
+ from __future__ import print_function
++
++import logging
+ import re
+-import time
+-import random
+ 
+ from streamlink.plugin import Plugin
+-from streamlink.plugin.api import http
+-from streamlink.plugin.api import validate
+-from streamlink.stream import HDSStream
++from streamlink.plugin.api import http, validate
++from streamlink.stream import HLSStream
++from streamlink.utils import parse_json, update_scheme
++
++log = logging.getLogger(__name__)
+ 
+ 
+ class AtresPlayer(Plugin):
+-    url_re = re.compile(r"https?://(?:www.)?atresplayer.com/directos/television/(\w+)/?")
+-    player_re = re.compile(r"""div.*?directo=(\d+)""")
+-    stream_api = "https://servicios.atresplayer.com/api/urlVideoLanguage/v3/{id}/web/{id}|{time}|{hash}/es.xml"
+-    manifest_re = re.compile(r"<resultDes>(.*?)</resultDes>")
++    url_re = re.compile(r"https?://(?:www.)?atresplayer.com/directos/([\w-]+)/?")
++    state_re = re.compile(r"""window.__PRELOADED_STATE__\s*=\s*({.*?});""", re.DOTALL)
++    channel_id_schema = validate.Schema(
++        validate.transform(state_re.search),
++        validate.any(
++            None,
++            validate.all(
++                validate.get(1),
++                validate.transform(parse_json),
++                {
++                    "programming": {
++                        validate.text: validate.all({"urlVideo": validate.text},
++                                                    validate.get("urlVideo"))
++                    }
++                },
++                validate.get("programming")
++            )))
++    stream_schema = validate.Schema(
++        validate.transform(parse_json),
++        {"sources": [
++            validate.all({"src": validate.url()},
++                         validate.get("src"))
++        ]}, validate.get("sources"))
++
+ 
+     @classmethod
+     def can_handle_url(cls, url):
+         return cls.url_re.match(url) is not None
+ 
++    def __init__(self, url):
++        # must be HTTPS
++        super(AtresPlayer, self).__init__(update_scheme("https://", url))
++
+     def _get_streams(self):
+-        res = http.get(self.url)
+-        match = self.player_re.search(res.text)
+-        if match:
+-            channel_id = match.group(1)
+-
+-            stream_api = self.stream_api.format(id=channel_id,
+-                                                time=int(time.time()),
+-                                                hash=''.join(random.choice("abcdef0123456789") for x in range(28)))
+-
+-            res = http.get(stream_api)
+-            f4m_url = self.manifest_re.search(res.text)
+-            if f4m_url:
+-                return HDSStream.parse_manifest(self.session, f4m_url.group(1))
++        programming = http.get(self.url, schema=self.channel_id_schema)
++        for api_url in programming.values():
++            for src in http.get(api_url, schema=self.stream_schema):
++                for s in HLSStream.parse_variant_playlist(self.session, src).items():
++                    yield s
+ 
+ 
+ __plugin__ = AtresPlayer
+diff --git a/src/streamlink/plugins/mitele.py b/src/streamlink/plugins/mitele.py
+index f2e7b7c9..8d0bd47d 100644
+--- a/src/streamlink/plugins/mitele.py
++++ b/src/streamlink/plugins/mitele.py
+@@ -31,7 +31,7 @@ class Mitele(Plugin):
+         "telecinco": livehlsdai,
+     }
+ 
+-    pdata_url = "https://indalo.mediaset.es/mmc-player/api/mmc/v1/{channel}/live/flash.json"
++    pdata_url = "https://indalo.mediaset.es/mmc-player/api/mmc/v1/{channel}/live/html5.json"
+     gate_url = "https://gatekeeper.mediaset.es"
+ 
+     pdata_schema = validate.Schema(
+@@ -39,7 +39,7 @@ class Mitele(Plugin):
+             {
+                 "locations": [{
+                     "gcp": validate.text,
+-                    "ogn": validate.text,
++                    "ogn": validate.any(None, validate.text),
+                 }],
+             },
+             validate.get("locations"),
+@@ -117,7 +117,7 @@ class Mitele(Plugin):
+ 
+         if hls_url:
+             self.logger.debug("HLS URL: {0}".format(hls_url))
+-            for s in HLSStream.parse_variant_playlist(self.session, hls_url, headers=self.headers).items():
++            for s in HLSStream.parse_variant_playlist(self.session, hls_url, headers=self.headers, name_fmt="{pixels}_{bitrate}").items():
+                 yield s
+ 
+ 
+diff --git a/src/streamlink/stream/dash.py b/src/streamlink/stream/dash.py
+index 562190a1..aa0a72fa 100644
+--- a/src/streamlink/stream/dash.py
++++ b/src/streamlink/stream/dash.py
+@@ -60,10 +60,10 @@ class DASHStreamWorker(SegmentedStreamWorker):
+         self.period = self.stream.period
+ 
+     @staticmethod
+-    def get_representation(mpd, representation_id):
++    def get_representation(mpd, representation_id, mime_type):
+         for aset in mpd.periods[0].adaptationSets:
+             for rep in aset.representations:
+-                if rep.id == representation_id:
++                if rep.id == representation_id and rep.mimeType == mime_type:
+                     return rep
+ 
+     def iter_segments(self):
+@@ -71,7 +71,7 @@ class DASHStreamWorker(SegmentedStreamWorker):
+         back_off_factor = 1
+         while not self.closed:
+             # find the representation by ID
+-            representation = self.get_representation(self.mpd, self.reader.representation_id)
++            representation = self.get_representation(self.mpd, self.reader.representation_id, self.reader.mime_type)
+             refresh_wait = max(self.mpd.minimumUpdatePeriod.total_seconds(),
+                                self.mpd.periods[0].duration.total_seconds()) or 5
+             with sleeper(refresh_wait * back_off_factor):
+@@ -96,7 +96,7 @@ class DASHStreamWorker(SegmentedStreamWorker):
+             return
+ 
+         self.reader.buffer.wait_free()
+-        log.debug("Reloading manifest ({0})".format(self.reader.representation_id))
++        log.debug("Reloading manifest ({0}:{1})".format(self.reader.representation_id, self.reader.mime_type))
+         res = self.session.http.get(self.mpd.url, exception=StreamError)
+ 
+         new_mpd = MPD(self.session.http.xml(res, ignore_ns=True),
+@@ -104,7 +104,7 @@ class DASHStreamWorker(SegmentedStreamWorker):
+                       url=self.mpd.url,
+                       timelines=self.mpd.timelines)
+ 
+-        new_rep = self.get_representation(new_mpd, self.reader.representation_id)
++        new_rep = self.get_representation(new_mpd, self.reader.representation_id, self.reader.mime_type)
+         with freeze_timeline(new_mpd):
+             changed = len(list(itertools.islice(new_rep.segments(), 1))) > 0
+ 
+@@ -118,10 +118,11 @@ class DASHStreamReader(SegmentedStreamReader):
+     __worker__ = DASHStreamWorker
+     __writer__ = DASHStreamWriter
+ 
+-    def __init__(self, stream, representation_id, *args, **kwargs):
++    def __init__(self, stream, representation_id, mime_type, *args, **kwargs):
+         SegmentedStreamReader.__init__(self, stream, *args, **kwargs)
++        self.mime_type = mime_type
+         self.representation_id = representation_id
+-        log.debug("Opening DASH reader for: {0}".format(self.representation_id))
++        log.debug("Opening DASH reader for: {0} ({1})".format(self.representation_id, self.mime_type))
+ 
+ 
+ 
+@@ -198,11 +199,11 @@ class DASHStream(Stream):
+ 
+     def open(self):
+         if self.video_representation:
+-            video = DASHStreamReader(self, self.video_representation.id)
++            video = DASHStreamReader(self, self.video_representation.id, self.video_representation.mimeType)
+             video.open()
+ 
+         if self.audio_representation:
+-            audio = DASHStreamReader(self, self.audio_representation.id)
++            audio = DASHStreamReader(self, self.audio_representation.id, self.audio_representation.mimeType)
+             audio.open()
+ 
+         if self.video_representation and self.audio_representation:
+

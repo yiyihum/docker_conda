@@ -1,0 +1,268 @@
+diff --git a/examples/webhooks/server.py b/examples/webhooks/server.py
+index 9d4b77d..4ccc8b3 100755
+--- a/examples/webhooks/server.py
++++ b/examples/webhooks/server.py
+@@ -129,7 +129,7 @@ def process_delta(delta):
+     """
+     kwargs = {
+         "type": delta["type"],
+-        "date": datetime.datetime.fromtimestamp(delta["date"]),
++        "date": datetime.datetime.utcfromtimestamp(delta["date"]),
+         "object_id": delta["object_data"]["id"],
+     }
+     print(" * {type} at {date} with ID {object_id}".format(**kwargs))
+diff --git a/nylas/client/client.py b/nylas/client/client.py
+index aaf92d8..5ab5833 100644
+--- a/nylas/client/client.py
++++ b/nylas/client/client.py
+@@ -1,8 +1,13 @@
+ from __future__ import print_function
+ import sys
+-import json
+ from os import environ
+ from base64 import b64encode
++import json
++try:
++    from json import JSONDecodeError
++except ImportError:
++    JSONDecodeError = ValueError
++
+ import requests
+ from urlobject import URLObject
+ from six.moves.urllib.parse import urlencode
+@@ -14,10 +19,7 @@ from nylas.client.restful_models import (
+     Label, Draft
+ )
+ from nylas.client.errors import APIClientError, ConnectionError, STATUS_MAP
+-try:
+-    from json import JSONDecodeError
+-except ImportError:
+-    JSONDecodeError = ValueError
++from nylas.utils import convert_datetimes_to_timestamps
+ 
+ DEBUG = environ.get('NYLAS_CLIENT_DEBUG')
+ API_SERVER = "https://api.nylas.com"
+@@ -256,7 +258,10 @@ class APIClient(json.JSONEncoder):
+                 postfix
+             )
+ 
+-        url = str(URLObject(url).add_query_params(filters.items()))
++        converted_filters = convert_datetimes_to_timestamps(
++            filters, cls.datetime_filter_attrs,
++        )
++        url = str(URLObject(url).add_query_params(converted_filters.items()))
+         response = self._get_http_session(cls.api_root).get(url)
+         results = _validate(response).json()
+         return [
+@@ -280,7 +285,10 @@ class APIClient(json.JSONEncoder):
+             url = "{}/a/{}/{}/{}{}".format(self.api_server, self.app_id,
+                                            cls.collection_name, id, postfix)
+ 
+-        url = str(URLObject(url).add_query_params(filters.items()))
++        converted_filters = convert_datetimes_to_timestamps(
++            filters, cls.datetime_filter_attrs,
++        )
++        url = str(URLObject(url).add_query_params(converted_filters.items()))
+ 
+         response = self._get_http_session(cls.api_root).get(url, headers=headers)
+         return _validate(response)
+@@ -311,10 +319,10 @@ class APIClient(json.JSONEncoder):
+         if cls == File:
+             response = session.post(url, files=data)
+         else:
+-            data = json.dumps(data)
++            converted_data = convert_datetimes_to_timestamps(data, cls.datetime_attrs)
+             headers = {'Content-Type': 'application/json'}
+             headers.update(self.session.headers)
+-            response = session.post(url, data=data, headers=headers)
++            response = session.post(url, json=converted_data, headers=headers)
+ 
+         result = _validate(response).json()
+         if cls.collection_name == 'send':
+@@ -332,10 +340,13 @@ class APIClient(json.JSONEncoder):
+         if cls == File:
+             response = session.post(url, files=data)
+         else:
+-            data = json.dumps(data)
++            converted_data = [
++                convert_datetimes_to_timestamps(datum, cls.datetime_attrs)
++                for datum in data
++            ]
+             headers = {'Content-Type': 'application/json'}
+             headers.update(self.session.headers)
+-            response = session.post(url, data=data, headers=headers)
++            response = session.post(url, json=converted_data, headers=headers)
+ 
+         results = _validate(response).json()
+         return [cls.create(self, **x) for x in results]
+@@ -363,7 +374,8 @@ class APIClient(json.JSONEncoder):
+ 
+         session = self._get_http_session(cls.api_root)
+ 
+-        response = session.put(url, json=data)
++        converted_data = convert_datetimes_to_timestamps(data, cls.datetime_attrs)
++        response = session.put(url, json=converted_data)
+ 
+         result = _validate(response).json()
+         return cls.create(self, **result)
+@@ -390,9 +402,10 @@ class APIClient(json.JSONEncoder):
+             URLObject(self.api_server)
+             .with_path(url_path)
+         )
++        converted_data = convert_datetimes_to_timestamps(data, cls.datetime_attrs)
+ 
+         session = self._get_http_session(cls.api_root)
+-        response = session.post(url, json=data)
++        response = session.post(url, json=converted_data)
+ 
+         result = _validate(response).json()
+         return cls.create(self, **result)
+diff --git a/nylas/client/restful_models.py b/nylas/client/restful_models.py
+index e73c100..1cb3bb9 100644
+--- a/nylas/client/restful_models.py
++++ b/nylas/client/restful_models.py
+@@ -1,5 +1,8 @@
++from datetime import datetime
++
+ from nylas.client.restful_model_collection import RestfulModelCollection
+ from nylas.client.errors import FileUploadError
++from nylas.utils import timestamp_from_dt
+ from six import StringIO
+ 
+ # pylint: disable=attribute-defined-outside-init
+@@ -7,6 +10,8 @@ from six import StringIO
+ 
+ class NylasAPIObject(dict):
+     attrs = []
++    datetime_attrs = {}
++    datetime_filter_attrs = {}
+     # The Nylas API holds most objects for an account directly under '/',
+     # but some of them are under '/a' (mostly the account-management
+     # and billing code). api_root is a tiny metaprogramming hack to let
+@@ -44,6 +49,9 @@ class NylasAPIObject(dict):
+                 attr = attr_name[1:]
+             if attr in kwargs:
+                 obj[attr_name] = kwargs[attr]
++        for dt_attr, ts_attr in cls.datetime_attrs.items():
++            if obj.get(ts_attr):
++                obj[dt_attr] = datetime.utcfromtimestamp(obj[ts_attr])
+         if 'id' not in kwargs:
+             obj['id'] = None
+ 
+@@ -54,6 +62,9 @@ class NylasAPIObject(dict):
+         for attr in self.cls.attrs:
+             if hasattr(self, attr):
+                 dct[attr] = getattr(self, attr)
++        for dt_attr, ts_attr in self.cls.datetime_attrs.items():
++            if self.get(dt_attr):
++                dct[ts_attr] = timestamp_from_dt(self[dt_attr])
+         return dct
+ 
+     def child_collection(self, cls, **filters):
+@@ -83,6 +94,13 @@ class Message(NylasAPIObject):
+              "account_id", "object", "snippet", "starred", "subject",
+              "thread_id", "to", "unread", "starred", "_folder", "_labels",
+              "headers"]
++    datetime_attrs = {
++        "received_at": "date",
++    }
++    datetime_filter_attrs = {
++        "received_before": "received_before",
++        "received_after": "received_after",
++    }
+     collection_name = 'messages'
+ 
+     def __init__(self, api):
+@@ -206,8 +224,21 @@ class Thread(NylasAPIObject):
+     attrs = ["draft_ids", "id", "message_ids", "account_id", "object",
+              "participants", "snippet", "subject", "subject_date",
+              "last_message_timestamp", "first_message_timestamp",
++             "last_message_received_timestamp", "last_message_sent_timestamp",
+              "unread", "starred", "version", "_folders", "_labels",
+              "received_recent_date"]
++    datetime_attrs = {
++        "first_message_at": "first_message_timestamp",
++        "last_message_at": "last_message_timestamp",
++        "last_message_received_at": "last_message_received_timestamp",
++        "last_message_sent_at": "last_message_sent_timestamp",
++    }
++    datetime_filter_attrs = {
++        "last_message_before": "last_message_before",
++        "last_message_after": "last_message_after",
++        "started_before": "started_before",
++        "started_after": "started_after",
++    }
+     collection_name = 'threads'
+ 
+     def __init__(self, api):
+@@ -313,6 +344,9 @@ class Draft(Message):
+              "account_id", "object", "subject", "thread_id", "to",
+              "unread", "version", "file_ids", "reply_to_message_id",
+              "reply_to", "starred", "snippet", "tracking"]
++    datetime_attrs = {
++        "last_modified_at": "date",
++    }
+     collection_name = 'drafts'
+ 
+     def __init__(self, api, thread_id=None):  # pylint: disable=unused-argument
+@@ -407,6 +441,9 @@ class Event(NylasAPIObject):
+              "read_only", "when", "busy", "participants", "calendar_id",
+              "recurrence", "status", "master_event_id", "owner",
+              "original_start_time", "object", "message_id"]
++    datetime_attrs = {
++        "original_start_at": "original_start_time",
++    }
+     collection_name = 'events'
+ 
+     def __init__(self, api):
+diff --git a/nylas/utils.py b/nylas/utils.py
+new file mode 100644
+index 0000000..5c9b389
+--- /dev/null
++++ b/nylas/utils.py
+@@ -0,0 +1,32 @@
++from __future__ import division
++from datetime import datetime
++
++
++def timestamp_from_dt(dt, epoch=datetime(1970, 1, 1)):
++    """
++    Convert a datetime to a timestamp.
++    https://stackoverflow.com/a/8778548/141395
++    """
++    delta = dt - epoch
++    # return delta.total_seconds()
++    return delta.seconds + delta.days * 86400
++
++
++def convert_datetimes_to_timestamps(data, datetime_attrs):
++    """
++    Given a dictionary of data, and a dictionary of datetime attributes,
++    return a new dictionary that converts any datetime attributes that may
++    be present to their timestamped equivalent.
++    """
++    if not data:
++        return data
++
++    new_data = {}
++    for key, value in data.items():
++        if key in datetime_attrs and isinstance(value, datetime):
++            new_key = datetime_attrs[key]
++            new_data[new_key] = timestamp_from_dt(value)
++        else:
++            new_data[key] = value
++
++    return new_data
+diff --git a/pylintrc b/pylintrc
+index 20eed34..1f4681c 100644
+--- a/pylintrc
++++ b/pylintrc
+@@ -156,7 +156,7 @@ function-name-hint=(([a-z][a-z0-9_]{2,30})|(_[a-z0-9_]*))$
+ function-rgx=(([a-z][a-z0-9_]{2,50})|(_[a-z0-9_]*))$
+ 
+ # Good variable names which should always be accepted, separated by a comma
+-good-names=i,j,k,ex,Run,_,id
++good-names=i,j,k,ex,Run,_,id,dt,db
+ 
+ # Include a hint for the correct naming format with invalid-name
+ include-naming-hint=no

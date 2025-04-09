@@ -1,0 +1,86 @@
+diff --git a/mopidy_spotify/images.py b/mopidy_spotify/images.py
+index 01adf2c..7dec2d8 100644
+--- a/mopidy_spotify/images.py
++++ b/mopidy_spotify/images.py
+@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
+ def get_images(web_client, uris):
+     result = {}
+     uri_type_getter = operator.itemgetter("type")
+-    uris = sorted((_parse_uri(u) for u in uris), key=uri_type_getter)
++    uris = (_parse_uri(u) for u in uris)
++    uris = sorted((u for u in uris if u), key=uri_type_getter)
+     for uri_type, group in itertools.groupby(uris, uri_type_getter):
+         batch = []
+         for uri in group:
+@@ -33,25 +34,27 @@ def get_images(web_client, uris):
+ 
+ 
+ def _parse_uri(uri):
+-    parsed_uri = urllib.parse.urlparse(uri)
+-    uri_type, uri_id = None, None
+-
+-    if parsed_uri.scheme == "spotify":
+-        uri_type, uri_id = parsed_uri.path.split(":")[:2]
+-    elif parsed_uri.scheme in ("http", "https"):
+-        if parsed_uri.netloc in ("open.spotify.com", "play.spotify.com"):
+-            uri_type, uri_id = parsed_uri.path.split("/")[1:3]
+-
+-    supported_types = ("track", "album", "artist", "playlist")
+-    if uri_type and uri_type in supported_types and uri_id:
+-        return {
+-            "uri": uri,
+-            "type": uri_type,
+-            "id": uri_id,
+-            "key": (uri_type, uri_id),
+-        }
+-
+-    raise ValueError(f"Could not parse {repr(uri)} as a Spotify URI")
++    try:
++        parsed_uri = urllib.parse.urlparse(uri)
++        uri_type, uri_id = None, None
++
++        if parsed_uri.scheme == "spotify":
++            uri_type, uri_id = parsed_uri.path.split(":")[:2]
++        elif parsed_uri.scheme in ("http", "https"):
++            if parsed_uri.netloc in ("open.spotify.com", "play.spotify.com"):
++                uri_type, uri_id = parsed_uri.path.split("/")[1:3]
++
++        supported_types = ("track", "album", "artist", "playlist")
++        if uri_type and uri_type in supported_types and uri_id:
++            return {
++                "uri": uri,
++                "type": uri_type,
++                "id": uri_id,
++                "key": (uri_type, uri_id),
++            }
++        raise ValueError("Unknown error")
++    except Exception as e:
++        logger.exception(f"Could not parse {repr(uri)} as a Spotify URI ({e})")
+ 
+ 
+ def _process_uri(web_client, uri):
+@@ -80,7 +83,10 @@ def _process_uris(web_client, uri_type, uris):
+ 
+         if uri["key"] not in _cache:
+             if uri_type == "track":
+-                album_key = _parse_uri(item["album"]["uri"])["key"]
++                album = _parse_uri(item["album"]["uri"])
++                if not album:
++                    continue
++                album_key = album["key"]
+                 if album_key not in _cache:
+                     _cache[album_key] = tuple(
+                         _translate_image(i) for i in item["album"]["images"]
+diff --git a/mopidy_spotify/web.py b/mopidy_spotify/web.py
+index a937d06..b5ebea5 100644
+--- a/mopidy_spotify/web.py
++++ b/mopidy_spotify/web.py
+@@ -196,7 +196,7 @@ class OAuthClient:
+ 
+             # Decide how long to sleep in the next iteration.
+             backoff_time = backoff_time or (2**i * self._backoff_factor)
+-            logger.debug(
++            logger.error(
+                 f"Retrying {prepared_request.url} in {backoff_time:.3f} "
+                 "seconds."
+             )

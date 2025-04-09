@@ -1,0 +1,178 @@
+diff --git a/loky/backend/context.py b/loky/backend/context.py
+index 0f744c5..dfeb4ed 100644
+--- a/loky/backend/context.py
++++ b/loky/backend/context.py
+@@ -211,8 +211,8 @@ class LokyContext(BaseContext):
+         """
+         def Semaphore(self, value=1):
+             """Returns a semaphore object"""
+-            from . import synchronize
+-            return synchronize.Semaphore(value=value)
++            from .synchronize import Semaphore
++            return Semaphore(value=value)
+ 
+         def BoundedSemaphore(self, value):
+             """Returns a bounded semaphore object"""
+diff --git a/loky/backend/reduction.py b/loky/backend/reduction.py
+index 0d40c5e..0bad5f6 100644
+--- a/loky/backend/reduction.py
++++ b/loky/backend/reduction.py
+@@ -188,7 +188,11 @@ def set_loky_pickler(loky_pickler=None):
+             if sys.version_info < (3,):
+                 self.dispatch = self._dispatch.copy()
+             else:
+-                self.dispatch_table = self._dispatch_table.copy()
++                if getattr(self, "dispatch_table", None) is not None:
++                    self.dispatch_table.update(self._dispatch_table.copy())
++                else:
++                    self.dispatch_table = self._dispatch_table.copy()
++
+             for type, reduce_func in reducers.items():
+                 self.register(type, reduce_func)
+ 
+diff --git a/loky/backend/semaphore_tracker.py b/loky/backend/semaphore_tracker.py
+index 7d3f23e..c83b8c6 100644
+--- a/loky/backend/semaphore_tracker.py
++++ b/loky/backend/semaphore_tracker.py
+@@ -37,10 +37,13 @@ except ImportError:
+     from .semlock import sem_unlink
+ 
+ if sys.version_info < (3,):
+-    BrokenPipeError = IOError
++    BrokenPipeError = OSError
+ 
+ __all__ = ['ensure_running', 'register', 'unregister']
+ 
++_HAVE_SIGMASK = hasattr(signal, 'pthread_sigmask')
++_IGNORED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
++
+ VERBOSE = False
+ 
+ 
+@@ -68,6 +71,13 @@ class SemaphoreTracker(object):
+                     return
+                 # => dead, launch it again
+                 os.close(self._fd)
++                try:
++                    # Clean-up to avoid dangling processes.
++                    os.waitpid(self._pid, 0)
++                except OSError:
++                    # The process was terminated or is a child from an ancestor
++                    # of the current process.
++                    pass
+                 self._fd = None
+                 self._pid = None
+ 
+@@ -80,8 +90,9 @@ class SemaphoreTracker(object):
+             except Exception:
+                 pass
+ 
+-            cmd = 'from {} import main; main(%d)'.format(main.__module__)
+             r, w = os.pipe()
++            cmd = 'from {} import main; main({}, {})'.format(
++                main.__module__, r, VERBOSE)
+             try:
+                 fds_to_pass.append(r)
+                 # process will out live us, so no need to wait on pid
+@@ -94,9 +105,23 @@ class SemaphoreTracker(object):
+                     import re
+                     for i in range(1, len(args)):
+                         args[i] = re.sub("-R+", "-R", args[i])
+-                args += ['-c', cmd % r]
++                args += ['-c', cmd]
+                 util.debug("launching Semaphore tracker: {}".format(args))
+-                pid = spawnv_passfds(exe, args, fds_to_pass)
++                # bpo-33613: Register a signal mask that will block the
++                # signals.  This signal mask will be inherited by the child
++                # that is going to be spawned and will protect the child from a
++                # race condition that can make the child die before it
++                # registers signal handlers for SIGINT and SIGTERM. The mask is
++                # unregistered after spawning the child.
++                try:
++                    if _HAVE_SIGMASK:
++                        signal.pthread_sigmask(signal.SIG_BLOCK,
++                                               _IGNORED_SIGNALS)
++                    pid = spawnv_passfds(exe, args, fds_to_pass)
++                finally:
++                    if _HAVE_SIGMASK:
++                        signal.pthread_sigmask(signal.SIG_UNBLOCK,
++                                               _IGNORED_SIGNALS)
+             except BaseException:
+                 os.close(w)
+                 raise
+@@ -142,19 +167,22 @@ unregister = _semaphore_tracker.unregister
+ getfd = _semaphore_tracker.getfd
+ 
+ 
+-def main(fd):
++def main(fd, verbose=0):
+     '''Run semaphore tracker.'''
+     # protect the process from ^C and "killall python" etc
+     signal.signal(signal.SIGINT, signal.SIG_IGN)
+     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+ 
++    if _HAVE_SIGMASK:
++        signal.pthread_sigmask(signal.SIG_UNBLOCK, _IGNORED_SIGNALS)
++
+     for f in (sys.stdin, sys.stdout):
+         try:
+             f.close()
+         except Exception:
+             pass
+ 
+-    if VERBOSE:  # pragma: no cover
++    if verbose:  # pragma: no cover
+         sys.stderr.write("Main semaphore tracker is running\n")
+         sys.stderr.flush()
+ 
+@@ -168,14 +196,14 @@ def main(fd):
+                     if cmd == b'REGISTER':
+                         name = name.decode('ascii')
+                         cache.add(name)
+-                        if VERBOSE:  # pragma: no cover
++                        if verbose:  # pragma: no cover
+                             sys.stderr.write("[SemaphoreTracker] register {}\n"
+                                              .format(name))
+                             sys.stderr.flush()
+                     elif cmd == b'UNREGISTER':
+                         name = name.decode('ascii')
+                         cache.remove(name)
+-                        if VERBOSE:  # pragma: no cover
++                        if verbose:  # pragma: no cover
+                             sys.stderr.write("[SemaphoreTracker] unregister {}"
+                                              ": cache({})\n"
+                                              .format(name, len(cache)))
+@@ -205,16 +233,16 @@ def main(fd):
+             try:
+                 try:
+                     sem_unlink(name)
+-                    if VERBOSE:  # pragma: no cover
++                    if verbose:  # pragma: no cover
+                         sys.stderr.write("[SemaphoreTracker] unlink {}\n"
+                                          .format(name))
+                         sys.stderr.flush()
+                 except Exception as e:
+-                    warnings.warn('semaphore_tracker: %r: %r' % (name, e))
++                    warnings.warn('semaphore_tracker: %s: %r' % (name, e))
+             finally:
+                 pass
+ 
+-    if VERBOSE:  # pragma: no cover
++    if verbose:  # pragma: no cover
+         sys.stderr.write("semaphore tracker shut down\n")
+         sys.stderr.flush()
+ 
+diff --git a/loky/backend/spawn.py b/loky/backend/spawn.py
+index fb375e5..c0390e4 100644
+--- a/loky/backend/spawn.py
++++ b/loky/backend/spawn.py
+@@ -151,7 +151,7 @@ def prepare(data):
+     if 'orig_dir' in data:
+         process.ORIGINAL_DIR = data['orig_dir']
+ 
+-    if 'tacker_pid' in data:
++    if 'tracker_pid' in data:
+         from . import semaphore_tracker
+         semaphore_tracker._semaphore_tracker._pid = data["tracker_pid"]
+ 
+

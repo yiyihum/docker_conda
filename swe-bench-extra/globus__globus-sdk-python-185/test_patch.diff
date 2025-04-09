@@ -1,0 +1,152 @@
+diff --git a/tests/integration/test_auth_client_flow.py b/tests/integration/test_auth_client_flow.py
+index c6e8ffa3..4ca019d8 100644
+--- a/tests/integration/test_auth_client_flow.py
++++ b/tests/integration/test_auth_client_flow.py
+@@ -27,7 +27,8 @@ class AuthClientIntegrationTests(CapturedIOTestCase):
+                          "client_id=" + ac.client_id,
+                          "redirect_uri=" +
+                          quote_plus(ac.base_url + "v2/web/auth-code"),
+-                         "scope=" + quote_plus(DEFAULT_REQUESTED_SCOPES),
++                         "scope=" + quote_plus(
++                             " ".join(DEFAULT_REQUESTED_SCOPES)),
+                          "state=" + "_default",
+                          "response_type=" + "code",
+                          "code_challenge=" +
+@@ -76,7 +77,8 @@ class AuthClientIntegrationTests(CapturedIOTestCase):
+         expected_vals = [ac.base_url + "v2/oauth2/authorize?",
+                          "client_id=" + ac.client_id,
+                          "redirect_uri=" + "uri",
+-                         "scope=" + quote_plus(DEFAULT_REQUESTED_SCOPES),
++                         "scope=" + quote_plus(
++                             " ".join(DEFAULT_REQUESTED_SCOPES)),
+                          "state=" + "_default",
+                          "response_type=" + "code",
+                          "access_type=" + "online"]
+diff --git a/tests/integration/test_confidential_client_flow.py b/tests/integration/test_confidential_client_flow.py
+index e7039e44..d713c741 100644
+--- a/tests/integration/test_confidential_client_flow.py
++++ b/tests/integration/test_confidential_client_flow.py
+@@ -31,7 +31,8 @@ class ConfidentialAppAuthClientIntegrationTests(CapturedIOTestCase):
+         flow = self.cac.oauth2_start_flow("uri")
+         self.assertIsInstance(flow, GlobusAuthorizationCodeFlowManager)
+         self.assertEqual(flow.redirect_uri, "uri")
+-        self.assertEqual(flow.requested_scopes, DEFAULT_REQUESTED_SCOPES)
++        self.assertEqual(flow.requested_scopes,
++                         " ".join(DEFAULT_REQUESTED_SCOPES))
+         self.assertEqual(flow.state, "_default")
+         self.assertFalse(flow.refresh_tokens)
+ 
+@@ -40,7 +41,8 @@ class ConfidentialAppAuthClientIntegrationTests(CapturedIOTestCase):
+         expected_vals = [self.cac.base_url + "v2/oauth2/authorize?",
+                          "client_id=" + self.cac.client_id,
+                          "redirect_uri=" + "uri",
+-                         "scope=" + quote_plus(DEFAULT_REQUESTED_SCOPES),
++                         "scope=" + quote_plus(
++                             " ".join(DEFAULT_REQUESTED_SCOPES)),
+                          "state=" + "_default",
+                          "access_type=" + "online"]
+         for val in expected_vals:
+diff --git a/tests/integration/test_native_client_flow.py b/tests/integration/test_native_client_flow.py
+index c07a8c40..6d7d42a2 100644
+--- a/tests/integration/test_native_client_flow.py
++++ b/tests/integration/test_native_client_flow.py
+@@ -31,7 +31,8 @@ class NativeAppAuthClientIntegrationTests(CapturedIOTestCase):
+         self.assertIsInstance(flow, GlobusNativeAppFlowManager)
+         self.assertEqual(flow.redirect_uri,
+                          self.nac.base_url + "v2/web/auth-code")
+-        self.assertEqual(flow.requested_scopes, DEFAULT_REQUESTED_SCOPES)
++        self.assertEqual(flow.requested_scopes,
++                         " ".join(DEFAULT_REQUESTED_SCOPES))
+         self.assertEqual(flow.state, "_default")
+         self.assertFalse(flow.refresh_tokens)
+ 
+@@ -41,7 +42,8 @@ class NativeAppAuthClientIntegrationTests(CapturedIOTestCase):
+                          "client_id=" + self.nac.client_id,
+                          "redirect_uri=" +
+                          quote_plus(self.nac.base_url + "v2/web/auth-code"),
+-                         "scope=" + quote_plus(DEFAULT_REQUESTED_SCOPES),
++                         "scope=" + quote_plus(
++                             " ".join(DEFAULT_REQUESTED_SCOPES)),
+                          "state=" + "_default",
+                          "code_challenge=" + quote_plus(flow.challenge),
+                          "access_type=" + "online"]
+diff --git a/tests/unit/test_confidential_client.py b/tests/unit/test_confidential_client.py
+index 3346ba96..a6b1059d 100644
+--- a/tests/unit/test_confidential_client.py
++++ b/tests/unit/test_confidential_client.py
+@@ -1,3 +1,8 @@
++try:
++    import mock
++except ImportError:
++    from unittest import mock
++
+ import globus_sdk
+ from tests.framework import CapturedIOTestCase, get_client_data
+ from globus_sdk.exc import GlobusAPIError
+@@ -28,7 +33,14 @@ class ConfidentialAppAuthClientTests(CapturedIOTestCase):
+         Confirm tokens allow use of userinfo for the client
+         Returns access_token for testing
+         """
+-        token_res = self.cac.oauth2_client_credentials_tokens()
++        with mock.patch.object(self.cac, 'oauth2_token',
++                               side_effect=self.cac.oauth2_token) as m:
++            token_res = self.cac.oauth2_client_credentials_tokens(
++                requested_scopes="openid profile")
++            m.assert_called_once_with(
++                {"grant_type": "client_credentials",
++                 "scope": "openid profile"})
++
+         # validate results
+         self.assertIn("access_token", token_res)
+         self.assertIn("expires_in", token_res)
+diff --git a/tests/unit/test_oauth2_authorization_code.py b/tests/unit/test_oauth2_authorization_code.py
+index 5c531719..5c634b91 100644
+--- a/tests/unit/test_oauth2_authorization_code.py
++++ b/tests/unit/test_oauth2_authorization_code.py
+@@ -18,10 +18,16 @@ class GlobusAuthorizationCodeFlowManagerTests(CapturedIOTestCase):
+         self.ac = mock.Mock()
+         self.ac.client_id = "client_id"
+         self.ac.base_url = "base_url/"
+-        self.flow_manager = globus_sdk.auth.GlobusNativeAppFlowManager(
++        self.flow_manager = globus_sdk.auth.GlobusAuthorizationCodeFlowManager(
+             self.ac, requested_scopes="scopes", redirect_uri="uri",
+             state="state")
+ 
++    def test_init_handles_iterable_scopes(self):
++        flow_manager = globus_sdk.auth.GlobusAuthorizationCodeFlowManager(
++            self.ac, requested_scopes=["scope1", "scope2"], redirect_uri="uri",
++            state="state")
++        self.assertEquals(flow_manager.requested_scopes, "scope1 scope2")
++
+     def test_get_authorize_url(self):
+         """
+         Creates an authorize url, confirms results match object values
+@@ -55,9 +61,7 @@ class GlobusAuthorizationCodeFlowManagerTests(CapturedIOTestCase):
+         auth_code = "code"
+         self.flow_manager.exchange_code_for_tokens(auth_code)
+ 
+-        expected = {"client_id": self.ac.client_id,
+-                    "grant_type": "authorization_code",
++        expected = {"grant_type": "authorization_code",
+                     "code": auth_code.encode("utf-8"),
+-                    "code_verifier": self.flow_manager.verifier,
+                     "redirect_uri": self.flow_manager.redirect_uri}
+         self.ac.oauth2_token.assert_called_with(expected)
+diff --git a/tests/unit/test_oauth2_native_app.py b/tests/unit/test_oauth2_native_app.py
+index fb060c90..0782c1ae 100644
+--- a/tests/unit/test_oauth2_native_app.py
++++ b/tests/unit/test_oauth2_native_app.py
+@@ -26,6 +26,13 @@ class GlobusNativeAppFlowManagerTests(CapturedIOTestCase):
+             self.ac, requested_scopes="scopes", redirect_uri="uri",
+             state="state")
+ 
++    def test_init_handles_iterable_scopes(self):
++        flow_manager = globus_sdk.auth.GlobusNativeAppFlowManager(
++            self.ac, requested_scopes=set(("scope1", "scope2")),
++            redirect_uri="uri", state="state")
++        self.assertIn(flow_manager.requested_scopes, ("scope1 scope2",
++                                                      "scope2 scope1"))
++
+     def test_make_native_app_challenge(self):
+         """
+         Makes native app challenge with and without verifier,

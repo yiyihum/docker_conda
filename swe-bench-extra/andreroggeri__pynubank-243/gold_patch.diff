@@ -1,0 +1,83 @@
+diff --git a/pynubank/nubank.py b/pynubank/nubank.py
+index b0c1be9..931ad44 100644
+--- a/pynubank/nubank.py
++++ b/pynubank/nubank.py
+@@ -1,6 +1,5 @@
+ import calendar
+ import datetime
+-import re
+ import uuid
+ from typing import Tuple
+ 
+@@ -10,6 +9,7 @@ from pynubank.exception import NuMissingCreditCard
+ from pynubank.utils.discovery import Discovery
+ from pynubank.utils.graphql import prepare_request_body
+ from pynubank.utils.http import HttpClient
++from pynubank.utils.parsing import parse_float, parse_pix_transaction
+ 
+ PAYMENT_EVENT_TYPES = (
+     'TransferOutEvent',
+@@ -20,7 +20,11 @@ PAYMENT_EVENT_TYPES = (
+     'DebitPurchaseReversalEvent',
+     'BillPaymentEvent',
+     'DebitWithdrawalFeeEvent',
+-    'DebitWithdrawalEvent'
++    'DebitWithdrawalEvent',
++    'PixTransferOutEvent',
++    'PixTransferInEvent',
++    'PixTransferOutReversalEvent',
++    'PixTransferFailedEvent',
+ )
+ 
+ 
+@@ -157,6 +161,7 @@ class Nubank:
+ 
+     def get_account_statements(self):
+         feed = self.get_account_feed()
++        feed = map(parse_pix_transaction, feed)
+         return list(filter(lambda x: x['__typename'] in PAYMENT_EVENT_TYPES, feed))
+ 
+     def get_account_balance(self):
+@@ -179,7 +184,7 @@ class Nubank:
+ 
+         value = data['data']['viewer']['productFeatures']['savings']['screens']['detailedBalance']['monthBalanceSection']['yieldSection']['semantics']['label']
+ 
+-        return float(re.search(r'\d*,\d\d', value).group().replace(',', '.'))
++        return parse_float(value)
+ 
+     def create_boleto(self, amount: float) -> str:
+         customer_id_response = self._make_graphql_request('account_id')
+diff --git a/pynubank/utils/parsing.py b/pynubank/utils/parsing.py
+new file mode 100644
+index 0000000..6dab3b4
+--- /dev/null
++++ b/pynubank/utils/parsing.py
+@@ -0,0 +1,28 @@
++import re
++
++TITLE_INFLOW_PIX = 'Transferência recebida'
++TITLE_OUTFLOW_PIX = 'Transferência enviada'
++TITLE_REVERSAL_PIX = 'Reembolso enviado'
++TITLE_FAILED_PIX = 'Transferência falhou'
++
++PIX_TRANSACTION_MAP = {
++    TITLE_INFLOW_PIX: 'PixTransferInEvent',
++    TITLE_OUTFLOW_PIX: 'PixTransferOutEvent',
++    TITLE_REVERSAL_PIX: 'PixTransferOutReversalEvent',
++    TITLE_FAILED_PIX: 'PixTransferFailedEvent',
++}
++
++
++def parse_float(value: str):
++    return float(re.search(r'(?:\d.)?\d+,\d*', value).group().replace('.', '').replace(',', '.'))
++
++
++def parse_pix_transaction(transaction: dict) -> dict:
++    if transaction['__typename'] != 'GenericFeedEvent':
++        return transaction
++
++    if transaction['title'] in PIX_TRANSACTION_MAP.keys():
++        transaction['__typename'] = PIX_TRANSACTION_MAP[transaction['title']]
++        transaction['amount'] = parse_float(transaction['detail'])
++
++    return transaction

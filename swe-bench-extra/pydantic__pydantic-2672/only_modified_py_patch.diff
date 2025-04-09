@@ -1,0 +1,254 @@
+diff --git a/pydantic/__init__.py b/pydantic/__init__.py
+--- a/pydantic/__init__.py
++++ b/pydantic/__init__.py
+@@ -78,6 +78,8 @@
+     'conlist',
+     'ConstrainedSet',
+     'conset',
++    'ConstrainedFrozenSet',
++    'confrozenset',
+     'ConstrainedStr',
+     'constr',
+     'PyObject',
+diff --git a/pydantic/errors.py b/pydantic/errors.py
+--- a/pydantic/errors.py
++++ b/pydantic/errors.py
+@@ -36,7 +36,6 @@
+     'IntegerError',
+     'FloatError',
+     'PathError',
+-    '_PathValueError',
+     'PathNotExistsError',
+     'PathNotAFileError',
+     'PathNotADirectoryError',
+@@ -49,11 +48,14 @@
+     'TupleLengthError',
+     'ListMinLengthError',
+     'ListMaxLengthError',
++    'SetMinLengthError',
++    'SetMaxLengthError',
++    'FrozenSetMinLengthError',
++    'FrozenSetMaxLengthError',
+     'AnyStrMinLengthError',
+     'AnyStrMaxLengthError',
+     'StrError',
+     'StrRegexError',
+-    '_NumberBoundError',
+     'NumberNotGtError',
+     'NumberNotGeError',
+     'NumberNotLtError',
+@@ -338,6 +340,22 @@ def __init__(self, *, limit_value: int) -> None:
+         super().__init__(limit_value=limit_value)
+ 
+ 
++class FrozenSetMinLengthError(PydanticValueError):
++    code = 'frozenset.min_items'
++    msg_template = 'ensure this value has at least {limit_value} items'
++
++    def __init__(self, *, limit_value: int) -> None:
++        super().__init__(limit_value=limit_value)
++
++
++class FrozenSetMaxLengthError(PydanticValueError):
++    code = 'frozenset.max_items'
++    msg_template = 'ensure this value has at most {limit_value} items'
++
++    def __init__(self, *, limit_value: int) -> None:
++        super().__init__(limit_value=limit_value)
++
++
+ class AnyStrMinLengthError(PydanticValueError):
+     code = 'any_str.min_length'
+     msg_template = 'ensure this value has at least {limit_value} characters'
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -618,6 +618,13 @@ def _type_analysis(self) -> None:  # noqa: C901 (ignore complexity)
+             self.type_ = get_args(self.type_)[0]
+             self.shape = SHAPE_SET
+         elif issubclass(origin, FrozenSet):
++            # Create self validators
++            get_validators = getattr(self.type_, '__get_validators__', None)
++            if get_validators:
++                self.class_validators.update(
++                    {f'frozenset_{i}': Validator(validator, pre=True) for i, validator in enumerate(get_validators())}
++                )
++
+             self.type_ = get_args(self.type_)[0]
+             self.shape = SHAPE_FROZENSET
+         elif issubclass(origin, Deque):
+diff --git a/pydantic/networks.py b/pydantic/networks.py
+--- a/pydantic/networks.py
++++ b/pydantic/networks.py
+@@ -12,8 +12,8 @@
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    Collection,
+     Dict,
+-    FrozenSet,
+     Generator,
+     Optional,
+     Pattern,
+@@ -123,7 +123,7 @@ class AnyUrl(str):
+     strip_whitespace = True
+     min_length = 1
+     max_length = 2 ** 16
+-    allowed_schemes: Optional[Set[str]] = None
++    allowed_schemes: Optional[Collection[str]] = None
+     tld_required: bool = False
+     user_required: bool = False
+     host_required: bool = True
+@@ -249,7 +249,7 @@ def validate_parts(cls, parts: 'Parts') -> 'Parts':
+             raise errors.UrlSchemeError()
+ 
+         if cls.allowed_schemes and scheme.lower() not in cls.allowed_schemes:
+-            raise errors.UrlSchemePermittedError(cls.allowed_schemes)
++            raise errors.UrlSchemePermittedError(set(cls.allowed_schemes))
+ 
+         port = parts['port']
+         if port is not None and int(port) > 65_535:
+@@ -383,7 +383,7 @@ def stricturl(
+     max_length: int = 2 ** 16,
+     tld_required: bool = True,
+     host_required: bool = True,
+-    allowed_schemes: Optional[Union[FrozenSet[str], Set[str]]] = None,
++    allowed_schemes: Optional[Collection[str]] = None,
+ ) -> Type[AnyUrl]:
+     # use kwargs then define conf in a dict to aid with IDE type hinting
+     namespace = dict(
+diff --git a/pydantic/schema.py b/pydantic/schema.py
+--- a/pydantic/schema.py
++++ b/pydantic/schema.py
+@@ -48,6 +48,7 @@
+ from .types import (
+     ConstrainedDecimal,
+     ConstrainedFloat,
++    ConstrainedFrozenSet,
+     ConstrainedInt,
+     ConstrainedList,
+     ConstrainedSet,
+@@ -57,6 +58,7 @@
+     conbytes,
+     condecimal,
+     confloat,
++    confrozenset,
+     conint,
+     conlist,
+     conset,
+@@ -962,7 +964,7 @@ def go(type_: Any) -> Type[Any]:
+         if (
+             is_literal_type(annotation)
+             or isinstance(type_, ForwardRef)
+-            or lenient_issubclass(type_, (ConstrainedList, ConstrainedSet))
++            or lenient_issubclass(type_, (ConstrainedList, ConstrainedSet, ConstrainedFrozenSet))
+         ):
+             return type_
+         origin = get_origin(type_)
+@@ -985,6 +987,10 @@ def go(type_: Any) -> Type[Any]:
+                 used_constraints.update({'min_items', 'max_items'})
+                 return conset(go(args[0]), min_items=field_info.min_items, max_items=field_info.max_items)
+ 
++            if issubclass(origin, FrozenSet) and (field_info.min_items is not None or field_info.max_items is not None):
++                used_constraints.update({'min_items', 'max_items'})
++                return confrozenset(go(args[0]), min_items=field_info.min_items, max_items=field_info.max_items)
++
+             for t in (Tuple, List, Set, FrozenSet, Sequence):
+                 if issubclass(origin, t):  # type: ignore
+                     return t[tuple(go(a) for a in args)]  # type: ignore
+@@ -1008,7 +1014,16 @@ def constraint_func(**kwargs: Any) -> Type[Any]:
+                 attrs = ('max_length', 'min_length', 'regex')
+                 constraint_func = conbytes
+             elif issubclass(type_, numeric_types) and not issubclass(
+-                type_, (ConstrainedInt, ConstrainedFloat, ConstrainedDecimal, ConstrainedList, ConstrainedSet, bool)
++                type_,
++                (
++                    ConstrainedInt,
++                    ConstrainedFloat,
++                    ConstrainedDecimal,
++                    ConstrainedList,
++                    ConstrainedSet,
++                    ConstrainedFrozenSet,
++                    bool,
++                ),
+             ):
+                 # Is numeric type
+                 attrs = ('gt', 'lt', 'ge', 'le', 'multiple_of')
+diff --git a/pydantic/types.py b/pydantic/types.py
+--- a/pydantic/types.py
++++ b/pydantic/types.py
+@@ -12,6 +12,7 @@
+     Callable,
+     ClassVar,
+     Dict,
++    FrozenSet,
+     List,
+     Optional,
+     Pattern,
+@@ -36,6 +37,7 @@
+     constr_strip_whitespace,
+     decimal_validator,
+     float_validator,
++    frozenset_validator,
+     int_validator,
+     list_validator,
+     number_multiple_validator,
+@@ -62,6 +64,8 @@
+     'conlist',
+     'ConstrainedSet',
+     'conset',
++    'ConstrainedFrozenSet',
++    'confrozenset',
+     'ConstrainedStr',
+     'constr',
+     'PyObject',
+@@ -484,6 +488,48 @@ def conset(item_type: Type[T], *, min_items: int = None, max_items: int = None)
+     return new_class('ConstrainedSetValue', (ConstrainedSet,), {}, lambda ns: ns.update(namespace))
+ 
+ 
++# This types superclass should be FrozenSet[T], but cython chokes on that...
++class ConstrainedFrozenSet(frozenset):  # type: ignore
++    # Needed for pydantic to detect that this is a set
++    __origin__ = frozenset
++    __args__: FrozenSet[Type[T]]  # type: ignore
++
++    min_items: Optional[int] = None
++    max_items: Optional[int] = None
++    item_type: Type[T]  # type: ignore
++
++    @classmethod
++    def __get_validators__(cls) -> 'CallableGenerator':
++        yield cls.frozenset_length_validator
++
++    @classmethod
++    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
++        update_not_none(field_schema, minItems=cls.min_items, maxItems=cls.max_items)
++
++    @classmethod
++    def frozenset_length_validator(cls, v: 'Optional[FrozenSet[T]]') -> 'Optional[FrozenSet[T]]':
++        if v is None:
++            return None
++
++        v = frozenset_validator(v)
++        v_len = len(v)
++
++        if cls.min_items is not None and v_len < cls.min_items:
++            raise errors.FrozenSetMinLengthError(limit_value=cls.min_items)
++
++        if cls.max_items is not None and v_len > cls.max_items:
++            raise errors.FrozenSetMaxLengthError(limit_value=cls.max_items)
++
++        return v
++
++
++def confrozenset(item_type: Type[T], *, min_items: int = None, max_items: int = None) -> Type[FrozenSet[T]]:
++    # __args__ is needed to conform to typing generics api
++    namespace = {'min_items': min_items, 'max_items': max_items, 'item_type': item_type, '__args__': [item_type]}
++    # We use new_class to be able to deal with Generic types
++    return new_class('ConstrainedFrozenSetValue', (ConstrainedFrozenSet,), {}, lambda ns: ns.update(namespace))
++
++
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LIST TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+ # This types superclass should be List[T], but cython chokes on that...
+

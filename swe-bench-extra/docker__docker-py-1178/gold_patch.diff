@@ -1,0 +1,100 @@
+diff --git a/docker/api/network.py b/docker/api/network.py
+index 34cd8987..0ee0dab6 100644
+--- a/docker/api/network.py
++++ b/docker/api/network.py
+@@ -22,7 +22,8 @@ class NetworkApiMixin(object):
+ 
+     @minimum_version('1.21')
+     def create_network(self, name, driver=None, options=None, ipam=None,
+-                       check_duplicate=None, internal=False):
++                       check_duplicate=None, internal=False, labels=None,
++                       enable_ipv6=False):
+         if options is not None and not isinstance(options, dict):
+             raise TypeError('options must be a dictionary')
+ 
+@@ -34,6 +35,22 @@ class NetworkApiMixin(object):
+             'CheckDuplicate': check_duplicate
+         }
+ 
++        if labels is not None:
++            if version_lt(self._version, '1.23'):
++                raise InvalidVersion(
++                    'network labels were introduced in API 1.23'
++                )
++            if not isinstance(labels, dict):
++                raise TypeError('labels must be a dictionary')
++            data["Labels"] = labels
++
++        if enable_ipv6:
++            if version_lt(self._version, '1.23'):
++                raise InvalidVersion(
++                    'enable_ipv6 was introduced in API 1.23'
++                )
++            data['EnableIPv6'] = True
++
+         if internal:
+             if version_lt(self._version, '1.22'):
+                 raise InvalidVersion('Internal networks are not '
+@@ -76,8 +93,15 @@ class NetworkApiMixin(object):
+ 
+     @check_resource
+     @minimum_version('1.21')
+-    def disconnect_container_from_network(self, container, net_id):
+-        data = {"container": container}
++    def disconnect_container_from_network(self, container, net_id,
++                                          force=False):
++        data = {"Container": container}
++        if force:
++            if version_lt(self._version, '1.22'):
++                raise InvalidVersion(
++                    'Forced disconnect was introduced in API 1.22'
++                )
++            data['Force'] = force
+         url = self._url("/networks/{0}/disconnect", net_id)
+         res = self._post_json(url, data=data)
+         self._raise_for_status(res)
+diff --git a/docs/api.md b/docs/api.md
+index 895d7d45..1699344a 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -283,22 +283,25 @@ The utility can be used as follows:
+ ```python
+ >>> import docker.utils
+ >>> my_envs = docker.utils.parse_env_file('/path/to/file')
+->>> docker.utils.create_container_config('1.18', '_mongodb', 'foobar',  environment=my_envs)
++>>> client.create_container('myimage', 'command', environment=my_envs)
+ ```
+ 
+-You can now use this with 'environment' for `create_container`.
+-
+-
+ ## create_network
+ 
+-Create a network, similar to the `docker network create` command.
++Create a network, similar to the `docker network create` command. See the
++[networks documentation](networks.md) for details.
+ 
+ **Params**:
+ 
+ * name (str): Name of the network
+ * driver (str): Name of the driver used to create the network
+-
+ * options (dict): Driver options as a key-value dictionary
++* ipam (dict): Optional custom IP scheme for the network
++* check_duplicate (bool): Request daemon to check for networks with same name.
++  Default: `True`.
++* internal (bool): Restrict external access to the network. Default `False`.
++* labels (dict): Map of labels to set on the network. Default `None`.
++* enable_ipv6 (bool): Enable IPv6 on the network. Default `False`.
+ 
+ **Returns** (dict): The created network reference object
+ 
+@@ -352,6 +355,8 @@ Inspect changes on a container's filesystem.
+ 
+ * container (str): container-id/name to be disconnected from a network
+ * net_id (str): network id
++* force (bool): Force the container to disconnect from a network.
++  Default: `False`
+ 
+ ## events
+ 

@@ -1,0 +1,390 @@
+diff --git a/CHANGELOG_SINCE_LAST_VERSION.md b/CHANGELOG_SINCE_LAST_VERSION.md
+index ab4a35a..80efcc1 100644
+--- a/CHANGELOG_SINCE_LAST_VERSION.md
++++ b/CHANGELOG_SINCE_LAST_VERSION.md
+@@ -1,3 +1,4 @@
+ - Added enriched Galerkin element
+ - Improved plotting
+ - Added enriched vector Galerkin element
++- Fixed bug in integration of piecewise functions
+diff --git a/symfem/basis_functions.py b/symfem/basis_functions.py
+index 1c7a053..6c0a7c5 100644
+--- a/symfem/basis_functions.py
++++ b/symfem/basis_functions.py
+@@ -10,7 +10,7 @@ import sympy
+ from .functions import AnyFunction, FunctionInput, ScalarFunction, SympyFormat, ValuesToSubstitute
+ from .geometry import PointType
+ from .references import Reference
+-from .symbols import AxisVariables, AxisVariablesNotSingle, t
++from .symbols import AxisVariables, AxisVariablesNotSingle, t, x
+ 
+ 
+ class BasisFunction(AnyFunction):
+@@ -282,17 +282,21 @@ class BasisFunction(AnyFunction):
+         """
+         raise self.get_function().norm()
+ 
+-    def integral(self, domain: Reference, vars: AxisVariablesNotSingle = t) -> AnyFunction:
++    def integral(
++        self, domain: Reference, vars: AxisVariablesNotSingle = x,
++        dummy_vars: AxisVariablesNotSingle = t
++    ) -> ScalarFunction:
+         """Compute the integral of the function.
+ 
+         Args:
+-            domain: The domain to integrate over
+-            vars: The variables to integrate over
++            domain: The domain of the integral
++            vars: The variables to integrate with respect to
++            dummy_vars: The dummy variables to use inside the integral
+ 
+         Returns:
+             The integral
+         """
+-        return self.get_function().integral(domain, vars)
++        return self.get_function().integral(domain, vars, dummy_vars)
+ 
+     def subs(self, vars: AxisVariables, values: ValuesToSubstitute) -> BasisFunction:
+         """Substitute values into the function.
+diff --git a/symfem/functions.py b/symfem/functions.py
+index d7f45ef..209b4b4 100644
+--- a/symfem/functions.py
++++ b/symfem/functions.py
+@@ -314,12 +314,16 @@ class AnyFunction(ABC):
+         pass
+ 
+     @abstractmethod
+-    def integral(self, domain: Reference, vars: AxisVariablesNotSingle = t):
++    def integral(
++        self, domain: Reference, vars: AxisVariablesNotSingle = x,
++        dummy_vars: AxisVariablesNotSingle = t
++    ) -> ScalarFunction:
+         """Compute the integral of the function.
+ 
+         Args:
+             domain: The domain of the integral
+             vars: The variables to integrate with respect to
++            dummy_vars: The dummy variables to use inside the integral
+ 
+         Returns:
+             The integral
+@@ -758,22 +762,27 @@ class ScalarFunction(AnyFunction):
+         """
+         return ScalarFunction(abs(self._f))
+ 
+-    def integral(self, domain: Reference, vars: AxisVariablesNotSingle = t) -> ScalarFunction:
++    def integral(
++        self, domain: Reference, vars: AxisVariablesNotSingle = x,
++        dummy_vars: AxisVariablesNotSingle = t
++    ) -> ScalarFunction:
+         """Compute the integral of the function.
+ 
+         Args:
+             domain: The domain of the integral
+             vars: The variables to integrate with respect to
++            dummy_vars: The dummy variables to use inside the integral
+ 
+         Returns:
+             The integral
+         """
+-        limits = domain.integration_limits(vars)
+-
++        limits = domain.integration_limits(dummy_vars)
+         point = VectorFunction(domain.origin)
+-        for ti, a in zip(t, domain.axes):
++        for ti, a in zip(dummy_vars, domain.axes):
+             point += ti * VectorFunction(a)
+-        out = self._f.subs(x, point)
++        out = self._f * 1
++        for v, p in zip(vars, point):
++            out = out.subs(v, p)
+ 
+         if len(limits[0]) == 2:
+             for i in limits:
+@@ -1159,12 +1168,16 @@ class VectorFunction(AnyFunction):
+             a += i._f ** 2
+         return ScalarFunction(sympy.sqrt(a))
+ 
+-    def integral(self, domain: Reference, vars: AxisVariablesNotSingle = t):
++    def integral(
++        self, domain: Reference, vars: AxisVariablesNotSingle = x,
++        dummy_vars: AxisVariablesNotSingle = t
++    ) -> ScalarFunction:
+         """Compute the integral of the function.
+ 
+         Args:
+             domain: The domain of the integral
+             vars: The variables to integrate with respect to
++            dummy_vars: The dummy variables to use inside the integral
+ 
+         Returns:
+             The integral
+@@ -1587,12 +1600,16 @@ class MatrixFunction(AnyFunction):
+         """
+         raise NotImplementedError()
+ 
+-    def integral(self, domain: Reference, vars: AxisVariablesNotSingle = t):
++    def integral(
++        self, domain: Reference, vars: AxisVariablesNotSingle = x,
++        dummy_vars: AxisVariablesNotSingle = t
++    ) -> ScalarFunction:
+         """Compute the integral of the function.
+ 
+         Args:
+             domain: The domain of the integral
+             vars: The variables to integrate with respect to
++            dummy_vars: The dummy variables to use inside the integral
+ 
+         Returns:
+             The integral
+diff --git a/symfem/piecewise_functions.py b/symfem/piecewise_functions.py
+index c714e04..ac8ddb2 100644
+--- a/symfem/piecewise_functions.py
++++ b/symfem/piecewise_functions.py
+@@ -6,8 +6,8 @@ import typing
+ 
+ import sympy
+ 
+-from .functions import (AnyFunction, FunctionInput, SympyFormat, ValuesToSubstitute, VectorFunction,
+-                        _to_sympy_format, parse_function_input)
++from .functions import (AnyFunction, FunctionInput, ScalarFunction, SympyFormat, ValuesToSubstitute,
++                        VectorFunction, _to_sympy_format, parse_function_input)
+ from .geometry import (PointType, SetOfPoints, SetOfPointsInput, parse_set_of_points_input,
+                        point_in_quadrilateral, point_in_tetrahedron, point_in_triangle)
+ from .references import Reference
+@@ -422,20 +422,27 @@ class PiecewiseFunction(AnyFunction):
+         return PiecewiseFunction(
+             {shape: f.norm() for shape, f in self._pieces.items()}, self.tdim)
+ 
+-    def integral(self, domain: Reference, vars: AxisVariablesNotSingle = t) -> AnyFunction:
++    def integral(
++        self, domain: Reference, vars: AxisVariablesNotSingle = x,
++        dummy_vars: AxisVariablesNotSingle = t
++    ) -> ScalarFunction:
+         """Compute the integral of the function.
+ 
+         Args:
+             domain: The domain of the integral
+             vars: The variables to integrate with respect to
++            dummy_vars: The dummy variables to use inside the integral
+ 
+         Returns:
+             The integral
+         """
+-        # TODO: Add check that the domain is a subset of one piece
+-        # TODO: Add integral over multiple pieces
+-        p = self.get_piece(domain.midpoint())
+-        return p.integral(domain, vars)
++        result = ScalarFunction(0)
++        for shape, f in self._pieces.items():
++            ref = _piece_reference(self.tdim, shape)
++            sub_domain = ref.intersection(domain)
++            if sub_domain is not None:
++                result += f.integral(sub_domain, vars, dummy_vars)
++        return result
+ 
+     def det(self) -> PiecewiseFunction:
+         """Compute the determinant.
+@@ -500,25 +507,11 @@ class PiecewiseFunction(AnyFunction):
+             value_scale: The scale factor for the function values
+             n: The number of points per side for plotting
+         """
+-        from .create import create_reference
+         from .plotting import Picture
+         assert isinstance(img, Picture)
+ 
+         for shape, f in self._pieces.items():
+-            if self.tdim == 2:
+-                if len(shape) == 3:
+-                    ref = create_reference("triangle", shape)
+-                elif len(shape) == 4:
+-                    ref = create_reference("quadrilateral", shape)
+-                else:
+-                    raise ValueError("Unsupported cell type")
+-            elif self.tdim == 3:
+-                if len(shape) == 4:
+-                    ref = create_reference("tetrahedron", shape)
+-                else:
+-                    raise ValueError("Unsupported cell type")
+-            else:
+-                raise ValueError("Unsupported tdim")
++            ref = _piece_reference(self.tdim, shape)
+             f.plot_values(ref, img, value_scale, n // 2)
+ 
+     def with_floats(self) -> AnyFunction:
+@@ -529,3 +522,22 @@ class PiecewiseFunction(AnyFunction):
+         """
+         return PiecewiseFunction(
+             {shape: f.with_floats() for shape, f in self._pieces.items()}, self.tdim)
++
++
++def _piece_reference(tdim, shape):
++    """Create a reference element for a single piece."""
++    from .create import create_reference
++    if tdim == 2:
++        if len(shape) == 3:
++            return create_reference("triangle", shape)
++        elif len(shape) == 4:
++            return create_reference("quadrilateral", shape)
++        else:
++            raise ValueError("Unsupported cell type")
++    elif tdim == 3:
++        if len(shape) == 4:
++            return create_reference("tetrahedron", shape)
++        else:
++            raise ValueError("Unsupported cell type")
++    else:
++        raise ValueError("Unsupported tdim")
+diff --git a/symfem/polynomials.py b/symfem/polynomials.py
+index bf6d99b..b6fef54 100644
+--- a/symfem/polynomials.py
++++ b/symfem/polynomials.py
+@@ -1076,7 +1076,7 @@ def orthonormal_basis(
+     ref = create_reference(cell)
+     if variables is None:
+         variables = x
+-    norms = [sympy.sqrt((f ** 2).integral(ref, variables)) for f in poly[0]]
++    norms = [sympy.sqrt((f ** 2).integral(ref, dummy_vars=variables)) for f in poly[0]]
+     for i, n in enumerate(norms):
+         for j in range(len(poly)):
+             poly[j][i] /= n
+diff --git a/symfem/references.py b/symfem/references.py
+index bfa2a3a..3d70d22 100644
+--- a/symfem/references.py
++++ b/symfem/references.py
+@@ -17,6 +17,49 @@ IntLimits = typing.List[typing.Union[
+     typing.Tuple[sympy.core.symbol.Symbol, sympy.core.expr.Expr]]]
+ 
+ 
++def _which_side(vs: SetOfPoints, p: PointType, q: PointType) -> typing.Optional[int]:
++    """Check which side of a line or plane a set of points are.
++
++    Args:
++        vs: The set of points
++        p: A point on the line or plane
++        q: Another point on the line (2D) or the normal to the plane (3D)
++
++    Returns:
++        2 if the points are all to the left, 1 if the points are all to the left or on the line,
++        0 if the points are all on the line, -1 if the points are all to the right or on the line,
++        -1 if the points are all to the right, None if there are some points on either side.
++    """
++    sides = []
++    for v in vs:
++        if len(q) == 2:
++            cross = (v[0] - p[0]) * (q[1] - p[1]) - (v[1] - p[1]) * (q[0] - p[0])
++        elif len(q) == 3:
++            cross = (v[0] - p[0]) * q[0] + (v[1] - p[1]) * q[1] + (v[2] - p[2]) * q[2]
++        else:
++            return None
++        if cross == 0:
++            sides.append(0)
++        elif cross > 0:
++            sides.append(1)
++        else:
++            sides.append(-1)
++
++    if -1 in sides and 1 in sides:
++        return None
++    if 1 in sides:
++        if 0 in sides:
++            return 1
++        else:
++            return 2
++    if -1 in sides:
++        if 0 in sides:
++            return -1
++        else:
++            return -2
++    return 0
++
++
+ def _vsub(v: PointTypeInput, w: PointTypeInput) -> PointType:
+     """Subtract.
+ 
+@@ -155,6 +198,45 @@ class Reference(ABC):
+         """
+         return self.vertices
+ 
++    def intersection(self, other: Reference) -> typing.Optional[Reference]:
++        """Get the intersection of two references.
++
++        Returns:
++            A reference element that is the intersection
++        """
++        if self.gdim != other.gdim:
++            raise ValueError("Incompatible cell dimensions")
++
++        for cell1, cell2 in [(self, other), (other, self)]:
++            try:
++                for v in cell1.vertices:
++                    if not cell2.contains(v):
++                        break
++                else:
++                    return cell1
++            except NotImplementedError:
++                pass
++        for cell1, cell2 in [(self, other), (other, self)]:
++            if cell1.gdim == 2:
++                for e in cell1.edges:
++                    p = cell1.vertices[e[0]]
++                    q = cell1.vertices[e[1]]
++                    dir1 = _which_side(cell1.vertices, p, q)
++                    dir2 = _which_side(cell2.vertices, p, q)
++                    if dir1 is not None and dir2 is not None and dir1 * dir2 < 0:
++                        return None
++            if cell1.gdim == 3:
++                for i in range(cell1.sub_entity_count(2)):
++                    face = cell1.sub_entity(2, i)
++                    p = face.midpoint()
++                    n = face.normal()
++                    dir1 = _which_side(cell1.vertices, p, n)
++                    dir2 = _which_side(cell2.vertices, p, n)
++                    if dir1 is not None and dir2 is not None and dir1 * dir2 < 0:
++                        return None
++
++        raise NotImplementedError("Intersection of these elements is not yet supported")
++
+     @abstractmethod
+     def default_reference(self) -> Reference:
+         """Get the default reference for this cell type.
+@@ -1028,9 +1110,17 @@ class Triangle(Reference):
+         Returns:
+             Is the point contained in the reference?
+         """
+-        if self.vertices != self.reference_vertices:
+-            raise NotImplementedError()
+-        return 0 <= point[0] and 0 <= point[1] and sum(point) <= 1
++        if self.vertices == self.reference_vertices:
++            return 0 <= point[0] and 0 <= point[1] and sum(point) <= 1
++        elif self.gdim == 2:
++            po = _vsub(point, self.origin)
++            det = self.axes[0][0] * self.axes[1][1] - self.axes[0][1] * self.axes[1][0]
++            t0 = (self.axes[1][1] * po[0] - self.axes[1][0] * po[1]) / det
++            t1 = (self.axes[0][0] * po[1] - self.axes[0][1] * po[0]) / det
++            print(self.origin, self.axes, point)
++            print(t0, t1)
++            return 0 <= t0 and 0 <= t1 and t0 + t1 <= 1
++        raise NotImplementedError()
+ 
+ 
+ class Tetrahedron(Reference):
+@@ -1203,9 +1293,15 @@ class Tetrahedron(Reference):
+         Returns:
+             Is the point contained in the reference?
+         """
+-        if self.vertices != self.reference_vertices:
+-            raise NotImplementedError()
+-        return 0 <= point[0] and 0 <= point[1] and 0 <= point[2] and sum(point) <= 1
++        if self.vertices == self.reference_vertices:
++            return 0 <= point[0] and 0 <= point[1] and 0 <= point[2] and sum(point) <= 1
++        else:
++            po = _vsub(point, self.origin)
++            minv = sympy.Matrix([[a[i] for a in self.axes] for i in range(3)]).inv()
++            t0 = (minv[0, 0] * po[0] + minv[0, 1] * po[1] + minv[0, 2] * po[2])
++            t1 = (minv[1, 0] * po[0] + minv[1, 1] * po[1] + minv[1, 2] * po[2])
++            t2 = (minv[2, 0] * po[0] + minv[2, 1] * po[1] + minv[2, 2] * po[2])
++            return 0 <= t0 and 0 <= t1 and 0 >= t2 and t0 + t1 + t2 <= 1
+ 
+ 
+ class Quadrilateral(Reference):

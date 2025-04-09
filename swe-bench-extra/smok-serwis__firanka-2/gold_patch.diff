@@ -1,0 +1,309 @@
+diff --git a/README.md b/README.md
+index c71f28c..f14d95a 100644
+--- a/README.md
++++ b/README.md
+@@ -98,6 +98,17 @@ By definition, _ModuloSeries_ has the domain of all real numbers.
+ Note that someOtherSeries's domain length must be non-zero and finite. Otherwise
+ _ValueError_ will be thrown.
+ 
++## LinearInterpolationSeries
++
++These are discretes, but allow you to define an operator that will
++take its neighbours into account and let you return a custom value.
++
++By default, it will assumes that values can be added, subbed, multed and dived,
++and will do classical linear interpolation.
++
++They can either utilize an existing discrete series, or be created just as
++any other discrete series would be.
++
+ ## Ranges
+ 
+ Can be imported from _sai.ranges_.
+@@ -111,9 +122,7 @@ You can create Ranges as follows:
+ Range(-5, 5, True, False) == Range('<-5;5)')
+ ```
+ 
+-First boolean argument signifies whether the interval is left-closed,
+-and second whether it is right-closed.
+-
++For more information [use the source](firanka/ranges.py#L33)
+ Range's are immutable and hashable. They can be sliced:
+ 
+ ```python
+@@ -134,3 +143,8 @@ Or you can check for strict inclusion
+ Range('<-1;1>') in Range('<-2;2>')
+ ```
+ 
++## TimeProviders
++
++**EXPERIMENTAL**
++
++Can be imported from _sai.timeproviders_.
+diff --git a/firanka/ranges.py b/firanka/ranges.py
+index a2b2ae1..3e06c1e 100644
+--- a/firanka/ranges.py
++++ b/firanka/ranges.py
+@@ -1,9 +1,11 @@
+ # coding=UTF-8
+ from __future__ import print_function, absolute_import, division
+-import six
++
+ import functools
+ import math
+ 
++import six
++
+ __all__ = [
+     'Range',
+     'REAL_SET',
+@@ -31,6 +33,16 @@ class Range(object):
+                      self.right_inc)
+ 
+     def __init__(self, *args):
++        """
++        Create like:
++
++        * Range('<a;b>')
++        * Range(a, b, is_left_closed_, is_right_closed)
++        * Range(a, b) - will have both sides closed, unless one is inf
++        * Range(slice(a, b)) - will have both sides closed, unless one is None
++
++        :param args:
++        """
+         if len(args) == 1:
+             rs, = args
+             if isinstance(rs, type(self)):
+@@ -48,6 +60,10 @@ class Range(object):
+                 start, stop = rs[1:-1].split(';')
+                 args = float(start), float(stop), rs[0] == '<', rs[-1] == '>'
+ 
++        elif len(args) == 2:
++            args = args[0], args[1], not math.isinf(args[0]), not math.isinf(
++                args[1])
++
+         q = lambda a, b, args: args[a] and math.isinf(args[b])
+ 
+         if q(2, 0, args) or q(3, 1, args):
+@@ -65,7 +81,7 @@ class Range(object):
+         if isinstance(x, Range):
+             if ((x.start == self.start) and (x.left_inc ^ self.left_inc)) \
+                     or ((x.stop == self.stop) and (
+-                        x.right_inc ^ self.right_inc)):
++                                x.right_inc ^ self.right_inc)):
+                 return False
+ 
+             return (x.start >= self.start) and (x.stop <= self.stop)
+@@ -80,15 +96,15 @@ class Range(object):
+ 
+     def is_empty(self):
+         return (self.start == self.stop) and not (
+-        self.left_inc or self.right_inc)
++            self.left_inc or self.right_inc)
+ 
+     def length(self):
+         return self.stop - self.start
+ 
+     def __repr__(self):
+         return 'Range(%s, %s, %s, %s)' % (
+-        repr(self.start), repr(self.stop), repr(self.left_inc),
+-        repr(self.right_inc))
++            repr(self.start), repr(self.stop), repr(self.left_inc),
++            repr(self.right_inc))
+ 
+     def __getitem__(self, item):
+         if not isinstance(item, slice):
+diff --git a/firanka/series/__init__.py b/firanka/series/__init__.py
+new file mode 100644
+index 0000000..f738011
+--- /dev/null
++++ b/firanka/series/__init__.py
+@@ -0,0 +1,16 @@
++# coding=UTF-8
++from __future__ import absolute_import
++
++from .base import FunctionSeries, DiscreteSeries, Series
++from .interpolations import LinearInterpolationSeries, \
++    SCALAR_LINEAR_INTERPOLATOR
++from .modulo import ModuloSeries
++
++__all__ = [
++    'FunctionSeries',
++    'DiscreteSeries',
++    'ModuloSeries',
++    'Series',
++    'SCALAR_LINEAR_INTERPOLATOR',
++    'LinearInterpolationSeries',
++]
+diff --git a/firanka/series.py b/firanka/series/base.py
+similarity index 88%
+rename from firanka/series.py
+rename to firanka/series/base.py
+index c1bb0cc..6182ce0 100644
+--- a/firanka/series.py
++++ b/firanka/series/base.py
+@@ -1,19 +1,10 @@
+ # coding=UTF-8
+ from __future__ import print_function, absolute_import, division
+ 
+-import math
+-
+ import six
+ 
+ from firanka.exceptions import NotInDomainError
+-from firanka.ranges import Range, REAL_SET, EMPTY_SET
+-
+-__all__ = [
+-    'FunctionSeries',
+-    'DiscreteSeries',
+-    'ModuloSeries',
+-    'Series',
+-]
++from firanka.ranges import Range, EMPTY_SET
+ 
+ 
+ class Series(object):
+@@ -286,31 +277,3 @@ class JoinedSeries(Series):
+ 
+     def _get_for(self, item):
+         return self.op(self.ser1._get_for(item), self.ser2._get_for(item))
+-
+-
+-class ModuloSeries(Series):
+-    def __init__(self, series, *args, **kwargs):
+-        """
+-        Construct a modulo series
+-        :param series: base series to use
+-        :raise ValueError: invalid domain length
+-        """
+-        super(ModuloSeries, self).__init__(REAL_SET, *args, **kwargs)
+-
+-        self.series = series
+-        self.period = self.series.domain.length()
+-
+-        if self.period == 0:
+-            raise ValueError('Modulo series cannot have a period of 0')
+-        elif math.isinf(self.period):
+-            raise ValueError('Modulo series cannot have an infinite period')
+-
+-    def _get_for(self, item):
+-        if item < 0:
+-            item = -(item // self.period) * self.period + item
+-        elif item > self.period:
+-            item = item - (item // self.period) * self.period
+-        elif item == self.period:
+-            item = 0
+-
+-        return self.series._get_for(self.series.domain.start + item)
+diff --git a/firanka/series/interpolations.py b/firanka/series/interpolations.py
+new file mode 100644
+index 0000000..178c0ff
+--- /dev/null
++++ b/firanka/series/interpolations.py
+@@ -0,0 +1,49 @@
++# coding=UTF-8
++from __future__ import print_function, absolute_import, division
++
++import six
++
++from .base import DiscreteSeries, Series
++
++
++def SCALAR_LINEAR_INTERPOLATOR(t0, v0, t1, v1, tt):
++    """
++    Good intepolator if our values can be added, subtracted, multiplied and divided
++    """
++    return v0 + (tt - t0) * (t1 - t0) / (v1 - v0)
++
++
++class LinearInterpolationSeries(DiscreteSeries):
++    def __init__(self, data, domain=None,
++                 interpolator=SCALAR_LINEAR_INTERPOLATOR,
++                 *args, **kwargs):
++        """
++        :param interpolator: callable(t0: float, v0: any, t1: float, v1: any, tt: float) -> any
++            This, given intepolation points (t0, v0) and (t1, v1) such that t0 <= tt <= t1,
++            return a value for index tt
++        :raise TypeError: a non-discrete series was passed as data
++        """
++        self.interpolator = interpolator
++        if isinstance(data, DiscreteSeries):
++            data, domain = data.data, data.domain
++        elif isinstance(data, Series):
++            raise TypeError('non-discrete series not supported!')
++
++        super(LinearInterpolationSeries, self).__init__(data, domain, *args,
++                                                        **kwargs)
++
++    def _get_for(self, item):
++        if item == self.domain.start:
++            return self.data[0][1]
++
++        if len(self.data) == 1:
++            return super(LinearInterpolationSeries, self).__getitem__(item)
++
++        for i in six.moves.range(0, len(self.data) - 1):
++            cur_i, cur_v = self.data[i]
++            next_i, next_v = self.data[i + 1]
++
++            if cur_i <= item <= next_i:
++                return self.interpolator(cur_i, cur_v, next_i, next_v, item)
++
++        return self.data[-1][1]
+diff --git a/firanka/series/modulo.py b/firanka/series/modulo.py
+new file mode 100644
+index 0000000..ed72808
+--- /dev/null
++++ b/firanka/series/modulo.py
+@@ -0,0 +1,35 @@
++# coding=UTF-8
++from __future__ import print_function, absolute_import, division
++
++import math
++
++from .base import Series
++from ..ranges import REAL_SET
++
++
++class ModuloSeries(Series):
++    def __init__(self, series, *args, **kwargs):
++        """
++        Construct a modulo series
++        :param series: base series to use
++        :raise ValueError: invalid domain length
++        """
++        super(ModuloSeries, self).__init__(REAL_SET, *args, **kwargs)
++
++        self.series = series
++        self.period = self.series.domain.length()
++
++        if self.period == 0:
++            raise ValueError('Modulo series cannot have a period of 0')
++        elif math.isinf(self.period):
++            raise ValueError('Modulo series cannot have an infinite period')
++
++    def _get_for(self, item):
++        if item < 0:
++            item = -(item // self.period) * self.period + item
++        elif item > self.period:
++            item = item - (item // self.period) * self.period
++        elif item == self.period:
++            item = 0
++
++        return self.series._get_for(self.series.domain.start + item)
+diff --git a/firanka/timeproviders.py b/firanka/timeproviders.py
+index 2cca5f4..47dbd0c 100644
+--- a/firanka/timeproviders.py
++++ b/firanka/timeproviders.py
+@@ -1,10 +1,8 @@
+ # coding=UTF-8
+ from __future__ import print_function, absolute_import, division
+-import six
+-import logging
+ 
+-from .series import Series
+ from .ranges import Range
++from .series import Series
+ 
+ 
+ class BijectionMapping(object):

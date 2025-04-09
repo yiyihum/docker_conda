@@ -1,0 +1,423 @@
+diff --git a/tests/test_generics.py b/tests/test_generics.py
+--- a/tests/test_generics.py
++++ b/tests/test_generics.py
+@@ -4,7 +4,7 @@
+ 
+ import pytest
+ 
+-from pydantic import BaseModel, ValidationError, validator
++from pydantic import BaseModel, ValidationError, root_validator, validator
+ from pydantic.generics import GenericModel, _generic_types_cache
+ 
+ skip_36 = pytest.mark.skipif(sys.version_info < (3, 7), reason='generics only supported for python 3.7 and above')
+@@ -42,11 +42,17 @@ class Response(GenericModel, Generic[T]):
+ 
+         @validator('data', each_item=True)
+         def validate_value_nonzero(cls, v):
+-            if isinstance(v, dict):
+-                return v  # ensure v is actually a value of the dict, not the dict itself
+             if v == 0:
+                 raise ValueError('value is zero')
++            return v
++
++        @root_validator()
++        def validate_sum(cls, values):
++            if sum(values.get('data', {}).values()) > 5:
++                raise ValueError('sum too large')
++            return values
+ 
++    assert Response[Dict[int, int]](data={1: '4'}).dict() == {'data': {1: 4}}
+     with pytest.raises(ValidationError) as exc_info:
+         Response[Dict[int, int]](data={1: 'a'})
+     assert exc_info.value.errors() == [
+@@ -57,6 +63,10 @@ def validate_value_nonzero(cls, v):
+         Response[Dict[int, int]](data={1: 0})
+     assert exc_info.value.errors() == [{'loc': ('data', 1), 'msg': 'value is zero', 'type': 'value_error'}]
+ 
++    with pytest.raises(ValidationError) as exc_info:
++        Response[Dict[int, int]](data={1: 3, 2: 6})
++    assert exc_info.value.errors() == [{'loc': ('__root__',), 'msg': 'sum too large', 'type': 'value_error'}]
++
+ 
+ @skip_36
+ def test_methods_are_inherited():
+diff --git a/tests/test_orm_mode.py b/tests/test_orm_mode.py
+--- a/tests/test_orm_mode.py
++++ b/tests/test_orm_mode.py
+@@ -1,8 +1,8 @@
+-from typing import List
++from typing import Any, List
+ 
+ import pytest
+ 
+-from pydantic import BaseModel, ConfigError, ValidationError
++from pydantic import BaseModel, ConfigError, ValidationError, root_validator
+ from pydantic.utils import GetterDict
+ 
+ 
+@@ -26,7 +26,7 @@ def __getattr__(self, key):
+ 
+     t = TestCls()
+     gd = GetterDict(t)
+-    assert gd.keys() == set()
++    assert gd.keys() == ['a', 'c', 'd']
+     assert gd.get('a', None) == 1
+     assert gd.get('b', None) is None
+     assert gd.get('b', 1234) == 1234
+@@ -34,6 +34,13 @@ def __getattr__(self, key):
+     assert gd.get('d', None) == 4
+     assert gd.get('e', None) == 5
+     assert gd.get('f', 'missing') == 'missing'
++    assert list(gd.values()) == [1, 3, 4]
++    assert list(gd.items()) == [('a', 1), ('c', 3), ('d', 4)]
++    assert list(gd) == ['a', 'c', 'd']
++    assert gd == {'a': 1, 'c': 3, 'd': 4}
++    assert 'a' in gd
++    assert len(gd) == 3
++    assert str(gd) == "<GetterDict(TestCls) {'a': 1, 'c': 3, 'd': 4}>"
+ 
+ 
+ def test_orm_mode():
+@@ -166,3 +173,87 @@ class Config:
+ 
+     model = Model.from_orm(TestCls())
+     assert model.dict() == {'x': 1}
++
++
++def test_root_validator():
++    validator_value = None
++
++    class TestCls:
++        x = 1
++        y = 2
++
++    class Model(BaseModel):
++        x: int
++        y: int
++        z: int
++
++        @root_validator(pre=True)
++        def change_input_data(cls, value):
++            nonlocal validator_value
++            validator_value = value
++            return {**value, 'z': value['x'] + value['y']}
++
++        class Config:
++            orm_mode = True
++
++    model = Model.from_orm(TestCls())
++    assert model.dict() == {'x': 1, 'y': 2, 'z': 3}
++    assert isinstance(validator_value, GetterDict)
++    assert validator_value == {'x': 1, 'y': 2}
++
++
++def test_custom_getter_dict():
++    class TestCls:
++        x = 1
++        y = 2
++
++    def custom_getter_dict(obj):
++        assert isinstance(obj, TestCls)
++        return {'x': 42, 'y': 24}
++
++    class Model(BaseModel):
++        x: int
++        y: int
++
++        class Config:
++            orm_mode = True
++            getter_dict = custom_getter_dict
++
++    model = Model.from_orm(TestCls())
++    assert model.dict() == {'x': 42, 'y': 24}
++
++
++def test_custom_getter_dict_derived_model_class():
++    class CustomCollection:
++        __custom__ = True
++
++        def __iter__(self):
++            for elem in range(5):
++                yield elem
++
++    class Example:
++        def __init__(self, *args, **kwargs):
++            self.col = CustomCollection()
++            self.id = 1
++            self.name = 'name'
++
++    class MyGetterDict(GetterDict):
++        def get(self, key: Any, default: Any = None) -> Any:
++            res = getattr(self._obj, key, default)
++            if hasattr(res, '__custom__'):
++                return list(res)
++            return res
++
++    class ExampleBase(BaseModel):
++        name: str
++        col: List[int]
++
++    class ExampleOrm(ExampleBase):
++        id: int
++
++        class Config:
++            orm_mode = True
++            getter_dict = MyGetterDict
++
++    model = ExampleOrm.from_orm(Example())
++    assert model.dict() == {'name': 'name', 'col': [0, 1, 2, 3, 4], 'id': 1}
+diff --git a/tests/test_parse.py b/tests/test_parse.py
+--- a/tests/test_parse.py
++++ b/tests/test_parse.py
+@@ -20,7 +20,7 @@ def test_parse_obj_fails():
+     with pytest.raises(ValidationError) as exc_info:
+         Model.parse_obj([1, 2, 3])
+     assert exc_info.value.errors() == [
+-        {'loc': ('__obj__',), 'msg': 'Model expected dict not list', 'type': 'type_error'}
++        {'loc': ('__root__',), 'msg': 'Model expected dict not list', 'type': 'type_error'}
+     ]
+ 
+ 
+@@ -84,14 +84,14 @@ def test_bad_ct():
+     with pytest.raises(ValidationError) as exc_info:
+         Model.parse_raw('{"a": 12, "b": 8}', content_type='application/missing')
+     assert exc_info.value.errors() == [
+-        {'loc': ('__obj__',), 'msg': 'Unknown content-type: application/missing', 'type': 'type_error'}
++        {'loc': ('__root__',), 'msg': 'Unknown content-type: application/missing', 'type': 'type_error'}
+     ]
+ 
+ 
+ def test_bad_proto():
+     with pytest.raises(ValidationError) as exc_info:
+         Model.parse_raw('{"a": 12, "b": 8}', proto='foobar')
+-    assert exc_info.value.errors() == [{'loc': ('__obj__',), 'msg': 'Unknown protocol: foobar', 'type': 'type_error'}]
++    assert exc_info.value.errors() == [{'loc': ('__root__',), 'msg': 'Unknown protocol: foobar', 'type': 'type_error'}]
+ 
+ 
+ def test_file_json(tmpdir):
+diff --git a/tests/test_validators.py b/tests/test_validators.py
+--- a/tests/test_validators.py
++++ b/tests/test_validators.py
+@@ -3,8 +3,8 @@
+ 
+ import pytest
+ 
+-from pydantic import BaseModel, ConfigError, ValidationError, errors, validator
+-from pydantic.class_validators import make_generic_validator
++from pydantic import BaseModel, ConfigError, Extra, ValidationError, errors, validator
++from pydantic.class_validators import make_generic_validator, root_validator
+ 
+ 
+ def test_simple():
+@@ -715,3 +715,167 @@ class Model(BaseModel):
+             @validator('x', whole=True)
+             def check_something(cls, v):
+                 return v
++
++
++def test_root_validator():
++    root_val_values = []
++
++    class Model(BaseModel):
++        a: int = 1
++        b: str
++
++        @validator('b')
++        def repeat_b(cls, v):
++            return v * 2
++
++        @root_validator
++        def root_validator(cls, values):
++            root_val_values.append(values)
++            if 'snap' in values.get('b', ''):
++                raise ValueError('foobar')
++            return dict(values, b='changed')
++
++    assert Model(a='123', b='bar').dict() == {'a': 123, 'b': 'changed'}
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model(b='snap dragon')
++    assert exc_info.value.errors() == [{'loc': ('__root__',), 'msg': 'foobar', 'type': 'value_error'}]
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model(a='broken', b='bar')
++    assert exc_info.value.errors() == [
++        {'loc': ('a',), 'msg': 'value is not a valid integer', 'type': 'type_error.integer'}
++    ]
++
++    assert root_val_values == [{'a': 123, 'b': 'barbar'}, {'a': 1, 'b': 'snap dragonsnap dragon'}, {'b': 'barbar'}]
++
++
++def test_root_validator_pre():
++    root_val_values = []
++
++    class Model(BaseModel):
++        a: int = 1
++        b: str
++
++        @validator('b')
++        def repeat_b(cls, v):
++            return v * 2
++
++        @root_validator(pre=True)
++        def root_validator(cls, values):
++            root_val_values.append(values)
++            if 'snap' in values.get('b', ''):
++                raise ValueError('foobar')
++            return {'a': 42, 'b': 'changed'}
++
++    assert Model(a='123', b='bar').dict() == {'a': 42, 'b': 'changedchanged'}
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model(b='snap dragon')
++
++    assert root_val_values == [{'a': '123', 'b': 'bar'}, {'b': 'snap dragon'}]
++    assert exc_info.value.errors() == [{'loc': ('__root__',), 'msg': 'foobar', 'type': 'value_error'}]
++
++
++def test_root_validator_repeat():
++    with pytest.raises(errors.ConfigError, match='duplicate validator function'):
++
++        class Model(BaseModel):
++            a: int = 1
++
++            @root_validator
++            def root_validator_repeated(cls, values):
++                return values
++
++            @root_validator  # noqa: F811
++            def root_validator_repeated(cls, values):
++                return values
++
++
++def test_root_validator_repeat2():
++    with pytest.raises(errors.ConfigError, match='duplicate validator function'):
++
++        class Model(BaseModel):
++            a: int = 1
++
++            @validator('a')
++            def repeat_validator(cls, v):
++                return v
++
++            @root_validator(pre=True)  # noqa: F811
++            def repeat_validator(cls, values):
++                return values
++
++
++def test_root_validator_self():
++    with pytest.raises(
++        errors.ConfigError, match=r'Invalid signature for root validator root_validator: \(self, values\)'
++    ):
++
++        class Model(BaseModel):
++            a: int = 1
++
++            @root_validator
++            def root_validator(self, values):
++                return values
++
++
++def test_root_validator_extra():
++    with pytest.raises(errors.ConfigError) as exc_info:
++
++        class Model(BaseModel):
++            a: int = 1
++
++            @root_validator
++            def root_validator(cls, values, another):
++                return values
++
++    assert str(exc_info.value) == (
++        'Invalid signature for root validator root_validator: (cls, values, another), should be: (cls, values).'
++    )
++
++
++def test_root_validator_types():
++    root_val_values = None
++
++    class Model(BaseModel):
++        a: int = 1
++        b: str
++
++        @root_validator
++        def root_validator(cls, values):
++            nonlocal root_val_values
++            root_val_values = cls, values
++            return values
++
++        class Config:
++            extra = Extra.allow
++
++    assert Model(b='bar', c='wobble').dict() == {'a': 1, 'b': 'bar', 'c': 'wobble'}
++
++    assert root_val_values == (Model, {'a': 1, 'b': 'bar', 'c': 'wobble'})
++
++
++def test_root_validator_inheritance():
++    calls = []
++
++    class Parent(BaseModel):
++        pass
++
++        @root_validator
++        def root_validator_parent(cls, values):
++            calls.append(f'parent validator: {values}')
++            return {'extra1': 1, **values}
++
++    class Child(Parent):
++        a: int
++
++        @root_validator
++        def root_validator_child(cls, values):
++            calls.append(f'child validator: {values}')
++            return {'extra2': 2, **values}
++
++    assert len(Child.__post_root_validators__) == 2
++    assert len(Child.__pre_root_validators__) == 0
++    assert Child(a=123).dict() == {'extra2': 2, 'extra1': 1, 'a': 123}
++    assert calls == ["parent validator: {'a': 123}", "child validator: {'extra1': 1, 'a': 123}"]
+diff --git a/tests/test_validators_dataclass.py b/tests/test_validators_dataclass.py
+--- a/tests/test_validators_dataclass.py
++++ b/tests/test_validators_dataclass.py
+@@ -3,7 +3,7 @@
+ 
+ import pytest
+ 
+-from pydantic import ValidationError, validator
++from pydantic import ValidationError, root_validator, validator
+ from pydantic.dataclasses import dataclass
+ 
+ 
+@@ -108,3 +108,31 @@ def add_to_a(cls, v):
+             return v + 5
+ 
+     assert Child(a=0).a == 5
++
++
++def test_root_validator():
++    root_val_values = []
++
++    @dataclass
++    class MyDataclass:
++        a: int
++        b: str
++
++        @validator('b')
++        def repeat_b(cls, v):
++            return v * 2
++
++        @root_validator
++        def root_validator(cls, values):
++            root_val_values.append(values)
++            if 'snap' in values.get('b', ''):
++                raise ValueError('foobar')
++            return dict(values, b='changed')
++
++    assert asdict(MyDataclass(a='123', b='bar')) == {'a': 123, 'b': 'changed'}
++
++    with pytest.raises(ValidationError) as exc_info:
++        MyDataclass(a=1, b='snap dragon')
++    assert root_val_values == [{'a': 123, 'b': 'barbar'}, {'a': 1, 'b': 'snap dragonsnap dragon'}]
++
++    assert exc_info.value.errors() == [{'loc': ('__root__',), 'msg': 'foobar', 'type': 'value_error'}]

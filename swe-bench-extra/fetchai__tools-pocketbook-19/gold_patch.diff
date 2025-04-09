@@ -1,0 +1,166 @@
+diff --git a/pocketbook/cli.py b/pocketbook/cli.py
+index 19c0cd9..65bddfd 100644
+--- a/pocketbook/cli.py
++++ b/pocketbook/cli.py
+@@ -4,13 +4,13 @@ import sys
+ from . import __version__
+ from .commands.add import run_add
+ from .commands.create import run_create
++from .commands.delete import run_delete
+ from .commands.display import run_display
+ from .commands.list import run_list
+ from .commands.rename import run_rename
+ from .commands.transfer import run_transfer
+-from .commands.delete import run_delete
+ from .disclaimer import display_disclaimer
+-from .utils import NetworkUnavailableError, checked_address
++from .utils import NetworkUnavailableError, checked_address, to_canonical, MINIMUM_FRACTIONAL_FET
+ 
+ 
+ def parse_commandline():
+@@ -38,8 +38,10 @@ def parse_commandline():
+     parser_transfer = subparsers.add_parser('transfer')
+     parser_transfer.add_argument('destination',
+                                  help='The destination address either a name in the address book or an address')
+-    parser_transfer.add_argument('amount', type=int, help='The amount in whole FET to be transferred')
++    parser_transfer.add_argument('amount', type=to_canonical, help='The amount of FET to be transferred')
+     parser_transfer.add_argument('--from', dest='from_address', help='The signing account, required for multi-sig')
++    parser_transfer.add_argument('-R', '--charge-rate', type=to_canonical, default=to_canonical(MINIMUM_FRACTIONAL_FET),
++                                 help='The charge rate associated with this transaction')
+     parser_transfer.add_argument('signers', nargs='+', help='The series of key names needed to sign the transaction')
+     parser_transfer.set_defaults(handler=run_transfer)
+ 
+diff --git a/pocketbook/commands/transfer.py b/pocketbook/commands/transfer.py
+index cc9dbcb..eadda8a 100644
+--- a/pocketbook/commands/transfer.py
++++ b/pocketbook/commands/transfer.py
+@@ -6,21 +6,25 @@ def run_transfer(args):
+ 
+     from pocketbook.address_book import AddressBook
+     from pocketbook.key_store import KeyStore
+-    from pocketbook.utils import create_api
++    from pocketbook.utils import create_api, from_canonical, token_amount
+ 
+     address_book = AddressBook()
+     key_store = KeyStore()
+ 
+     # choose the destination
++    destination_name = '{}:'.format(args.destination)
+     if args.destination in address_book.keys():
+         destination = address_book.lookup_address(args.destination)
+     else:
+         destination = key_store.lookup_address(args.destination)
+         if destination is None:
+             destination = Address(args.destination)
++            destination_name = ''
+ 
+-    # change the amount
+-    amount = args.amount * 10000000000
++    # convert the amount
++    amount = args.amount
++    charge_rate = args.charge_rate
++    computed_amount = from_canonical(amount)
+ 
+     # check all the signers make sense
+     for signer in args.signers:
+@@ -39,11 +43,24 @@ def run_transfer(args):
+     else:
+         raise RuntimeError('Unable to determine from account')
+ 
++    required_ops = len(args.signers)
++    fee = required_ops * charge_rate
++    computed_fee = from_canonical(fee)
++    computed_total = computed_amount + computed_fee
++    computed_charge_rate = from_canonical(charge_rate)
++
+     print('Network....:', args.network)
+     print('From.......:', str(from_address_name))
+-    print('Signers....:', args.signers)
+-    print('Destination:', str(destination))
+-    print('Amount.....:', args.amount, 'FET')
++    print('Signer(s)..:', ','.join(args.signers))
++    print('Destination:', destination_name, str(destination))
++    print('Amount.....:', token_amount(computed_amount))
++    print('Fee........:', token_amount(computed_fee))
++
++    # only display extended fee information if something other than the default it selected
++    if charge_rate != 1:
++        print('           : {} ops @ {}'.format(required_ops, token_amount(computed_charge_rate)))
++
++    print('Total......:', token_amount(computed_total), '(Amount + Fee)')
+     print()
+     input('Press enter to continue')
+ 
+@@ -62,7 +79,8 @@ def run_transfer(args):
+         from_address = Address(address_book.lookup_address(from_address_name))
+ 
+     # build up the basic transaction information
+-    tx = api.tokens._create_skeleton_tx(len(entities.values()))
++    tx = api.tokens._create_skeleton_tx(required_ops)
++    tx.charge_rate = charge_rate
+     tx.from_address = Address(from_address)
+     tx.add_transfer(destination, amount)
+     for entity in entities.values():
+diff --git a/pocketbook/utils.py b/pocketbook/utils.py
+index 37249bf..c9bc94e 100644
+--- a/pocketbook/utils.py
++++ b/pocketbook/utils.py
+@@ -1,18 +1,56 @@
++from typing import Union
++
+ from fetchai.ledger.crypto import Address
+ 
++CANONICAL_FET_UNIT = 1e10
++MINIMUM_FRACTIONAL_FET = 1 / CANONICAL_FET_UNIT
++
+ 
+ class NetworkUnavailableError(Exception):
+     pass
+ 
+ 
++class ConversionError(RuntimeError):
++    def __init__(self, msg):
++        super().__init__(msg)
++
++
++def to_canonical(value: Union[float, int]) -> int:
++    value = float(value)
++    if value < 0:
++        raise ConversionError('Unable to convert negative token amount: {}'.format(value))
++    if value < MINIMUM_FRACTIONAL_FET:
++        raise ConversionError(
++            'Converted value {} is below minimum transfer value: {}'.format(value, MINIMUM_FRACTIONAL_FET))
++
++    return int(value * CANONICAL_FET_UNIT)
++
++
++def from_canonical(value: int) -> float:
++    value = int(value)
++    if value < 0:
++        raise ConversionError('Unable to convert negative token amount: {}'.format(value))
++
++    return value / int(CANONICAL_FET_UNIT)
++
++
++def token_amount(value: float) -> str:
++    """
++    Converts a token amount into a fixed precision string value
++    :param value: The input value to display
++    :return: The converted value
++    """
++    return '{:6.10f} FET'.format(float(value))
++
++
+ def get_balance(api, address):
+     balance = int(api.tokens.balance(address))
+-    return balance / 10000000000
++    return from_canonical(balance)
+ 
+ 
+ def get_stake(api, addresss):
+     stake = int(api.tokens.stake(addresss))
+-    return stake / 10000000000
++    return from_canonical(stake)
+ 
+ 
+ def create_api(name: str):

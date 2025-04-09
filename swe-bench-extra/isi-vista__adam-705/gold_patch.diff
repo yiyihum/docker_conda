@@ -1,0 +1,157 @@
+diff --git a/adam/curriculum/phase1_curriculum.py b/adam/curriculum/phase1_curriculum.py
+index 9d8ad916..b372de56 100644
+--- a/adam/curriculum/phase1_curriculum.py
++++ b/adam/curriculum/phase1_curriculum.py
+@@ -20,6 +20,7 @@ from adam.language_specific.english.english_language_generator import (
+     PREFER_DITRANSITIVE,
+     USE_ADVERBIAL_PATH_MODIFIER,
+     IGNORE_HAS_AS_VERB,
++    ATTRIBUTES_AS_X_IS_Y,
+ )
+ from adam.ontology import THING, IS_SPEAKER, IS_ADDRESSEE
+ from adam.ontology.during import DuringAction
+@@ -199,6 +200,35 @@ def _make_objects_with_colors_curriculum() -> Phase1InstanceGroup:
+     )
+ 
+ 
++def _object_with_color_is_template(
++    object_with_color: TemplateObjectVariable,
++) -> Phase1SituationTemplate:
++    return Phase1SituationTemplate(
++        "object-with-color",
++        salient_object_variables=[object_with_color],
++        syntax_hints=[ATTRIBUTES_AS_X_IS_Y],
++    )
++
++
++def _make_objects_with_colors_is_curriculum() -> Phase1InstanceGroup:
++    color = color_variable("color")
++    object_with_color = standard_object("object", added_properties=[color])
++
++    return phase1_instances(
++        "objects with colors",
++        chain(
++            *[
++                sampled(
++                    _object_with_color_is_template(object_with_color),
++                    ontology=GAILA_PHASE_1_ONTOLOGY,
++                    chooser=PHASE1_CHOOSER_FACTORY(),
++                    max_to_sample=20,
++                )
++            ]
++        ),
++    )
++
++
+ def _make_multiple_objects_curriculum() -> Phase1InstanceGroup:
+     """
+     We are deferring handling numeric quantifiers until Phase 2,
+@@ -1592,7 +1622,11 @@ def build_gaila_phase1_attribute_curriculum() -> Sequence[Phase1InstanceGroup]:
+     """
+     One particular instantiation of the object-learning parts of the curriculum for GAILA Phase 1.
+     """
+-    return [_make_objects_with_colors_curriculum(), _make_my_your_object_curriculum()]
++    return [
++        _make_objects_with_colors_curriculum(),
++        _make_objects_with_colors_is_curriculum(),
++        _make_my_your_object_curriculum(),
++    ]
+ 
+ 
+ def build_gaila_phase1_relation_curriculum() -> Sequence[Phase1InstanceGroup]:
+diff --git a/adam/language/dependency/universal_dependencies.py b/adam/language/dependency/universal_dependencies.py
+index a984a0dc..09efb7cb 100644
+--- a/adam/language/dependency/universal_dependencies.py
++++ b/adam/language/dependency/universal_dependencies.py
+@@ -33,6 +33,7 @@ ADJECTIVAL_MODIFIER = DependencyRole("amod")
+ APPOSITIONAL_MODIFIER = DependencyRole("appos")
+ AUXILIARY = DependencyRole("aux")
+ CASE_MARKING = DependencyRole("case")
++IS_ATTRIBUTE = DependencyRole("isattr")
+ # hack
+ CASE_POSSESSIVE = DependencyRole("case:poss")
+ CASE_SPATIAL = DependencyRole("case:sptial")
+diff --git a/adam/language_specific/english/english_language_generator.py b/adam/language_specific/english/english_language_generator.py
+index 0db590c5..a42cff8a 100644
+--- a/adam/language_specific/english/english_language_generator.py
++++ b/adam/language_specific/english/english_language_generator.py
+@@ -34,6 +34,8 @@ from adam.language.dependency.universal_dependencies import (
+     OBJECT,
+     OBLIQUE_NOMINAL,
+     PROPER_NOUN,
++    VERB,
++    IS_ATTRIBUTE,
+ )
+ from adam.language.language_generator import LanguageGenerator
+ from adam.language.lexicon import LexiconEntry
+@@ -282,7 +284,44 @@ class SimpleRuleBasedEnglishLanguageGenerator(
+                 _object, count, dependency_node, noun_lexicon_entry=noun_lexicon_entry
+             )
+ 
+-            if IGNORE_COLORS not in self.situation.syntax_hints:
++            if ATTRIBUTES_AS_X_IS_Y in self.situation.syntax_hints:
++                # We can use this only in static situations
++                if self.situation.is_dynamic:
++                    raise RuntimeError(
++                        "Cannot produce X is Y language in dynamic situations"
++                    )
++                # If we want x is y language, first get the attributes
++                if IGNORE_COLORS in self.situation.syntax_hints:
++                    properties = [
++                        property_
++                        for property_ in _object.properties
++                        if not self.situation.ontology.is_subtype_of(property_, COLOR)
++                    ]
++                else:
++                    properties = [property_ for property_ in _object.properties]
++                if len(properties) > 1:
++                    raise RuntimeError(
++                        "Cannot handle X is Y language with multiple attributes"
++                    )
++                elif not properties:
++                    raise RuntimeError(
++                        "No available attributes (Y) for the X is Y language"
++                    )
++
++                attribute_lexicon_entry = self._unique_lexicon_entry(first(properties))
++                node = DependencyTreeToken(
++                    attribute_lexicon_entry.base_form,
++                    attribute_lexicon_entry.part_of_speech,
++                    attribute_lexicon_entry.intrinsic_morphosyntactic_properties,
++                )
++                is_node = DependencyTreeToken("is", VERB, {})
++                self.dependency_graph.add_edge(
++                    is_node, dependency_node, role=IS_ATTRIBUTE
++                )
++                self.dependency_graph.add_edge(
++                    node, dependency_node, role=NOMINAL_MODIFIER
++                )
++            elif IGNORE_COLORS not in self.situation.syntax_hints:
+                 # Begin work on translating modifiers of Nouns with Color
+                 for property_ in _object.properties:
+                     if self.situation.ontology.is_subtype_of(property_, COLOR):
+@@ -935,3 +974,4 @@ USE_ADVERBIAL_PATH_MODIFIER = "USE_ADVERBIAL_PATH_MODIFIER"
+ PREFER_DITRANSITIVE = "PREFER_DITRANSITIVE"
+ IGNORE_COLORS = "IGNORE_COLORS"
+ IGNORE_HAS_AS_VERB = "IGNORE_HAS_AS_VERB"
++ATTRIBUTES_AS_X_IS_Y = "ATTRIBUTES_AS_X_IS_Y"
+diff --git a/adam/language_specific/english/english_syntax.py b/adam/language_specific/english/english_syntax.py
+index 77bdd439..086c8885 100644
+--- a/adam/language_specific/english/english_syntax.py
++++ b/adam/language_specific/english/english_syntax.py
+@@ -25,6 +25,7 @@ from adam.language.dependency.universal_dependencies import (
+     OBLIQUE_NOMINAL,
+     PROPER_NOUN,
+     VERB,
++    IS_ATTRIBUTE,
+ )
+ 
+ _ENGLISH_HEAD_TO_ROLE_ORDER: ImmutableDict[
+@@ -58,6 +59,7 @@ _ENGLISH_HEAD_TO_ROLE_ORDER: ImmutableDict[
+                 # so this works, but we will need something more
+                 # sophisticated than this map eventually to handle
+                 # distinctions between noun modifier types.
++                IS_ATTRIBUTE,
+                 NOMINAL_MODIFIER,
+                 CASE_POSSESSIVE,
+             ),

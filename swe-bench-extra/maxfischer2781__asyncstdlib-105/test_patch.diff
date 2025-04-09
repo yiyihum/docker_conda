@@ -1,0 +1,171 @@
+diff --git a/typetests/README.rst b/typetests/README.rst
+new file mode 100644
+index 0000000..361fa3e
+--- /dev/null
++++ b/typetests/README.rst
+@@ -0,0 +1,37 @@
++=================
++MyPy Type Testing
++=================
++
++This suite contains *type* tests for ``asyncstdlib``.
++These tests follow similar conventions to unittests but are checked by MyPy.
++
++Test Files
++==========
++
++Tests MUST be organised into files, with similar tests grouped together.
++Each test file SHOULD be called as per the pattern ``type_<scope>.py``,
++where ``<scope>`` describes what the tests cover;
++for example, ``test_functools.py`` type-tests the ``functools`` package.
++
++An individual test is a function, method or class and SHOULD be named
++with a `test_` or `Test` prefix for functions/methods or classes, respectively.
++A class SHOULD be considered a test if it contains any tests.
++Tests MUST contain statements to be type-checked:
++- plain statements required to be type consistent,
++  such as passing parameters of expected correct type to a function.
++- assertions about types and exhaustiveness,
++  using `typing.assert_type` or `typing.assert_never`.
++- statements required to be type inconsistent with an expected type error,
++  such as passing parameters of wrong type with `# type: ignore[arg-type]`.
++
++Test files MAY contain non-test functions, methods or classes for use inside tests.
++These SHOULD be type-consistent and not require any type assertions or expected errors.
++
++Test Execution
++==============
++
++Tests MUST be checked by MyPy using
++the ``warn_unused_ignores`` configuration or ``--warn-unused-ignores`` command line
++option.
++This is required for negative type consistency checks,
++i.e. using expected type errors such as ``# type: ignore[arg-type]``.
+diff --git a/typetests/test_functools.py b/typetests/test_functools.py
+new file mode 100644
+index 0000000..361971e
+--- /dev/null
++++ b/typetests/test_functools.py
+@@ -0,0 +1,23 @@
++from asyncstdlib import lru_cache
++
++
++@lru_cache()
++async def lru_function(a: int) -> int:
++    return a
++
++
++async def test_cache_parameters() -> None:
++    await lru_function(12)
++    await lru_function("wrong parameter type")  # type: ignore[arg-type]
++
++
++class TestLRUMethod:
++    """
++    Test that `lru_cache` works on methods
++    """
++    @lru_cache()
++    async def cached(self) -> int:
++        return 1
++
++    async def test_implicit_self(self) -> int:
++        return await self.cached()
+diff --git a/unittests/test_functools.py b/unittests/test_functools.py
+index 9d13530..6e6e7dc 100644
+--- a/unittests/test_functools.py
++++ b/unittests/test_functools.py
+@@ -203,6 +203,32 @@ async def test_lru_cache_typed():
+         assert pingpong.cache_info().hits == (val + 1) * 2
+ 
+ 
++@sync
++async def test_lru_cache_method():
++    """
++    Test that the lru_cache can be used on methods
++    """
++
++    class SelfCached:
++        def __init__(self, ident: int):
++            self.ident = ident
++
++        @a.lru_cache()
++        async def pingpong(self, arg):
++            # return identifier of instance to separate cache entries per instance
++            return arg, self.ident
++
++    for iteration in range(4):
++        instance = SelfCached(iteration)
++        for val in range(20):
++            # 1 read initializes, 2 reads hit
++            assert await instance.pingpong(val) == (val, iteration)
++            assert await instance.pingpong(float(val)) == (val, iteration)
++            assert await instance.pingpong(val) == (val, iteration)
++            assert instance.pingpong.cache_info().misses == val + 1 + 20 * iteration
++            assert instance.pingpong.cache_info().hits == (val + 1 + 20 * iteration) * 2
++
++
+ @sync
+ async def test_lru_cache_bare():
+     @a.lru_cache
+diff --git a/unittests/test_itertools.py b/unittests/test_itertools.py
+index a4d3984..43ce466 100644
+--- a/unittests/test_itertools.py
++++ b/unittests/test_itertools.py
+@@ -87,6 +87,57 @@ async def test_chain(iterables):
+         )
+ 
+ 
++class ACloseFacade:
++    """Wrapper to check if an iterator has been closed"""
++
++    def __init__(self, iterable):
++        self.closed = False
++        self.__wrapped__ = iterable
++        self._iterator = a.iter(iterable)
++
++    async def __anext__(self):
++        if self.closed:
++            raise StopAsyncIteration()
++        return await self._iterator.__anext__()
++
++    def __aiter__(self):
++        return self
++
++    async def aclose(self):
++        if hasattr(self._iterator, "aclose"):
++            await self._iterator.aclose()
++        self.closed = True
++
++
++@pytest.mark.parametrize("iterables", chains)
++@sync
++async def test_chain_close_auto(iterables):
++    """Test that `chain` closes exhausted iterators"""
++    closeable_iterables = [ACloseFacade(iterable) for iterable in iterables]
++    assert await a.list(a.chain(*closeable_iterables)) == list(
++        itertools.chain(*iterables)
++    )
++    assert all(iterable.closed for iterable in closeable_iterables)
++
++
++# insert a known filled iterable since chain closes all that are exhausted
++@pytest.mark.parametrize("iterables", [([1], *chain) for chain in chains])
++@pytest.mark.parametrize(
++    "chain_type, must_close",
++    [(lambda iterators: a.chain(*iterators), True), (a.chain.from_iterable, False)],
++)
++@sync
++async def test_chain_close_partial(iterables, chain_type, must_close):
++    """Test that `chain` closes owned iterators"""
++    closeable_iterables = [ACloseFacade(iterable) for iterable in iterables]
++    chain = chain_type(closeable_iterables)
++    assert await a.anext(chain) == next(itertools.chain(*iterables))
++    await chain.aclose()
++    assert all(iterable.closed == must_close for iterable in closeable_iterables[1:])
++    # closed chain must remain closed regardless of iterators
++    assert await a.anext(chain, "sentinel") == "sentinel"
++
++
+ compress_cases = [
+     (range(20), [idx % 2 for idx in range(20)]),
+     ([1] * 5, [True, True, False, True, True]),

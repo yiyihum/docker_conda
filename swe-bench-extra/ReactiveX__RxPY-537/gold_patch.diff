@@ -1,0 +1,136 @@
+diff --git a/rx/__init__.py b/rx/__init__.py
+index b995f2b2..ce18e050 100644
+--- a/rx/__init__.py
++++ b/rx/__init__.py
+@@ -6,7 +6,6 @@ from typing import Iterable, Callable, Any, Optional, Union, Mapping
+ from .core import Observable, pipe, typing
+ from .internal.utils import alias
+ 
+-
+ # Please make sure the version here remains the same as in project.cfg
+ __version__ = '3.1.1'
+ 
+@@ -561,8 +560,8 @@ def generate(initial_state: Any,
+ 
+ 
+ def hot(string: str,
+-        timespan: typing.RelativeTime=0.1,
+-        duetime:typing.AbsoluteOrRelativeTime = 0.0,
++        timespan: typing.RelativeTime = 0.1,
++        duetime: typing.AbsoluteOrRelativeTime = 0.0,
+         scheduler: Optional[typing.Scheduler] = None,
+         lookup: Optional[Mapping] = None,
+         error: Optional[Exception] = None
+@@ -1092,8 +1091,8 @@ def zip(*args: Observable) -> Observable:
+         :alt: zip
+ 
+         --1--2---3-----4---|
+-        -a----b----c-d-----|
+-        [       zip()      ]
++        -a----b----c-d------|
++        [       zip()       ]
+         --1,a-2,b--3,c-4,d-|
+ 
+     Example:
+diff --git a/rx/core/observable/zip.py b/rx/core/observable/zip.py
+index 530ab8c8..8b756477 100644
+--- a/rx/core/observable/zip.py
++++ b/rx/core/observable/zip.py
+@@ -1,11 +1,11 @@
++from threading import RLock
+ from typing import Optional, List
+ 
+ from rx import from_future
+ from rx.core import Observable, typing
+ from rx.disposable import CompositeDisposable, SingleAssignmentDisposable
+-from rx.internal.utils import is_future
+ from rx.internal.concurrency import synchronized
+-from threading import RLock
++from rx.internal.utils import is_future
+ 
+ 
+ # pylint: disable=redefined-builtin
+@@ -29,11 +29,11 @@ def _zip(*args: Observable) -> Observable:
+ 
+     sources = list(args)
+ 
+-    def subscribe(observer: typing.Observer, scheduler: Optional[typing.Scheduler] = None):
++    def subscribe(observer: typing.Observer,
++                  scheduler: Optional[typing.Scheduler] = None) -> CompositeDisposable:
+         n = len(sources)
+         queues: List[List] = [[] for _ in range(n)]
+         lock = RLock()
+-        is_done = [False] * n
+ 
+         @synchronized(lock)
+         def next(i):
+@@ -46,13 +46,6 @@ def _zip(*args: Observable) -> Observable:
+                     return
+ 
+                 observer.on_next(res)
+-            elif all([x for j, x in enumerate(is_done) if j != i]):
+-                observer.on_completed()
+-
+-        def done(i):
+-            is_done[i] = True
+-            if all(is_done):
+-                observer.on_completed()
+ 
+         subscriptions = [None] * n
+ 
+@@ -65,7 +58,7 @@ def _zip(*args: Observable) -> Observable:
+                 queues[i].append(x)
+                 next(i)
+ 
+-            sad.disposable = source.subscribe_(on_next, observer.on_error, lambda: done(i), scheduler)
++            sad.disposable = source.subscribe_(on_next, observer.on_error, observer.on_completed, scheduler)
+             subscriptions[i] = sad
+ 
+         for idx in range(n):
+diff --git a/rx/core/operators/tofuture.py b/rx/core/operators/tofuture.py
+index 67197888..f0f1d435 100644
+--- a/rx/core/operators/tofuture.py
++++ b/rx/core/operators/tofuture.py
+@@ -38,18 +38,20 @@ def _to_future(future_ctor: Optional[Callable[[], Future]] = None,
+             has_value = True
+ 
+         def on_error(err):
+-            future.set_exception(err)
++            if not future.cancelled():
++                future.set_exception(err)
+ 
+         def on_completed():
+             nonlocal last_value
+-            if has_value:
+-                future.set_result(last_value)
+-            else:
+-                future.set_exception(SequenceContainsNoElementsError())
++            if not future.cancelled():
++                if has_value:
++                    future.set_result(last_value)
++                else:
++                    future.set_exception(SequenceContainsNoElementsError())
+             last_value = None
+ 
+-        source.subscribe_(on_next, on_error, on_completed, scheduler=scheduler)
++        dis = source.subscribe_(on_next, on_error, on_completed, scheduler=scheduler)
++        future.add_done_callback(lambda _: dis.dispose())
+ 
+-        # No cancellation can be done
+         return future
+     return to_future
+diff --git a/rx/operators/__init__.py b/rx/operators/__init__.py
+index c2373d76..b7da67a4 100644
+--- a/rx/operators/__init__.py
++++ b/rx/operators/__init__.py
+@@ -3492,8 +3492,8 @@ def zip(*args: Observable) -> Callable[[Observable], Observable]:
+         :alt: zip
+ 
+         --1--2---3-----4---|
+-        -a----b----c-d-----|
+-        [       zip()      ]
++        -a----b----c-d------|
++        [       zip()       ]
+         --1,a-2,b--3,c-4,d-|
+ 
+ 

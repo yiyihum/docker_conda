@@ -1,0 +1,166 @@
+diff --git a/tests/admin/test_serve.py b/tests/admin/test_serve.py
+index b4734d8..c779506 100644
+--- a/tests/admin/test_serve.py
++++ b/tests/admin/test_serve.py
+@@ -222,6 +222,7 @@ class TestArtifactServer:
+             ("blog", "/blog@1"),
+             ("blog/2015/12/post1/", "/blog/post1"),
+             ("de/blog/", "/blog@1"),
++            ("extra/container", "/extra/container"),
+         ],
+     )
+     def test_resolve_url_path(self, a_s, url_path, source_path):
+@@ -359,6 +360,10 @@ class TestArtifactServer:
+             ("extra/build-failure/", "text/html", True),  # Failing build
+             # Asset file
+             ("static/demo.css", "text/css", False),
++            # Page with hidden parent
++            ("extra/container/a/", "text/html", True),
++            # Asset file with hidden parent
++            ("extra/container/hello.txt", "text/plain", False),
+             # Asset directories with index.{htm,html}
+             ("dir_with_index_html/", "text/html", False),
+             ("dir_with_index_htm/", "text/html", False),
+@@ -380,6 +385,7 @@ class TestArtifactServer:
+         "url_path",
+         [
+             "test@192.jpg",  # sub-artifact — no resolvable to source object
++            "extra/container/",  # hidden page
+             "static/",  # Asset directory without index.html
+             "dir_with_index_html/index.htm",
+             "dir_with_index_htm/index.html",
+@@ -449,6 +455,7 @@ def test_serve_file_dir_handling(output_path, app, index_html):
+     "path",
+     [
+         "missing",
++        "example/container",  # hidden page
+         "adir/",  # no adir/index.{html,htm} exists
+         "adir/../top.txt",  # ".." not allowed in path
+         "../adir/index.txt",  # points outside of output_path
+@@ -472,17 +479,19 @@ def test_serve_file_raises_404(output_path, app, path):
+ 
+ 
+ @pytest.mark.parametrize(
+-    "path, status, mimetype",
++    "path, status, mimetype, content",
+     [
+-        ("/hello.txt", 200, "text/plain"),
+-        ("/missing/", 404, "text/html"),
++        ("/hello.txt", 200, "text/plain", "Hello I am an Attachment"),
++        ("/missing/", 404, "text/html", "The requested URL was not found"),
++        ("/extra/container/", 404, "text/html", "Record is hidden"),
+     ],
+ )
+-def test_serve(app, path, status, mimetype):
++def test_serve(app, path, status, mimetype, content):
+     with app.test_client() as c:
+         resp = c.get(path)
+         assert resp.status_code == status
+         assert resp.mimetype == mimetype
++        assert content in resp.get_data(True)
+ 
+ 
+ def test_serve_from_file(app, output_path):
+diff --git a/tests/test_builder.py b/tests/test_builder.py
+index 87425a1..5310c9d 100644
+--- a/tests/test_builder.py
++++ b/tests/test_builder.py
+@@ -1,5 +1,6 @@
+ from pathlib import Path
+ 
++import pytest
+ from markers import imagemagick
+ 
+ 
+@@ -34,6 +35,7 @@ def test_child_sources_basic(pad, builder):
+     assert [x["_id"] for x in child_sources] == [
+         "a",
+         "b",
++        "container",  # hidden children should be built, too
+         "file.ext",
+         "hello.txt",
+         "paginated",
+@@ -261,6 +263,26 @@ def test_iter_child_attachments(child_sources_test_project_builder):
+     assert builder.pad.get("attachment.txt") in prog.iter_child_sources()
+ 
+ 
++@pytest.mark.parametrize(
++    "parent_path, child_name",
++    [
++        ("/extra", "container"),  # a hidden page
++        ("/extra/container", "a"),  # a page whose parent is hidden
++        ("/extra/container", "hello.txt"),  # an attachment whose parent is hidden
++    ],
++)
++def test_iter_children_of_hidden_pages(builder, pad, parent_path, child_name):
++    # Test that child sources are built even if they're parent is hidden
++    parent = pad.get(parent_path)
++    child = pad.get(f"{parent_path}/{child_name}")
++    # sanity checks
++    assert parent is not None and child is not None
++    assert parent.is_hidden or child.is_hidden
++
++    prog, _ = builder.build(parent)
++    assert child in prog.iter_child_sources()
++
++
+ def test_record_is_file(pad, builder):
+     record = pad.get("/extra/file.ext")
+ 
+@@ -300,3 +322,23 @@ def test_asseturl_dependency_tracking_integration(
+     updated_asset_url = output.read_text(encoding="utf-8").rstrip()
+     assert updated_asset_url != asset_url
+     assert len(build_state.updated_artifacts) == 1
++
++
++def test_prune_remove_artifacts_of_hidden_pages(scratch_project_data, scratch_builder):
++    pad = scratch_builder.pad
++    # Build root page
++    prog, _ = scratch_builder.build(pad.root)
++    (artifact,) = prog.artifacts
++    assert Path(artifact.dst_filename).is_file()
++
++    # Do a prune.  Output artifact should survive
++    pad.cache.flush()
++    scratch_builder.prune()
++    assert Path(artifact.dst_filename).is_file()
++
++    # Mark page as hidden, prune should then clean the artifact
++    contents_lr = scratch_project_data.joinpath("content/contents.lr")
++    contents_lr.write_text(contents_lr.read_text() + "\n---\n_hidden: yes\n")
++    pad.cache.flush()
++    scratch_builder.prune()
++    assert not Path(artifact.dst_filename).is_file()
+diff --git a/tests/test_db.py b/tests/test_db.py
+index 500a3c5..b6c434d 100644
+--- a/tests/test_db.py
++++ b/tests/test_db.py
+@@ -78,6 +78,28 @@ def test_url_matching_with_customized_slug_in_alt(pad):
+     assert get_alts(en) == ["en", "de"]
+ 
+ 
++@pytest.mark.parametrize(
++    "path",
++    [
++        "/",
++        "/extra/container/a",  # child if hidden page explicit marked as non-hidden
++        "/extra/container/hello.txt",  # attachment of hidden page
++    ],
++)
++def test_resolve_url(pad, path):
++    assert pad.resolve_url_path(path) is not None
++
++
++def test_resolve_url_hidden_page(pad):
++    assert pad.resolve_url_path("/extra/container") is None
++    assert pad.resolve_url_path("/extra/container", include_invisible=True) is not None
++
++
++def test_resolve_url_asset(pad):
++    assert pad.resolve_url_path("/static/demo.css") is not None
++    assert pad.resolve_url_path("/static/demo.css", include_assets=False) is None
++
++
+ def test_basic_alts(pad):
+     with Context(pad=pad):
+         assert get_alts() == ["en", "de"]

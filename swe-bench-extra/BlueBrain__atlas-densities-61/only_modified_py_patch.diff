@@ -1,0 +1,258 @@
+diff --git a/atlas_densities/app/cell_densities.py b/atlas_densities/app/cell_densities.py
+index 019145e..f60a87b 100644
+--- a/atlas_densities/app/cell_densities.py
++++ b/atlas_densities/app/cell_densities.py
+@@ -621,6 +621,12 @@ def compile_measurements(
+ 
+ @app.command()
+ @common_atlas_options
++@click.option(
++    "--region-name",
++    type=str,
++    default="root",
++    help="Name of the root region in the hierarchy",
++)
+ @click.option(
+     "--cell-density-path",
+     type=EXISTING_FILE_PATH,
+@@ -654,6 +660,7 @@ def compile_measurements(
+ def measurements_to_average_densities(
+     annotation_path,
+     hierarchy_path,
++    region_name,
+     cell_density_path,
+     neuron_density_path,
+     measurements_path,
+@@ -666,6 +673,10 @@ def measurements_to_average_densities(
+     `neuron_density_path`) are used to compute average cell densities in every AIBS region where
+     sufficient information is available.
+ 
++    Measurements from regions which are not in the provided brain region hierarchy or not in the
++    provided annotation volume will be ignored. A warning with all ignored lines from the
++    measurements file will be displayed.
++
+     The different cell types (e.g., PV+, SST+, VIP+ or overall inhibitory neurons) and
+     brain regions under consideration are prescribed by the input measurements.
+ 
+@@ -709,6 +720,7 @@ def measurements_to_average_densities(
+     region_map = RegionMap.load_json(hierarchy_path)
+     L.info("Loading measurements ...")
+     measurements_df = pd.read_csv(measurements_path)
++
+     L.info("Measurement to average density: started")
+     average_cell_densities_df = measurement_to_average_density(
+         region_map,
+@@ -718,6 +730,7 @@ def measurements_to_average_densities(
+         overall_cell_density.raw,
+         neuron_density.raw,
+         measurements_df,
++        region_name,
+     )
+ 
+     remove_non_density_measurements(average_cell_densities_df)
+@@ -735,7 +748,7 @@ def measurements_to_average_densities(
+     "--region-name",
+     type=str,
+     default="root",
+-    help="Name of the region in the hierarchy",
++    help="Name of the root region in the hierarchy",
+ )
+ @click.option(
+     "--neuron-density-path",
+@@ -822,6 +835,10 @@ def fit_average_densities(
+     `neuron_density_path` is used to compute the average density of inhibitory neurons (a.k.a
+     gad67+) in every homogenous region of type "inhibitory".
+ 
++    Regions from the literature values and homogenous regions which are not in the provided brain
++    region hierarchy or not in the provided annotation volume will be ignored. A warning with all
++    ignored lines from the measurements file will be displayed.
++
+     Our linear fitting of density values relies on the assumption that the average cell density
+     (number of cells per mm^3) of a cell type T in a brain region R depends linearly on the
+     average intensity of a gene marker of T. The conversion factor is a constant which depends only
+@@ -932,7 +949,7 @@ def fit_average_densities(
+     "--region-name",
+     type=str,
+     default="root",
+-    help="Name of the region in the hierarchy",
++    help="Name of the root region in the hierarchy",
+ )
+ @click.option(
+     "--neuron-density-path",
+diff --git a/atlas_densities/densities/fitting.py b/atlas_densities/densities/fitting.py
+index 1fa8dc6..14428ad 100644
+--- a/atlas_densities/densities/fitting.py
++++ b/atlas_densities/densities/fitting.py
+@@ -29,6 +29,7 @@ from scipy.optimize import curve_fit
+ from tqdm import tqdm
+ 
+ from atlas_densities.densities import utils
++from atlas_densities.densities.measurement_to_density import remove_unknown_regions
+ from atlas_densities.exceptions import AtlasDensitiesError, AtlasDensitiesWarning
+ 
+ if TYPE_CHECKING:  # pragma: no cover
+@@ -625,6 +626,9 @@ def linear_fitting(  # pylint: disable=too-many-arguments
+     _check_homogenous_regions_sanity(homogenous_regions)
+ 
+     hierarchy_info = utils.get_hierarchy_info(region_map, root=region_name)
++    remove_unknown_regions(average_densities, region_map, annotation, hierarchy_info)
++    remove_unknown_regions(homogenous_regions, region_map, annotation, hierarchy_info)
++
+     L.info("Creating a data frame from known densities ...")
+     densities = create_dataframe_from_known_densities(
+         hierarchy_info["brain_region"].to_list(), average_densities
+diff --git a/atlas_densities/densities/measurement_to_density.py b/atlas_densities/densities/measurement_to_density.py
+index 49b8777..65170e4 100644
+--- a/atlas_densities/densities/measurement_to_density.py
++++ b/atlas_densities/densities/measurement_to_density.py
+@@ -11,6 +11,7 @@ more than 40 scientific articles.
+ 
+ Densities are expressed in number of cells per mm^3.
+ """
++import warnings
+ from typing import Set, Tuple, Union
+ 
+ import numpy as np
+@@ -20,6 +21,7 @@ from tqdm import tqdm
+ from voxcell import RegionMap  # type: ignore
+ 
+ from atlas_densities.densities.utils import compute_region_volumes, get_hierarchy_info
++from atlas_densities.exceptions import AtlasDensitiesWarning
+ 
+ 
+ def get_parent_region(region_name: str, region_map: RegionMap) -> Union[str, None]:
+@@ -255,7 +257,59 @@ def cell_count_per_slice_to_density(
+     measurements[mask_50um] = cell_counts_per_slice
+ 
+ 
+-def measurement_to_average_density(
++def remove_unknown_regions(
++    measurements: "pd.DataFrame",
++    region_map: RegionMap,
++    annotation: AnnotationT,
++    hierarchy_info: "pd.DataFrame",
++):
++    """
++    Drop lines from the measurements dataframe which brain regions are not in the AIBS brain region
++    hierarchy or not in the annotation volume.
++    The data frame `measurements` is modified in place.
++
++    Args:
++        measurements: dataframe whose columns are described in
++            :func:`atlas_densities.app.densities.compile_measurements`.
++        region_map: RegionMap object to navigate the brain regions hierarchy.
++        annotation: int array of shape (W, H, D) holding the annotation of the whole AIBS
++            mouse brain. (The integers W, H and D are the dimensions of the array).
++        hierarchy_info: data frame returned by
++            :func:`atlas_densities.densities.utils.get_hierarchy_info`.
++    """
++    pd.set_option("display.max_colwidth", None)
++    indices_ids = measurements.index[
++        ~measurements["brain_region"].isin(hierarchy_info["brain_region"])
++    ]
++    if len(indices_ids) > 0:
++        warnings.warn(
++            "The following lines in the measurements dataframe have no equivalent in the "
++            "brain region hierarchy: \n"
++            f"{measurements.loc[indices_ids, 'brain_region'].to_string()}",
++            AtlasDensitiesWarning,
++        )
++        measurements.drop(indices_ids, inplace=True)
++
++    u_regions = np.unique(annotation)
++    u_regions = np.delete(u_regions, 0)  # don't take 0, i.e: outside of the brain
++    u_regions = [
++        region_map.get(u_region, "name", with_ascendants=True)
++        for u_region in u_regions
++        if region_map.find(u_region, "id")
++    ]
++    u_regions = np.unique([elem for row in u_regions for elem in row])  # flatten
++
++    indices_ann = measurements.index[~measurements["brain_region"].isin(u_regions)]
++    if len(indices_ann) > 0:
++        warnings.warn(
++            "The following lines in the measurements dataframe have no equivalent in the "
++            f"annotation volume: \n{measurements.loc[indices_ann, 'brain_region'].to_string()}",
++            AtlasDensitiesWarning,
++        )
++        measurements.drop(indices_ann, inplace=True)
++
++
++def measurement_to_average_density(  # pylint: disable=too-many-arguments
+     region_map: RegionMap,
+     annotation: AnnotationT,
+     voxel_dimensions: Tuple[float, float, float],
+@@ -263,6 +317,7 @@ def measurement_to_average_density(
+     cell_density: FloatArray,
+     neuron_density: FloatArray,
+     measurements: "pd.DataFrame",
++    root_region: str = "Basic cell groups and regions",
+ ) -> "pd.DataFrame":
+     """
+     Compute average cell densities in AIBS brain regions based on experimental `measurements`.
+@@ -274,9 +329,6 @@ def measurement_to_average_density(
+     (or if several cell density computations are possible from measurements of different
+     articles), the output cell density of the region is the average of the possible cell densities.
+ 
+-    The region names in `measurements` which are not compliant with the AIBS nomenclature (1.json)
+-    are ignored.
+-
+     Args:
+         region_map: RegionMap object to navigate the brain regions hierarchy.
+         annotation: int array of shape (W, H, D) holding the annotation of the whole AIBS
+@@ -291,6 +343,7 @@ def measurement_to_average_density(
+             in that voxel expressed in number of neurons per mm^3.
+         measurements: dataframe whose columns are described in
+             :func:`atlas_densities.app.densities.compile_measurements`.
++        root_region: name of the root region in the brain region hierarchy.
+ 
+     Returns:
+         dataframe of the same format as `measurements` but where all measurements of type
+@@ -298,10 +351,8 @@ def measurement_to_average_density(
+         type "cell density". Densities are expressed in number of cells per mm^3.
+     """
+ 
+-    # Filter out non-AIBS compliant region names
+-    hierarchy_info = get_hierarchy_info(region_map)
+-    indices = measurements.index[~measurements["brain_region"].isin(hierarchy_info["brain_region"])]
+-    measurements = measurements.drop(indices)
++    hierarchy_info = get_hierarchy_info(region_map, root_region)
++    remove_unknown_regions(measurements, region_map, annotation, hierarchy_info)
+ 
+     # Replace NaN standard deviations by measurement values
+     nan_mask = measurements["standard_deviation"].isna()
+diff --git a/atlas_densities/version.py b/atlas_densities/version.py
+index 907cbe3..90cc3fc 100644
+--- a/atlas_densities/version.py
++++ b/atlas_densities/version.py
+@@ -1,4 +1,4 @@
+ """version"""
+-from pkg_resources import get_distribution  # type: ignore
++import importlib.metadata
+ 
+-VERSION = get_distribution("atlas_densities").version
++VERSION = importlib.metadata.version("atlas_densities")
+diff --git a/doc/source/conf.py b/doc/source/conf.py
+index 885f797..4014bef 100644
+--- a/doc/source/conf.py
++++ b/doc/source/conf.py
+@@ -11,8 +11,7 @@
+ import os
+ import sys
+ 
+-from pkg_resources import get_distribution
+-
++import importlib.metadata
+ 
+ # If extensions (or modules to document with autodoc) are in another directory,
+ # add these directories to sys.path here. If the directory is relative to the
+@@ -52,7 +51,7 @@ project = 'atlas-densities'
+ # built documents.
+ #
+ # The short X.Y version.
+-version = get_distribution(project).version
++version = importlib.metadata.version(project)
+ # The full version, including alpha/beta/rc tags.
+ release = version
+ 
+

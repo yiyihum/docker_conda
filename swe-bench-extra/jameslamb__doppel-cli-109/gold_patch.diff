@@ -1,0 +1,198 @@
+diff --git a/README.md b/README.md
+index fc07162..a9f4968 100644
+--- a/README.md
++++ b/README.md
+@@ -73,7 +73,7 @@ Cool! Let's do some testing! `doppel-test` can be used to compare multiple packa
+ doppel-test \
+     --files $(pwd)/test_data/python_${PACKAGE}.json,$(pwd)/test_data/r_${PACKAGE}.json \
+     | tee out.log \
+-    cat
++    | cat
+ ```
+ 
+ This will yield something like this:
+@@ -84,7 +84,7 @@ Function Count
+ +---------------------+----------------+
+ |   argparse [python] |   argparse [r] |
+ +=====================+================+
+-|                   1 |              1 |
++|                   0 |              1 |
+ +---------------------+----------------+
+ 
+ 
+@@ -93,11 +93,13 @@ Function Names
+ +-----------------+---------------------+----------------+
+ | function_name   | argparse [python]   | argparse [r]   |
+ +=================+=====================+================+
+-| ngettext        | yes                 | no             |
+-+-----------------+---------------------+----------------+
+ | ArgumentParser  | no                  | yes            |
+ +-----------------+---------------------+----------------+
+ 
++Function Argument Names
++=======================
++No shared functions.
++
+ Class Count
+ ===========
+ +---------------------+----------------+
+@@ -112,26 +114,34 @@ Class Names
+ +-------------------------------+---------------------+----------------+
+ | class_name                    | argparse [python]   | argparse [r]   |
+ +===============================+=====================+================+
+-| HelpFormatter                 | yes                 | no             |
++| MetavarTypeHelpFormatter      | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+-| Namespace                     | yes                 | no             |
++| ArgumentParser                | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+-| RawDescriptionHelpFormatter   | yes                 | no             |
++| FileType                      | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+-| ArgumentParser                | yes                 | no             |
++| HelpFormatter                 | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+-| MetavarTypeHelpFormatter      | yes                 | no             |
++| RawDescriptionHelpFormatter   | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+ | Action                        | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+ | ArgumentDefaultsHelpFormatter | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+-| FileType                      | yes                 | no             |
++| Namespace                     | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+ | RawTextHelpFormatter          | yes                 | no             |
+ +-------------------------------+---------------------+----------------+
+ 
+ 
++Class Public Methods
++====================
++No shared classes.
++
++Arguments in Class Public Methods
++=================================
++No shared classes.
++
+ Test Failures (12)
+ ===================
+ 1. Function 'ngettext()' is not exported by all packages
+diff --git a/doppel/reporters.py b/doppel/reporters.py
+index 320246d..6b82bed 100644
+--- a/doppel/reporters.py
++++ b/doppel/reporters.py
+@@ -189,7 +189,6 @@ class SimpleReporter:
+         }
+         pkg_names = self.pkg_collection.package_names()
+         shared_functions = self.pkg_collection.shared_functions()
+-        all_functions = self.pkg_collection.all_functions()
+ 
+         # If there are no shared functions, skip
+         if len(shared_functions) == 0:
+@@ -200,7 +199,10 @@ class SimpleReporter:
+         rows = []
+ 
+         for func_name in shared_functions:
+-            args = [func_blocks_by_package[p][func_name]['args'] for p in pkg_names]
++            args = [
++                func_blocks_by_package[p][func_name]['args']
++                for p in pkg_names
++            ]
+ 
+             # check 1: same number of arguments?
+             same_length = reduce(lambda a, b: len(a) == len(b), args)
+@@ -238,7 +240,7 @@ class SimpleReporter:
+         # Report output
+         stdout.write('\n{} of the {} functions shared across all packages have identical signatures\n\n'.format(
+             len([r for r in filter(lambda x: x[1] == 'yes', rows)]),
+-            len(all_functions)
++            len(shared_functions)
+         ))
+ 
+         out = _OutputTable(headers=headers, rows=rows)
+@@ -376,23 +378,73 @@ class SimpleReporter:
+         stdout.write("\nArguments in Class Public Methods\n")
+         stdout.write("=================================\n")
+ 
++        shared_classes = self.pkg_collection.shared_classes()
++        if len(shared_classes) == 0:
++            stdout.write('No shared classes.\n')
++            return
++
++        # Initialize the table
++        headers = ['class.method', 'identical api?']
++        rows = []
++
+         shared_methods_by_class = self.pkg_collection.shared_methods_by_class()
+         for class_name, methods in shared_methods_by_class.items():
+             for method_name in methods:
+-                all_args = set(self.pkgs[0].public_method_args(class_name, method_name))
+-                shared_args = set(self.pkgs[0].public_method_args(class_name, method_name))
+-                for pkg in self.pkgs[1:]:
+-                    args = pkg.public_method_args(class_name, method_name)
+-                    all_args = all_args.union(args)
+-                    shared_args = shared_args.intersection(args)
+-
+-                # report errors
+-                non_shared_args = all_args.difference(shared_args)
+-                for arg in non_shared_args:
+-                    error_txt = "Not all implementations of '{}.{}()' have keyword argument '{}'."
++
++                display_name = "{}.{}()".format(
++                    class_name,
++                    method_name
++                )
++
++                # Generate a list of lists of args
++                args = [
++                    pkg.public_method_args(class_name, method_name)
++                    for pkg in self.pkgs
++                ]
++
++                # check 1: same number of arguments?
++                same_length = reduce(lambda a, b: len(a) == len(b), args)
++                if not same_length:
++                    error_txt = "Public method '{}()' on class '{}' exists in all packages but with differing number of arguments ({})."
+                     error_txt = error_txt.format(
++                        method_name,
+                         class_name,
++                        ",".join([str(len(a)) for a in args])
++                    )
++                    self.errors.append(DoppelTestError(error_txt))
++                    rows.append([display_name, 'no'])
++                    continue
++
++                # check 2: same set of arguments
++                same_args = reduce(lambda a, b: sorted(a) == sorted(b), args)
++                if not same_args:
++                    error_txt = "Public method '{}()' on class '{}' exists in all packages but some arguments are not shared in all implementations."
++                    error_txt = error_txt.format(
++                        method_name,
++                        class_name
++                    )
++                    self.errors.append(DoppelTestError(error_txt))
++                    rows.append([display_name, 'no'])
++                    continue
++
++                # check 3: same set or arguments and same order
++                same_order = reduce(lambda a, b: a == b, args)
++                if not same_order:
++                    error_txt = "Public method '{}()' on class '{}' exists in all packages but with differing order of keyword arguments."
++                    error_txt = error_txt.format(
+                         method_name,
+-                        arg
++                        class_name
+                     )
+                     self.errors.append(DoppelTestError(error_txt))
++                    rows.append([display_name, 'no'])
++                    continue
++
++                # if you get here, we're gucci
++                rows.append([display_name, 'yes'])
++
++        # Report output
++        out = _OutputTable(headers=headers, rows=rows)
++        out.write()
++
++        # Print output
++        stdout.write("\n")

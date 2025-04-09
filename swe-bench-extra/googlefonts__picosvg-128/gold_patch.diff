@@ -1,0 +1,460 @@
+diff --git a/src/picosvg/svg.py b/src/picosvg/svg.py
+index ffd6e95..52a5bb1 100644
+--- a/src/picosvg/svg.py
++++ b/src/picosvg/svg.py
+@@ -19,11 +19,19 @@ import itertools
+ from lxml import etree  # pytype: disable=import-error
+ import re
+ from typing import List, Optional, Tuple
+-from picosvg.svg_meta import ntos, svgns, xlinkns, parse_css_declarations
++from picosvg.svg_meta import (
++    number_or_percentage,
++    ntos,
++    strip_ns,
++    svgns,
++    xlinkns,
++    parse_css_declarations,
++)
+ from picosvg.svg_types import *
++from picosvg.svg_transform import Affine2D
+ import numbers
+ 
+-_ELEMENT_CLASSES = {
++_SHAPE_CLASSES = {
+     "circle": SVGCircle,
+     "ellipse": SVGEllipse,
+     "line": SVGLine,
+@@ -32,8 +40,17 @@ _ELEMENT_CLASSES = {
+     "polyline": SVGPolyline,
+     "rect": SVGRect,
+ }
+-_CLASS_ELEMENTS = {v: f"{{{svgns()}}}{k}" for k, v in _ELEMENT_CLASSES.items()}
+-_ELEMENT_CLASSES.update({f"{{{svgns()}}}{k}": v for k, v in _ELEMENT_CLASSES.items()})
++_CLASS_ELEMENTS = {v: f"{{{svgns()}}}{k}" for k, v in _SHAPE_CLASSES.items()}
++_SHAPE_CLASSES.update({f"{{{svgns()}}}{k}": v for k, v in _SHAPE_CLASSES.items()})
++
++_GRADIENT_CLASSES = {
++    "linearGradient": SVGLinearGradient,
++    "radialGradient": SVGRadialGradient,
++}
++_GRADIENT_COORDS = {
++    "linearGradient": (("x1", "y1"), ("x2", "y2")),
++    "radialGradient": (("cx", "cy"), ("fx", "fy")),
++}
+ 
+ _XLINK_TEMP = "xlink_"
+ 
+@@ -46,6 +63,10 @@ _MAX_PCT_ERROR = 0.1
+ _DEFAULT_DEFAULT_TOLERENCE = 0.1
+ 
+ 
++# Rounding for rewritten gradient matrices
++_GRADIENT_TRANSFORM_NDIGITS = 6
++
++
+ def _xlink_href_attr_name() -> str:
+     return f"{{{xlinkns()}}}href"
+ 
+@@ -104,9 +125,10 @@ def _field_name(attr_name):
+ 
+ 
+ def from_element(el):
+-    if el.tag not in _ELEMENT_CLASSES:
++    if el.tag not in _SHAPE_CLASSES:
+         raise ValueError(f"Bad tag <{el.tag}>")
+-    data_type = _ELEMENT_CLASSES[el.tag]
++    data_type = _SHAPE_CLASSES[el.tag]
++    parse_fn = getattr(data_type, "from_element", None)
+     args = {
+         f.name: f.type(el.attrib[_attr_name(f.name)])
+         for f in dataclasses.fields(data_type)
+@@ -148,8 +170,9 @@ class SVG:
+         if self.elements:
+             return self.elements
+         elements = []
++        view_box = self.view_box()
+         for el in self.svg_root.iter("*"):
+-            if el.tag not in _ELEMENT_CLASSES:
++            if el.tag not in _SHAPE_CLASSES:
+                 continue
+             elements.append((el, (from_element(el),)))
+         self.elements = elements
+@@ -679,17 +702,89 @@ class SVG:
+ 
+         return self
+ 
++    def _select_gradients(self):
++        return self.xpath(" | ".join(f"//svg:{tag}" for tag in _GRADIENT_CLASSES))
++
++    def _collect_gradients(self, inplace=False):
++        if not inplace:
++            svg = SVG(copy.deepcopy(self.svg_root))
++            svg._collect_gradients(inplace=False)
++            return svg
++
++        # Collect gradients; remove other defs
++        defs = etree.Element(f"{{{svgns()}}}defs", nsmap=self.svg_root.nsmap)
++        for gradient in self._select_gradients():
++            gradient.getparent().remove(gradient)
++            defs.append(gradient)
++
++        for def_el in [e for e in self.xpath("//svg:defs")]:
++            def_el.getparent().remove(def_el)
++
++        self.svg_root.insert(0, defs)
++
++    def _apply_gradient_translation(self, inplace=False):
++        if not inplace:
++            svg = SVG(copy.deepcopy(self.svg_root))
++            svg._apply_gradient_translation(inplace=True)
++            return svg
++
++        for el in self._select_gradients():
++            gradient = _GRADIENT_CLASSES[strip_ns(el.tag)].from_element(
++                el, self.view_box()
++            )
++            affine = gradient.gradientTransform
++            a, b, c, d, dx, dy = affine
++            if (dx, dy) == (0, 0):
++                continue
++            affine_prime = affine._replace(e=0, f=0)
++
++            for x_attr, y_attr in _GRADIENT_COORDS[strip_ns(el.tag)]:
++                # if at default just ignore
++                if x_attr not in el.attrib and y_attr not in el.attrib:
++                    continue
++                x = getattr(gradient, x_attr)
++                y = getattr(gradient, y_attr)
++
++                # We need x`, y` such that matrix a b c d 0 0 yields same
++                # result as x,y with a b c d e f
++                # That is:
++                # 1)  ax` + cy` + 0 = ax + cy + e
++                # 2)  bx` + dy` + 0 = bx + dy + f
++                #                   ^ rhs is a known scalar; we'll call r1, r2
++                # multiply 1) by b/a so when subtracted from 2) we eliminate x`
++                # 1)  bx` + (b/a)cy` = (b/a) * r1
++                # 2) - 1)  bx` - bx` + dy` - (b/a)cy` = r2 - (b/a) * r1
++                #         y` = (r2 - (b/a) * r1) / (d - (b/a)c)
++                r1, r2 = affine.map_point((x, y))
++                assert r1 == a * x + c * y + dx
++                assert r2 == b * x + d * y + dy
++                y_prime = (r2 - r1 * b / a) / (d - b * c / a)
++
++                # Sub y` into 1)
++                # 1) x` = (r1 - cy`) / a
++                x_prime = (r1 - c * y_prime) / a
++
++                # sanity check: a`(x`, y`) should be a(x, y)
++                p = affine.map_point((x, y))
++                p_prime = affine_prime.map_point((x_prime, y_prime))
++                assert p.almost_equals(p_prime)
++
++                el.attrib[x_attr] = ntos(round(x_prime, _GRADIENT_TRANSFORM_NDIGITS))
++                el.attrib[y_attr] = ntos(round(y_prime, _GRADIENT_TRANSFORM_NDIGITS))
++
++            if affine_prime != Affine2D.identity():
++                el.attrib["gradientTransform"] = (
++                    "matrix(" + " ".join(ntos(v) for v in affine_prime) + ")"
++                )
++            else:
++                del el.attrib["gradientTransform"]
++
+     def checkpicosvg(self):
+         """Check for nano violations, return xpaths to bad elements.
+ 
+         If result sequence empty then this is a valid picosvg.
+         """
+ 
+-        def _strip_ns(tagname):
+-            if "}" in tagname:
+-                return tagname[tagname.index("}") + 1 :]
+-            return tagname
+-
+         self._update_etree()
+ 
+         errors = []
+@@ -705,7 +800,7 @@ class SVG:
+         frontier = [(0, self.svg_root, "")]
+         while frontier:
+             el_idx, el, parent_path = frontier.pop(0)
+-            el_tag = _strip_ns(el.tag)
++            el_tag = strip_ns(el.tag)
+             el_path = f"{parent_path}/{el_tag}[{el_idx}]"
+ 
+             if not any((re.match(pat, el_path) for pat in path_whitelist)):
+@@ -742,16 +837,8 @@ class SVG:
+         self.absolute(inplace=True)
+         self.round_floats(ndigits, inplace=True)
+ 
+-        # Collect gradients; remove other defs
+-        defs = etree.Element(f"{{{svgns()}}}defs", nsmap=self.svg_root.nsmap)
+-        for gradient in self.xpath("//svg:linearGradient | //svg:radialGradient"):
+-            gradient.getparent().remove(gradient)
+-            defs.append(gradient)
+-
+-        for def_el in [e for e in self.xpath("//svg:defs")]:
+-            def_el.getparent().remove(def_el)
+-
+-        self.svg_root.insert(0, defs)
++        self._apply_gradient_translation(inplace=True)
++        self._collect_gradients(inplace=True)
+ 
+         nano_violations = self.checkpicosvg()
+         if nano_violations:
+diff --git a/src/picosvg/svg_meta.py b/src/picosvg/svg_meta.py
+index 253d333..fea4c73 100644
+--- a/src/picosvg/svg_meta.py
++++ b/src/picosvg/svg_meta.py
+@@ -36,6 +36,12 @@ def xlinkns():
+     return "http://www.w3.org/1999/xlink"
+ 
+ 
++def strip_ns(tagname):
++    if "}" in tagname:
++        return tagname[tagname.index("}") + 1 :]
++    return tagname
++
++
+ # https://www.w3.org/TR/SVG11/paths.html#PathData
+ _CMD_ARGS = {
+     "m": 2,
+@@ -100,6 +106,10 @@ def ntos(n: float) -> str:
+     return str(int(n)) if isinstance(n, float) and n.is_integer() else str(n)
+ 
+ 
++def number_or_percentage(s: str, scale=1) -> float:
++    return float(s[:-1]) / 100 * scale if s.endswith("%") else float(s)
++
++
+ def path_segment(cmd, *args):
+     # put commas between coords, spaces otherwise, author readability pref
+     args_per_cmd = check_cmd(cmd, args)
+diff --git a/src/picosvg/svg_types.py b/src/picosvg/svg_types.py
+index b8ebd5e..3565354 100644
+--- a/src/picosvg/svg_types.py
++++ b/src/picosvg/svg_types.py
+@@ -15,7 +15,16 @@
+ import copy
+ import dataclasses
+ from picosvg.geometric_types import Point, Rect
+-from picosvg import svg_meta
++from picosvg.svg_meta import (
++    check_cmd,
++    cmd_coords,
++    number_or_percentage,
++    parse_css_declarations,
++    path_segment,
++    strip_ns,
++    SVGCommand,
++    SVGCommandSeq,
++)
+ from picosvg import svg_pathops
+ from picosvg.arc_to_cubic import arc_to_cubic
+ from picosvg.svg_path_iter import parse_svg_path
+@@ -45,7 +54,7 @@ def _explicit_lines_callback(subpath_start, curr_pos, cmd, args, *_):
+ 
+ 
+ def _relative_to_absolute(curr_pos, cmd, args):
+-    x_coord_idxs, y_coord_idxs = svg_meta.cmd_coords(cmd)
++    x_coord_idxs, y_coord_idxs = cmd_coords(cmd)
+     if cmd.islower():
+         cmd = cmd.upper()
+         args = list(args)  # we'd like to mutate 'em
+@@ -59,7 +68,7 @@ def _relative_to_absolute(curr_pos, cmd, args):
+ 
+ def _next_pos(curr_pos, cmd, cmd_args):
+     # update current position
+-    x_coord_idxs, y_coord_idxs = svg_meta.cmd_coords(cmd)
++    x_coord_idxs, y_coord_idxs = cmd_coords(cmd)
+     new_x, new_y = curr_pos
+     if cmd.isupper():
+         if x_coord_idxs:
+@@ -79,7 +88,7 @@ def _move_endpoint(curr_pos, cmd, cmd_args, new_endpoint):
+     # we need to be able to alter both axes
+     ((cmd, cmd_args),) = _explicit_lines_callback(None, curr_pos, cmd, cmd_args)
+ 
+-    x_coord_idxs, y_coord_idxs = svg_meta.cmd_coords(cmd)
++    x_coord_idxs, y_coord_idxs = cmd_coords(cmd)
+     cmd_args = list(cmd_args)  # we'd like to mutate
+     new_x, new_y = new_endpoint
+     if cmd.islower():
+@@ -179,7 +188,7 @@ class SVGShape:
+     def as_path(self) -> "SVGPath":
+         raise NotImplementedError("You should implement as_path")
+ 
+-    def as_cmd_seq(self) -> svg_meta.SVGCommandSeq:
++    def as_cmd_seq(self) -> SVGCommandSeq:
+         return (
+             self.as_path()
+             .explicit_lines()  # hHvV => lL
+@@ -193,7 +202,7 @@ class SVGShape:
+         # only meaningful for path, which overrides
+         return self
+ 
+-    def stroke_commands(self, tolerance) -> Generator[svg_meta.SVGCommand, None, None]:
++    def stroke_commands(self, tolerance) -> Generator[SVGCommand, None, None]:
+         return svg_pathops.stroke(
+             self.as_cmd_seq(),
+             self.stroke_linecap,
+@@ -217,7 +226,7 @@ class SVGShape:
+                 f.name.replace("_", "-"): f.type for f in dataclasses.fields(self)
+             }
+             raw_attrs = {}
+-            unparsed_style = svg_meta.parse_css_declarations(
++            unparsed_style = parse_css_declarations(
+                 target.style, raw_attrs, property_names=attr_types.keys()
+             )
+             for attr_name, attr_value in raw_attrs.items():
+@@ -245,7 +254,7 @@ class SVGShape:
+ 
+ # https://www.w3.org/TR/SVG11/paths.html#PathElement
+ @dataclasses.dataclass
+-class SVGPath(SVGShape, svg_meta.SVGCommandSeq):
++class SVGPath(SVGShape, SVGCommandSeq):
+     d: str = ""
+ 
+     def __init__(self, **kwargs):
+@@ -258,7 +267,7 @@ class SVGPath(SVGShape, svg_meta.SVGCommandSeq):
+         self.d += path_snippet
+ 
+     def _add_cmd(self, cmd, *args):
+-        self._add(svg_meta.path_segment(cmd, *args))
++        self._add(path_segment(cmd, *args))
+ 
+     def M(self, *args):
+         self._add_cmd("M", *args)
+@@ -267,7 +276,7 @@ class SVGPath(SVGShape, svg_meta.SVGCommandSeq):
+         self._add_cmd("m", *args)
+ 
+     def _arc(self, c, rx, ry, x, y, large_arc):
+-        self._add(svg_meta.path_segment(c, rx, ry, 0, large_arc, 1, x, y))
++        self._add(path_segment(c, rx, ry, 0, large_arc, 1, x, y))
+ 
+     def A(self, rx, ry, x, y, large_arc=0):
+         self._arc("A", rx, ry, x, y, large_arc)
+@@ -332,7 +341,7 @@ class SVGPath(SVGShape, svg_meta.SVGCommandSeq):
+ 
+         # iteration gives us exploded commands
+         for idx, (cmd, args) in enumerate(self):
+-            svg_meta.check_cmd(cmd, args)
++            check_cmd(cmd, args)
+             if idx == 0 and cmd == "m":
+                 cmd = "M"
+ 
+@@ -366,7 +375,7 @@ class SVGPath(SVGShape, svg_meta.SVGCommandSeq):
+             # Shift the absolute parts and call it a day.
+             if cmd.islower():
+                 return ((cmd, args),)
+-            x_coord_idxs, y_coord_idxs = svg_meta.cmd_coords(cmd)
++            x_coord_idxs, y_coord_idxs = cmd_coords(cmd)
+             args = list(args)  # we'd like to mutate 'em
+             for x_coord_idx in x_coord_idxs:
+                 args[x_coord_idx] += dx
+@@ -485,13 +494,11 @@ class SVGPath(SVGShape, svg_meta.SVGCommandSeq):
+         return target
+ 
+     @classmethod
+-    def from_commands(
+-        cls, svg_cmds: Generator[svg_meta.SVGCommand, None, None]
+-    ) -> "SVGPath":
++    def from_commands(cls, svg_cmds: Generator[SVGCommand, None, None]) -> "SVGPath":
+         return cls().update_path(svg_cmds, inplace=True)
+ 
+     def update_path(
+-        self, svg_cmds: Generator[svg_meta.SVGCommand, None, None], inplace=False
++        self, svg_cmds: Generator[SVGCommand, None, None], inplace=False
+     ) -> "SVGPath":
+         target = self
+         if not inplace:
+@@ -637,6 +644,90 @@ class SVGRect(SVGShape):
+         return path
+ 
+ 
++def _get_gradient_units_relative_scale(grad_el, view_box):
++    gradient_units = grad_el.attrib.get("gradientUnits", "objectBoundingBox")
++    if gradient_units == "userSpaceOnUse":
++        # For gradientUnits="userSpaceOnUse", percentages represent values relative to
++        # the current viewport.
++        return view_box
++    elif gradient_units == "objectBoundingBox":
++        # For gradientUnits="objectBoundingBox", percentages represent values relative
++        # to the object bounding box. The latter defines an abstract coordinate system
++        # with origin at (0,0) and a nominal width and height = 1.
++        return Rect(0, 0, 1, 1)
++    else:
++        raise ValueError(
++            f'{strip_ns(grad_el.tag)} gradientUnits="{gradient_units}" not supported'
++        )
++
++
++def _parse_common_gradient_parts(gradient, el, view_box):
++    self = gradient
++    self.gradientUnits = _get_gradient_units_relative_scale(el, view_box)
++    if "gradientTransform" in el.attrib:
++        self.gradientTransform = Affine2D.fromstring(el.attrib["gradientTransform"])
++    if "spreadMethod" in el.attrib:
++        self.spreadMethod = el.attrib["spreadMethod"]
++    return self.gradientUnits.w, self.gradientUnits.h
++
++
++# https://developer.mozilla.org/en-US/docs/Web/SVG/Element/linearGradient
++# Should be parsed with from_element
++@dataclasses.dataclass
++class SVGLinearGradient:
++    x1: float = 0.0
++    x2: float = 0.0
++    y1: float = 0.0
++    y2: float = 0.0
++    gradientUnits: Rect = Rect(0, 0, 1, 1)
++    gradientTransform: Affine2D = Affine2D.identity()
++    spreadMethod: str = "pad"
++
++    @staticmethod
++    def from_element(el, view_box) -> "SVGLinearGradient":
++        self = SVGLinearGradient()
++        width, height = _parse_common_gradient_parts(self, el, view_box)
++
++        self.x1 = number_or_percentage(el.attrib.get("x1", "0%"), width)
++        self.y1 = number_or_percentage(el.attrib.get("y1", "0%"), height)
++        self.x2 = number_or_percentage(el.attrib.get("x2", "100%"), width)
++        self.y2 = number_or_percentage(el.attrib.get("y2", "0%"), height)
++        return self
++
++
++# https://developer.mozilla.org/en-US/docs/Web/SVG/Element/radialGradient
++# Should be parsed with from_element
++@dataclasses.dataclass
++class SVGRadialGradient:
++    cx: float = 0.0
++    cy: float = 0.0
++    r: float = 0.0
++    fr: float = 0.0
++    fx: float = 0.0
++    fy: float = 0.0
++    gradientUnits: Rect = Rect(0, 0, 1, 1)
++    gradientTransform: Affine2D = Affine2D.identity()
++    spreadMethod: str = "pad"
++
++    @staticmethod
++    def from_element(el, view_box) -> "SVGRadialGradient":
++        self = SVGRadialGradient()
++        width, height = _parse_common_gradient_parts(self, el, view_box)
++
++        self.cx = number_or_percentage(el.attrib.get("cx", "50%"), width)
++        self.cy = number_or_percentage(el.attrib.get("cy", "50%"), height)
++        self.r = number_or_percentage(el.attrib.get("r", "50%"), width)
++
++        raw_fx = el.attrib.get("fx")
++        self.fx = number_or_percentage(raw_fx, width) if raw_fx is not None else self.cx
++        raw_fy = el.attrib.get("fy")
++        self.fy = (
++            number_or_percentage(raw_fy, height) if raw_fy is not None else self.cy
++        )
++        self.fr = number_or_percentage(el.attrib.get("fr", "0%"), width)
++        return self
++
++
+ def union(shapes: Iterable[SVGShape]) -> SVGPath:
+     return SVGPath.from_commands(
+         svg_pathops.union(

@@ -1,0 +1,167 @@
+diff --git a/README.rst b/README.rst
+index 9ea1223..771796a 100644
+--- a/README.rst
++++ b/README.rst
+@@ -17,10 +17,11 @@ Table of contents
+ 2. Installation
+ 3. Google Play (`receipt` + `signature`)
+ 4. Google Play (verification)
+-5. App Store (`receipt` + using optional `shared-secret`)
+-6. App Store Response (`validation_result` / `raw_response`) example
+-7. App Store, **asyncio** version (available in the inapppy.asyncio package)
+-8. Development
++5. Google Play (verification with result)
++6. App Store (`receipt` + using optional `shared-secret`)
++7. App Store Response (`validation_result` / `raw_response`) example
++8. App Store, **asyncio** version (available in the inapppy.asyncio package)
++9. Development
+ 
+ 
+ 1. Introduction
+@@ -88,7 +89,42 @@ In-app purchase validation library for `Apple AppStore` and `GooglePlay` (`App S
+         return response
+ 
+ 
+-5. App Store (validates `receipt` using optional `shared-secret` against iTunes service)
++5. Google Play verification (with result)
++=========================================
++Alternative to `.verify` method, instead of raising an error result class will be returned.
++
++.. code:: python
++
++    from inapppy import GooglePlayVerifier, errors
++
++
++    def google_validator(receipt):
++        """
++        Accepts receipt, validates in Google.
++        """
++        purchase_token = receipt['purchaseToken']
++        product_sku = receipt['productId']
++        verifier = GooglePlayVerifier(
++            GOOGLE_BUNDLE_ID,
++            GOOGLE_SERVICE_ACCOUNT_KEY_FILE,
++        )
++        response = {'valid': False, 'transactions': []}
++
++        result = verifier.verify_with_result(
++            purchase_token,
++            product_sku,
++            is_subscription=True
++        )
++
++        # result contains data
++        raw_response = result.raw_response
++        is_canceled = result.is_canceled
++        is_expired = result.is_expired
++
++        return result
++
++
++6. App Store (validates `receipt` using optional `shared-secret` against iTunes service)
+ ========================================================================================
+ .. code:: python
+ 
+@@ -110,7 +146,7 @@ In-app purchase validation library for `Apple AppStore` and `GooglePlay` (`App S
+ 
+ 
+ 
+-6. App Store Response (`validation_result` / `raw_response`) example
++7. App Store Response (`validation_result` / `raw_response`) example
+ ====================================================================
+ .. code:: json
+ 
+@@ -190,7 +226,7 @@ In-app purchase validation library for `Apple AppStore` and `GooglePlay` (`App S
+     }
+ 
+ 
+-7. App Store, asyncio version (available in the inapppy.asyncio package)
++8. App Store, asyncio version (available in the inapppy.asyncio package)
+ ========================================================================
+ .. code:: python
+ 
+@@ -213,7 +249,7 @@ In-app purchase validation library for `Apple AppStore` and `GooglePlay` (`App S
+ 
+ 
+ 
+-8. Development
++9. Development
+ ==============
+ 
+ .. code:: bash
+diff --git a/inapppy/errors.py b/inapppy/errors.py
+index 6436945..bad7e22 100644
+--- a/inapppy/errors.py
++++ b/inapppy/errors.py
+@@ -18,5 +18,4 @@ class InAppPyValidationError(Exception):
+ 
+ 
+ class GoogleError(InAppPyValidationError):
+-    def __init__(self, message: str = None, raw_response: dict = None, *args, **kwargs):
+-        super().__init__(message, raw_response, *args, **kwargs)
++    pass
+diff --git a/inapppy/googleplay.py b/inapppy/googleplay.py
+index 25a849c..eee64a8 100644
+--- a/inapppy/googleplay.py
++++ b/inapppy/googleplay.py
+@@ -72,6 +72,27 @@ class GooglePlayValidator:
+             return False
+ 
+ 
++class GoogleVerificationResult:
++    """Google verification result class."""
++
++    raw_response: dict = {}
++    is_expired: bool = False
++    is_canceled: bool = False
++
++    def __init__(self, raw_response: dict, is_expired: bool, is_canceled: bool):
++        self.raw_response = raw_response
++        self.is_expired = is_expired
++        self.is_canceled = is_canceled
++
++    def __repr__(self):
++        return (
++            f"GoogleVerificationResult("
++            f"raw_response={self.raw_response}, "
++            f"is_expired={self.is_expired}, "
++            f"is_canceled={self.is_canceled})"
++        )
++
++
+ class GooglePlayVerifier:
+     def __init__(self, bundle_id: str, private_key_path: str, http_timeout: int = 15) -> None:
+         """
+@@ -159,3 +180,32 @@ class GooglePlayVerifier:
+                 raise GoogleError("Purchase cancelled", result)
+ 
+         return result
++
++    def verify_with_result(
++        self, purchase_token: str, product_sku: str, is_subscription: bool = False
++    ) -> GoogleVerificationResult:
++        """Verifies by returning verification result instead of raising an error,
++        basically it's and better alternative to verify method."""
++        service = build("androidpublisher", "v3", http=self.http)
++        verification_result = GoogleVerificationResult({}, False, False)
++
++        if is_subscription:
++            result = self.check_purchase_subscription(purchase_token, product_sku, service)
++            verification_result.raw_response = result
++
++            cancel_reason = int(result.get("cancelReason", 0))
++            if cancel_reason != 0:
++                verification_result.is_canceled = True
++
++            ms_timestamp = result.get("expiryTimeMillis", 0)
++            if self._ms_timestamp_expired(ms_timestamp):
++                verification_result.is_expired = True
++        else:
++            result = self.check_purchase_product(purchase_token, product_sku, service)
++            verification_result.raw_response = result
++
++            purchase_state = int(result.get("purchaseState", 1))
++            if purchase_state != 0:
++                verification_result.is_canceled = True
++
++        return verification_result

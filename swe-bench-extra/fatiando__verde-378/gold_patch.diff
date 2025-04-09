@@ -1,0 +1,279 @@
+diff --git a/AUTHORS.md b/AUTHORS.md
+index f0594b3..1dfac30 100644
+--- a/AUTHORS.md
++++ b/AUTHORS.md
+@@ -3,6 +3,7 @@
+ The following people have made contributions to the project (in alphabetical
+ order by last name) and are considered "The Verde Developers":
+ 
++* [Sarah Margrethe Askevold](https://github.com/SAskevold) - University of Liverpool, UK (ORCID: [0000-0002-9434-3594](https://www.orcid.org/0000-0002-9434-3594))
+ * [David Hoese](https://github.com/djhoese) - University of Wisconsin - Madison, USA (ORCID: [0000-0003-1167-7829](https://www.orcid.org/0000-0003-1167-7829))
+ * [Lindsey Heagy](https://github.com/lheagy) - University of California Berkeley, Department of Statistics, USA (ORCID: [0000-0002-1551-5926](https://www.orcid.org/0000-0002-1551-5926))
+ * [Jesse Pisel](https://github.com/jessepisel) - University of Texas at Austin, College of Natural Sciences, USA (ORCID: [0000-0002-7358-0590](https://www.orcid.org/0000-0002-7358-0590))
+diff --git a/doc/api/index.rst b/doc/api/index.rst
+index 9529aba..334d095 100644
+--- a/doc/api/index.rst
++++ b/doc/api/index.rst
+@@ -15,6 +15,7 @@ Interpolators
+ 
+     Spline
+     SplineCV
++    KNeighbors
+     Linear
+     Cubic
+     VectorSpline2D
+diff --git a/doc/gallery_src/kneighbors_gridder.py b/doc/gallery_src/kneighbors_gridder.py
+new file mode 100644
+index 0000000..ea0bf35
+--- /dev/null
++++ b/doc/gallery_src/kneighbors_gridder.py
+@@ -0,0 +1,92 @@
++# Copyright (c) 2017 The Verde Developers.
++# Distributed under the terms of the BSD 3-Clause License.
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# This code is part of the Fatiando a Terra project (https://www.fatiando.org)
++#
++"""
++Gridding with a nearest-neighbors interpolator
++==============================================
++
++Verde offers the :class:`verde.KNeighbors` class for nearest-neighbor gridding.
++The interpolation looks at the data values of the *k* nearest neighbors of a
++interpolated point. If *k* is 1, then the data value of the closest neighbor is
++assigned to the point. If *k* is greater than 1, the average value of the
++closest *k* neighbors is assigned to the point.
++
++The interpolation works on Cartesian data, so if we want to grid geographic
++data (like our Baja California bathymetry) we need to project them into a
++Cartesian system. We'll use `pyproj <https://github.com/jswhit/pyproj>`__ to
++calculate a Mercator projection for the data.
++
++For convenience, Verde still allows us to make geographic grids by passing the
++``projection`` argument to :meth:`verde.KNeighbors.grid` and the like. When
++doing so, the grid will be generated using geographic coordinates which will be
++projected prior to interpolation.
++"""
++import cartopy.crs as ccrs
++import matplotlib.pyplot as plt
++import numpy as np
++import pyproj
++
++import verde as vd
++
++# We'll test this on the Baja California shipborne bathymetry data
++data = vd.datasets.fetch_baja_bathymetry()
++
++# Data decimation using verde.BlockReduce is not necessary here since the
++# averaging operation is already performed by the k nearest-neighbor
++# interpolator.
++
++# Project the data using pyproj so that we can use it as input for the gridder.
++# We'll set the latitude of true scale to the mean latitude of the data.
++projection = pyproj.Proj(proj="merc", lat_ts=data.latitude.mean())
++proj_coordinates = projection(data.longitude, data.latitude)
++
++# Now we can set up a gridder using the 10 nearest neighbors and averaging
++# using using a median instead of a mean (the default). The median is better in
++# this case since our data are expected to have sharp changes at ridges and
++# faults.
++grd = vd.KNeighbors(k=10, reduction=np.median)
++grd.fit(proj_coordinates, data.bathymetry_m)
++
++# Get the grid region in geographic coordinates
++region = vd.get_region((data.longitude, data.latitude))
++print("Data region:", region)
++
++# The 'grid' method can still make a geographic grid if we pass in a projection
++# function that converts lon, lat into the easting, northing coordinates that
++# we used in 'fit'. This can be any function that takes lon, lat and returns x,
++# y. In our case, it'll be the 'projection' variable that we created above.
++# We'll also set the names of the grid dimensions and the name the data
++# variable in our grid (the default would be 'scalars', which isn't very
++# informative).
++grid = grd.grid(
++    region=region,
++    spacing=1 / 60,
++    projection=projection,
++    dims=["latitude", "longitude"],
++    data_names="bathymetry_m",
++)
++print("Generated geographic grid:")
++print(grid)
++
++# Cartopy requires setting the coordinate reference system (CRS) of the
++# original data through the transform argument. Their docs say to use
++# PlateCarree to represent geographic data.
++crs = ccrs.PlateCarree()
++
++plt.figure(figsize=(7, 6))
++# Make a Mercator map of our gridded bathymetry
++ax = plt.axes(projection=ccrs.Mercator())
++# Plot the gridded bathymetry
++pc = grid.bathymetry_m.plot.pcolormesh(
++    ax=ax, transform=crs, vmax=0, zorder=-1, add_colorbar=False
++)
++plt.colorbar(pc).set_label("meters")
++# Plot the locations of the data
++ax.plot(data.longitude, data.latitude, ".k", markersize=0.1, transform=crs)
++# Use an utility function to setup the tick labels and the land feature
++vd.datasets.setup_baja_bathymetry_map(ax)
++ax.set_title("Nearest-neighbor gridding of bathymetry")
++plt.show()
+diff --git a/verde/__init__.py b/verde/__init__.py
+index 1c6204d..eb456d3 100644
+--- a/verde/__init__.py
++++ b/verde/__init__.py
+@@ -30,6 +30,7 @@ from .model_selection import (
+     cross_val_score,
+     train_test_split,
+ )
++from .neighbors import KNeighbors
+ from .projections import project_grid, project_region
+ from .scipygridder import Cubic, Linear, ScipyGridder
+ from .spline import Spline, SplineCV
+diff --git a/verde/neighbors.py b/verde/neighbors.py
+new file mode 100644
+index 0000000..658c4fc
+--- /dev/null
++++ b/verde/neighbors.py
+@@ -0,0 +1,139 @@
++# Copyright (c) 2017 The Verde Developers.
++# Distributed under the terms of the BSD 3-Clause License.
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# This code is part of the Fatiando a Terra project (https://www.fatiando.org)
++#
++"""
++Nearest neighbor interpolation
++"""
++import warnings
++
++import numpy as np
++from sklearn.utils.validation import check_is_fitted
++
++from .base import BaseGridder, check_fit_input, n_1d_arrays
++from .coordinates import get_region
++from .utils import kdtree
++
++
++class KNeighbors(BaseGridder):
++    """
++    Nearest neighbor interpolation.
++
++    This gridder assumes Cartesian coordinates.
++
++    Interpolation based on the values of the *k* nearest neighbors of each
++    interpolated point. The number of neighbors *k* can be controlled and
++    mostly influences the spatial smoothness of the interpolated values.
++
++    The data values of the *k* nearest neighbors are combined into a single
++    value by a reduction function, which defaults to the mean. This can also be
++    configured.
++
++    .. note::
++
++        If installed, package ``pykdtree`` will be used for the nearest
++        neighbors look-up instead of :class:`scipy.spatial.cKDTree` for better
++        performance.
++
++    Parameters
++    ----------
++    k : int
++        The number of neighbors to use for each interpolated point. Default is
++        1.
++    reduction : function
++        Function used to combine the values of the *k* neighbors into a single
++        value. Can be any function that takes a 1D numpy array as input and
++        outputs a single value. Default is :func:`numpy.mean`.
++
++    Attributes
++    ----------
++    tree_ : K-D tree
++        An instance of the K-D tree data structure for the data points that is
++        used to query for nearest neighbors.
++    data_ : 1D array
++        A copy of the input data as a 1D array. Used to look up values for
++        interpolation/prediction.
++    region_ : tuple
++        The boundaries (``[W, E, S, N]``) of the data used to fit the
++        interpolator. Used as the default region for the
++        :meth:`~verde.KNeighbors.grid`` method.
++
++    """
++
++    def __init__(self, k=1, reduction=np.mean):
++        super().__init__()
++        self.k = k
++        self.reduction = reduction
++
++    def fit(self, coordinates, data, weights=None):
++        """
++        Fit the interpolator to the given data.
++
++        The data region is captured and used as default for the
++        :meth:`~verde.KNeighbors.grid` method.
++
++        Parameters
++        ----------
++        coordinates : tuple of arrays
++            Arrays with the coordinates of each data point. Should be in the
++            following order: (easting, northing, vertical, ...). Only easting
++            and northing will be used, all subsequent coordinates will be
++            ignored.
++        data : array
++            The data values that will be interpolated.
++        weights : None or array
++            Data weights are **not supported** by this interpolator and will be
++            ignored. Only present for compatibility with other gridders.
++
++        Returns
++        -------
++        self
++            Returns this gridder instance for chaining operations.
++
++        """
++        if weights is not None:
++            warnings.warn(
++                "{} does not support weights and they will be ignored.".format(
++                    self.__class__.__name__
++                )
++            )
++        coordinates, data, weights = check_fit_input(coordinates, data, weights)
++        self.region_ = get_region(coordinates[:2])
++        self.tree_ = kdtree(coordinates[:2])
++        # Make sure this is an array and not a subclass of array (pandas,
++        # xarray, etc) so that we can index it later during predict.
++        self.data_ = np.asarray(data).ravel().copy()
++        return self
++
++    def predict(self, coordinates):
++        """
++        Interpolate data on the given set of points.
++
++        Requires a fitted gridder (see :meth:`~verde.KNeighbors.fit`).
++
++        Parameters
++        ----------
++        coordinates : tuple of arrays
++            Arrays with the coordinates of each data point. Should be in the
++            following order: (easting, northing, vertical, ...). Only easting
++            and northing will be used, all subsequent coordinates will be
++            ignored.
++
++        Returns
++        -------
++        data : array
++            The data values interpolated on the given points.
++
++        """
++        check_is_fitted(self, ["tree_"])
++        distances, indices = self.tree_.query(
++            np.transpose(n_1d_arrays(coordinates, 2)), k=self.k
++        )
++        if indices.ndim == 1:
++            indices = np.atleast_2d(indices).T
++        neighbor_values = np.reshape(self.data_[indices.ravel()], indices.shape)
++        data = self.reduction(neighbor_values, axis=1)
++        shape = np.broadcast(*coordinates[:2]).shape
++        return data.reshape(shape)

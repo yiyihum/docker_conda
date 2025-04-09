@@ -1,0 +1,184 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2e60480..1c71659 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,13 @@
+ ## CHANGELOG
+ 
++### 4.2.0
++
++* Implement new option `--with-maintainers`
++* Implement new option `--python`
++* Allow version spec in `--ignore-packages` parameters
++* When the `Author` field is `UNKNOWN`, the output is automatically completed from `Author-email`
++* When the `home-page` field is `UNKNOWN`, the output is automatically completed from `Project-URL`
++
+ ### 4.1.0
+ 
+ * Support case-insensitive license name matching around `--fail-on` and `--allow-only` parameters
+diff --git a/README.md b/README.md
+index 7517b50..76855da 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,7 @@ Dump the software license list of Python packages installed with pip.
+     * [Format options](#format-options)
+         * [Option: with\-system](#option-with-system)
+         * [Option: with\-authors](#option-with-authors)
++        * [Option: with\-maintainers](#option-with-maintainers)
+         * [Option: with\-urls](#option-with-urls)
+         * [Option: with\-description](#option-with-description)
+         * [Option: with\-license\-file](#option-with-license-file)
+@@ -429,6 +430,12 @@ When executed with the `--with-authors` option, output with author of the packag
+  pytz    2017.3   MIT      Stuart Bishop
+ ```
+ 
++#### Option: with-maintainers
++
++When executed with the `--with-maintainers` option, output with maintainer of the package.
++
++**Note:** This option is available for users who want information about the maintainer as well as the author. See [#144](https://github.com/raimon49/pip-licenses/issues/144)
++
+ #### Option: with-urls
+ 
+ For packages without Metadata, the license is output as `UNKNOWN`. To get more package information, use the `--with-urls` option.
+diff --git a/piplicenses.py b/piplicenses.py
+index 488c338..90da0b7 100644
+--- a/piplicenses.py
++++ b/piplicenses.py
+@@ -49,13 +49,14 @@ from prettytable import NONE as RULE_NONE
+ from prettytable import PrettyTable
+ 
+ if TYPE_CHECKING:
+-    from typing import Iterator, Optional, Sequence
++    from email.message import Message
++    from typing import Callable, Dict, Iterator, Optional, Sequence
+ 
+ 
+ open = open  # allow monkey patching
+ 
+ __pkgname__ = "pip-licenses"
+-__version__ = "4.1.0"
++__version__ = "4.2.0"
+ __author__ = "raimon"
+ __license__ = "MIT"
+ __summary__ = (
+@@ -73,6 +74,7 @@ FIELD_NAMES = (
+     "NoticeFile",
+     "NoticeText",
+     "Author",
++    "Maintainer",
+     "Description",
+     "URL",
+ )
+@@ -95,11 +97,50 @@ SUMMARY_OUTPUT_FIELDS = (
+     "License",
+ )
+ 
+-METADATA_KEYS = {
+-    "home-page": ["home-page"],
+-    "author": ["author", "author-email"],
+-    "license": ["license"],
+-    "summary": ["summary"],
++
++def extract_homepage(metadata: Message) -> Optional[str]:
++    """Extracts the homepage attribute from the package metadata.
++
++    Not all python packages have defined a home-page attribute.
++    As a fallback, the `Project-URL` metadata can be used.
++    The python core metadata supports multiple (free text) values for
++    the `Project-URL` field that are comma separated.
++
++    Args:
++        metadata: The package metadata to extract the homepage from.
++
++    Returns:
++        The home page if applicable, None otherwise.
++    """
++    homepage = metadata.get("home-page", None)
++    if homepage is not None:
++        return homepage
++
++    candidates: Dict[str, str] = {}
++
++    for entry in metadata.get_all("Project-URL", []):
++        key, value = entry.split(",", 1)
++        candidates[key.strip()] = value.strip()
++
++    for priority_key in ["Homepage", "Source", "Changelog", "Bug Tracker"]:
++        if priority_key in candidates:
++            return candidates[priority_key]
++
++    return None
++
++
++METADATA_KEYS: Dict[str, List[Callable[[Message], Optional[str]]]] = {
++    "home-page": [extract_homepage],
++    "author": [
++        lambda metadata: metadata.get("author"),
++        lambda metadata: metadata.get("author-email"),
++    ],
++    "maintainer": [
++        lambda metadata: metadata.get("maintainer"),
++        lambda metadata: metadata.get("maintainer-email"),
++    ],
++    "license": [lambda metadata: metadata.get("license")],
++    "summary": [lambda metadata: metadata.get("summary")],
+ }
+ 
+ # Mapping of FIELD_NAMES to METADATA_KEYS where they differ by more than case
+@@ -168,10 +209,12 @@ def get_packages(
+             "noticetext": notice_text,
+         }
+         metadata = pkg.metadata
+-        for field_name, field_selectors in METADATA_KEYS.items():
++        for field_name, field_selector_fns in METADATA_KEYS.items():
+             value = None
+-            for selector in field_selectors:
+-                value = metadata.get(selector, None)  # type: ignore[attr-defined] # noqa: E501
++            for field_selector_fn in field_selector_fns:
++                # Type hint of `Distribution.metadata` states `PackageMetadata`
++                # but it's actually of type `email.Message`
++                value = field_selector_fn(metadata)  # type: ignore
+                 if value:
+                     break
+             pkg_info[field_name] = value or LICENSE_UNKNOWN
+@@ -542,6 +585,9 @@ def get_output_fields(args: CustomNamespace) -> list[str]:
+     if args.with_authors:
+         output_fields.append("Author")
+ 
++    if args.with_maintainers:
++        output_fields.append("Maintainer")
++
+     if args.with_urls:
+         output_fields.append("URL")
+ 
+@@ -571,6 +617,8 @@ def get_sortby(args: CustomNamespace) -> str:
+         return "Name"
+     elif args.order == OrderArg.AUTHOR and args.with_authors:
+         return "Author"
++    elif args.order == OrderArg.MAINTAINER and args.with_maintainers:
++        return "Maintainer"
+     elif args.order == OrderArg.URL and args.with_urls:
+         return "URL"
+ 
+@@ -739,6 +787,7 @@ class OrderArg(NoValueEnum):
+     LICENSE = L = auto()
+     NAME = N = auto()
+     AUTHOR = A = auto()
++    MAINTAINER = M = auto()
+     URL = U = auto()
+ 
+ 
+@@ -897,6 +946,12 @@ def create_parser() -> CompatibleArgumentParser:
+         default=False,
+         help="dump with package authors",
+     )
++    format_options.add_argument(
++        "--with-maintainers",
++        action="store_true",
++        default=False,
++        help="dump with package maintainers",
++    )
+     format_options.add_argument(
+         "-u",
+         "--with-urls",

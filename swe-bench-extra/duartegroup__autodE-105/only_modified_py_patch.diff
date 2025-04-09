@@ -1,0 +1,168 @@
+diff --git a/autode/calculation.py b/autode/calculation.py
+index b1a7931..a0accc4 100644
+--- a/autode/calculation.py
++++ b/autode/calculation.py
+@@ -3,6 +3,7 @@ import os
+ import hashlib
+ import base64
+ from typing import Optional, List
++from functools import wraps
+ import autode.wrappers.keywords as kws
+ import autode.exceptions as ex
+ from autode.utils import cached_property
+@@ -23,6 +24,22 @@ def execute_calc(calc):
+     return calc.execute_calculation()
+ 
+ 
++def _requires_set_output_filename(func):
++    """Calculation method requiring the output filename to be set"""
++
++    @wraps(func)
++    def wrapped_function(*args, **kwargs):
++        calc = args[0]
++
++        if calc.output.filename is None:
++            raise ex.CouldNotGetProperty(
++                f'Could not get property from {calc.name}. '
++                f'Has .run() been called?')
++        return func(*args, **kwargs)
++
++    return wrapped_function
++
++
+ class Calculation:
+ 
+     def __init__(self,
+@@ -238,28 +255,29 @@ class Calculation:
+         methods.add(f'{string}.\n')
+         return None
+ 
+-    def get_energy(self) -> Optional[PotentialEnergy]:
++    @_requires_set_output_filename
++    def get_energy(self) -> PotentialEnergy:
+         """
+-        Total electronic potential energy
++        Total electronic potential energy from the final structure in the
++        calculation
+ 
++        -----------------------------------------------------------------------
+         Returns:
+             (autode.values.PotentialEnergy | None):
++
++        Raises:
++            (autode.exceptions.CouldNotGetProperty):
+         """
+         logger.info(f'Getting energy from {self.output.filename}')
+ 
+         if not self.terminated_normally:
+-            logger.error('Calculation did not terminate normally. '
+-                         'Energy = None')
+-            return None
++            logger.error(f'Calculation of {self.molecule} did not terminate '
++                         f'normally')
++            raise ex.CouldNotGetProperty(name='energy')
+ 
+-        try:
+-            return PotentialEnergy(self.method.get_energy(self),
+-                                   method=self.method,
+-                                   keywords=self.input.keywords)
+-
+-        except ex.CouldNotGetProperty:
+-            logger.warning('Could not get energy. Energy = None')
+-            return None
++        return PotentialEnergy(self.method.get_energy(self),
++                               method=self.method,
++                               keywords=self.input.keywords)
+ 
+     def optimisation_converged(self) -> bool:
+         """
+@@ -289,6 +307,7 @@ class Calculation:
+ 
+         return self.method.optimisation_nearly_converged(self)
+ 
++    @_requires_set_output_filename
+     def get_final_atoms(self) -> Atoms:
+         """
+         Get the atoms from the final step of a geometry optimisation
+@@ -317,6 +336,7 @@ class Calculation:
+ 
+         return atoms
+ 
++    @_requires_set_output_filename
+     def get_atomic_charges(self) -> List[float]:
+         """
+         Get the partial atomic charges from a calculation. The method used to
+@@ -338,6 +358,7 @@ class Calculation:
+ 
+         return charges
+ 
++    @_requires_set_output_filename
+     def get_gradients(self) -> Gradient:
+         """
+         Get the gradient (dE/dr) with respect to atomic displacement from a
+@@ -357,6 +378,7 @@ class Calculation:
+ 
+         return gradients
+ 
++    @_requires_set_output_filename
+     def get_hessian(self) -> Hessian:
+         """
+         Get the Hessian matrix (d^2E/dr^2) i.e. the matrix of second
+@@ -628,3 +650,7 @@ class CalculationInput:
+             return self.additional_filenames
+ 
+         return [self.filename] + self.additional_filenames
++
++
++
++
+diff --git a/autode/species/species.py b/autode/species/species.py
+index b8aa2bb..63d009c 100644
+--- a/autode/species/species.py
++++ b/autode/species/species.py
+@@ -1014,9 +1014,16 @@ class Species(AtomCollection):
+ 
+         if calc is not None and calc.output.exists:
+             self.atoms = calc.get_final_atoms()
+-            self.energy = calc.get_energy()
+             self.hessian = calc.get_hessian()
+ 
++            try:
++                self.energy = calc.get_energy()
++
++            except CalculationException:
++                logger.warning(f'Failed to get the potential energy from '
++                               f'{calc.name} but not essential for thermo'
++                               f'chemical calculation')
++
+         elif self.hessian is None or (calc is not None and not calc.output.exists):
+             logger.info('Calculation did not exist or Hessian was None - '
+                         'calculating the Hessian')
+@@ -1074,13 +1081,7 @@ class Species(AtomCollection):
+                          keywords=keywords,
+                          n_cores=Config.n_cores if n_cores is None else n_cores)
+         sp.run()
+-        energy = sp.get_energy()
+-
+-        if energy is None:
+-            raise CalculationException("Failed to calculate a single point "
+-                                       f"energy for {self}")
+-
+-        self.energy = energy
++        self.energy = sp.get_energy()
+         return None
+ 
+     @work_in('conformers')
+diff --git a/autode/transition_states/base.py b/autode/transition_states/base.py
+index 51b943c..4956b08 100644
+--- a/autode/transition_states/base.py
++++ b/autode/transition_states/base.py
+@@ -295,7 +295,7 @@ class TSbase(Species, ABC):
+                                  keywords=method.keywords.low_opt,
+                                  reset_graph=True)
+ 
+-                except ex.AtomsNotFound:
++                except ex.CalculationException:
+                     logger.error(f'Failed to optimise {mol.name} with '
+                                  f'{method}. Assuming no link')
+                     return False

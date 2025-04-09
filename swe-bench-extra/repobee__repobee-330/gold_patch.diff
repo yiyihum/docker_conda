@@ -1,0 +1,246 @@
+diff --git a/requirements.txt b/requirements.txt
+index f1c41ee..684860e 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -4,4 +4,4 @@ daiquiri
+ pluggy>=0.8.0
+ pygithub
+ python-gitlab==1.8.0
+-repobee-plug==0.9.0
++repobee-plug==0.10.0-alpha.1
+diff --git a/setup.py b/setup.py
+index 39587b7..c0760ba 100644
+--- a/setup.py
++++ b/setup.py
+@@ -23,7 +23,7 @@ required = [
+     "daiquiri",
+     "pygithub",
+     "colored",
+-    "repobee-plug==0.9.0",
++    "repobee-plug==0.10.0-alpha.1",
+     "python-gitlab==1.8.0",
+ ]
+ 
+diff --git a/src/_repobee/cli.py b/src/_repobee/cli.py
+index e43b0b5..96d3499 100644
+--- a/src/_repobee/cli.py
++++ b/src/_repobee/cli.py
+@@ -111,6 +111,15 @@ PARSER_NAMES = (
+     CHECK_REVIEW_PROGRESS_PARSER,
+ )
+ 
++HOOK_RESULTS_PARSER = argparse.ArgumentParser(add_help=False)
++HOOK_RESULTS_PARSER.add_argument(
++    "--hook-results-file",
++    help="Path to a file to store results from plugin hooks in. The "
++    "results are stored as JSON, regardless of file extension.",
++    type=str,
++    default=None,
++)
++
+ 
+ # add any diprecated parsers to this dict on the following form:
+ #
+@@ -316,6 +325,7 @@ def dispatch_command(
+             hook_results = command.clone_repos(
+                 args.master_repo_names, args.students, api
+             )
++            LOGGER.info(formatters.format_hook_results_output(hook_results))
+     elif args.subparser == VERIFY_PARSER:
+         with _sys_exit_on_expected_error():
+             plug.manager.hook.get_api_class().verify_settings(
+@@ -327,7 +337,7 @@ def dispatch_command(
+             )
+     elif args.subparser == LIST_ISSUES_PARSER:
+         with _sys_exit_on_expected_error():
+-            command.list_issues(
++            hook_results = command.list_issues(
+                 args.master_repo_names,
+                 args.students,
+                 api,
+@@ -368,24 +378,20 @@ def dispatch_command(
+             "This is a bug, please open an issue.".format(args.subparser)
+         )
+ 
+-    if hook_results:
++    if hook_results and args.hook_results_file:
+         _handle_hook_results(
+             hook_results=hook_results, filepath=args.hook_results_file
+         )
+ 
+ 
+ def _handle_hook_results(hook_results, filepath):
+-    LOGGER.info(formatters.format_hook_results_output(hook_results))
+-    if filepath:
+-        LOGGER.warning(
+-            "Storing hook results to file is a beta feature, the file format "
+-            "is not final"
+-        )
+-        output_file = pathlib.Path(filepath)
+-        util.atomic_write(
+-            plug.result_mapping_to_json(hook_results), output_file
+-        )
+-        LOGGER.info("Hook results stored to {}".format(filepath))
++    LOGGER.warning(
++        "Storing hook results to file is an alpha feature, the file format "
++        "is not final"
++    )
++    output_file = pathlib.Path(filepath)
++    util.atomic_write(plug.result_mapping_to_json(hook_results), output_file)
++    LOGGER.info("Hook results stored to {}".format(filepath))
+ 
+ 
+ def _add_peer_review_parsers(base_parsers, subparsers):
+@@ -532,7 +538,7 @@ def _add_issue_parsers(base_parsers, subparsers):
+         LIST_ISSUES_PARSER,
+         description="List issues in student repos.",
+         help="List issues in student repos.",
+-        parents=base_parsers,
++        parents=[*base_parsers, HOOK_RESULTS_PARSER],
+         formatter_class=_OrderedFormatter,
+     )
+     list_parser.add_argument(
+@@ -782,16 +788,14 @@ def _add_subparsers(parser, show_all_opts, ext_commands):
+         CLONE_PARSER,
+         help="Clone student repos.",
+         description="Clone student repos asynchronously in bulk.",
+-        parents=[base_parser, base_student_parser, repo_name_parser],
++        parents=[
++            base_parser,
++            base_student_parser,
++            repo_name_parser,
++            HOOK_RESULTS_PARSER,
++        ],
+         formatter_class=_OrderedFormatter,
+     )
+-    clone.add_argument(
+-        "--hook-results-file",
+-        help="Path to a file to store results from plugin hooks in. The "
+-        "results are stored as JSON, regardless of file extension.",
+-        type=str,
+-        default=None,
+-    )
+ 
+     plug.manager.hook.clone_parser_hook(clone_parser=clone)
+ 
+diff --git a/src/_repobee/command.py b/src/_repobee/command.py
+index ae5b14c..f6a9b87 100644
+--- a/src/_repobee/command.py
++++ b/src/_repobee/command.py
+@@ -199,11 +199,11 @@ def list_issues(
+     master_repo_names: Iterable[str],
+     teams: Iterable[plug.Team],
+     api: plug.API,
+-    state: str = "open",
++    state: plug.IssueState = plug.IssueState.OPEN,
+     title_regex: str = "",
+     show_body: bool = False,
+     author: Optional[str] = None,
+-) -> None:
++) -> List[plug.HookResult]:
+     """List all issues in the specified repos.
+ 
+     Args:
+@@ -211,7 +211,7 @@ def list_issues(
+         teams: An iterable of student teams.
+         api: An implementation of :py:class:`repobee_plug.API` used to
+             interface with the platform (e.g. GitHub or GitLab) instance.
+-        state: state of the repo (open or closed). Defaults to 'open'.
++        state: state of the repo (open or closed). Defaults to open.
+         title_regex: If specified, only issues with titles matching the regex
+             are displayed. Defaults to the empty string (which matches
+             everything).
+@@ -221,16 +221,67 @@ def list_issues(
+     """
+     repo_names = util.generate_repo_names(teams, master_repo_names)
+     max_repo_name_length = max(map(len, repo_names))
++    issues_per_repo = _get_issue_generator(
++        repo_names=repo_names,
++        state=state,
++        title_regex=title_regex,
++        author=author,
++        api=api,
++    )
+ 
+-    issues_per_repo = api.get_issues(repo_names, state, title_regex)
++    # _log_repo_issues exhausts the issues_per_repo iterator and
++    # returns a list with the same information. It's important to
++    # have issues_per_repo as an iterator as it greatly speeds
++    # up visual feedback to the user when fetching many issues
++    pers_issues_per_repo = _log_repo_issues(
++        issues_per_repo, show_body, max_repo_name_length + 6
++    )
+ 
+-    if author:
+-        issues_per_repo = (
+-            (repo_name, (issue for issue in issues if issue.author == author))
+-            for repo_name, issues in issues_per_repo
++    # for writing to JSON
++    hook_result_mapping = {
++        repo_name: [
++            plug.HookResult(
++                hook="list-issues",
++                status=plug.Status.SUCCESS,
++                msg="Fetched {} issues from {}".format(len(issues), repo_name),
++                data={issue.number: issue.to_dict() for issue in issues},
++            )
++        ]
++        for repo_name, issues in pers_issues_per_repo
++    }
++    # meta hook result
++    hook_result_mapping["list-issues"] = [
++        plug.HookResult(
++            hook="meta",
++            status=plug.Status.SUCCESS,
++            msg="Meta info about the list-issues hook results",
++            data={"state": state.value},
+         )
++    ]
++    return hook_result_mapping
+ 
+-    _log_repo_issues(issues_per_repo, show_body, max_repo_name_length + 6)
++
++def _get_issue_generator(
++    repo_names: List[str],
++    state: plug.IssueState,
++    title_regex: str,
++    author: Optional[str],
++    api: plug.API,
++) -> Generator[
++    Tuple[str, Generator[Iterable[plug.Issue], None, None]], None, None
++]:
++    issues_per_repo = (
++        (
++            repo_name,
++            [
++                issue
++                for issue in issues
++                if not author or issue.author == author
++            ],
++        )
++        for repo_name, issues in api.get_issues(repo_names, state, title_regex)
++    )
++    return issues_per_repo
+ 
+ 
+ def _log_repo_issues(
+@@ -247,8 +298,10 @@ def _log_repo_issues(
+             start of the line.
+     """
+     even = True
++    persistent_issues_per_repo = []
+     for repo_name, issues in issues_per_repo:
+         issues = list(issues)
++        persistent_issues_per_repo.append((repo_name, issues))
+ 
+         if not issues:
+             LOGGER.warning("{}: No matching issues".format(repo_name))
+@@ -275,6 +328,8 @@ def _log_repo_issues(
+                 out += os.linesep * 2 + _limit_line_length(issue.body)
+             LOGGER.info(out)
+ 
++    return persistent_issues_per_repo
++
+ 
+ def _limit_line_length(s: str, max_line_length: int = 100) -> str:
+     """Return the input string with lines no longer than max_line_length.

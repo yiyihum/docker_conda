@@ -1,0 +1,134 @@
+diff --git a/tests/test_imapclient.py b/tests/test_imapclient.py
+index f8f458f..f56ca5b 100644
+--- a/tests/test_imapclient.py
++++ b/tests/test_imapclient.py
+@@ -12,7 +12,9 @@ import logging
+ 
+ import six
+ 
+-from imapclient.exceptions import CapabilityError, IMAPClientError
++from imapclient.exceptions import (
++    CapabilityError, IMAPClientError, ProtocolError
++)
+ from imapclient.imapclient import IMAPlibLoggerAdapter
+ from imapclient.fixed_offset import FixedOffset
+ from imapclient.testable_imapclient import TestableIMAPClient as IMAPClient
+@@ -651,3 +653,14 @@ class TestContextManager(IMAPClientTest):
+         with self.assertRaises(ValueError):
+             with self.client as _:
+                 raise ValueError("Error raised inside the context manager")
++
++
++class TestProtocolError(IMAPClientTest):
++
++    def test_tagged_response_with_parse_error(self):
++        client = self.client
++        client._imap.tagged_commands = {sentinel.tag: None}
++        client._imap._get_response = lambda: b'NOT-A-STAR 99 EXISTS'
++
++        with self.assertRaises(ProtocolError):
++            client._consume_until_tagged_response(sentinel.tag, b'IDLE')
+\ No newline at end of file
+diff --git a/tests/test_response_parser.py b/tests/test_response_parser.py
+index 946cd16..04694fc 100644
+--- a/tests/test_response_parser.py
++++ b/tests/test_response_parser.py
+@@ -16,9 +16,9 @@ from imapclient.response_parser import (
+     parse_response,
+     parse_message_list,
+     parse_fetch_response,
+-    ParseError,
+ )
+ from imapclient.response_types import Envelope, Address
++from imapclient.exceptions import ProtocolError
+ from tests.util import unittest
+ from .util import patch
+ 
+@@ -160,7 +160,7 @@ class TestParseResponse(unittest.TestCase):
+     def _test_parse_error(self, to_parse, expected_msg):
+         if not isinstance(to_parse, list):
+             to_parse = [to_parse]
+-        self.assertRaisesRegex(ParseError, expected_msg,
++        self.assertRaisesRegex(ProtocolError, expected_msg,
+                                parse_response, to_parse)
+ 
+ 
+@@ -200,13 +200,13 @@ class TestParseFetchResponse(unittest.TestCase):
+         self.assertEqual(parse_fetch_response([None]), {})
+ 
+     def test_bad_msgid(self):
+-        self.assertRaises(ParseError, parse_fetch_response, [b'abc ()'])
++        self.assertRaises(ProtocolError, parse_fetch_response, [b'abc ()'])
+ 
+     def test_bad_data(self):
+-        self.assertRaises(ParseError, parse_fetch_response, [b'2 WHAT'])
++        self.assertRaises(ProtocolError, parse_fetch_response, [b'2 WHAT'])
+ 
+     def test_missing_data(self):
+-        self.assertRaises(ParseError, parse_fetch_response, [b'2'])
++        self.assertRaises(ProtocolError, parse_fetch_response, [b'2'])
+ 
+     def test_simple_pairs(self):
+         self.assertEqual(parse_fetch_response([b'23 (ABC 123 StUfF "hello")']),
+@@ -215,8 +215,8 @@ class TestParseFetchResponse(unittest.TestCase):
+                                b'SEQ': 23}})
+ 
+     def test_odd_pairs(self):
+-        self.assertRaises(ParseError, parse_fetch_response, [b'(ONE)'])
+-        self.assertRaises(ParseError, parse_fetch_response, [b'(ONE TWO THREE)'])
++        self.assertRaises(ProtocolError, parse_fetch_response, [b'(ONE)'])
++        self.assertRaises(ProtocolError, parse_fetch_response, [b'(ONE TWO THREE)'])
+ 
+     def test_UID(self):
+         self.assertEqual(parse_fetch_response([b'23 (UID 76)']),
+@@ -230,7 +230,7 @@ class TestParseFetchResponse(unittest.TestCase):
+                                b'SEQ': 23}})
+ 
+     def test_bad_UID(self):
+-        self.assertRaises(ParseError, parse_fetch_response, [b'(UID X)'])
++        self.assertRaises(ProtocolError, parse_fetch_response, [b'(UID X)'])
+ 
+     def test_FLAGS(self):
+         self.assertEqual(parse_fetch_response([b'23 (FLAGS (\Seen Stuff))']),
+diff --git a/tests/test_util_functions.py b/tests/test_util_functions.py
+index b3becb8..ba3f271 100644
+--- a/tests/test_util_functions.py
++++ b/tests/test_util_functions.py
+@@ -4,15 +4,17 @@
+ 
+ from __future__ import unicode_literals
+ 
+-from imapclient.exceptions import InvalidCriteriaError
++from imapclient.exceptions import InvalidCriteriaError, ProtocolError
+ from imapclient.imapclient import (
+     join_message_ids,
+     _normalise_search_criteria,
+     normalise_text_list,
+     seq_to_parenstr,
+     seq_to_parenstr_upper,
+-    _quoted
++    _quoted,
++    _parse_untagged_response
+ )
++from imapclient.util import assert_imap_protocol
+ from tests.util import unittest
+ 
+ 
+@@ -166,3 +168,17 @@ class Test_normalise_search_criteria(unittest.TestCase):
+ 
+     def test_empty(self):
+         self.assertRaises(InvalidCriteriaError, _normalise_search_criteria, '', None)
++
++
++class TestAssertIMAPProtocol(unittest.TestCase):
++
++    def test_assert_imap_protocol(self):
++        assert_imap_protocol(True)
++        with self.assertRaises(ProtocolError):
++            assert_imap_protocol(False)
++
++
++    def test_assert_imap_protocol_with_message(self):
++        assert_imap_protocol(True, 'foo')
++        with self.assertRaises(ProtocolError):
++            assert_imap_protocol(False, 'foo')

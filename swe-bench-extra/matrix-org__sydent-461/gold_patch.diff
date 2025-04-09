@@ -1,0 +1,75 @@
+diff --git a/changelog.d/461.misc b/changelog.d/461.misc
+new file mode 100644
+index 0000000..e4b16d6
+--- /dev/null
++++ b/changelog.d/461.misc
+@@ -0,0 +1,1 @@
++Fix a bug introduced in Sydent 2.5.0 where calls to `/_matrix/identity/api/v1/validate/email/requestToken` would fail with an HTTP 500 Internal Server Error if arguments were given as a query string or as a www-form-urlencoded body.
+\ No newline at end of file
+diff --git a/sydent/http/servlets/__init__.py b/sydent/http/servlets/__init__.py
+index 3d8b1e2..de758cf 100644
+--- a/sydent/http/servlets/__init__.py
++++ b/sydent/http/servlets/__init__.py
+@@ -49,9 +49,13 @@ def get_args(
+     Helper function to get arguments for an HTTP request.
+     Currently takes args from the top level keys of a json object or
+     www-form-urlencoded for backwards compatibility on v1 endpoints only.
+-    Returns a tuple (error, args) where if error is non-null,
+-    the request is malformed. Otherwise, args contains the
+-    parameters passed.
++
++    ⚠️ BEWARE ⚠. If a v1 request provides its args in urlencoded form (either in
++    a POST body or as URL query parameters), then we'll return `Dict[str, str]`.
++    The caller may need to interpret these strings as e.g. an `int`, `bool`, etc.
++    Arguments given as a json body are processed with `json.JSONDecoder.decode`,
++    and so are automatically deserialised to a Python type. The caller should
++    still validate that these have the correct type!
+ 
+     :param request: The request received by the servlet.
+     :param args: The args to look for in the request's parameters.
+@@ -60,6 +64,10 @@ def get_args(
+ 
+     :raises: MatrixRestError if required is True and a given parameter
+         was not found in the request's query parameters.
++    :raises: MatrixRestError if we the request body contains bad JSON.
++    :raises: MatrixRestError if arguments are given in www-form-urlencodedquery
++        form, and some argument name or value is not a valid UTF-8-encoded
++        string.
+ 
+     :return: A dict containing the requested args and their values. String values
+         are of type unicode.
+diff --git a/sydent/http/servlets/emailservlet.py b/sydent/http/servlets/emailservlet.py
+index 11ac04c..d23ed96 100644
+--- a/sydent/http/servlets/emailservlet.py
++++ b/sydent/http/servlets/emailservlet.py
+@@ -50,9 +50,29 @@ class EmailRequestCodeServlet(Resource):
+         args = get_args(request, ("email", "client_secret", "send_attempt"))
+ 
+         email = args["email"]
+-        sendAttempt = args["send_attempt"]
+         clientSecret = args["client_secret"]
+ 
++        try:
++            # if we got this via the v1 API in a querystring or urlencoded body,
++            # then the values in args will be a string. So check that
++            # send_attempt is an int.
++            #
++            # NB: We don't check if we're processing a url-encoded v1 request.
++            # This means we accept string representations of integers for
++            # `send_attempt` in v2 requests, and in v1 requests that supply a
++            # JSON body. This is contrary to the spec and leaves me with a dirty
++            # feeling I can't quite shake off.
++            #
++            # Where's Raymond Hettinger when you need him? (THUMP) There must be
++            # a better way!
++            sendAttempt = int(args["send_attempt"])
++        except (TypeError, ValueError):
++            request.setResponseCode(400)
++            return {
++                "errcode": "M_INVALID_PARAM",
++                "error": f"send_attempt should be an integer (got {args['send_attempt']}",
++            }
++
+         if not is_valid_client_secret(clientSecret):
+             request.setResponseCode(400)
+             return {

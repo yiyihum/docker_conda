@@ -1,0 +1,243 @@
+diff --git a/CHANGELOG.rst b/CHANGELOG.rst
+index 3e4a477..7958e8f 100644
+--- a/CHANGELOG.rst
++++ b/CHANGELOG.rst
+@@ -15,6 +15,11 @@ paths are considered internals and can change in minor and patch releases.
+ v4.25.0 (2023-09-??)
+ --------------------
+ 
++Added
++^^^^^
++- Support for user-defined generic types (`#366
++  <https://github.com/omni-us/jsonargparse/issues/366>`__).
++
+ Fixed
+ ^^^^^
+ - ``--print_config`` fails when parser has shallow links.
+diff --git a/DOCUMENTATION.rst b/DOCUMENTATION.rst
+index f68a386..46dc308 100644
+--- a/DOCUMENTATION.rst
++++ b/DOCUMENTATION.rst
+@@ -407,6 +407,9 @@ Some notes about this support are:
+   see :ref:`dataclass-like`. If a dataclass is mixed inheriting from a normal
+   class, it is considered a subclass type instead of a dataclass.
+ 
++- User-defined ``Generic`` types are supported. For more details see
++  :ref:`generic-types`.
++
+ - `Pydantic types <https://docs.pydantic.dev/usage/types/#pydantic-types>`__ are
+   supported. There might be edge cases which don't work as expected. Please
+   report any encountered issues.
+@@ -876,6 +879,39 @@ structure.
+       number: 8
+       accepted: true
+ 
++.. _generic-types:
++
++Generic types
++-------------
++
++Classes that inherit from ``typing.Generic``, also known as `user-defined
++generic types
++<https://docs.python.org/3/library/typing.html#user-defined-generic-types>`__,
++are supported. Take for example a point in 2D:
++
++.. testsetup:: generic_types
++
++    parser = ArgumentParser()
++
++.. testcode:: generic_types
++
++    from typing import Generic, TypeVar
++
++    Number = TypeVar("Number", float, complex)
++
++    @dataclass
++    class Point2d(Generic[Number]):
++        x: Number = 0.0
++        y: Number = 0.0
++
++Parsing complex-valued points would be:
++
++.. doctest:: generic_types
++
++    >>> parser.add_argument("--point", type=Point2d[complex])  # doctest: +IGNORE_RESULT
++    >>> parser.parse_args(["--point.x=(1+2j)"]).point
++    Namespace(x=(1+2j), y=0.0)
++
+ 
+ .. _callable-type:
+ 
+diff --git a/README.rst b/README.rst
+index a06ac4b..c1c7aa2 100644
+--- a/README.rst
++++ b/README.rst
+@@ -63,9 +63,9 @@ high-quality code**. It encompasses numerous powerful features, some unique to
+ 
+ Other notable features include:
+ 
+-- **Extensive type hint support:** nested types (union, tuple, etc.),
+-  containers (list, dict, etc.), restricted types (regex, numbers), paths, URLs,
+-  types from stubs (``*.pyi``), future annotations (PEP `563
++- **Extensive type hint support:** nested types (union, optional), containers
++  (list, dict, etc.), user-defined generics, restricted types (regex, numbers),
++  paths, URLs, types from stubs (``*.pyi``), future annotations (PEP `563
+   <https://peps.python.org/pep-0563/>`__), and backports (PEPs `604
+   <https://peps.python.org/pep-0604>`__/`585
+   <https://peps.python.org/pep-0585>`__).
+diff --git a/jsonargparse/_common.py b/jsonargparse/_common.py
+index 348f523..06053c9 100644
+--- a/jsonargparse/_common.py
++++ b/jsonargparse/_common.py
+@@ -3,7 +3,7 @@ import inspect
+ import sys
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+-from typing import Dict, Optional, Tuple, Type, TypeVar, Union
++from typing import Dict, Generic, Optional, Tuple, Type, TypeVar, Union, _GenericAlias  # type: ignore
+ 
+ from ._namespace import Namespace
+ from ._type_checking import ArgumentParser
+@@ -70,12 +70,22 @@ def is_final_class(cls) -> bool:
+     return getattr(cls, "__final__", False)
+ 
+ 
++def is_generic_class(cls) -> bool:
++    return isinstance(cls, _GenericAlias) and getattr(cls, "__module__", "") != "typing"
++
++
++def get_generic_origin(cls):
++    return cls.__origin__ if is_generic_class(cls) else cls
++
++
+ def is_dataclass_like(cls) -> bool:
++    if is_generic_class(cls):
++        return is_dataclass_like(cls.__origin__)
+     if not inspect.isclass(cls):
+         return False
+     if is_final_class(cls):
+         return True
+-    classes = [c for c in inspect.getmro(cls) if c != object]
++    classes = [c for c in inspect.getmro(cls) if c not in {object, Generic}]
+     all_dataclasses = all(dataclasses.is_dataclass(c) for c in classes)
+     from ._optionals import attrs_support, pydantic_support
+ 
+diff --git a/jsonargparse/_parameter_resolvers.py b/jsonargparse/_parameter_resolvers.py
+index a2df528..a53513b 100644
+--- a/jsonargparse/_parameter_resolvers.py
++++ b/jsonargparse/_parameter_resolvers.py
+@@ -11,7 +11,7 @@ from dataclasses import dataclass
+ from functools import partial
+ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+ 
+-from ._common import is_dataclass_like, is_subclass
++from ._common import get_generic_origin, is_dataclass_like, is_generic_class, is_subclass
+ from ._optionals import parse_docs
+ from ._postponed_annotations import evaluate_postponed_annotations
+ from ._stubs_resolver import get_stub_types
+@@ -283,9 +283,28 @@ def get_signature_parameters_and_indexes(component, parent, logger):
+         )
+     evaluate_postponed_annotations(params, signature_source, parent, logger)
+     stubs = get_stub_types(params, signature_source, parent, logger)
++    replace_generic_type_vars(params, parent)
+     return params, args_idx, kwargs_idx, doc_params, stubs
+ 
+ 
++def replace_generic_type_vars(params: ParamList, parent) -> None:
++    if is_generic_class(parent) and parent.__args__ and getattr(parent.__origin__, "__parameters__", None):
++        type_vars = dict(zip(parent.__origin__.__parameters__, parent.__args__))
++
++        def replace_type_vars(annotation):
++            if annotation in type_vars:
++                return type_vars[annotation]
++            if getattr(annotation, "__args__", None):
++                origin = annotation.__origin__
++                if sys.version_info < (3, 10) and getattr(origin, "__module__", "") != "typing":
++                    origin = getattr(__import__("typing"), origin.__name__.capitalize(), origin)
++                return origin[tuple(replace_type_vars(a) for a in annotation.__args__)]
++            return annotation
++
++        for param in params:
++            param.annotation = replace_type_vars(param.annotation)
++
++
+ def add_stub_types(stubs: Optional[Dict[str, Any]], params: ParamList, component) -> None:
+     if not stubs:
+         return
+@@ -380,7 +399,7 @@ def group_parameters(params_list: List[ParamList]) -> ParamList:
+ 
+ 
+ def has_dunder_new_method(cls, attr_name):
+-    classes = inspect.getmro(cls)[1:]
++    classes = inspect.getmro(get_generic_origin(cls))[1:]
+     return (
+         attr_name == "__init__"
+         and cls.__new__ is not object.__new__
+@@ -424,13 +443,13 @@ def get_component_and_parent(
+     if is_subclass(function_or_class, ClassFromFunctionBase) and method_or_property in {None, "__init__"}:
+         function_or_class = function_or_class.wrapped_function  # type: ignore
+         method_or_property = None
+-    elif inspect.isclass(function_or_class) and method_or_property is None:
++    elif inspect.isclass(get_generic_origin(function_or_class)) and method_or_property is None:
+         method_or_property = "__init__"
+     elif method_or_property and not isinstance(method_or_property, str):
+         method_or_property = method_or_property.__name__
+     parent = component = None
+     if method_or_property:
+-        attr = inspect.getattr_static(function_or_class, method_or_property)
++        attr = inspect.getattr_static(get_generic_origin(function_or_class), method_or_property)
+         if is_staticmethod(attr):
+             component = getattr(function_or_class, method_or_property)
+             return component, parent, method_or_property
+diff --git a/jsonargparse/_signatures.py b/jsonargparse/_signatures.py
+index 6e6bd31..ba5731f 100644
+--- a/jsonargparse/_signatures.py
++++ b/jsonargparse/_signatures.py
+@@ -8,7 +8,7 @@ from contextlib import suppress
+ from typing import Any, Callable, List, Optional, Set, Tuple, Type, Union
+ 
+ from ._actions import _ActionConfigLoad
+-from ._common import get_class_instantiator, is_dataclass_like, is_subclass
++from ._common import get_class_instantiator, get_generic_origin, is_dataclass_like, is_subclass
+ from ._optionals import get_doc_short_description, pydantic_support
+ from ._parameter_resolvers import (
+     ParamData,
+@@ -72,7 +72,7 @@ class SignatureArguments(LoggerProperty):
+             ValueError: When not given a class.
+             ValueError: When there are required parameters without at least one valid type.
+         """
+-        if not inspect.isclass(theclass):
++        if not inspect.isclass(get_generic_origin(theclass)):
+             raise ValueError(f'Expected "theclass" parameter to be a class type, got: {theclass}.')
+         if default and not (isinstance(default, LazyInitBaseClass) and isinstance(default, theclass)):
+             raise ValueError(f'Expected "default" parameter to be a lazy instance of the class, got: {default}.')
+@@ -133,7 +133,7 @@ class SignatureArguments(LoggerProperty):
+             ValueError: When not given a class or the name of a method of the class.
+             ValueError: When there are required parameters without at least one valid type.
+         """
+-        if not inspect.isclass(theclass):
++        if not inspect.isclass(get_generic_origin(theclass)):
+             raise ValueError('Expected "theclass" argument to be a class object.')
+         if not hasattr(theclass, themethod) or not callable(getattr(theclass, themethod)):
+             raise ValueError('Expected "themethod" argument to be a callable member of the class.')
+diff --git a/jsonargparse/_util.py b/jsonargparse/_util.py
+index 7d4c33a..e5b8eb9 100644
+--- a/jsonargparse/_util.py
++++ b/jsonargparse/_util.py
+@@ -30,7 +30,7 @@ from typing import (
+     get_type_hints,
+ )
+ 
+-from ._common import ClassType, is_subclass, parser_capture, parser_context
++from ._common import ClassType, get_generic_origin, is_subclass, parser_capture, parser_context
+ from ._deprecated import PathDeprecations
+ from ._loaders_dumpers import json_dump, load_value
+ from ._optionals import (
+@@ -215,6 +215,7 @@ def get_module_var_path(module_path: str, value: Any) -> Optional[str]:
+ def get_import_path(value: Any) -> Optional[str]:
+     """Returns the shortest dot import path for the given object."""
+     path = None
++    value = get_generic_origin(value)
+     module_path = getattr(value, "__module__", None)
+     qualname = getattr(value, "__qualname__", "")
+ 

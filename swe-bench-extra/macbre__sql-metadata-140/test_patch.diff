@@ -1,0 +1,229 @@
+diff --git a/test/test_getting_columns.py b/test/test_getting_columns.py
+index 26c0ddd..6fd4d8b 100644
+--- a/test/test_getting_columns.py
++++ b/test/test_getting_columns.py
+@@ -250,3 +250,103 @@ def test_columns_and_sql_functions():
+     assert Parser(
+         "select count(col)+max(col2)+ min(col3)+ count(distinct  col4) + custom_func(col5) from dual"
+     ).columns == ["col", "col2", "col3", "col4", "col5"]
++
++
++def test_columns_starting_with_keywords():
++    query = """
++    SELECT `schema_name`, full_table_name, `column_name`, `catalog_name`, 
++    `table_name`, column_length, column_weight, annotation 
++    FROM corporate.all_tables
++    """
++    parser = Parser(query)
++    assert parser.columns == [
++        "schema_name",
++        "full_table_name",
++        "column_name",
++        "catalog_name",
++        "table_name",
++        "column_length",
++        "column_weight",
++        "annotation",
++    ]
++
++
++def test_columns_with_keywords_parts():
++    query = """
++    SELECT column_length, column_weight, table_random, drop_20, create_table
++    FROM sample_table
++    """
++    assert Parser(query).columns == [
++        "column_length",
++        "column_weight",
++        "table_random",
++        "drop_20",
++        "create_table",
++    ]
++
++
++def test_columns_with_complex_aliases_same_as_columns():
++    query = """
++    select targetingtype, sellerid, sguid, 'd01' as datetype, adgroupname, targeting, 
++    customersearchterm, 
++    'product_search_term' as `type`, 
++    sum(impressions) as impr, 
++    sum(clicks) as clicks, 
++    sum(seventotalunits) as sold, 
++    sum(sevenadvertisedskuunits) as advertisedskuunits, 
++    sum(sevenotherskuunits) as otherskuunits, 
++    sum(sevendaytotalsales) as totalsales, 
++    round(sum(spend), 4) as spend, if(sum(impressions) > 0, 
++    round(sum(clicks)/sum(impressions), 4), 0) as ctr, 
++    if(sum(clicks) > 0, round(sum(seventotalunits)/sum(clicks), 4), 0) as cr, 
++    if(sum(clicks) > 0, round(sum(spend)/sum(clicks), 2), 0) as cpc 
++    from amazon_pl.search_term_report_impala 
++    where reportday >= to_date('2021-05-16 00:00:00.0') 
++    and reportday <= to_date('2021-05-16 00:00:00.0') 
++    and targetingtype in ('auto','manual') 
++    and sguid is not null and sguid != '' 
++    group by targetingtype,sellerid,sguid,adgroupname,targeting,customersearchterm 
++    order by impr desc
++    """
++    parser = Parser(query)
++    assert parser.columns == [
++        "targetingtype",
++        "sellerid",
++        "sguid",
++        "adgroupname",
++        "targeting",
++        "customersearchterm",
++        "impressions",
++        "clicks",
++        "seventotalunits",
++        "sevenadvertisedskuunits",
++        "sevenotherskuunits",
++        "sevendaytotalsales",
++        "spend",
++        "reportday",
++    ]
++
++
++def test_columns_with_aliases_same_as_columns():
++    query = """
++    select 
++    round(sum(impressions),1) as impressions, 
++    sum(clicks) as clicks
++    from amazon_pl.search_term_report_impala 
++    """
++    parser = Parser(query)
++    assert parser.columns == ["impressions", "clicks"]
++    assert parser.columns_aliases == {}
++
++    query = """
++    select
++    if(sum(clicks) > 0, round(sum(seventotalunits)/sum(clicks), 4), 0) as clicks, 
++    if(sum(clicks) > 0, round(sum(spend)/sum(clicks), 2), 0) as cpc 
++    from amazon_pl.search_term_report_impala 
++    """
++    parser = Parser(query)
++    assert parser.columns == ["clicks", "seventotalunits", "spend"]
++    assert parser.columns_aliases == {
++        "clicks": ["clicks", "seventotalunits"],
++        "cpc": ["clicks", "spend"],
++    }
+diff --git a/test/test_getting_tables.py b/test/test_getting_tables.py
+index c9bcc16..9657e64 100644
+--- a/test/test_getting_tables.py
++++ b/test/test_getting_tables.py
+@@ -418,3 +418,29 @@ with ur
+         "zekerheid_accijnsbeweging": "accounting_entity.remainder",
+         "zekerheid_douanevervoer": "accounting_entity.remainder",
+     }
++
++
++def test_get_tables_with_leading_digits():
++    # see #139
++
++    # Identifiers may begin with a digit but unless quoted may not consist solely of digits.
++    assert ["0020"] == Parser("SELECT * FROM `0020`").tables
++
++    assert ["0020_big_table"] == Parser(
++        "SELECT t.val as value, count(*) FROM `0020_big_table` as t WHERE id BETWEEN 10 AND 20 GROUP BY val"
++    ).tables
++    assert ["0020_big_table"] == Parser(
++        "SELECT t.val as value, count(*) FROM `0020_big_table`"
++    ).tables
++    assert ["0020_big_table"] == Parser(
++        'SELECT t.val as value, count(*) FROM "0020_big_table" as t WHERE id BETWEEN 10 AND 20 GROUP BY val'
++    ).tables
++    assert ["0020_big_table"] == Parser(
++        "SELECT t.val as value, count(*) FROM 0020_big_table as t WHERE id BETWEEN 10 AND 20 GROUP BY val"
++    ).tables
++    assert ["0020_big_table"] == Parser(
++        "SELECT t.val as value, count(*) FROM `0020_big_table` as t WHERE id BETWEEN 10 AND 20 GROUP BY val"
++    ).tables
++    assert ["0020_big_table"] == Parser(
++        "SELECT t.val as value, count(*) FROM 0020_big_table"
++    ).tables
+diff --git a/test/test_unions.py b/test/test_unions.py
+new file mode 100644
+index 0000000..f0506be
+--- /dev/null
++++ b/test/test_unions.py
+@@ -0,0 +1,81 @@
++from sql_metadata import Parser
++
++
++def test_union():
++    query = """
++    SELECT
++ACCOUNTING_ENTITY.VERSION as "accountingEntityVersion",
++ACCOUNTING_ENTITY.ACTIVE as "active",
++ACCOUNTING_ENTITY.CATEGORY as "category",
++ACCOUNTING_ENTITY.CREATION_DATE as "creationDate",
++ACCOUNTING_ENTITY.DESCRIPTION as "description",
++ACCOUNTING_ENTITY.ID as "accountingEntityId",
++ACCOUNTING_ENTITY.MINIMAL_REMAINDER as "minimalRemainder",
++ACCOUNTING_ENTITY.REMAINDER as "remainder",
++ACCOUNTING_ENTITY.SYSTEM_TYPE_ID as "aeSystemTypeId",
++ACCOUNTING_ENTITY.DATE_CREATION as "dateCreation",
++ACCOUNTING_ENTITY.DATE_LAST_MODIFICATION as "dateLastModification",
++ACCOUNTING_ENTITY.USER_CREATION as "userCreation",
++ACCOUNTING_ENTITY.USER_LAST_MODIFICATION as "userLastModification"
++FROM ACCOUNTING_ENTITY
++WHERE ACCOUNTING_ENTITY.ID IN (
++SELECT DPD.ACCOUNTING_ENTITY_ID AS "ACCOUNTINGENTITYID" FROM DEBT D
++INNER JOIN DUTY_PER_DEBT DPD ON DPD.DEBT_ID = D.ID
++INNER JOIN DECLARATION_V2 DV2 ON DV2.ID = D.DECLARATION_ID
++WHERE DV2.DECLARATION_REF = #MRNFORMOVEMENT
++UNION
++SELECT BX.ACCOUNTING_ENTITY_ID AS "ACCOUNTINGENTITYID" FROM BENELUX BX
++INNER JOIN DECLARATION_V2 DV2 ON DV2.ID = BX.DECLARATION_ID
++WHERE DV2.DECLARATION_REF = #MRNFORMOVEMENT
++UNION
++SELECT CA4D.ACCOUNTING_ENTITY_ID AS "ACCOUNTINGENTITYID" FROM RESERVATION R
++INNER JOIN CA4_RESERVATIONS_DECLARATION CA4D ON CA4D.ID = R.CA4_ID
++INNER JOIN DECLARATION_V2 DV2 ON DV2.ID = R.DECLARATION_ID
++WHERE DV2.DECLARATION_REF = #MRNFORMOVEMENT)
++    """
++
++    parser = Parser(query)
++    assert parser.tables == [
++        "ACCOUNTING_ENTITY",
++        "DEBT",
++        "DUTY_PER_DEBT",
++        "DECLARATION_V2",
++        "BENELUX",
++        "RESERVATION",
++        "CA4_RESERVATIONS_DECLARATION",
++    ]
++    assert parser.columns_dict == {
++        "join": [
++            "DUTY_PER_DEBT.DEBT_ID",
++            "DEBT.ID",
++            "DECLARATION_V2.ID",
++            "DEBT.DECLARATION_ID",
++            "BENELUX.DECLARATION_ID",
++            "CA4_RESERVATIONS_DECLARATION.ID",
++            "RESERVATION.CA4_ID",
++            "RESERVATION.DECLARATION_ID",
++        ],
++        "select": [
++            "ACCOUNTING_ENTITY.VERSION",
++            "ACCOUNTING_ENTITY.ACTIVE",
++            "ACCOUNTING_ENTITY.CATEGORY",
++            "ACCOUNTING_ENTITY.CREATION_DATE",
++            "ACCOUNTING_ENTITY.DESCRIPTION",
++            "ACCOUNTING_ENTITY.ID",
++            "ACCOUNTING_ENTITY.MINIMAL_REMAINDER",
++            "ACCOUNTING_ENTITY.REMAINDER",
++            "ACCOUNTING_ENTITY.SYSTEM_TYPE_ID",
++            "ACCOUNTING_ENTITY.DATE_CREATION",
++            "ACCOUNTING_ENTITY.DATE_LAST_MODIFICATION",
++            "ACCOUNTING_ENTITY.USER_CREATION",
++            "ACCOUNTING_ENTITY.USER_LAST_MODIFICATION",
++            "DUTY_PER_DEBT.ACCOUNTING_ENTITY_ID",
++            "BENELUX.ACCOUNTING_ENTITY_ID",
++            "CA4_RESERVATIONS_DECLARATION.ACCOUNTING_ENTITY_ID",
++        ],
++        "where": [
++            "ACCOUNTING_ENTITY.ID",
++            "DECLARATION_V2.DECLARATION_REF",
++            "#MRNFORMOVEMENT",
++        ],
++    }

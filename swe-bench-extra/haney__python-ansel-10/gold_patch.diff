@@ -1,0 +1,166 @@
+diff --git a/HISTORY.rst b/HISTORY.rst
+index 2b2cd2e..2bc7672 100644
+--- a/HISTORY.rst
++++ b/HISTORY.rst
+@@ -6,6 +6,9 @@ History
+ -----------
+ 
+ * Improve encoding (~50%) and decoding (~25%) performance.
++* Fix handling of combining characters that occur at the end of a file or before
++  a control character. In those cases an implicit space (`U+0020`) is
++  introduced.
+ 
+ 
+ 0.1.1 (2018-12-31)
+diff --git a/ansel/codec.py b/ansel/codec.py
+index 1b8aa24..5bcad57 100644
+--- a/ansel/codec.py
++++ b/ansel/codec.py
+@@ -8,6 +8,7 @@ class Codec(codecs.Codec):
+     encode_char_map = {}
+     encode_modifier_map = {}
+     decode_char_map = {}
++    decode_control_map = {}
+     decode_modifier_map = {}
+ 
+     def encode(self, input, errors="strict"):
+@@ -21,5 +22,6 @@ class Codec(codecs.Codec):
+         decoder = IncrementalDecoder(errors)
+         decoder.name = self.name
+         decoder.decode_char_map = self.decode_char_map
++        decoder.decode_control_map = self.decode_control_map
+         decoder.decode_modifier_map = self.decode_modifier_map
+         return decoder.decode(input, final=True), len(input)
+diff --git a/ansel/encodings/ansel.py b/ansel/encodings/ansel.py
+index a3a59d4..f93e212 100644
+--- a/ansel/encodings/ansel.py
++++ b/ansel/encodings/ansel.py
+@@ -2,7 +2,7 @@ import codecs
+ 
+ from .. import codec, incremental
+ 
+-ANSEL_TO_UNICODE = {
++ANSEL_TO_UNICODE_CONTROL = {
+     0x00: "\u0000",  # NULL CHARACTER
+     0x01: "\u0001",  # START OF HEADING
+     0x02: "\u0002",  # START OF TEXT
+@@ -35,6 +35,9 @@ ANSEL_TO_UNICODE = {
+     0x1D: "\u001D",  # GROUP SEPARATOR
+     0x1E: "\u001E",  # RECORD SEPARATOR
+     0x1F: "\u001F",  # UNIT SEPARATOR
++}
++
++ANSEL_TO_UNICODE = {
+     0x20: "\u0020",  # SPACE
+     0x21: "\u0021",  # EXCLAMATION MARK
+     0x22: "\u0022",  # QUOTATION MARK
+@@ -823,12 +826,14 @@ class Codec(codec.Codec):
+     encode_char_map = UNICODE_TO_ANSEL
+     encode_modifier_map = UNICODE_TO_ANSEL_MODIFIERS
+     decode_char_map = ANSEL_TO_UNICODE
++    decode_control_map = ANSEL_TO_UNICODE_CONTROL
+     decode_modifier_map = ANSEL_TO_UNICODE_MODIFIERS
+ 
+ 
+ class IncrementalDecoder(incremental.IncrementalDecoder):
+     name = "ansel"
+     decode_char_map = ANSEL_TO_UNICODE
++    decode_control_map = ANSEL_TO_UNICODE_CONTROL
+     decode_modifier_map = ANSEL_TO_UNICODE_MODIFIERS
+ 
+ 
+diff --git a/ansel/encodings/gedcom.py b/ansel/encodings/gedcom.py
+index 1efe93c..b2c779c 100644
+--- a/ansel/encodings/gedcom.py
++++ b/ansel/encodings/gedcom.py
+@@ -3,6 +3,8 @@ import codecs
+ from . import ansel
+ from .. import codec, incremental
+ 
++GEDCOM_TO_UNICODE_CONTROL = ansel.ANSEL_TO_UNICODE_CONTROL
++
+ GEDCOM_TO_UNICODE = ansel.ANSEL_TO_UNICODE.copy()
+ GEDCOM_TO_UNICODE.update(
+     {
+@@ -40,12 +42,14 @@ class Codec(codec.Codec):
+     encode_char_map = UNICODE_TO_GEDCOM
+     encode_modifier_map = UNICODE_TO_GEDCOM_MODIFIERS
+     decode_char_map = GEDCOM_TO_UNICODE
++    decode_control_map = GEDCOM_TO_UNICODE_CONTROL
+     decode_modifier_map = GEDCOM_TO_UNICODE_MODIFIERS
+ 
+ 
+ class IncrementalDecoder(incremental.IncrementalDecoder):
+     name = "gedcom"
+     decode_char_map = GEDCOM_TO_UNICODE
++    decode_control_map = GEDCOM_TO_UNICODE_CONTROL
+     decode_modifier_map = GEDCOM_TO_UNICODE_MODIFIERS
+ 
+ 
+diff --git a/ansel/incremental.py b/ansel/incremental.py
+index ec5aea0..05a38dc 100644
+--- a/ansel/incremental.py
++++ b/ansel/incremental.py
+@@ -4,6 +4,7 @@ import codecs
+ class IncrementalDecoder(codecs.IncrementalDecoder):
+     name = None
+     decode_char_map = {}
++    decode_control_map = {}
+     decode_modifier_map = {}
+ 
+     def __init__(self, errors="strict"):
+@@ -32,6 +33,7 @@ class IncrementalDecoder(codecs.IncrementalDecoder):
+ 
+     def decode(self, input, final=False):
+         decode_char_map = self.decode_char_map
++        decode_control_map = self.decode_control_map
+         decode_modifier_map = self.decode_modifier_map
+         decoded_modifiers = self.decoded_modifiers
+         error_handler = codecs.lookup_error(self.errors)
+@@ -46,24 +48,33 @@ class IncrementalDecoder(codecs.IncrementalDecoder):
+                     decoded_modifiers = []
+             except KeyError:
+                 try:
+-                    decoded_item = decode_modifier_map[item]
+-                    decoded_modifiers.insert(0, decoded_item)
+-                except KeyError:
+-                    decoded_item, _ = error_handler(
+-                        UnicodeDecodeError(
+-                            self.name,
+-                            input,
+-                            index,
+-                            index + 1,
+-                            "character maps to <undefined>",
+-                        )
+-                    )
+-                    decoded_chars.append(decoded_item)
++                    decoded_item = decode_control_map[item]
+                     if decoded_modifiers:
++                        decoded_chars.append(" ")
+                         decoded_chars += decoded_modifiers
+                         decoded_modifiers = []
++                    decoded_chars.append(decoded_item)
++                except KeyError:
++                    try:
++                        decoded_item = decode_modifier_map[item]
++                        decoded_modifiers.insert(0, decoded_item)
++                    except KeyError:
++                        decoded_item, _ = error_handler(
++                            UnicodeDecodeError(
++                                self.name,
++                                input,
++                                index,
++                                index + 1,
++                                "character maps to <undefined>",
++                            )
++                        )
++                        decoded_chars.append(decoded_item)
++                        if decoded_modifiers:
++                            decoded_chars += decoded_modifiers
++                            decoded_modifiers = []
+ 
+         if final and decoded_modifiers:
++            decoded_chars.append(" ")
+             decoded_chars += decoded_modifiers
+             decoded_modifiers = []
+ 

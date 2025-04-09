@@ -1,0 +1,190 @@
+diff --git a/sphinx_gallery/tests/conftest.py b/sphinx_gallery/tests/conftest.py
+index 77d7e04..ff49c55 100644
+--- a/sphinx_gallery/tests/conftest.py
++++ b/sphinx_gallery/tests/conftest.py
+@@ -5,14 +5,18 @@ Pytest fixtures
+ from __future__ import division, absolute_import, print_function
+ 
+ import collections
+-import logging
+ 
+ import pytest
+ 
++import sphinx
+ import sphinx_gallery.docs_resolv
+ import sphinx_gallery.gen_gallery
+ import sphinx_gallery.gen_rst
+-from sphinx_gallery import sphinx_compatibility
++
++
++def pytest_report_header(config, startdir):
++    """Add information to the pytest run header."""
++    return 'Sphinx:  %s (%s)' % (sphinx.__version__, sphinx.__file__)
+ 
+ 
+ Params = collections.namedtuple('Params', 'args kwargs')
+diff --git a/sphinx_gallery/tests/test_gen_gallery.py b/sphinx_gallery/tests/test_gen_gallery.py
+index 20da966..c8a2877 100644
+--- a/sphinx_gallery/tests/test_gen_gallery.py
++++ b/sphinx_gallery/tests/test_gen_gallery.py
+@@ -273,7 +273,7 @@ def test_example_sorting_title(sphinx_app_wrapper):
+     _check_order(sphinx_app, 'title')
+ 
+ 
+-def test_collect_gallery_files(sphinx_app_wrapper, tmpdir):
++def test_collect_gallery_files(tmpdir):
+     """Test that example files are collected properly."""
+     rel_filepaths = ['examples/file1.py',
+                      'examples/test.rst',
+diff --git a/sphinx_gallery/tests/test_gen_rst.py b/sphinx_gallery/tests/test_gen_rst.py
+index b7ef18f..61afc12 100644
+--- a/sphinx_gallery/tests/test_gen_rst.py
++++ b/sphinx_gallery/tests/test_gen_rst.py
+@@ -12,6 +12,7 @@ import io
+ import tempfile
+ import re
+ import os
++import shutil
+ import zipfile
+ import codeop
+ 
+@@ -20,9 +21,15 @@ import pytest
+ import sphinx_gallery.gen_rst as sg
+ from sphinx_gallery import downloads
+ from sphinx_gallery.gen_gallery import generate_dir_rst, _complete_gallery_conf
+-from sphinx_gallery.utils import _TempDir
++from sphinx_gallery.utils import _TempDir, Bunch
+ from sphinx_gallery.scrapers import ImagePathIterator
+ 
++try:
++    FileNotFoundError
++except NameError:
++    # Python2
++    FileNotFoundError = IOError
++
+ CONTENT = [
+     '"""',
+     '================',
+@@ -223,8 +230,7 @@ def test_extract_intro_and_title():
+ 
+ 
+ def test_md5sums():
+-    """Test md5sum check functions work on know file content"""
+-
++    """Test md5sum check functions work on know file content."""
+     with tempfile.NamedTemporaryFile('wb', delete=False) as f:
+         f.write(b'Local test\n')
+     try:
+@@ -246,15 +252,17 @@ def test_md5sums():
+ 
+ @pytest.fixture
+ def gallery_conf(tmpdir):
+-    """Sets up a test sphinx-gallery configuration"""
+-    gallery_conf = _complete_gallery_conf({}, str(tmpdir), True, False)
++    """Set up a test sphinx-gallery configuration."""
++    app = Bunch()
++    app.config = dict(source_suffix={'.rst': None})
++    gallery_conf = _complete_gallery_conf({}, str(tmpdir), True, False,
++                                          app=app)
+     gallery_conf.update(examples_dir=_TempDir(), gallery_dir=str(tmpdir))
+     return gallery_conf
+ 
+ 
+ def test_fail_example(gallery_conf, log_collector):
+-    """Test that failing examples are only executed until failing block"""
+-
++    """Test that failing examples are only executed until failing block."""
+     gallery_conf.update(filename_pattern='raise.py')
+ 
+     failing_code = CONTENT + ['#' * 79,
+@@ -281,8 +289,7 @@ def test_fail_example(gallery_conf, log_collector):
+ 
+ 
+ def _generate_rst(gallery_conf, fname, content):
+-    """
+-    Helper function returning the rST text of a given example content.
++    """Return the rST text of a given example content.
+ 
+     This writes a file gallery_conf['examples_dir']/fname with *content*,
+     creates the corresponding rst file by running generate_file_rst() and
+@@ -327,21 +334,28 @@ def test_remove_config_comments(gallery_conf):
+     assert '# sphinx_gallery_thumbnail_number = 1' not in rst
+ 
+ 
+-def test_gen_dir_rst(gallery_conf, fakesphinxapp):
++@pytest.mark.parametrize('ext', ('.txt', '.rst', '.bad'))
++def test_gen_dir_rst(gallery_conf, fakesphinxapp, ext):
+     """Test gen_dir_rst."""
+     print(os.listdir(gallery_conf['examples_dir']))
+     fname_readme = os.path.join(gallery_conf['src_dir'], 'README.txt')
+     with open(fname_readme, 'wb') as fid:
+         fid.write(u"Testing\n=======\n\nÓscar here.".encode('utf-8'))
++    fname_out = os.path.splitext(fname_readme)[0] + ext
++    if fname_readme != fname_out:
++        shutil.move(fname_readme, fname_out)
+     args = (gallery_conf['src_dir'], gallery_conf['gallery_dir'],
+             gallery_conf, [])
+-    out = generate_dir_rst(*args)
+-    assert u"Óscar here" in out[0]
++    if ext == '.bad':  # not found with correct ext
++        with pytest.raises(FileNotFoundError, match='does not have a README'):
++            generate_dir_rst(*args)
++    else:
++        out = generate_dir_rst(*args)
++        assert u"Óscar here" in out[0]
+ 
+ 
+ def test_pattern_matching(gallery_conf, log_collector):
+-    """Test if only examples matching pattern are executed"""
+-
++    """Test if only examples matching pattern are executed."""
+     gallery_conf.update(filename_pattern=re.escape(os.sep) + 'plot_0')
+ 
+     code_output = ('\n Out:\n\n .. code-block:: none\n'
+@@ -383,7 +397,7 @@ def test_thumbnail_number(test_str):
+ 
+ 
+ def test_zip_notebooks(gallery_conf):
+-    """Test generated zipfiles are not corrupt"""
++    """Test generated zipfiles are not corrupt."""
+     gallery_conf.update(examples_dir='examples')
+     examples = downloads.list_downloadable_sources(
+         gallery_conf['examples_dir'])
+@@ -395,8 +409,7 @@ def test_zip_notebooks(gallery_conf):
+ 
+ 
+ def test_rst_example(gallery_conf):
+-    """Test generated rst file includes the correct paths for binder"""
+-
++    """Test generated rst file includes the correct paths for binder."""
+     gallery_conf.update(binder={'org': 'sphinx-gallery',
+                                 'repo': 'sphinx-gallery.github.io',
+                                 'binderhub_url': 'https://mybinder.org',
+@@ -448,7 +461,6 @@ def test_output_indentation(gallery_conf):
+     assert output_test_string == test_string.replace(r"\n", "\n")
+ 
+ 
+-
+ class TestLoggingTee:
+     def setup(self):
+         self.output_file = io.StringIO()
+@@ -510,6 +522,5 @@ class TestLoggingTee:
+ 
+ 
+ # TODO: test that broken thumbnail does appear when needed
+-# TODO: test that examples are not executed twice
+ # TODO: test that examples are executed after a no-plot and produce
+ #       the correct image in the thumbnail
+diff --git a/sphinx_gallery/tests/test_notebook.py b/sphinx_gallery/tests/test_notebook.py
+index 0d5b9f0..e3180c3 100644
+--- a/sphinx_gallery/tests/test_notebook.py
++++ b/sphinx_gallery/tests/test_notebook.py
+@@ -14,7 +14,7 @@ import pytest
+ import sphinx_gallery.gen_rst as sg
+ from sphinx_gallery.notebook import (rst2md, jupyter_notebook, save_notebook,
+                                      python_to_jupyter_cli)
+-from sphinx_gallery.tests.test_gen_rst import gallery_conf
++from sphinx_gallery.tests.test_gen_rst import gallery_conf  # noqa
+ 
+ try:
+     FileNotFoundError

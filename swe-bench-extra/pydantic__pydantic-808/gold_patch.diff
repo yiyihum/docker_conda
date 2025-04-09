@@ -1,0 +1,174 @@
+diff --git a/docs/examples/bare_type_type.py b/docs/examples/bare_type_type.py
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/bare_type_type.py
+@@ -0,0 +1,24 @@
++from typing import Type
++
++from pydantic import BaseModel, ValidationError
++
++
++class Foo:
++    pass
++
++
++class LenientSimpleModel(BaseModel):
++    any_class_goes: Type
++
++
++LenientSimpleModel(any_class_goes=int)
++LenientSimpleModel(any_class_goes=Foo)
++try:
++    LenientSimpleModel(any_class_goes=Foo())
++except ValidationError as e:
++    print(e)
++"""
++1 validation error
++any_class_goes
++  subclass of type expected (type=type_error.class)
++"""
+diff --git a/docs/examples/type_type.py b/docs/examples/type_type.py
+new file mode 100644
+--- /dev/null
++++ b/docs/examples/type_type.py
+@@ -0,0 +1,29 @@
++from typing import Type
++
++from pydantic import BaseModel
++from pydantic import ValidationError
++
++class Foo:
++    pass
++
++class Bar(Foo):
++    pass
++
++class Other:
++    pass
++
++class SimpleModel(BaseModel):
++    just_subclasses: Type[Foo]
++
++
++SimpleModel(just_subclasses=Foo)
++SimpleModel(just_subclasses=Bar)
++try:
++    SimpleModel(just_subclasses=Other)
++except ValidationError as e:
++    print(e)
++"""
++1 validation error
++just_subclasses
++  subclass of Foo expected (type=type_error.class)
++"""
+diff --git a/pydantic/errors.py b/pydantic/errors.py
+--- a/pydantic/errors.py
++++ b/pydantic/errors.py
+@@ -324,6 +324,19 @@ def __init__(self, *, expected_arbitrary_type: AnyType) -> None:
+         super().__init__(expected_arbitrary_type=display_as_type(expected_arbitrary_type))
+ 
+ 
++class ClassError(PydanticTypeError):
++    code = 'class'
++    msg_template = 'a class is expected'
++
++
++class SubclassError(PydanticTypeError):
++    code = 'subclass'
++    msg_template = 'subclass of {expected_class} expected'
++
++    def __init__(self, *, expected_class: AnyType) -> None:
++        super().__init__(expected_class=display_as_type(expected_class))
++
++
+ class JsonError(PydanticValueError):
+     msg_template = 'Invalid JSON'
+ 
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -248,6 +248,8 @@ def _populate_sub_fields(self) -> None:  # noqa: C901 (ignore complexity)
+             )
+             self.type_ = self.type_.__args__[1]  # type: ignore
+             self.shape = SHAPE_MAPPING
++        elif issubclass(origin, Type):  # type: ignore
++            return
+         else:
+             raise TypeError(f'Fields of type "{origin}" are not supported.')
+ 
+diff --git a/pydantic/typing.py b/pydantic/typing.py
+--- a/pydantic/typing.py
++++ b/pydantic/typing.py
+@@ -193,3 +193,21 @@ def update_field_forward_refs(field: 'Field', globalns: Any, localns: Any) -> No
+     if field.sub_fields:
+         for sub_f in field.sub_fields:
+             update_field_forward_refs(sub_f, globalns=globalns, localns=localns)
++
++
++def get_class(type_: AnyType) -> Union[None, bool, AnyType]:
++    """
++    Tries to get the class of a Type[T] annotation. Returns True if Type is used
++    without brackets. Otherwise returns None.
++    """
++    try:
++        origin = getattr(type_, '__origin__')
++        if origin is None:  # Python 3.6
++            origin = type_
++        if issubclass(origin, Type):  # type: ignore
++            if type_.__args__ is None or not isinstance(type_.__args__[0], type):
++                return True
++            return type_.__args__[0]
++    except AttributeError:
++        pass
++    return None
+diff --git a/pydantic/validators.py b/pydantic/validators.py
+--- a/pydantic/validators.py
++++ b/pydantic/validators.py
+@@ -26,8 +26,8 @@
+ 
+ from . import errors
+ from .datetime_parse import parse_date, parse_datetime, parse_duration, parse_time
+-from .typing import AnyCallable, AnyType, ForwardRef, display_as_type, is_callable_type, is_literal_type
+-from .utils import almost_equal_floats, change_exception, sequence_like
++from .typing import AnyCallable, AnyType, ForwardRef, display_as_type, get_class, is_callable_type, is_literal_type
++from .utils import almost_equal_floats, change_exception, lenient_issubclass, sequence_like
+ 
+ if TYPE_CHECKING:  # pragma: no cover
+     from .fields import Field
+@@ -404,6 +404,21 @@ def arbitrary_type_validator(v: Any) -> T:
+     return arbitrary_type_validator
+ 
+ 
++def make_class_validator(type_: Type[T]) -> Callable[[Any], Type[T]]:
++    def class_validator(v: Any) -> Type[T]:
++        if lenient_issubclass(v, type_):
++            return v
++        raise errors.SubclassError(expected_class=type_)
++
++    return class_validator
++
++
++def any_class_validator(v: Any) -> Type[T]:
++    if isinstance(v, type):
++        return v
++    raise errors.ClassError()
++
++
+ def pattern_validator(v: Any) -> Pattern[str]:
+     with change_exception(errors.PatternError, re.error):
+         return re.compile(v)
+@@ -486,6 +501,14 @@ def find_validators(  # noqa: C901 (ignore complexity)
+         yield make_literal_validator(type_)
+         return
+ 
++    class_ = get_class(type_)
++    if class_ is not None:
++        if isinstance(class_, type):
++            yield make_class_validator(class_)
++        else:
++            yield any_class_validator
++        return
++
+     supertype = _find_supertype(type_)
+     if supertype is not None:
+         type_ = supertype

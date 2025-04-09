@@ -1,0 +1,241 @@
+diff --git a/dvc/dependency/__init__.py b/dvc/dependency/__init__.py
+--- a/dvc/dependency/__init__.py
++++ b/dvc/dependency/__init__.py
+@@ -47,16 +47,29 @@ def loads_from(stage, s_list, erepo=None):
+ def _merge_params(s_list):
+     d = defaultdict(list)
+     default_file = ParamsDependency.DEFAULT_PARAMS_FILE
++
++    # figure out completely tracked params file, and ignore specific keys
++    wholly_tracked = set()
++    for key in s_list:
++        if not isinstance(key, dict):
++            continue
++        wholly_tracked.update(k for k, params in key.items() if not params)
++
+     for key in s_list:
+         if isinstance(key, str):
+-            d[default_file].append(key)
++            if default_file not in wholly_tracked:
++                d[default_file].append(key)
+             continue
++
+         if not isinstance(key, dict):
+             msg = "Only list of str/dict is supported. Got: "
+             msg += f"'{type(key).__name__}'."
+             raise ValueError(msg)
+ 
+         for k, params in key.items():
++            if k in wholly_tracked:
++                d[k] = []
++                continue
+             if not isinstance(params, list):
+                 msg = "Expected list of params for custom params file "
+                 msg += f"'{k}', got '{type(params).__name__}'."
+diff --git a/dvc/dependency/param.py b/dvc/dependency/param.py
+--- a/dvc/dependency/param.py
++++ b/dvc/dependency/param.py
+@@ -1,7 +1,9 @@
+ import errno
+ import logging
+ import os
++import typing
+ from collections import defaultdict
++from typing import Dict
+ 
+ import dpath.util
+ from voluptuous import Any
+@@ -37,51 +39,82 @@ class ParamsDependency(Dependency):
+     DEFAULT_PARAMS_FILE = "params.yaml"
+ 
+     def __init__(self, stage, path, params=None, repo=None):
+-        info = {}
+-        self.params = params or []
+-        if params:
+-            if isinstance(params, list):
+-                self.params = params
+-            else:
+-                assert isinstance(params, dict)
+-                self.params = list(params.keys())
+-                info = {self.PARAM_PARAMS: params}
+-
+-        super().__init__(
+-            stage,
+-            path
+-            or os.path.join(stage.repo.root_dir, self.DEFAULT_PARAMS_FILE),
+-            info=info,
+-            repo=repo,
++        self.params = list(params) if params else []
++        info = (
++            {self.PARAM_PARAMS: params} if isinstance(params, dict) else None
+         )
++        repo = repo or stage.repo
++        path = path or os.path.join(repo.root_dir, self.DEFAULT_PARAMS_FILE)
++        super().__init__(stage, path, info=info, repo=repo)
+ 
+     def dumpd(self):
+         ret = super().dumpd()
+         if not self.hash_info:
+-            ret[self.PARAM_PARAMS] = self.params
++            ret[self.PARAM_PARAMS] = self.params or {}
+         return ret
+ 
+     def fill_values(self, values=None):
+         """Load params values dynamically."""
+-        if not values:
++        if values is None:
+             return
++
+         info = {}
++        if not self.params:
++            info.update(values)
+         for param in self.params:
+             if param in values:
+                 info[param] = values[param]
+         self.hash_info = HashInfo(self.PARAM_PARAMS, info)
+ 
++    def read_params(
++        self, flatten: bool = True, **kwargs: typing.Any
++    ) -> Dict[str, typing.Any]:
++        try:
++            config = self.read_file()
++        except MissingParamsFile:
++            config = {}
++
++        if not self.params:
++            return config
++
++        ret = {}
++        if flatten:
++            for param in self.params:
++                try:
++                    ret[param] = dpath.util.get(config, param, separator=".")
++                except KeyError:
++                    continue
++            return ret
++
++        from dpath.util import merge
++
++        for param in self.params:
++            merge(
++                ret,
++                dpath.util.search(config, param, separator="."),
++                separator=".",
++            )
++        return ret
++
+     def workspace_status(self):
+-        status = super().workspace_status()
++        if not self.exists:
++            return {str(self): "deleted"}
++        if self.hash_info.value is None:
++            return {str(self): "new"}
+ 
+-        if status.get(str(self)) == "deleted":
+-            return status
++        from funcy import ldistinct
+ 
+         status = defaultdict(dict)
+         info = self.hash_info.value if self.hash_info else {}
+         actual = self.read_params()
+-        for param in self.params:
+-            if param not in actual.keys():
++
++        # NOTE: we want to preserve the order of params as specified in the
++        # status. In case of tracking the whole file, the order is top-level
++        # keys in the file and then the keys in the `info` from `dvc.lock`
++        # (which are alphabetically sorted).
++        params = self.params or ldistinct([*actual.keys(), *info.keys()])
++        for param in params:
++            if param not in actual:
+                 st = "deleted"
+             elif param not in info:
+                 st = "new"
+@@ -130,35 +163,6 @@ def read_file(self):
+                 f"Unable to read parameters from '{self}'"
+             ) from exc
+ 
+-    def _read(self):
+-        try:
+-            return self.read_file()
+-        except MissingParamsFile:
+-            return {}
+-
+-    def read_params_d(self, **kwargs):
+-        config = self._read()
+-
+-        ret = {}
+-        for param in self.params:
+-            dpath.util.merge(
+-                ret,
+-                dpath.util.search(config, param, separator="."),
+-                separator=".",
+-            )
+-        return ret
+-
+-    def read_params(self):
+-        config = self._read()
+-
+-        ret = {}
+-        for param in self.params:
+-            try:
+-                ret[param] = dpath.util.get(config, param, separator=".")
+-            except KeyError:
+-                pass
+-        return ret
+-
+     def get_hash(self):
+         info = self.read_params()
+ 
+@@ -179,12 +183,5 @@ def save(self):
+         if not self.isfile and not self.isdir:
+             raise self.IsNotFileOrDirError(self)
+ 
+-        if self.is_empty:
+-            logger.warning(f"'{self}' is empty.")
+-
+         self.ignore()
+-
+-        if self.metric or self.plot:
+-            self.verify_metric()
+-
+         self.hash_info = self.get_hash()
+diff --git a/dvc/repo/params/show.py b/dvc/repo/params/show.py
+--- a/dvc/repo/params/show.py
++++ b/dvc/repo/params/show.py
+@@ -66,7 +66,9 @@ def _read_params(
+ 
+     if deps:
+         for param in params:
+-            params_dict = error_handler(param.read_params_d)(onerror=onerror)
++            params_dict = error_handler(param.read_params)(
++                onerror=onerror, flatten=False
++            )
+             if params_dict:
+                 res[
+                     repo.fs.path.relpath(param.fs_path, os.getcwd())
+diff --git a/dvc/stage/serialize.py b/dvc/stage/serialize.py
+--- a/dvc/stage/serialize.py
++++ b/dvc/stage/serialize.py
+@@ -90,18 +90,12 @@ def _serialize_params_keys(params):
+     """
+     keys = []
+     for param_dep in sort_by_path(params):
+-        dump = param_dep.dumpd()
+-        path, params = dump[PARAM_PATH], dump[PARAM_PARAMS]
+-        assert isinstance(params, (dict, list))
+         # when on no_exec, params are not filled and are saved as list
+-        k = sorted(params.keys() if isinstance(params, dict) else params)
+-        if not k:
+-            continue
+-
+-        if path == DEFAULT_PARAMS_FILE:
++        k = sorted(param_dep.params)
++        if k and param_dep.def_path == DEFAULT_PARAMS_FILE:
+             keys = k + keys
+         else:
+-            keys.append({path: k})
++            keys.append({param_dep.def_path: k or None})
+     return keys
+ 
+ 

@@ -1,0 +1,196 @@
+diff --git a/dataclasses_avroschema/exceptions.py b/dataclasses_avroschema/exceptions.py
+index f694907..079718a 100644
+--- a/dataclasses_avroschema/exceptions.py
++++ b/dataclasses_avroschema/exceptions.py
+@@ -1,22 +1,6 @@
+ import typing
+ 
+ 
+-class NameSpaceRequiredException(Exception):
+-    def __init__(self, field_type: typing.Any, field_name: str) -> None:
+-        self.field_type = field_type
+-        self.field_name = field_name
+-
+-    def __repr__(self) -> str:
+-        class_name = self.__class__.__name__
+-        return f"{class_name} {self.field_name},{self.field_type}"
+-
+-    def __str__(self) -> str:
+-        return (  # pragma: no cover
+-            f"Required namespace in Meta for type {self.field_type}. "
+-            f"The field {self.field_name} is using an exiting type"
+-        )
+-
+-
+ class InvalidMap(Exception):
+     def __init__(self, field_name: str, key_type: typing.Any) -> None:
+         self.field_name = field_name
+diff --git a/dataclasses_avroschema/fields.py b/dataclasses_avroschema/fields.py
+index 74a22a9..fb4d62a 100644
+--- a/dataclasses_avroschema/fields.py
++++ b/dataclasses_avroschema/fields.py
+@@ -20,7 +20,7 @@ from pytz import utc
+ from dataclasses_avroschema import schema_generator, serialization, types, utils
+ 
+ from . import field_utils
+-from .exceptions import InvalidMap, NameSpaceRequiredException
++from .exceptions import InvalidMap
+ from .types import JsonDict
+ 
+ PY_VER = sys.version_info
+@@ -483,8 +483,9 @@ class EnumField(BaseField):
+         else:
+             namespace = metadata.get("namespace")
+             if namespace is None:
+-                raise NameSpaceRequiredException(field_type=self.type, field_name=name)
+-            return f"{namespace}.{name}"
++                return name
++            else:
++                return f"{namespace}.{name}"
+ 
+     def get_default_value(self) -> typing.Union[str, dataclasses._MISSING_TYPE, None]:
+         if self.default == types.MissingSentinel:
+@@ -770,8 +771,9 @@ class RecordField(BaseField):
+             record_type["name"] = name
+         else:
+             if metadata.namespace is None:
+-                raise NameSpaceRequiredException(field_type=self.type, field_name=self.name)
+-            record_type = f"{metadata.namespace}.{name}"
++                record_type = name
++            else:
++                record_type = f"{metadata.namespace}.{name}"
+ 
+         if self.default is None:
+             return [field_utils.NULL, record_type]
+diff --git a/docs/complex_types.md b/docs/complex_types.md
+index 8e7f9b0..54cb245 100644
+--- a/docs/complex_types.md
++++ b/docs/complex_types.md
+@@ -71,7 +71,8 @@ User.avro_schema()
+ 
+ ### Repeated Enums
+ 
+-Sometimes we have cases where an `Enum` is used more than once with a particular class, for those cases, you `MUST` define the namespace in order to generate a valid `avro schema`
++Sometimes we have cases where an `Enum` is used more than once with a particular class, for those cases the same `type` is used in order to generate a valid schema.
++It is a good practice but *NOT* neccesary to a define the `namespace` on the repeated `type`.
+ 
+ ```python
+ import enum
+@@ -123,7 +124,7 @@ resulting in
+       "name": "optional_distance",
+       "type": [
+         "null",
+-        "trip.TripDistance"
++        "trip.TripDistance"  // using the namespace and the TripDistance type
+       ],
+       "default": null
+     }
+@@ -132,9 +133,6 @@ resulting in
+ }
+ ```
+ 
+-!!! warning
+-    If you do not specify the `namespace` in the `Enum` the exception `NameSpaceRequiredException` is raised
+-
+ ## Arrays
+ 
+ ```python title="Array example"
+diff --git a/docs/good_practices.md b/docs/good_practices.md
+index 5a8f5e2..c632df3 100644
+--- a/docs/good_practices.md
++++ b/docs/good_practices.md
+@@ -1,6 +1,6 @@
+-## Streaming
++# Streaming
+ 
+-### Schema server and AvroModel
++## Schema server and AvroModel
+ 
+ First, let's clarify what a schema server is: It is a `central place/repository` that contains schemas with formats like `avro`, `json` or `protobuf`, with the purpose of exposing them through an `API`, so applications can access them and `serialize/deserialize` events. The schema server could have a `RESTful` interface so tasks like `create`, `delete` `get` schemas can be performed easily. 
+ 
+@@ -29,8 +29,7 @@ class User(AvroModel):
+ 
+ The purpose of the `schema_id` is to give a fast notion what the model is representing. Also, could be used as `documentation`
+ 
+-
+-### Include event metadata
++## Include event metadata
+ 
+ `avro schemas` are used widely in `streaming` to `serialize` events, and with `dataclasses-avroschemas` it is straigtforward. Once 
+ that you have the event, it is a good practice to also add the `event metadata` at the moment of `producing` so `consumers` will know what to do.
+@@ -56,7 +55,7 @@ class User(AvroModel):
+     money: float = 100.3
+ 
+     class Meta:
+-        schema_id = "https://my-schema-server/users/schema.avsc" # or in a Concluent way: https://my-schema-server/schemas/ids/{int: id}
++        schema_id = "https://my-schema-server/users/schema.avsc" # or in a Confluent way: https://my-schema-server/schemas/ids/{int: id}
+ 
+ 
+ async def produce():
+@@ -80,4 +79,14 @@ async def produce():
+ 
+ if __name__ == "__main__":
+     asyncio.run(produce)
+-```
+\ No newline at end of file
++```
++
++## Define Namespaces
++
++When there are types that are used more than once in a schema, for example `records` and `enums` it is a good practice to define `namespace` for the repeated type.
++This will allow you to identify more easily the `types`, specially if you have all the schemas in a `schema server` like `confluent`.
++
++Uses cases:
++
++- [Reusing types with records](https://marcosschroh.github.io/dataclasses-avroschema/schema_relationships/#avoid-name-collision-in-multiple-relationships)
++- [Reusing types with enums](https://marcosschroh.github.io/dataclasses-avroschema/complex_types/#repeated-enums)
+diff --git a/docs/model_generator.md b/docs/model_generator.md
+index cee7009..acec709 100644
+--- a/docs/model_generator.md
++++ b/docs/model_generator.md
+@@ -11,7 +11,7 @@ The rendered result is a string that contains the proper identation, so the resu
+     In future releases it will be possible to generate models for other programming langagues like `java` and `rust`
+ 
+ !!! note
+-    You can also use [dc-avro](https://github.com/marcosschroh/dc-avro)d to generate the models from the command line
++    You can also use [dc-avro](https://github.com/marcosschroh/dc-avro) to generate the models from the command line
+ 
+ ## Usage
+ 
+diff --git a/docs/schema_relationships.md b/docs/schema_relationships.md
+index 9f4bbba..39cf3df 100644
+--- a/docs/schema_relationships.md
++++ b/docs/schema_relationships.md
+@@ -278,11 +278,10 @@ User.avro_schema()
+ 
+ ## Avoid name collision in multiple relationships
+ 
+-Sometimes we have relationships where a class is related more than once with a particular class,
+-and the name for the nested schemas must be different, otherwise we will generate an invalid `avro schema`.
+-For those cases, you *MUST* define the `namespace`.
++Sometimes we have relationships where a class is related more than once with a particular class.
++In those cases, the `predifne` type is used in order to generate a valid schema. It is a good practice but *NOT* neccesary to a define the `namespace` on the repeated `type`.
+ 
+-```python title="Avoiding name collision example"
++```python title="Repetead types"
+ from dataclasses import dataclass
+ from datetime import datetime
+ import json
+@@ -296,7 +295,7 @@ class Location(AvroModel):
+     longitude: float
+ 
+     class Meta:
+-        namespace = "types.location_type"
++        namespace = "types.location_type"  # Good practise to use `namespaces`
+ 
+ @dataclass
+ class Trip(AvroModel):
+@@ -333,7 +332,7 @@ Trip.avro_schema()
+       "type": {"type": "long", "logicalType": "timestamp-millis"}
+     },
+     {
+-      "name": "finish_location", "type": "types.location_type.Location"  // using the namespace
++      "name": "finish_location", "type": "types.location_type.Location"  // using the namespace and the Location type
+     }
+   ],
+   "doc": "Trip(start_time: datetime.datetime, start_location: __main__.Location, finish_time: datetime.datetime, finish_location: __main__.Location)"

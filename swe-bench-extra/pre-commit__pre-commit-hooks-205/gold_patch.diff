@@ -1,0 +1,244 @@
+diff --git a/.gitignore b/.gitignore
+index 2626934..6fdf044 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,7 @@
+ *.iml
+ *.py[co]
+ .*.sw[a-z]
++.cache
+ .coverage
+ .idea
+ .project
+diff --git a/.pre-commit-hooks.yaml b/.pre-commit-hooks.yaml
+index bda3f76..e7f433b 100644
+--- a/.pre-commit-hooks.yaml
++++ b/.pre-commit-hooks.yaml
+@@ -147,6 +147,12 @@
+     entry: requirements-txt-fixer
+     language: python
+     files: requirements.*\.txt$
++-   id: sort-simple-yaml
++    name: Sort simple YAML files
++    language: python
++    entry: sort-simple-yaml
++    description: Sorts simple YAML files which consist only of top-level keys, preserving comments and blocks.
++    files: '^$'
+ -   id: trailing-whitespace
+     name: Trim Trailing Whitespace
+     description: This hook trims trailing whitespace.
+diff --git a/README.md b/README.md
+index 3b62234..8db7eef 100644
+--- a/README.md
++++ b/README.md
+@@ -67,6 +67,7 @@ Add this to your `.pre-commit-config.yaml`
+     - `--no-sort-keys` - when autofixing, retain the original key ordering (instead of sorting the keys)
+     - `--top-keys comma,separated,keys` - Keys to keep at the top of mappings.
+ - `requirements-txt-fixer` - Sorts entries in requirements.txt
++- `sort-simple-yaml` - Sorts simple YAML files which consist only of top-level keys, preserving comments and blocks.
+ - `trailing-whitespace` - Trims trailing whitespace.
+     - Markdown linebreak trailing spaces preserved for `.md` and`.markdown`;
+       use `args: ['--markdown-linebreak-ext=txt,text']` to add other extensions,
+diff --git a/hooks.yaml b/hooks.yaml
+index bda3f76..e7f433b 100644
+--- a/hooks.yaml
++++ b/hooks.yaml
+@@ -147,6 +147,12 @@
+     entry: requirements-txt-fixer
+     language: python
+     files: requirements.*\.txt$
++-   id: sort-simple-yaml
++    name: Sort simple YAML files
++    language: python
++    entry: sort-simple-yaml
++    description: Sorts simple YAML files which consist only of top-level keys, preserving comments and blocks.
++    files: '^$'
+ -   id: trailing-whitespace
+     name: Trim Trailing Whitespace
+     description: This hook trims trailing whitespace.
+diff --git a/pre_commit_hooks/requirements_txt_fixer.py b/pre_commit_hooks/requirements_txt_fixer.py
+index efa1906..41e1ffc 100644
+--- a/pre_commit_hooks/requirements_txt_fixer.py
++++ b/pre_commit_hooks/requirements_txt_fixer.py
+@@ -30,21 +30,25 @@ class Requirement(object):
+ 
+ def fix_requirements(f):
+     requirements = []
+-    before = []
++    before = list(f)
+     after = []
+ 
+-    for line in f:
+-        before.append(line)
++    before_string = b''.join(before)
++
++    # If the file is empty (i.e. only whitespace/newlines) exit early
++    if before_string.strip() == b'':
++        return 0
+ 
+-        # If the most recent requirement object has a value, then it's time to
+-        # start building the next requirement object.
++    for line in before:
++        # If the most recent requirement object has a value, then it's
++        # time to start building the next requirement object.
+         if not len(requirements) or requirements[-1].value is not None:
+             requirements.append(Requirement())
+ 
+         requirement = requirements[-1]
+ 
+-        # If we see a newline before any requirements, then this is a top of
+-        # file comment.
++        # If we see a newline before any requirements, then this is a
++        # top of file comment.
+         if len(requirements) == 1 and line.strip() == b'':
+             if len(requirement.comments) and requirement.comments[0].startswith(b'#'):
+                 requirement.value = b'\n'
+@@ -60,7 +64,6 @@ def fix_requirements(f):
+             after.append(comment)
+         after.append(requirement.value)
+ 
+-    before_string = b''.join(before)
+     after_string = b''.join(after)
+ 
+     if before_string == after_string:
+diff --git a/pre_commit_hooks/sort_simple_yaml.py b/pre_commit_hooks/sort_simple_yaml.py
+new file mode 100755
+index 0000000..7afae91
+--- /dev/null
++++ b/pre_commit_hooks/sort_simple_yaml.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++"""Sort a simple YAML file, keeping blocks of comments and definitions
++together.
++
++We assume a strict subset of YAML that looks like:
++
++    # block of header comments
++    # here that should always
++    # be at the top of the file
++
++    # optional comments
++    # can go here
++    key: value
++    key: value
++
++    key: value
++
++In other words, we don't sort deeper than the top layer, and might corrupt
++complicated YAML files.
++"""
++from __future__ import print_function
++
++import argparse
++
++
++QUOTES = ["'", '"']
++
++
++def sort(lines):
++    """Sort a YAML file in alphabetical order, keeping blocks together.
++
++    :param lines: array of strings (without newlines)
++    :return: sorted array of strings
++    """
++    # make a copy of lines since we will clobber it
++    lines = list(lines)
++    new_lines = parse_block(lines, header=True)
++
++    for block in sorted(parse_blocks(lines), key=first_key):
++        if new_lines:
++            new_lines.append('')
++        new_lines.extend(block)
++
++    return new_lines
++
++
++def parse_block(lines, header=False):
++    """Parse and return a single block, popping off the start of `lines`.
++
++    If parsing a header block, we stop after we reach a line that is not a
++    comment. Otherwise, we stop after reaching an empty line.
++
++    :param lines: list of lines
++    :param header: whether we are parsing a header block
++    :return: list of lines that form the single block
++    """
++    block_lines = []
++    while lines and lines[0] and (not header or lines[0].startswith('#')):
++        block_lines.append(lines.pop(0))
++    return block_lines
++
++
++def parse_blocks(lines):
++    """Parse and return all possible blocks, popping off the start of `lines`.
++
++    :param lines: list of lines
++    :return: list of blocks, where each block is a list of lines
++    """
++    blocks = []
++
++    while lines:
++        if lines[0] == '':
++            lines.pop(0)
++        else:
++            blocks.append(parse_block(lines))
++
++    return blocks
++
++
++def first_key(lines):
++    """Returns a string representing the sort key of a block.
++
++    The sort key is the first YAML key we encounter, ignoring comments, and
++    stripping leading quotes.
++
++    >>> print(test)
++    # some comment
++    'foo': true
++    >>> first_key(test)
++    'foo'
++    """
++    for line in lines:
++        if line.startswith('#'):
++            continue
++        if any(line.startswith(quote) for quote in QUOTES):
++            return line[1:]
++        return line
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser()
++    parser.add_argument('filenames', nargs='*', help='Filenames to fix')
++    args = parser.parse_args(argv)
++
++    retval = 0
++
++    for filename in args.filenames:
++        with open(filename, 'r+') as f:
++            lines = [line.rstrip() for line in f.readlines()]
++            new_lines = sort(lines)
++
++            if lines != new_lines:
++                print("Fixing file `{filename}`".format(filename=filename))
++                f.seek(0)
++                f.write("\n".join(new_lines) + "\n")
++                f.truncate()
++                retval = 1
++
++    return retval
++
++
++if __name__ == '__main__':
++    exit(main())
+diff --git a/setup.py b/setup.py
+index 4abb7a2..af21e16 100644
+--- a/setup.py
++++ b/setup.py
+@@ -55,6 +55,7 @@ setup(
+             'no-commit-to-branch = pre_commit_hooks.no_commit_to_branch:main',
+             'pretty-format-json = pre_commit_hooks.pretty_format_json:pretty_format_json',
+             'requirements-txt-fixer = pre_commit_hooks.requirements_txt_fixer:fix_requirements_txt',
++            'sort-simple-yaml = pre_commit_hooks.sort_simple_yaml:main',
+             'trailing-whitespace-fixer = pre_commit_hooks.trailing_whitespace_fixer:fix_trailing_whitespace',
+         ],
+     },

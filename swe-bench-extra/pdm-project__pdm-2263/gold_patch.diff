@@ -1,0 +1,105 @@
+diff --git a/news/2071.doc.md b/news/2071.doc.md
+new file mode 100644
+index 00000000..20f852c2
+--- /dev/null
++++ b/news/2071.doc.md
+@@ -0,0 +1,1 @@
++Clarify what `--no-isolated` does.
+\ No newline at end of file
+diff --git a/news/2261.bugfix.md b/news/2261.bugfix.md
+new file mode 100644
+index 00000000..53a05c30
+--- /dev/null
++++ b/news/2261.bugfix.md
+@@ -0,0 +1,1 @@
++Reject the candidate if it contains invalid metadata, to avoid a crash in the process of resolution.
+diff --git a/src/pdm/cli/options.py b/src/pdm/cli/options.py
+index ec5f5f4c..1f431c08 100644
+--- a/src/pdm/cli/options.py
++++ b/src/pdm/cli/options.py
+@@ -172,7 +172,13 @@ install_group.add_argument(
+ install_group.add_argument("--fail-fast", "-x", action="store_true", help="Abort on first installation error")
+ 
+ 
+-@Option("--no-isolation", dest="build_isolation", nargs=0, help="Do not isolate the build in a clean environment")
++@Option(
++    "--no-isolation",
++    dest="build_isolation",
++    nargs=0,
++    help="Disable isolation when building a source distribution that follows PEP 517, "
++    "as in: build dependencies specified by PEP 518 must be already installed if this option is used.",
++)
+ def no_isolation_option(project: Project, namespace: argparse.Namespace, values: str | Sequence[Any] | None) -> None:
+     os.environ["PDM_BUILD_ISOLATION"] = "no"
+ 
+diff --git a/src/pdm/resolver/providers.py b/src/pdm/resolver/providers.py
+index 0de102f2..d43b46d6 100644
+--- a/src/pdm/resolver/providers.py
++++ b/src/pdm/resolver/providers.py
+@@ -5,8 +5,10 @@ import os
+ from typing import TYPE_CHECKING, Callable, cast
+ 
+ from packaging.specifiers import InvalidSpecifier, SpecifierSet
+-from resolvelib import AbstractProvider
++from resolvelib import AbstractProvider, RequirementsConflicted
++from resolvelib.resolvers import Criterion
+ 
++from pdm.exceptions import InvalidPyVersion, RequirementError
+ from pdm.models.candidates import Candidate, make_candidate
+ from pdm.models.repositories import LockedRepository
+ from pdm.models.requirements import FileRequirement, parse_requirement, strip_extras
+@@ -16,6 +18,7 @@ from pdm.resolver.python import (
+     find_python_matches,
+     is_python_satisfied_by,
+ )
++from pdm.termui import logger
+ from pdm.utils import is_url, url_without_fragments
+ 
+ if TYPE_CHECKING:
+@@ -81,9 +84,15 @@ class BaseProvider(AbstractProvider):
+             )
+             dep_depth = min(parent_depths, default=0) + 1
+         # Use the REAL identifier as it may be updated after candidate preparation.
+-        candidate = next(candidates[identifier])
++        deps: list[Requirement] = []
++        for candidate in candidates[identifier]:
++            try:
++                deps = self.get_dependencies(candidate)
++            except RequirementsConflicted:
++                continue
++            break
+         self._known_depth[self.identify(candidate)] = dep_depth
+-        is_backtrack_cause = any(dep.identify() in backtrack_identifiers for dep in self.get_dependencies(candidate))
++        is_backtrack_cause = any(dep.identify() in backtrack_identifiers for dep in deps)
+         is_file_or_url = any(not requirement.is_named for requirement, _ in information[identifier])
+         operators = [
+             spec.operator for req, _ in information[identifier] if req.specifier is not None for spec in req.specifier
+@@ -183,7 +192,13 @@ class BaseProvider(AbstractProvider):
+     def get_dependencies(self, candidate: Candidate) -> list[Requirement]:
+         if isinstance(candidate, PythonCandidate):
+             return []
+-        deps, requires_python, _ = self.repository.get_dependencies(candidate)
++        try:
++            deps, requires_python, _ = self.repository.get_dependencies(candidate)
++        except (RequirementError, InvalidPyVersion, InvalidSpecifier) as e:
++            # When the metadata is invalid, skip this candidate by marking it as conflicting.
++            # Here we pass an empty criterion so it doesn't provide any info to the resolution.
++            logger.error("Invalid metadata in %s: %s", candidate, e)
++            raise RequirementsConflicted(Criterion([], [], [])) from None
+ 
+         # Filter out incompatible dependencies(e.g. functools32) early so that
+         # we don't get errors when building wheels.
+diff --git a/src/pdm/resolver/reporters.py b/src/pdm/resolver/reporters.py
+index 54c5d91a..a696bbfb 100644
+--- a/src/pdm/resolver/reporters.py
++++ b/src/pdm/resolver/reporters.py
+@@ -72,6 +72,9 @@ class SpinnerReporter(BaseReporter):
+         logger.info("  Adding requirement %s%s", requirement.as_line(), parent_line)
+ 
+     def rejecting_candidate(self, criterion: Criterion, candidate: Candidate) -> None:
++        if not criterion.information:
++            logger.info("Candidate rejected because it contains invalid metadata: %s", candidate)
++            return
+         *others, last = criterion.information
+         logger.info(
+             "Candidate rejected: %s because it introduces a new requirement %s"

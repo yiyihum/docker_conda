@@ -1,0 +1,211 @@
+diff --git a/tests/test_class_schema.py b/tests/test_class_schema.py
+index 02f3ba3..69f358b 100644
+--- a/tests/test_class_schema.py
++++ b/tests/test_class_schema.py
+@@ -1,3 +1,4 @@
++import inspect
+ import typing
+ import unittest
+ from typing import Any, TYPE_CHECKING
+@@ -38,12 +39,60 @@ class TestClassSchema(unittest.TestCase):
+         complex_set = {
+             class_schema(ComplexNested),
+             class_schema(ComplexNested, base_schema=None),
++            class_schema(ComplexNested, clazz_frame=None),
+             class_schema(ComplexNested, None),
++            class_schema(ComplexNested, None, None),
+         }
+         simple_set = {
+             class_schema(Simple),
+             class_schema(Simple, base_schema=None),
++            class_schema(Simple, clazz_frame=None),
+             class_schema(Simple, None),
++            class_schema(Simple, None, None),
++        }
++        self.assertEqual(len(complex_set), 1)
++        self.assertEqual(len(simple_set), 1)
++
++    def test_nested_schema_with_passed_frame(self):
++        @dataclasses.dataclass
++        class Simple:
++            one: str = dataclasses.field()
++            two: str = dataclasses.field()
++
++        @dataclasses.dataclass
++        class ComplexNested:
++            three: int = dataclasses.field()
++            four: Simple = dataclasses.field()
++
++        frame = inspect.stack()[0][0]
++
++        self.assertIs(
++            class_schema(ComplexNested, clazz_frame=frame),
++            class_schema(ComplexNested, clazz_frame=frame),
++        )
++        self.assertIs(
++            class_schema(Simple, clazz_frame=frame),
++            class_schema(Simple, clazz_frame=frame),
++        )
++        self.assertIs(
++            class_schema(Simple, clazz_frame=frame),
++            class_schema(ComplexNested, clazz_frame=frame)
++            ._declared_fields["four"]
++            .nested,
++        )
++
++        complex_set = {
++            class_schema(ComplexNested, clazz_frame=frame),
++            class_schema(ComplexNested, base_schema=None, clazz_frame=frame),
++            class_schema(ComplexNested, None, clazz_frame=frame),
++            class_schema(ComplexNested, None, frame),
++        }
++        simple_set = {
++            class_schema(Simple, clazz_frame=frame),
++            class_schema(Simple, base_schema=None, clazz_frame=frame),
++            class_schema(Simple, None, clazz_frame=frame),
++            class_schema(Simple, clazz_frame=frame),
++            class_schema(Simple, None, frame),
+         }
+         self.assertEqual(len(complex_set), 1)
+         self.assertEqual(len(simple_set), 1)
+diff --git a/tests/test_forward_references.py b/tests/test_forward_references.py
+new file mode 100644
+index 0000000..fc05b12
+--- /dev/null
++++ b/tests/test_forward_references.py
+@@ -0,0 +1,135 @@
++import unittest
++from typing import List, Optional
++
++from marshmallow_dataclass import dataclass
++
++
++@dataclass
++class GlobalA:
++    b: "GlobalB"
++
++
++@dataclass
++class GlobalB:
++    pass
++
++
++@dataclass
++class GlobalSelfRecursion:
++    related: "List[GlobalSelfRecursion]"
++
++
++@dataclass
++class GlobalRecursion:
++    related: "List[GlobalRecursion]"
++
++
++@dataclass
++class GlobalCyclicA:
++    b: "Optional[GlobalCyclicB]"
++
++
++@dataclass
++class GlobalCyclicB:
++    a: "Optional[GlobalCyclicA]"
++
++
++class TestForwardReferences(unittest.TestCase):
++    def test_late_evaluated_types(self):
++        @dataclass
++        class MyData:
++            value: int
++
++        self.assertEqual(MyData(1), MyData.Schema().load(dict(value=1)))
++
++    def test_forward_references_for_basic_types(self):
++        @dataclass
++        class Person:
++            name: "str"
++            age: "int"
++
++        self.assertEqual(
++            Person("Jon", 25), Person.Schema().load(dict(name="Jon", age=25))
++        )
++
++    def test_global_forward_references(self):
++        self.assertEqual(GlobalA(GlobalB()), GlobalA.Schema().load(dict(b=dict())))
++
++    def test_global_self_recursive_type(self):
++        self.assertEqual(
++            GlobalSelfRecursion([GlobalSelfRecursion([])]),
++            GlobalSelfRecursion.Schema().load(dict(related=[dict(related=[])])),
++        )
++
++    def test_global_recursive_type(self):
++        self.assertEqual(
++            GlobalRecursion([GlobalRecursion([])]),
++            GlobalRecursion.Schema().load(dict(related=[dict(related=[])])),
++        )
++
++    def test_global_circular_reference(self):
++        self.assertEqual(
++            GlobalCyclicA(GlobalCyclicB(GlobalCyclicA(None))),
++            GlobalCyclicA.Schema().load(dict(b=dict(a=dict(b=None)))),
++        )
++
++    def test_local_self_recursive_type(self):
++        @dataclass
++        class LocalSelfRecursion:
++            related: "List[LocalSelfRecursion]"
++
++        self.assertEqual(
++            LocalSelfRecursion([LocalSelfRecursion([])]),
++            LocalSelfRecursion.Schema().load(dict(related=[dict(related=[])])),
++        )
++
++    def test_local_recursive_type(self):
++        @dataclass
++        class LocalRecursion:
++            related: "List[LocalRecursion]"
++
++        self.assertEqual(
++            LocalRecursion([LocalRecursion([])]),
++            LocalRecursion.Schema().load(dict(related=[dict(related=[])])),
++        )
++
++    def test_local_forward_references(self):
++        @dataclass
++        class LocalA:
++            b: "LocalB"
++
++        @dataclass
++        class LocalB:
++            pass
++
++        self.assertEqual(LocalA(LocalB()), LocalA.Schema().load(dict(b=dict())))
++
++    def test_name_collisions(self):
++        """
++        This is one example about why you should not make local schemas
++        :return:
++        """
++
++        def make_another_a():
++            @dataclass
++            class A:
++                d: int
++
++            A.Schema()
++
++        make_another_a()
++
++        @dataclass
++        class A:
++            c: int
++
++        A.Schema()
++
++        @dataclass
++        class B:
++            a: "A"
++
++        # with self.assertRaises(marshmallow.exceptions.ValidationError):
++        B.Schema().load(dict(a=dict(c=1)))
++        # marshmallow.exceptions.ValidationError:
++        # {'a': {'d': ['Missing data for required field.'], 'c': ['Unknown field.']}}

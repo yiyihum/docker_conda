@@ -1,0 +1,329 @@
+diff --git a/examples/dev_sandbox.css b/examples/dev_sandbox.css
+new file mode 100644
+index 000000000..2e348e134
+--- /dev/null
++++ b/examples/dev_sandbox.css
+@@ -0,0 +1,49 @@
++/* CSS file for dev_sandbox.py */
++
++App > View {
++  docks: side=left/1;
++  text: on #20639b;
++}
++
++Widget:hover {
++  outline: heavy;
++  text: bold !important;
++}
++
++#sidebar {
++  text: #09312e on #3caea3;
++  dock: side;
++  width: 30;
++  offset-x: -100%;
++  transition: offset 500ms in_out_cubic;
++  border-right: outer #09312e;
++}
++
++#sidebar.-active {
++  offset-x: 0;
++}
++
++#header {
++  text: white on #173f5f;
++  height: 3;
++  border: hkey;
++}
++
++#header.-visible {
++  visibility: hidden;
++}
++
++#content {
++  text: white on #20639b;
++  border-bottom: hkey #0f2b41;
++  offset-y: -3;
++}
++
++#content.-content-visible {
++  visibility: hidden;
++}
++
++#footer {
++  text: #3a3009 on #f6d55c;
++  height: 3;
++}
+diff --git a/examples/dev_sandbox.py b/examples/dev_sandbox.py
+new file mode 100644
+index 000000000..d53946fb3
+--- /dev/null
++++ b/examples/dev_sandbox.py
+@@ -0,0 +1,32 @@
++from rich.console import RenderableType
++from rich.panel import Panel
++
++from textual.app import App
++from textual.widget import Widget
++
++
++class PanelWidget(Widget):
++    def render(self) -> RenderableType:
++        return Panel("hello world!", title="Title")
++
++
++class BasicApp(App):
++    """Sandbox application used for testing/development by Textual developers"""
++
++    def on_load(self):
++        """Bind keys here."""
++        self.bind("tab", "toggle_class('#sidebar', '-active')")
++        self.bind("a", "toggle_class('#header', '-visible')")
++        self.bind("c", "toggle_class('#content', '-content-visible')")
++
++    def on_mount(self):
++        """Build layout here."""
++        self.mount(
++            header=Widget(),
++            content=PanelWidget(),
++            footer=Widget(),
++            sidebar=Widget(),
++        )
++
++
++BasicApp.run(css_file="test_app.css", watch_css=True, log="textual.log")
+diff --git a/src/textual/dom.py b/src/textual/dom.py
+index 8b17700ed..566f62858 100644
+--- a/src/textual/dom.py
++++ b/src/textual/dom.py
+@@ -9,7 +9,7 @@ from rich.style import Style
+ from rich.tree import Tree
+ 
+ from .css._error_tools import friendly_list
+-from .css.constants import VALID_DISPLAY
++from .css.constants import VALID_DISPLAY, VALID_VISIBILITY
+ from .css.errors import StyleValueError
+ from .css.styles import Styles
+ from .message_pump import MessagePump
+@@ -160,6 +160,22 @@ class DOMNode(MessagePump):
+                 f"expected {friendly_list(VALID_DISPLAY)})",
+             )
+ 
++    @property
++    def visible(self) -> bool:
++        return self.styles.visibility != "hidden"
++
++    @visible.setter
++    def visible(self, new_value: bool) -> None:
++        if isinstance(new_value, bool):
++            self.styles.visibility = "visible" if new_value else "hidden"
++        elif new_value in VALID_VISIBILITY:
++            self.styles.visibility = new_value
++        else:
++            raise StyleValueError(
++                f"invalid value for visibility (received {new_value!r}, "
++                f"expected {friendly_list(VALID_VISIBILITY)})"
++            )
++
+     @property
+     def z(self) -> tuple[int, ...]:
+         """Get the z index tuple for this node.
+diff --git a/src/textual/layout.py b/src/textual/layout.py
+index 72f5e1422..8542e5942 100644
+--- a/src/textual/layout.py
++++ b/src/textual/layout.py
+@@ -199,6 +199,15 @@ class Layout(ABC):
+         raise NoWidget(f"No widget under screen coordinate ({x}, {y})")
+ 
+     def get_style_at(self, x: int, y: int) -> Style:
++        """Get the Style at the given cell or Style.null()
++
++        Args:
++            x (int): X position within the Layout
++            y (int): Y position within the Layout
++
++        Returns:
++            Style: The Style at the cell (x, y) within the Layout
++        """
+         try:
+             widget, region = self.get_widget_at(x, y)
+         except NoWidget:
+@@ -217,6 +226,18 @@ class Layout(ABC):
+         return Style.null()
+ 
+     def get_widget_region(self, widget: Widget) -> Region:
++        """Get the Region of a Widget contained in this Layout.
++
++        Args:
++            widget (Widget): The Widget in this layout you wish to know the Region of.
++
++        Raises:
++            NoWidget: If the Widget is not contained in this Layout.
++
++        Returns:
++            Region: The Region of the Widget.
++
++        """
+         try:
+             region, *_ = self.map[widget]
+         except KeyError:
+@@ -270,7 +291,7 @@ class Layout(ABC):
+ 
+         for widget, region, _order, clip in widget_regions:
+ 
+-            if not widget.is_visual:
++            if not (widget.is_visual and widget.visible):
+                 continue
+ 
+             lines = widget._get_lines()
+diff --git a/src/textual/view.py b/src/textual/view.py
+index d6cd03784..220551eb7 100644
+--- a/src/textual/view.py
++++ b/src/textual/view.py
+@@ -1,26 +1,19 @@
+ from __future__ import annotations
+ 
+-from itertools import chain
+-from typing import Callable, Iterable, ClassVar, TYPE_CHECKING
++from typing import Callable, Iterable
+ 
+-from rich.console import RenderableType
+ import rich.repr
++from rich.console import RenderableType
+ from rich.style import Style
+ 
+-from . import events
+ from . import errors
+-from . import log
++from . import events
+ from . import messages
++from .geometry import Size, Offset, Region
+ from .layout import Layout, NoWidget, WidgetPlacement
+ from .layouts.factory import get_layout
+-from .geometry import Size, Offset, Region
+ from .reactive import Reactive, watch
+-
+-from .widget import Widget, Widget
+-
+-
+-if TYPE_CHECKING:
+-    from .app import App
++from .widget import Widget
+ 
+ 
+ class LayoutProperty:
+diff --git a/src/textual/widget.py b/src/textual/widget.py
+index 51c7e97ab..94d768129 100644
+--- a/src/textual/widget.py
++++ b/src/textual/widget.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from logging import PercentStyle, getLogger
++from logging import getLogger
+ from typing import (
+     Any,
+     Awaitable,
+@@ -11,35 +11,29 @@ from typing import (
+     NamedTuple,
+     cast,
+ )
++
+ import rich.repr
+-from rich import box
+ from rich.align import Align
+-from rich.console import Console, RenderableType, ConsoleOptions
+-from rich.measure import Measurement
+-from rich.panel import Panel
++from rich.console import Console, RenderableType
+ from rich.padding import Padding
+-from rich.pretty import Pretty
+-from rich.segment import Segment
+-from rich.style import Style, StyleType
++from rich.style import Style
+ from rich.styled import Styled
+-from rich.text import Text, TextType
++from rich.text import Text
+ 
+-from . import events
+ from . import errors
++from . import events
+ from ._animator import BoundAnimator
+-from ._border import Border, BORDER_STYLES
++from ._border import Border
+ from ._callback import invoke
+-from .blank import Blank
+-from .dom import DOMNode
+ from ._context import active_app
+-from .geometry import Size, Spacing, SpacingDimensions
++from ._types import Lines
++from .dom import DOMNode
++from .geometry import Size, Spacing
+ from .message import Message
+ from .messages import Layout, Update
+-from .reactive import Reactive, watch
+-from ._types import Lines
++from .reactive import watch
+ 
+ if TYPE_CHECKING:
+-    from .app import App
+     from .view import View
+ 
+ log = getLogger("rich")
+@@ -163,34 +157,29 @@ class Widget(DOMNode):
+         styles = self.styles
+         parent_text_style = self.parent.text_style
+ 
+-        if styles.visibility == "hidden":
+-            renderable = Blank(parent_text_style)
+-        else:
+-            text_style = styles.text
+-            renderable_text_style = parent_text_style + text_style
+-            if renderable_text_style:
+-                renderable = Styled(renderable, renderable_text_style)
+-
+-            if styles.has_padding:
+-                renderable = Padding(
+-                    renderable, styles.padding, style=renderable_text_style
+-                )
+-
+-            if styles.has_border:
+-                renderable = Border(
+-                    renderable, styles.border, style=renderable_text_style
+-                )
+-
+-            if styles.has_margin:
+-                renderable = Padding(renderable, styles.margin, style=parent_text_style)
+-
+-            if styles.has_outline:
+-                renderable = Border(
+-                    renderable,
+-                    styles.outline,
+-                    outline=True,
+-                    style=renderable_text_style,
+-                )
++        text_style = styles.text
++        renderable_text_style = parent_text_style + text_style
++        if renderable_text_style:
++            renderable = Styled(renderable, renderable_text_style)
++
++        if styles.has_padding:
++            renderable = Padding(
++                renderable, styles.padding, style=renderable_text_style
++            )
++
++        if styles.has_border:
++            renderable = Border(renderable, styles.border, style=renderable_text_style)
++
++        if styles.has_margin:
++            renderable = Padding(renderable, styles.margin, style=parent_text_style)
++
++        if styles.has_outline:
++            renderable = Border(
++                renderable,
++                styles.outline,
++                outline=True,
++                style=renderable_text_style,
++            )
+ 
+         return renderable
+ 

@@ -1,0 +1,289 @@
+diff --git a/data_extractor/abc.py b/data_extractor/abc.py
+index 84f6dd4..b41f71e 100644
+--- a/data_extractor/abc.py
++++ b/data_extractor/abc.py
+@@ -4,19 +4,29 @@ Abstract Base Classes.
+ # Standard Library
+ import warnings
+ 
+-from abc import ABC, abstractmethod
+-from typing import Any
++from abc import abstractmethod
++from typing import Any, Dict, List, Tuple
+ 
++# Local Folder
++from .utils import sentinel
+ 
+-class __Sentinel:
+-    def __repr__(self) -> str:
+-        return "sentinel"
+ 
++class ComplexExtractorMeta(type):
++    """
++    Complex Extractor Meta Class.
++    """
++
++    def __init__(cls, name: str, bases: Tuple[type], attr_dict: Dict[str, Any]):
++        super().__init__(name, bases, attr_dict)
++        field_names: List[str] = []
++        for key, attr in attr_dict.items():
++            if isinstance(type(attr), ComplexExtractorMeta):
++                field_names.append(key)
+ 
+-sentinel = __Sentinel()
++        cls._field_names = field_names
+ 
+ 
+-class AbstractExtractor(ABC):
++class AbstractExtractor(metaclass=ComplexExtractorMeta):
+     def __init__(self, expr: str):
+         self.expr = expr
+ 
+@@ -30,6 +40,8 @@ class AbstractExtractor(ABC):
+         """
+         raise NotImplementedError
+ 
++
++class ExtractFirstMixin(AbstractExtractor):
+     def extract_first(self, element: Any, default: Any = sentinel) -> Any:
+         """
+         Extract the first data or subelement from `extract` method call result.
+@@ -43,11 +55,13 @@ class AbstractExtractor(ABC):
+ 
+         if not rv:
+             if default is sentinel:
+-                raise ValueError(f"Invalid {self!r}")
++                from .exceptions import ExtractError
++
++                raise ExtractError(self, element)
+ 
+             return default
+ 
+         return rv[0]
+ 
+ 
+-__all__ = ("AbstractExtractor", "sentinel")
++__all__ = ("AbstractExtractor", "ComplexExtractorMeta", "ExtractFirstMixin")
+diff --git a/data_extractor/exceptions.py b/data_extractor/exceptions.py
+index ede9879..af6934e 100644
+--- a/data_extractor/exceptions.py
++++ b/data_extractor/exceptions.py
+@@ -1,8 +1,14 @@
+ """
+ Exceptions.
+ """
++# Standard Library
++import reprlib
++
++from typing import Any
++
+ # Local Folder
+ from .abc import AbstractExtractor
++from .utils import LazyStr
+ 
+ 
+ class ExprError(Exception):
+@@ -15,7 +21,31 @@ class ExprError(Exception):
+         self.exc = exc
+ 
+     def __repr__(self) -> str:
+-        return f"{self.__class__.__name__}({self.extractor!r}, {self.exc!r})"
++        return f"{self.__class__.__name__}({self.extractor!r}, exc={self.exc!r})"
++
++
++class ExtractError(Exception):
++    """
++    ExtractError thrown by extractor extracting data.
++    """
++
++    def __init__(self, extractor: AbstractExtractor, element: Any):
++        super().__init__(LazyStr(func=lambda: self._trace_repr))
++        self.element = element
++        self.extractors = [extractor]
++
++    def __repr__(self) -> str:
++        return f"{self.__class__.__name__}({self.extractors[0]!r}, element={reprlib.repr(self.element)})"
++
++    def _append(self, extractor: AbstractExtractor) -> None:
++        self.extractors.append(extractor)
++
++    @property
++    def _trace_repr(self) -> str:
++        return f"{self.__repr__()}\n" + "\n".join(
++            "  " * idx + "|-" + repr(extractor)
++            for idx, extractor in enumerate([*self.extractors[::-1], self.element])
++        )
+ 
+ 
+-__all__ = ("ExprError",)
++__all__ = ("ExprError", "ExtractError")
+diff --git a/data_extractor/item.py b/data_extractor/item.py
+index 9a4c0f6..f6de68e 100644
+--- a/data_extractor/item.py
++++ b/data_extractor/item.py
+@@ -4,28 +4,15 @@ Complex Extractor for data extracting.
+ # Standard Library
+ import warnings
+ 
+-from typing import Any, Dict, Iterator, List, Tuple
++from typing import Any, Iterator
+ 
+ # Local Folder
+-from .abc import AbstractExtractor, sentinel
++from .abc import AbstractExtractor
++from .exceptions import ExtractError
++from .utils import sentinel
+ 
+ 
+-class FieldMeta(type):
+-    """
+-    Complex Extractor Meta Class.
+-    """
+-
+-    def __init__(cls, name: str, bases: Tuple[type], attr_dict: Dict[str, Any]):
+-        super().__init__(name, bases, attr_dict)
+-        field_names: List[str] = []
+-        for key, attr in attr_dict.items():
+-            if isinstance(type(attr), FieldMeta):
+-                field_names.append(key)
+-
+-        cls._field_names = field_names
+-
+-
+-class Field(metaclass=FieldMeta):
++class Field(AbstractExtractor):
+     """
+     Extract data by cooperating with extractor.
+     """
+@@ -44,7 +31,7 @@ class Field(metaclass=FieldMeta):
+         self.is_many = is_many
+ 
+     def __repr__(self) -> str:
+-        return f"{self.__class__.__name__}(extractor={self.extractor!r}, default={self.default!r}, is_many={self.is_many})"
++        return f"{self.__class__.__name__}({self.extractor!r}, default={self.default!r}, is_many={self.is_many})"
+ 
+     def extract(self, element: Any) -> Any:
+         """
+@@ -65,7 +52,7 @@ class Field(metaclass=FieldMeta):
+ 
+         if not rv:
+             if self.default is sentinel:
+-                raise ValueError(f"Invalid {self!r}")
++                raise ExtractError(self, element)
+ 
+             return self.default
+ 
+@@ -83,7 +70,11 @@ class Item(Field):
+     def _extract(self, element: Any) -> Any:
+         rv = {}
+         for field in self.field_names():
+-            rv[field] = getattr(self, field).extract(element)
++            try:
++                rv[field] = getattr(self, field).extract(element)
++            except ExtractError as exc:
++                exc._append(extractor=self)
++                raise exc
+ 
+         return rv
+ 
+@@ -96,4 +87,4 @@ class Item(Field):
+             yield name
+ 
+ 
+-__all__ = ("Field", "FieldMeta", "Item")
++__all__ = ("Field", "Item")
+diff --git a/data_extractor/json.py b/data_extractor/json.py
+index b5c2fa5..38aaaae 100644
+--- a/data_extractor/json.py
++++ b/data_extractor/json.py
+@@ -8,10 +8,10 @@ from typing import Any
+ import jsonpath_rw
+ 
+ # Local Folder
+-from .abc import AbstractExtractor
++from .abc import ExtractFirstMixin
+ 
+ 
+-class JSONExtractor(AbstractExtractor):
++class JSONExtractor(ExtractFirstMixin):
+     """
+     Use JSONPath expression for JSON data extracting.
+ 
+diff --git a/data_extractor/lxml.py b/data_extractor/lxml.py
+index 4942444..dd7c74e 100644
+--- a/data_extractor/lxml.py
++++ b/data_extractor/lxml.py
+@@ -9,11 +9,11 @@ from lxml.etree import XPathEvalError
+ from lxml.etree import _Element as Element
+ 
+ # Local Folder
+-from .abc import AbstractExtractor
++from .abc import ExtractFirstMixin
+ from .exceptions import ExprError
+ 
+ 
+-class CSSExtractor(AbstractExtractor):
++class CSSExtractor(ExtractFirstMixin):
+     """
+     Use CSS Selector for XML or HTML data subelements extracting.
+ 
+@@ -27,7 +27,7 @@ class CSSExtractor(AbstractExtractor):
+         return element.cssselect(self.expr)
+ 
+ 
+-class TextCSSExtractor(AbstractExtractor):
++class TextCSSExtractor(ExtractFirstMixin):
+     """
+     Use CSS Selector for XML or HTML data subelements' text extracting.
+ 
+@@ -41,7 +41,7 @@ class TextCSSExtractor(AbstractExtractor):
+         return [ele.text for ele in CSSExtractor(self.expr).extract(element)]
+ 
+ 
+-class AttrCSSExtractor(AbstractExtractor):
++class AttrCSSExtractor(ExtractFirstMixin):
+     """
+     Use CSS Selector for XML or HTML data subelements' attribute value extracting.
+ 
+@@ -66,7 +66,7 @@ class AttrCSSExtractor(AbstractExtractor):
+         ]
+ 
+ 
+-class XPathExtractor(AbstractExtractor):
++class XPathExtractor(ExtractFirstMixin):
+     """
+     Use XPath for XML or HTML data extracting.
+ 
+diff --git a/data_extractor/utils.py b/data_extractor/utils.py
+new file mode 100644
+index 0000000..eabc2a0
+--- /dev/null
++++ b/data_extractor/utils.py
+@@ -0,0 +1,27 @@
++# Standard Library
++from typing import Callable
++
++
++class __Sentinel:
++    """ Singleton """
++
++    def __repr__(self) -> str:
++        return "sentinel"
++
++
++sentinel = __Sentinel()
++
++
++class LazyStr:
++    """
++    Lazy String
++    """
++
++    def __init__(self, func: Callable[[], str]):
++        self.func = func
++
++    def __str__(self) -> str:
++        return self.func()
++
++
++__all__ = ("LazyStr", "sentinel")

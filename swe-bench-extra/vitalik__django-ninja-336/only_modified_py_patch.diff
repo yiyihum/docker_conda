@@ -1,0 +1,165 @@
+diff --git a/ninja/main.py b/ninja/main.py
+index fbf540e..27ba4d6 100644
+--- a/ninja/main.py
++++ b/ninja/main.py
+@@ -335,13 +335,34 @@ class NinjaAPI:
+         return reverse(name)
+ 
+     def create_response(
+-        self, request: HttpRequest, data: Any, *, status: int = 200
++        self,
++        request: HttpRequest,
++        data: Any,
++        *,
++        status: int = None,
++        temporal_response: HttpResponse = None,
+     ) -> HttpResponse:
++        if temporal_response:
++            status = temporal_response.status_code
++        assert status
++
+         content = self.renderer.render(request, data, response_status=status)
+-        content_type = "{}; charset={}".format(
+-            self.renderer.media_type, self.renderer.charset
+-        )
+-        return HttpResponse(content, status=status, content_type=content_type)
++
++        if temporal_response:
++            response = temporal_response
++            response.content = content
++        else:
++            response = HttpResponse(
++                content, status=status, content_type=self.get_content_type()
++            )
++
++        return response
++
++    def create_temporal_response(self, request: HttpRequest) -> HttpResponse:
++        return HttpResponse("", content_type=self.get_content_type())
++
++    def get_content_type(self) -> str:
++        return "{}; charset={}".format(self.renderer.media_type, self.renderer.charset)
+ 
+     def get_openapi_schema(self, path_prefix: Optional[str] = None) -> OpenAPISchema:
+         if path_prefix is None:
+diff --git a/ninja/operation.py b/ninja/operation.py
+index 2fa0935..dcdb955 100644
+--- a/ninja/operation.py
++++ b/ninja/operation.py
+@@ -94,9 +94,10 @@ class Operation:
+         if error:
+             return error
+         try:
+-            values = self._get_values(request, kw)
++            temporal_response = self.api.create_temporal_response(request)
++            values = self._get_values(request, kw, temporal_response)
+             result = self.view_func(request, **values)
+-            return self._result_to_response(request, result)
++            return self._result_to_response(request, result, temporal_response)
+         except Exception as e:
+             if isinstance(e, TypeError) and "required positional argument" in str(e):
+                 msg = "Did you fail to use functools.wraps() in a decorator?"
+@@ -151,7 +152,7 @@ class Operation:
+         return self.api.create_response(request, {"detail": "Unauthorized"}, status=401)
+ 
+     def _result_to_response(
+-        self, request: HttpRequest, result: Any
++        self, request: HttpRequest, result: Any, temporal_response: HttpResponse
+     ) -> HttpResponseBase:
+         """
+         The protocol for results
+@@ -179,13 +180,16 @@ class Operation:
+                 f"Schema for status {status} is not set in response {self.response_models.keys()}"
+             )
+ 
++        temporal_response.status_code = status
++
+         if response_model is NOT_SET:
+-            return self.api.create_response(request, result, status=status)
++            return self.api.create_response(
++                request, result, temporal_response=temporal_response
++            )
+ 
+         if response_model is None:
+-            return HttpResponse(status=status)
+-            # TODO: ^ maybe self.api.create_empty_response ?
+-            # return self.api.create_response(request, result, status=status)
++            # Empty response.
++            return temporal_response
+ 
+         resp_object = ResponseObject(result)
+         # ^ we need object because getter_dict seems work only with from_orm
+@@ -195,9 +199,13 @@ class Operation:
+             exclude_defaults=self.exclude_defaults,
+             exclude_none=self.exclude_none,
+         )["response"]
+-        return self.api.create_response(request, result, status=status)
++        return self.api.create_response(
++            request, result, temporal_response=temporal_response
++        )
+ 
+-    def _get_values(self, request: HttpRequest, path_params: Any) -> DictStrAny:
++    def _get_values(
++        self, request: HttpRequest, path_params: Any, temporal_response: HttpResponse
++    ) -> DictStrAny:
+         values, errors = {}, []
+         for model in self.models:
+             try:
+@@ -213,6 +221,8 @@ class Operation:
+                 errors.extend(items)
+         if errors:
+             raise ValidationError(errors)
++        if self.signature.response_arg:
++            values[self.signature.response_arg] = temporal_response
+         return values
+ 
+     def _create_response_model_multiple(
+@@ -244,9 +254,10 @@ class AsyncOperation(Operation):
+         if error:
+             return error
+         try:
+-            values = self._get_values(request, kw)
++            temporal_response = self.api.create_temporal_response(request)
++            values = self._get_values(request, kw, temporal_response)
+             result = await self.view_func(request, **values)
+-            return self._result_to_response(request, result)
++            return self._result_to_response(request, result, temporal_response)
+         except Exception as e:
+             return self.api.on_exception(request, e)
+ 
+diff --git a/ninja/signature/details.py b/ninja/signature/details.py
+index 4aea69d..a740684 100644
+--- a/ninja/signature/details.py
++++ b/ninja/signature/details.py
+@@ -1,9 +1,10 @@
+ import inspect
+ import warnings
+ from collections import defaultdict, namedtuple
+-from typing import Any, Callable, Dict, Generator, List, Tuple, Union
++from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+ 
+ import pydantic
++from django.http import HttpResponse
+ 
+ from ninja import UploadedFile, params
+ from ninja.compatibility.util import get_args, get_origin as get_collection_origin
+@@ -28,6 +29,7 @@ class ViewSignature:
+     FLATTEN_PATH_SEP = (
+         "\x1e"  # ASCII Record Separator.  IE: not generally used in query names
+     )
++    response_arg: Optional[str] = None
+ 
+     def __init__(self, path: str, view_func: Callable) -> None:
+         self.view_func = view_func
+@@ -54,6 +56,10 @@ class ViewSignature:
+                 # Skipping *args
+                 continue
+ 
++            if arg.annotation is HttpResponse:
++                self.response_arg = name
++                continue
++
+             func_param = self._get_param_type(name, arg)
+             self.params.append(func_param)
+ 
+

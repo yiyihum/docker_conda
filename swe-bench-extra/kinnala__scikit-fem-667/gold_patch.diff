@@ -1,0 +1,188 @@
+diff --git a/README.md b/README.md
+index ec13b5ff..453498ed 100644
+--- a/README.md
++++ b/README.md
+@@ -257,6 +257,9 @@ with respect to documented and/or tested features.
+ - Added: `ElementTriCCR` and `ElementTetCCR`, conforming Crouzeix-Raviart finite elements
+ - Fixed: `Mesh.mirrored` returned a wrong mesh when a point other than the origin was used
+ - Fixed: `MeshLine` constructor accepted only NumPy arrays and not plain Python lists
++- Fixed: `Mesh.element_finder` (and `CellBasis.probes`, `CellBasis.interpolator`) was not working properly for a small number of elements (<5) or a large number of input points (>1000)
++- Fixed: `MeshTet` and `MeshTri.element_finder` is are now more robust against degenerate elements
++- Fixed: `Mesh.element_finder` (and `CellBasis.probes`, `CellBasis.interpolator`) raises exception if the query point is outside of the domain
+ 
+ ### [3.1.0] - 2021-06-18
+ 
+diff --git a/docs/examples/ex28.py b/docs/examples/ex28.py
+index 5c526815..987ce837 100644
+--- a/docs/examples/ex28.py
++++ b/docs/examples/ex28.py
+@@ -88,15 +88,7 @@ import numpy as np
+ import pygmsh
+ 
+ 
+-if version.parse(pygmsh.__version__) < version.parse('7.0.0'):
+-    class NullContextManager():
+-        def __enter__(self):
+-            return None
+-        def __exit__(self, *args):
+-            pass
+-    geometrycontext = NullContextManager()
+-else:
+-    geometrycontext = pygmsh.geo.Geometry()
++geometrycontext = pygmsh.geo.Geometry()
+ 
+ halfheight = 1.
+ length = 10.
+@@ -110,17 +102,12 @@ peclet = 357.
+ def make_mesh(halfheight: float,  # mm
+               length: float,
+               thickness: float) -> MeshTri:
+-    with geometrycontext as g:
+-        if version.parse(pygmsh.__version__) < version.parse('7.0.0'):
+-            geom = pygmsh.built_in.Geometry()
+-            geom.add_curve_loop = geom.add_line_loop
+-        else:
+-            geom = g
++    with geometrycontext as geom:
+ 
+         points = []
+         lines = []
+ 
+-        lcar = halfheight / 2**2
++        lcar = halfheight / 2 ** 2
+ 
+         for xy in [(0., halfheight),
+                    (0., -halfheight),
+@@ -155,10 +142,7 @@ def make_mesh(halfheight: float,  # mm
+         geom.add_physical(geom.add_plane_surface(geom.add_curve_loop(
+             [*lines[-3:], -lines[1]])), 'solid')
+ 
+-        if version.parse(pygmsh.__version__) < version.parse('7.0.0'):
+-            return from_meshio(pygmsh.generate_mesh(geom, dim=2))
+-        else:
+-            return from_meshio(geom.generate_mesh(dim=2))
++        return from_meshio(geom.generate_mesh(dim=2))
+ 
+ mesh = from_file(Path(__file__).parent / 'meshes' / 'ex28.json')
+ element = ElementTriP1()
+diff --git a/skfem/mesh/mesh_line_1.py b/skfem/mesh/mesh_line_1.py
+index ef85502c..e04afbda 100644
+--- a/skfem/mesh/mesh_line_1.py
++++ b/skfem/mesh/mesh_line_1.py
+@@ -74,6 +74,7 @@ class MeshLine1(Mesh):
+         return np.max(np.abs(self.p[0, self.t[1]] - self.p[0, self.t[0]]))
+ 
+     def element_finder(self, mapping=None):
++
+         ix = np.argsort(self.p[0])
+         maxt = self.t[np.argmax(self.p[0, self.t], 0),
+                       np.arange(self.t.shape[1])]
+@@ -81,8 +82,11 @@ class MeshLine1(Mesh):
+         def finder(x):
+             xin = x.copy()  # bring endpoint inside for np.digitize
+             xin[x == self.p[0, ix[-1]]] = self.p[0, ix[-2:]].mean()
+-            return np.nonzero(ix[np.digitize(xin, self.p[0, ix])][:, None]
+-                              == maxt)[1]
++            elems = np.nonzero(ix[np.digitize(xin, self.p[0, ix])][:, None]
++                               == maxt)[1]
++            if len(elems) < len(x):
++                raise ValueError("Point is outside of the mesh.")
++            return elems
+ 
+         return finder
+ 
+diff --git a/skfem/mesh/mesh_tet_1.py b/skfem/mesh/mesh_tet_1.py
+index a0ef8361..f7f75bbd 100644
+--- a/skfem/mesh/mesh_tet_1.py
++++ b/skfem/mesh/mesh_tet_1.py
+@@ -34,18 +34,34 @@ class MeshTet1(Mesh3D):
+         if mapping is None:
+             mapping = self._mapping()
+ 
+-        tree = cKDTree(np.mean(self.p[:, self.t], axis=1).T)
++        if not hasattr(self, '_cached_tree'):
++            self._cached_tree = cKDTree(np.mean(self.p[:, self.t], axis=1).T)
++
++        tree = self._cached_tree
++        nelems = self.t.shape[1]
++
++        def finder(x, y, z, _search_all=False):
++
++            if not _search_all:
++                ix = tree.query(np.array([x, y, z]).T,
++                                min(10, nelems))[1].flatten()
++                _, ix_ind = np.unique(ix, return_index=True)
++                ix = ix[np.sort(ix_ind)]
++            else:
++                ix = np.arange(nelems, dtype=np.int64)
+ 
+-        def finder(x, y, z):
+-            ix = tree.query(np.array([x, y, z]).T, 5)[1].flatten()
+             X = mapping.invF(np.array([x, y, z])[:, None], ix)
+-            inside = (
+-                (X[0] >= 0) *
+-                (X[1] >= 0) *
+-                (X[2] >= 0) *
+-                (1 - X[0] - X[1] - X[2] >= 0)
+-            )
+-            return np.array([ix[np.argmax(inside, axis=0)]]).flatten()
++            inside = ((X[0] >= 0) *
++                      (X[1] >= 0) *
++                      (X[2] >= 0) *
++                      (1 - X[0] - X[1] - X[2] >= 0))
++
++            if not inside.max(axis=0).all():
++                if _search_all:
++                    raise ValueError("Point is outside of the mesh.")
++                return finder(x, y, z, _search_all=True)
++
++            return np.array([ix[inside.argmax(axis=0)]]).flatten()
+ 
+         return finder
+ 
+diff --git a/skfem/mesh/mesh_tri_1.py b/skfem/mesh/mesh_tri_1.py
+index 055b758a..4b1a087d 100644
+--- a/skfem/mesh/mesh_tri_1.py
++++ b/skfem/mesh/mesh_tri_1.py
+@@ -325,16 +325,32 @@ class MeshTri1(Mesh2D):
+         if mapping is None:
+             mapping = self._mapping()
+ 
+-        tree = cKDTree(np.mean(self.p[:, self.t], axis=1).T)
++        if not hasattr(self, '_cached_tree'):
++            self._cached_tree = cKDTree(np.mean(self.p[:, self.t], axis=1).T)
++
++        tree = self._cached_tree
++        nelems = self.t.shape[1]
++
++        def finder(x, y, _search_all=False):
++
++            if not _search_all:
++                ix = tree.query(np.array([x, y]).T,
++                                min(5, nelems))[1].flatten()
++                _, ix_ind = np.unique(ix, return_index=True)
++                ix = ix[np.sort(ix_ind)]
++            else:
++                ix = np.arange(nelems, dtype=np.int64)
+ 
+-        def finder(x, y):
+-            ix = tree.query(np.array([x, y]).T, 5)[1].flatten()
+             X = mapping.invF(np.array([x, y])[:, None], ix)
+-            inside = (
+-                (X[0] >= 0) *
+-                (X[1] >= 0) *
+-                (1 - X[0] - X[1] >= 0)
+-            )
+-            return np.array([ix[np.argmax(inside, axis=0)]]).flatten()
++            inside = ((X[0] >= 0) *
++                      (X[1] >= 0) *
++                      (1 - X[0] - X[1] >= 0))
++
++            if not inside.max(axis=0).all():
++                if _search_all:
++                    raise ValueError("Point is outside of the mesh.")
++                return finder(x, y, _search_all=True)
++
++            return np.array([ix[inside.argmax(axis=0)]]).flatten()
+ 
+         return finder

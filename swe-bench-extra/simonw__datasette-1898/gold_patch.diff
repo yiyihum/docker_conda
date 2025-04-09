@@ -1,0 +1,170 @@
+diff --git a/datasette/templates/_codemirror.html b/datasette/templates/_codemirror.html
+index dea4710c..c4629aeb 100644
+--- a/datasette/templates/_codemirror.html
++++ b/datasette/templates/_codemirror.html
+@@ -4,7 +4,6 @@
+   .cm-editor {
+     resize: both;
+     overflow: hidden;
+-    min-height: 70px;
+     width: 80%;
+     border: 1px solid #ddd;
+   }
+diff --git a/datasette/templates/_codemirror_foot.html b/datasette/templates/_codemirror_foot.html
+index b76d06fa..a624c8a4 100644
+--- a/datasette/templates/_codemirror_foot.html
++++ b/datasette/templates/_codemirror_foot.html
+@@ -1,86 +1,11 @@
+ <script>
+-  const schema = {
+-    "123_starts_with_digits": ["content"],
+-    "Table With Space In Name": ["content", "pk"],
+-    attraction_characteristic: ["name", "pk"],
+-    binary_data: ["data"],
+-    complex_foreign_keys: ["f1", "f2", "f3", "pk"],
+-    compound_primary_key: ["content", "pk1", "pk2"],
+-    compound_three_primary_keys: ["content", "pk1", "pk2", "pk3"],
+-    custom_foreign_key_label: ["foreign_key_with_custom_label", "pk"],
+-    facet_cities: ["id", "name"],
+-    facetable: [
+-      "_city_id",
+-      "_neighborhood",
+-      "complex_array",
+-      "created",
+-      "distinct_some_null",
+-      "n",
+-      "on_earth",
+-      "pk",
+-      "planet_int",
+-      "state",
+-      "tags",
+-    ],
+-    foreign_key_references: [
+-      "foreign_key_compound_pk1",
+-      "foreign_key_compound_pk2",
+-      "foreign_key_with_blank_label",
+-      "foreign_key_with_label",
+-      "foreign_key_with_no_label",
+-      "pk",
+-    ],
+-    infinity: ["value"],
+-    no_primary_key: ["a", "b", "c", "content"],
+-    primary_key_multiple_columns: ["content", "content2", "id"],
+-    primary_key_multiple_columns_explicit_label: ["content", "content2", "id"],
+-    roadside_attraction_characteristics: ["attraction_id", "characteristic_id"],
+-    roadside_attractions: [
+-      "address",
+-      "latitude",
+-      "longitude",
+-      "name",
+-      "pk",
+-      "url",
+-    ],
+-    searchable: ["name with . and spaces", "pk", "text1", "text2"],
+-    searchable_fts: [
+-      "__langid",
+-      "docid",
+-      "name with . and spaces",
+-      "searchable_fts",
+-      "text1",
+-      "text2",
+-    ],
+-    searchable_fts_docsize: ["docid", "size"],
+-    searchable_fts_segdir: [
+-      "end_block",
+-      "idx",
+-      "leaves_end_block",
+-      "level",
+-      "root",
+-      "start_block",
+-    ],
+-    searchable_fts_segments: ["block", "blockid"],
+-    searchable_fts_stat: ["id", "value"],
+-    searchable_tags: ["searchable_id", "tag"],
+-    select: ["and", "group", "having", "json"],
+-    simple_primary_key: ["content", "id"],
+-    sortable: [
+-      "content",
+-      "pk1",
+-      "pk2",
+-      "sortable",
+-      "sortable_with_nulls",
+-      "sortable_with_nulls_2",
+-      "text",
+-    ],
+-    "table/with/slashes.csv": ["content", "pk"],
+-    tags: ["tag"],
+-    units: ["distance", "frequency", "pk"],
+-  };
++  {% if table_columns %}
++  const schema = {{ table_columns|tojson(2) }};
++  {% else %}
++  const schema = {};
++  {% endif %}
+ 
+-  window.onload = () => {
++  window.addEventListener("DOMContentLoaded", () => {
+     const sqlFormat = document.querySelector("button#sql-format");
+     const readOnly = document.querySelector("pre#sql-query");
+     const sqlInput = document.querySelector("textarea#sql-editor");
+@@ -113,5 +38,5 @@
+         });
+       }
+     }
+-  };
++  });
+ </script>
+diff --git a/datasette/views/database.py b/datasette/views/database.py
+index 8e08c3b1..a50cf3d3 100644
+--- a/datasette/views/database.py
++++ b/datasette/views/database.py
+@@ -139,6 +139,9 @@ class DatabaseView(DataView):
+ 
+         attached_databases = [d.name for d in await db.attached_databases()]
+ 
++        allow_execute_sql = await self.ds.permission_allowed(
++            request.actor, "execute-sql", database, default=True
++        )
+         return (
+             {
+                 "database": database,
+@@ -149,9 +152,10 @@ class DatabaseView(DataView):
+                 "hidden_count": len([t for t in tables if t["hidden"]]),
+                 "views": views,
+                 "queries": canned_queries,
+-                "allow_execute_sql": await self.ds.permission_allowed(
+-                    request.actor, "execute-sql", database, default=True
+-                ),
++                "allow_execute_sql": allow_execute_sql,
++                "table_columns": await _table_columns(self.ds, database)
++                if allow_execute_sql
++                else {},
+             },
+             {
+                 "database_actions": database_actions,
+@@ -508,6 +512,9 @@ class QueryView(DataView):
+                 "show_hide_text": show_hide_text,
+                 "show_hide_hidden": markupsafe.Markup(show_hide_hidden),
+                 "hide_sql": hide_sql,
++                "table_columns": await _table_columns(self.ds, database)
++                if allow_execute_sql
++                else {},
+             }
+ 
+         return (
+@@ -554,3 +561,15 @@ class MagicParameters(dict):
+                     return super().__getitem__(key)
+         else:
+             return super().__getitem__(key)
++
++
++async def _table_columns(datasette, database_name):
++    internal = datasette.get_database("_internal")
++    result = await internal.execute(
++        "select table_name, name from columns where database_name = ?",
++        [database_name],
++    )
++    table_columns = {}
++    for row in result.rows:
++        table_columns.setdefault(row["table_name"], []).append(row["name"])
++    return table_columns

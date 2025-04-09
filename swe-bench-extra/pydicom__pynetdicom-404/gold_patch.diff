@@ -1,0 +1,123 @@
+diff --git a/docs/changelog/v1.5.0.rst b/docs/changelog/v1.5.0.rst
+index 8bd8344df..5c88acc2d 100644
+--- a/docs/changelog/v1.5.0.rst
++++ b/docs/changelog/v1.5.0.rst
+@@ -10,6 +10,14 @@ Fixes
+   closing its sockets (:issue:`382`)
+ * Improved the robustness of determining the local IP address (:issue:`394`)
+ 
++Enhancements
++............
++
++* Added configuration option :attr:`_config.USE_SHORT_DIMSE_AET
++  <pynetdicom._config.USE_SHORT_DIMSE_AET>` so elements with a VR of *AE* in
++  DIMSE messages are only padded to the shortest even length rather than to
++  the maximum 16 characters. (:issue:`403`)
++
+ Changes
+ .......
+ 
+diff --git a/docs/reference/config.rst b/docs/reference/config.rst
+index 6cb9323fa..6e43fb58b 100644
+--- a/docs/reference/config.rst
++++ b/docs/reference/config.rst
+@@ -10,3 +10,4 @@ Configuration Options (:mod:`pynetdicom._config`)
+ 
+    ENFORCE_UID_CONFORMANCE
+    LOG_HANDLER_LEVEL
++   USE_SHORT_DIMSE_AET
+diff --git a/pynetdicom/_config.py b/pynetdicom/_config.py
+index e115d9f9a..53093bc9d 100644
+--- a/pynetdicom/_config.py
++++ b/pynetdicom/_config.py
+@@ -31,3 +31,19 @@ Examples
+ >>> from pynetdicom import _config
+ >>> _config.ENFORCE_UID_CONFORMANCE = True
+ """
++
++
++USE_SHORT_DIMSE_AET = False
++"""Use short AE titles in DIMSE messages.
++
++If ``False`` then elements with a VR of AE in DIMSE messages will be padded
++with trailing spaces up to the maximum allowable length (16 bytes), otherwise
++they will be padded with zero or one space to the smallest possible even
++length (i.e an AE title with 7 characters will be trailing padded to 8).
++
++Examples
++--------
++
++>>> from pynetdicom import _config
++>>> _config.USE_SHORT_DIMSE_AET = True
++"""
+diff --git a/pynetdicom/dimse_primitives.py b/pynetdicom/dimse_primitives.py
+index 0b276f203..3d8371844 100644
+--- a/pynetdicom/dimse_primitives.py
++++ b/pynetdicom/dimse_primitives.py
+@@ -17,6 +17,7 @@ import logging
+ from pydicom.tag import Tag
+ from pydicom.uid import UID
+ 
++from pynetdicom import _config
+ from pynetdicom.utils import validate_ae_title, validate_uid
+ 
+ 
+@@ -589,7 +590,7 @@ class C_STORE(DIMSEPrimitive):
+         if value:
+             try:
+                 self._move_originator_application_entity_title = (
+-                    validate_ae_title(value)
++                    validate_ae_title(value, _config.USE_SHORT_DIMSE_AET)
+                 )
+             except ValueError:
+                 LOGGER.error(
+@@ -1154,7 +1155,9 @@ class C_MOVE(DIMSEPrimitive):
+             value = codecs.encode(value, 'ascii')
+ 
+         if value is not None:
+-            self._move_destination = validate_ae_title(value)
++            self._move_destination = validate_ae_title(
++                value, _config.USE_SHORT_DIMSE_AET
++            )
+         else:
+             self._move_destination = None
+ 
+diff --git a/pynetdicom/utils.py b/pynetdicom/utils.py
+index fc9bfbc0a..0b5f6f5ae 100644
+--- a/pynetdicom/utils.py
++++ b/pynetdicom/utils.py
+@@ -71,7 +71,7 @@ def pretty_bytes(bytestream, prefix='  ', delimiter='  ', items_per_line=16,
+     return lines
+ 
+ 
+-def validate_ae_title(ae_title):
++def validate_ae_title(ae_title, use_short=False):
+     """Return a valid AE title from `ae_title`, if possible.
+ 
+     An AE title:
+@@ -93,6 +93,10 @@ def validate_ae_title(ae_title):
+     ----------
+     ae_title : bytes
+         The AE title to check.
++    use_short : bool, optional
++        If ``False`` (default) then pad AE titles with trailing spaces up to
++        the maximum allowable length (16 bytes), otherwise only pad odd length
++        AE titles with a single trailing space to make it even length.
+ 
+     Returns
+     -------
+@@ -131,8 +135,12 @@ def validate_ae_title(ae_title):
+ 
+     # Truncate if longer than 16 characters
+     ae_title = ae_title[:16]
+-    # Pad out to 16 characters using spaces
+-    ae_title = ae_title.ljust(16)
++    if not use_short:
++        # Pad out to 16 characters using spaces
++        ae_title = ae_title.ljust(16)
++    elif len(ae_title) % 2:
++        # Pad to even length
++        ae_title += ' '
+ 
+     # Unicode category: 'Cc' is control characters
+     invalid = [

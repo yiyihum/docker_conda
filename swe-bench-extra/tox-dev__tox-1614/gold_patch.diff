@@ -1,0 +1,99 @@
+diff --git a/docs/changelog/1575.feature.rst b/docs/changelog/1575.feature.rst
+new file mode 100644
+index 00000000..7a36ab20
+--- /dev/null
++++ b/docs/changelog/1575.feature.rst
+@@ -0,0 +1,3 @@
++Implement support for building projects
++having :pep:`517#in-tree-build-backends` ``backend-path`` setting -
++by :user:`webknjaz`
+diff --git a/src/tox/helper/build_isolated.py b/src/tox/helper/build_isolated.py
+index 55ea41b8..3d897097 100644
+--- a/src/tox/helper/build_isolated.py
++++ b/src/tox/helper/build_isolated.py
+@@ -1,10 +1,40 @@
++"""PEP 517 build backend invocation script.
++
++It accepts externally parsed build configuration from `[build-system]`
++in `pyproject.toml` and invokes an API endpoint for building an sdist
++tarball.
++"""
++
++import os
+ import sys
+ 
++
++def _ensure_module_in_paths(module, paths):
++    """Verify that the imported backend belongs in-tree."""
++    if not paths:
++        return
++
++    module_path = os.path.normcase(os.path.abspath(module.__file__))
++    normalized_paths = (os.path.normcase(os.path.abspath(path)) for path in paths)
++
++    if any(os.path.commonprefix((module_path, path)) == path for path in normalized_paths):
++        return
++
++    raise SystemExit(
++        "build-backend ({!r}) must exist in one of the paths "
++        "specified by backend-path ({!r})".format(module, paths),
++    )
++
++
+ dist_folder = sys.argv[1]
+ backend_spec = sys.argv[2]
+ backend_obj = sys.argv[3] if len(sys.argv) >= 4 else None
++backend_paths = sys.argv[4].split(os.path.pathsep) if sys.argv[4] else []
++
++sys.path[:0] = backend_paths
+ 
+ backend = __import__(backend_spec, fromlist=["_trash"])
++_ensure_module_in_paths(backend, backend_paths)
+ if backend_obj:
+     backend = getattr(backend, backend_obj)
+ 
+diff --git a/src/tox/package/builder/isolated.py b/src/tox/package/builder/isolated.py
+index c02aa109..38ebe8ea 100644
+--- a/src/tox/package/builder/isolated.py
++++ b/src/tox/package/builder/isolated.py
+@@ -1,6 +1,7 @@
+ from __future__ import unicode_literals
+ 
+ import json
++import os
+ from collections import namedtuple
+ 
+ import six
+@@ -11,7 +12,9 @@ from tox import reporter
+ from tox.config import DepConfig, get_py_project_toml
+ from tox.constants import BUILD_ISOLATED, BUILD_REQUIRE_SCRIPT
+ 
+-BuildInfo = namedtuple("BuildInfo", ["requires", "backend_module", "backend_object"])
++BuildInfo = namedtuple(
++    "BuildInfo", ["requires", "backend_module", "backend_object", "backend_paths"],
++)
+ 
+ 
+ def build(config, session):
+@@ -84,7 +87,12 @@ def get_build_info(folder):
+     module = args[0]
+     obj = args[1] if len(args) > 1 else ""
+ 
+-    return BuildInfo(requires, module, obj)
++    backend_paths = build_system.get("backend-path", [])
++    if not isinstance(backend_paths, list):
++        abort("backend-path key at build-system section must be a list, if specified")
++    backend_paths = [folder.join(p) for p in backend_paths]
++
++    return BuildInfo(requires, module, obj, backend_paths)
+ 
+ 
+ def perform_isolated_build(build_info, package_venv, dist_dir, setup_dir):
+@@ -103,6 +111,7 @@ def perform_isolated_build(build_info, package_venv, dist_dir, setup_dir):
+                 str(dist_dir),
+                 build_info.backend_module,
+                 build_info.backend_object,
++                os.path.pathsep.join(str(p) for p in build_info.backend_paths),
+             ],
+             returnout=True,
+             action=action,

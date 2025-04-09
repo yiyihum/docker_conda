@@ -1,0 +1,210 @@
+diff --git a/docs/examples/settings.py b/docs/examples/settings.py
+--- a/docs/examples/settings.py
++++ b/docs/examples/settings.py
+@@ -1,44 +1,57 @@
+ from typing import Set
+ 
+-from pydantic import BaseModel, DSN, BaseSettings, PyObject
+-
++from devtools import debug
++from pydantic import BaseModel, BaseSettings, PyObject, RedisDsn, PostgresDsn, Field
+ 
+ class SubModel(BaseModel):
+     foo = 'bar'
+     apple = 1
+ 
+-
+ class Settings(BaseSettings):
+-    redis_host = 'localhost'
+-    redis_port = 6379
+-    redis_database = 0
+-    redis_password: str = None
++    auth_key: str
++    api_key: str = Field(..., env='my_api_key')
+ 
+-    auth_key: str = ...
++    redis_dsn: RedisDsn = 'redis://user:pass@localhost:6379/1'
++    pg_dsn: PostgresDsn = 'postgres://user:pass@localhost:5432/foobar'
+ 
+-    invoicing_cls: PyObject = 'path.to.Invoice'
+-
+-    db_name = 'foobar'
+-    db_user = 'postgres'
+-    db_password: str = None
+-    db_host = 'localhost'
+-    db_port = '5432'
+-    db_driver = 'postgres'
+-    db_query: dict = None
+-    dsn: DSN = None
++    special_function: PyObject = 'math.cos'
+ 
+     # to override domains:
+-    # export MY_PREFIX_DOMAINS = '["foo.com", "bar.com"]'
++    # export my_prefix_domains='["foo.com", "bar.com"]'
+     domains: Set[str] = set()
+ 
+     # to override more_settings:
+-    # export MY_PREFIX_MORE_SETTINGS = '{"foo": "x", "apple": 1}'
++    # export my_prefix_more_settings='{"foo": "x", "apple": 1}'
+     more_settings: SubModel = SubModel()
+ 
+     class Config:
+-        env_prefix = 'MY_PREFIX_'  # defaults to 'APP_'
++        env_prefix = 'my_prefix_'  # defaults to no prefix, e.g. ""
+         fields = {
+             'auth_key': {
+-                'alias': 'my_api_key'
++                'env': 'my_auth_key',
++            },
++            'redis_dsn': {
++                'env': ['service_redis_dsn', 'redis_url']
+             }
+         }
++
++"""
++When calling with
++my_auth_key=a \
++MY_API_KEY=b \
++my_prefix_domains='["foo.com", "bar.com"]' \
++python docs/examples/settings.py 
++"""
++debug(Settings().dict())
++"""
++docs/examples/settings.py:45 <module>
++  Settings().dict(): {
++    'auth_key': 'a',
++    'api_key': 'b',
++    'redis_dsn': <RedisDsn('redis://user:pass@localhost:6379/1' scheme='redis' ...)>,
++    'pg_dsn': <PostgresDsn('postgres://user:pass@localhost:5432/foobar' scheme='postgres' ...)>,
++    'special_function': <built-in function cos>,
++    'domains': {'bar.com', 'foo.com'},
++    'more_settings': {'foo': 'bar', 'apple': 1},
++  } (dict) len=7
++"""
+diff --git a/pydantic/env_settings.py b/pydantic/env_settings.py
+--- a/pydantic/env_settings.py
++++ b/pydantic/env_settings.py
+@@ -1,7 +1,10 @@
+ import os
+-from typing import Any, Dict, Optional, cast
++import warnings
++from typing import Any, Dict, Iterable, Mapping, Optional
+ 
++from .fields import ModelField
+ from .main import BaseModel, Extra
++from .typing import display_as_type
+ 
+ 
+ class SettingsError(ValueError):
+@@ -30,26 +33,26 @@ def _build_environ(self) -> Dict[str, Optional[str]]:
+         d: Dict[str, Optional[str]] = {}
+ 
+         if self.__config__.case_sensitive:
+-            env_vars = cast(Dict[str, str], os.environ)
++            env_vars: Mapping[str, str] = os.environ
+         else:
+             env_vars = {k.lower(): v for k, v in os.environ.items()}
+ 
+         for field in self.__fields__.values():
+-            if field.has_alias:
+-                env_name = field.alias
+-            else:
+-                env_name = self.__config__.env_prefix + field.name.upper()
+-
+-            env_name_ = env_name if self.__config__.case_sensitive else env_name.lower()
+-            env_val = env_vars.get(env_name_, None)
+-
+-            if env_val:
+-                if field.is_complex():
+-                    try:
+-                        env_val = self.__config__.json_loads(env_val)  # type: ignore
+-                    except ValueError as e:
+-                        raise SettingsError(f'error parsing JSON for "{env_name}"') from e
+-                d[field.alias] = env_val
++            env_val: Optional[str] = None
++            for env_name in field.field_info.extra['env_names']:  # type: ignore
++                env_val = env_vars.get(env_name)
++                if env_val is not None:
++                    break
++
++            if env_val is None:
++                continue
++
++            if field.is_complex():
++                try:
++                    env_val = self.__config__.json_loads(env_val)  # type: ignore
++                except ValueError as e:
++                    raise SettingsError(f'error parsing JSON for "{env_name}"') from e
++            d[field.alias] = env_val
+         return d
+ 
+     class Config:
+@@ -59,4 +62,30 @@ class Config:
+         arbitrary_types_allowed = True
+         case_sensitive = False
+ 
++        @classmethod
++        def prepare_field(cls, field: ModelField) -> None:
++            if not field.field_info:
++                return
++
++            env_names: Iterable[str]
++            env = field.field_info.extra.pop('env', None)
++            if env is None:
++                if field.has_alias:
++                    warnings.warn(
++                        'aliases are no longer used by BaseSettings to define which environment variables to read. '
++                        'Instead use the "env" field setting. See https://pydantic-docs.helpmanual.io/#settings',
++                        DeprecationWarning,
++                    )
++                env_names = [cls.env_prefix + field.name]
++            elif isinstance(env, str):
++                env_names = {env}
++            elif isinstance(env, (list, set, tuple)):
++                env_names = env
++            else:
++                raise TypeError(f'invalid field env: {env!r} ({display_as_type(env)}); should be string, list or set')
++
++            if not cls.case_sensitive:
++                env_names = type(env_names)(n.lower() for n in env_names)
++            field.field_info.extra['env_names'] = env_names
++
+     __config__: Config  # type: ignore
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -229,6 +229,7 @@ def __init__(
+         self.post_validators: Optional['ValidatorsList'] = None
+         self.parse_json: bool = False
+         self.shape: int = SHAPE_SINGLETON
++        self.model_config.prepare_field(self)
+         self.prepare()
+ 
+     @classmethod
+diff --git a/pydantic/main.py b/pydantic/main.py
+--- a/pydantic/main.py
++++ b/pydantic/main.py
+@@ -73,7 +73,7 @@ class BaseConfig:
+     json_encoders: Dict[AnyType, AnyCallable] = {}
+ 
+     @classmethod
+-    def get_field_info(cls, name: str) -> Dict[str, str]:
++    def get_field_info(cls, name: str) -> Dict[str, Any]:
+         field_info = cls.fields.get(name) or {}
+         if isinstance(field_info, str):
+             field_info = {'alias': field_info}
+@@ -84,6 +84,13 @@ def get_field_info(cls, name: str) -> Dict[str, str]:
+             field_info['alias'] = alias
+         return field_info
+ 
++    @classmethod
++    def prepare_field(cls, field: 'ModelField') -> None:
++        """
++        Optional hook to check or modify fields during model creation.
++        """
++        pass
++
+ 
+ def inherit_config(self_config: 'ConfigType', parent_config: 'ConfigType') -> 'ConfigType':
+     if not self_config:
+

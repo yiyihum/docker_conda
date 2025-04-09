@@ -1,0 +1,311 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index a59041b..f12104b 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,4 +1,12 @@
+-# io Changelog
++# `bw2io` Changelog
++
++### DEV
++
++* Merged PR #213 Reparametrize lognormals for ecospold2 imports
++
++### 0.9.DEV22 (2023-09-15)
++
++* Pinned dependencies to fix environment problems
+ 
+ ### 0.9.DEV21 (2023-08-12)
+ 
+diff --git a/bw2io/extractors/simapro_lcia_csv.py b/bw2io/extractors/simapro_lcia_csv.py
+index 5adff67..f8c1033 100644
+--- a/bw2io/extractors/simapro_lcia_csv.py
++++ b/bw2io/extractors/simapro_lcia_csv.py
+@@ -5,7 +5,7 @@ from numbers import Number
+ from bw2data.logs import close_log, get_io_logger
+ from stats_arrays import *
+ 
+-INTRODUCTION = u"""Starting SimaPro import:
++INTRODUCTION = """Starting SimaPro import:
+ \tFilepath: %s
+ \tDelimiter: %s
+ """
+@@ -52,10 +52,11 @@ class SimaProLCIACSVExtractor(object):
+     list
+         List of datasets extracted from the SimaPro LCIACSV file.
+     """
++
+     @classmethod
+     def extract(cls, filepath, delimiter=";", encoding="cp1252"):
+         assert os.path.exists(filepath), "Can't find file %s" % filepath
+-        log, logfile = get_io_logger(u"SimaPro-LCIA-extractor")
++        log, logfile = get_io_logger("SimaPro-LCIA-extractor")
+ 
+         log.info(
+             INTRODUCTION
+@@ -73,7 +74,7 @@ class SimaProLCIACSVExtractor(object):
+             ]
+ 
+         # Check if valid SimaPro file
+-        assert u"SimaPro" in lines[0][0], "File is not valid SimaPro export"
++        assert "SimaPro" in lines[0][0], "File is not valid SimaPro export"
+ 
+         datasets = []
+ 
+@@ -118,7 +119,7 @@ class SimaProLCIACSVExtractor(object):
+             try:
+                 if data[index] and data[index][0] in SKIPPABLE_SECTIONS:
+                     index = cls.skip_to_section_end(data, index)
+-                elif data[index] and data[index][0] == u"Method":
++                elif data[index] and data[index][0] == "Method":
+                     return index + 1
+             except IndexError:
+                 # File ends without extra metadata
+@@ -162,11 +163,11 @@ class SimaProLCIACSVExtractor(object):
+         """
+         categories = (line[0], line[1])
+         return {
+-            u"amount": float(line[4]),
+-            u"CAS number": line[3],
+-            u"categories": categories,
+-            u"name": line[2],
+-            u"unit": line[5],
++            "amount": float(line[4].replace(",", ".")),
++            "CAS number": line[3],
++            "categories": categories,
++            "name": line[2],
++            "unit": line[5],
+         }
+ 
+     @classmethod
+@@ -220,7 +221,7 @@ class SimaProLCIACSVExtractor(object):
+         Raises
+         ------
+         ValueError
+-            
++
+         """
+         metadata, index = cls.read_metadata(data, index)
+         method_root_name = metadata.pop("Name")
+@@ -284,7 +285,7 @@ class SimaProLCIACSVExtractor(object):
+     def get_all_cfs(cls, nw_data, category_data):
+         """
+         Get all CFs from `nw_data` and `category_data`.
+-        
++
+         Parameters
+         ----------
+         nw_data : list
+@@ -296,6 +297,7 @@ class SimaProLCIACSVExtractor(object):
+         list
+             A list of all CFs.
+         """
++
+         def rescale(cf, scale):
+             cf["amount"] *= scale
+             return cf
+@@ -318,12 +320,13 @@ class SimaProLCIACSVExtractor(object):
+             A list of tuples containing the name and scale of the damage
+         category_data : list of tuples
+             A list of tuples containing the name, unit, and data of each impact category
+-        
++
+         Returns
+         -------
+         list of dictionaries
+             A list of dictionaries with the calculated damage exchanges of each impact category
+         """
++
+         def rescale(cf, scale):
+             cf["amount"] *= scale
+             return cf
+@@ -403,7 +406,7 @@ class SimaProLCIACSVExtractor(object):
+         index += 1
+         while data[index]:
+             method, scalar = data[index][:2]
+-            damage_data.append((method, float(scalar)))
++            damage_data.append((method, float(scalar.replace(",", "."))))
+             index += 1
+         return (name, unit, damage_data), index
+ 
+@@ -420,5 +423,5 @@ class SimaProLCIACSVExtractor(object):
+             index += 1
+             if weight == "0":
+                 continue
+-            nw_data.append((cat, float(weight)))
++            nw_data.append((cat, float(weight.replace(",", "."))))
+         return (name, nw_data), index
+diff --git a/bw2io/importers/ecospold2.py b/bw2io/importers/ecospold2.py
+index 2273c6b..931c36f 100644
+--- a/bw2io/importers/ecospold2.py
++++ b/bw2io/importers/ecospold2.py
+@@ -53,6 +53,7 @@ class SingleOutputEcospold2Importer(LCIImporter):
+         extractor=Ecospold2DataExtractor,
+         use_mp=True,
+         signal=None,
++        reparametrize_lognormals=False,
+     ):
+ 
+         """
+@@ -70,6 +71,10 @@ class SingleOutputEcospold2Importer(LCIImporter):
+             Flag to indicate whether to use multiprocessing, by default True.
+         signal : object
+             Object to indicate the status of the import process, by default None.
++        reparametrize_lognormals: bool
++            Flag to indicate if lognormal distributions for exchanges should be reparametrized
++            such that the mean value of the resulting distribution meets the amount
++            defined for the exchange.
+         """
+         
+         self.dirpath = dirpath
+@@ -93,13 +98,17 @@ class SingleOutputEcospold2Importer(LCIImporter):
+             delete_ghost_exchanges,
+             remove_uncertainty_from_negative_loss_exchanges,
+             fix_unreasonably_high_lognormal_uncertainties,
+-            set_lognormal_loc_value,
+             convert_activity_parameters_to_list,
+             add_cpc_classification_from_single_reference_product,
+             delete_none_synonyms,
+             partial(update_social_flows_in_older_consequential, biosphere_db=Database(config.biosphere)),
+         ]
+ 
++        if reparametrize_lognormals:
++            self.strategies.append(reparametrize_lognormal_to_agree_with_static_amount)
++        else:
++            self.strategies.append(set_lognormal_loc_value)
++
+         start = time()
+         try:
+             self.data = extractor.extract(dirpath, db_name, use_mp=use_mp)
+diff --git a/bw2io/strategies/__init__.py b/bw2io/strategies/__init__.py
+index c1be067..cb19e0b 100644
+--- a/bw2io/strategies/__init__.py
++++ b/bw2io/strategies/__init__.py
+@@ -28,6 +28,7 @@ __all__ = [
+     "fix_ecoinvent_flows_pre35",
+     "fix_localized_water_flows",
+     "fix_unreasonably_high_lognormal_uncertainties",
++    "reparametrize_lognormal_to_agree_with_static_amount",
+     "fix_zero_allocation_products",
+     "json_ld_add_activity_unit",
+     "json_ld_add_products_as_activities",
+diff --git a/bw2io/strategies/ecospold2.py b/bw2io/strategies/ecospold2.py
+index bcbea9e..ed3fe75 100644
+--- a/bw2io/strategies/ecospold2.py
++++ b/bw2io/strategies/ecospold2.py
+@@ -861,6 +861,79 @@ def set_lognormal_loc_value(db):
+     return db
+ 
+ 
++def reparametrize_lognormal_to_agree_with_static_amount(db):
++    """
++    For lognormal distributions, choose the mean of the underlying normal distribution
++    (loc) such that the expected value (mean) of the resulting distribution is
++    equal to the (static) amount defined for the exchange.
++
++    Parameters
++    ----------
++    db : list
++        A list of datasets, where each dataset is a dictionary containing an
++        'exchanges' key with a list of exchange dictionaries. The structure of a
++        dataset is as follows:
++
++        {
++            "exchanges": [
++                {
++                    "type": str,
++                    "name": str,
++                    "amount": float,
++                    "uncertainty type": int,
++                    "loc": float,
++                    "scale": float,
++                },
++                ...
++            ]
++        }
++
++    Returns
++    -------
++    list
++        The updated list of datasets with adjusted lognormal uncertainty
++        distribution loc values.
++
++    Examples
++    --------
++    >>> import math
++    >>> db = [
++    ...     {
++    ...         "exchanges": [
++    ...             {
++    ...                 "type": "technosphere",
++    ...                 "name": "input_A",
++    ...                 "amount": 5,
++    ...                 "uncertainty type": 2,
++    ...                 "loc": 1,
++    ...                 "scale": 0.5,
++    ...             },
++    ...         ],
++    ...     }
++    ... ]
++    >>> reparametrize_lognormals_to_agree_with_static_amount(db)
++    [
++        {
++            "exchanges": [
++                {
++                    "type": "technosphere",
++                    "name": "input_A",
++                    "amount": 5,
++                    "uncertainty type": 2,
++                    "loc": math.log(5) - 0.5**2 / 2,
++                    "scale": 0.5,
++                },
++            ],
++        }
++    ]
++    """
++    for ds in db:
++        for exc in ds.get("exchanges", []):
++            if exc["uncertainty type"] == LognormalUncertainty.id:
++                exc["loc"] = math.log(abs(exc["amount"])) - exc["scale"]**2 / 2
++    return db
++
++
+ def fix_unreasonably_high_lognormal_uncertainties(db, cutoff=2.5, replacement=0.25):
+     """
+     Replace unreasonably high lognormal uncertainties in the given database
+diff --git a/bw2io/version.py b/bw2io/version.py
+index 877a372..edb9b77 100644
+--- a/bw2io/version.py
++++ b/bw2io/version.py
+@@ -1,1 +1,1 @@
+-version = (0, 9, "DEV21")
++version = (0, 9, "DEV22")
+diff --git a/setup.py b/setup.py
+index 5f62474..e4d0be0 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,11 +1,11 @@
+ from setuptools import setup
+ 
+ REQUIREMENTS = [
+-    "bw2calc>=1.7.4",
+-    "bw2data>=3.5.1",
+-    "bw2parameters>=0.7.1",
+-    "bw_migrations",
+-    "bw_processing",
++    "bw2calc>=2.0.dev14",
++    "bw2data>=4.0.dev24",
++    "bw2parameters>=1.1.0",
++    "bw_migrations>=0.2",
++    "bw_processing>=0.8.5",
+     "lxml",
+     "mrio_common_metadata",
+     "numpy",
+@@ -13,7 +13,7 @@ REQUIREMENTS = [
+     "platformdirs",
+     "requests",
+     "scipy",
+-    "stats_arrays",
++    "stats_arrays>=0.6.5",
+     "tqdm",
+     "unidecode",
+     "voluptuous",

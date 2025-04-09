@@ -1,0 +1,149 @@
+diff --git a/heudiconv/bids.py b/heudiconv/bids.py
+index 1bbfcf6..9569278 100644
+--- a/heudiconv/bids.py
++++ b/heudiconv/bids.py
+@@ -240,6 +240,27 @@ def add_participant_record(studydir, subject, age, sex):
+             known_subjects = {l.split('\t')[0] for l in f.readlines()}
+         if participant_id in known_subjects:
+             return
++    else:
++        # Populate particpants.json (an optional file to describe column names in
++        # participant.tsv). This auto generation will make BIDS-validator happy.
++        participants_json = op.join(studydir, 'participants.json')
++        if not op.lexists(participants_json):
++            save_json(participants_json,
++                OrderedDict([
++                    ("participant_id", OrderedDict([
++                        ("Description", "Participant identifier")])),
++                    ("age", OrderedDict([
++                        ("Description", "Age in years (TODO - verify) as in the initial"
++                            " session, might not be correct for other sessions")])),
++                    ("sex", OrderedDict([
++                        ("Description", "self-rated by participant, M for male/F for "
++                            "female (TODO: verify)")])),
++                    ("group", OrderedDict([
++                        ("Description", "(TODO: adjust - by default everyone is in "
++                            "control group)")])),
++                ]),
++                sort_keys=False,
++                indent=2)
+     # Add a new participant
+     with open(participants_tsv, 'a') as f:
+         f.write(
+@@ -311,7 +332,8 @@ def save_scans_key(item, bids_files):
+ 
+ def add_rows_to_scans_keys_file(fn, newrows):
+     """
+-    Add new rows to file fn for scans key filename
++    Add new rows to file fn for scans key filename and generate accompanying json
++    descriptor to make BIDS validator happy.
+ 
+     Parameters
+     ----------
+@@ -334,6 +356,25 @@ def add_rows_to_scans_keys_file(fn, newrows):
+         os.unlink(fn)
+     else:
+         fnames2info = newrows
++        # Populate _scans.json (an optional file to describe column names in
++        # _scans.tsv). This auto generation will make BIDS-validator happy.
++        scans_json = '.'.join(fn.split('.')[:-1] + ['json'])
++        if not op.lexists(scans_json):
++            save_json(scans_json,
++                OrderedDict([
++                    ("filename", OrderedDict([
++                        ("Description", "Name of the nifti file")])),
++                    ("acq_time", OrderedDict([
++                        ("LongName", "Acquisition time"),
++                        ("Description", "Acquisition time of the particular scan")])),
++                    ("operator", OrderedDict([
++                        ("Description", "Name of the operator")])),
++                    ("randstr", OrderedDict([
++                        ("LongName", "Random string"),
++                        ("Description", "md5 hash of UIDs")])),
++                ]),
++                sort_keys=False,
++                indent=2)
+ 
+     header = ['filename', 'acq_time', 'operator', 'randstr']
+     # prepare all the data rows
+diff --git a/heudiconv/cli/run.py b/heudiconv/cli/run.py
+index cad83bf..ab69f10 100644
+--- a/heudiconv/cli/run.py
++++ b/heudiconv/cli/run.py
+@@ -16,7 +16,7 @@ import inspect
+ import logging
+ lgr = logging.getLogger(__name__)
+ 
+-INIT_MSG = "Running {packname} version {version}".format
++INIT_MSG = "Running {packname} version {version} latest {latest}".format
+ 
+ 
+ def is_interactive():
+@@ -245,8 +245,16 @@ def process_args(args):
+ 
+     outdir = op.abspath(args.outdir)
+ 
++    import etelemetry
++    try:
++        latest = etelemetry.get_project("nipy/heudiconv")
++    except Exception as e:
++        lgr.warning("Could not check for version updates: ", e)
++        latest = {"version": 'Unknown'}
++
+     lgr.info(INIT_MSG(packname=__packagename__,
+-                      version=__version__))
++                      version=__version__,
++                      latest=latest["version"]))
+ 
+     if args.command:
+         process_extra_commands(outdir, args)
+diff --git a/heudiconv/info.py b/heudiconv/info.py
+index 8c6b67c..feeae46 100644
+--- a/heudiconv/info.py
++++ b/heudiconv/info.py
+@@ -8,6 +8,19 @@ __longdesc__ = """Convert DICOM dirs based on heuristic info - HeuDiConv
+ uses the dcmstack package and dcm2niix tool to convert DICOM directories or
+ tarballs into collections of NIfTI files following pre-defined heuristic(s)."""
+ 
++CLASSIFIERS = [
++    'Environment :: Console',
++    'Intended Audience :: Science/Research',
++    'License :: OSI Approved :: Apache Software License',
++    'Programming Language :: Python :: 2.7',
++    'Programming Language :: Python :: 3.5',
++    'Programming Language :: Python :: 3.6',
++    'Programming Language :: Python :: 3.7',
++    'Topic :: Scientific/Engineering'
++]
++
++PYTHON_REQUIRES = ">=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*"
++
+ REQUIRES = [
+     'nibabel',
+     'pydicom',
+@@ -15,6 +28,7 @@ REQUIRES = [
+     'nipype >=1.0.0,!=1.2.1,!=1.2.2; python_version == "2.7"',
+     'pathlib',
+     'dcmstack>=0.7',
++    'etelemetry',
+ ]
+ 
+ TESTS_REQUIRES = [
+diff --git a/setup.py b/setup.py
+index 6017447..c3a804a 100755
+--- a/setup.py
++++ b/setup.py
+@@ -47,11 +47,13 @@ def main():
+         description=ldict['__description__'],
+         long_description=ldict['__longdesc__'],
+         license=ldict['__license__'],
++        classifiers=ldict['CLASSIFIERS'],
+         packages=heudiconv_pkgs,
+         entry_points={'console_scripts': [
+             'heudiconv=heudiconv.cli.run:main',
+             'heudiconv_monitor=heudiconv.cli.monitor:main',
+         ]},
++        python_requires=ldict['PYTHON_REQUIRES'],
+         install_requires=ldict['REQUIRES'],
+         extras_require=ldict['EXTRA_REQUIRES'],
+         package_data={

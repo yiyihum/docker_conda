@@ -1,0 +1,86 @@
+diff --git a/tests/mrp/test_protocol.py b/tests/mrp/test_protocol.py
+index 8c7e8c63..20043675 100644
+--- a/tests/mrp/test_protocol.py
++++ b/tests/mrp/test_protocol.py
+@@ -1,13 +1,20 @@
+ """Unittests for pyatv.mrp.protocol."""
++from unittest.mock import MagicMock
++
+ import pytest
+ 
+ from pyatv.conf import MrpService
+ from pyatv.const import Protocol
+ from pyatv.mrp.connection import MrpConnection
+-from pyatv.mrp.protocol import MrpProtocol
++from pyatv.mrp.protocol import (
++    HEARTBEAT_INTERVAL,
++    HEARTBEAT_RETRIES,
++    MrpProtocol,
++    heartbeat_loop,
++)
+ from pyatv.mrp.srp import SRPAuthHandler
+ 
+-from tests.utils import until, stub_sleep
++from tests.utils import until, total_sleep_time
+ from tests.fake_device import FakeAppleTV
+ 
+ 
+@@ -37,3 +44,15 @@ async def test_heartbeat_loop(mrp_atv, mrp_protocol):
+ 
+     mrp_state = mrp_atv.get_state(Protocol.MRP)
+     await until(lambda: mrp_state.heartbeat_count >= 3)
++
++
++@pytest.mark.asyncio
++async def test_heartbeat_fail_closes_connection(stub_sleep):
++    protocol = MagicMock()
++    protocol.send_and_receive.side_effect = Exception()
++
++    await heartbeat_loop(protocol)
++    assert protocol.send_and_receive.call_count == 1 + HEARTBEAT_RETRIES
++    assert total_sleep_time() == HEARTBEAT_INTERVAL
++
++    protocol.connection.close.assert_called_once()
+diff --git a/tests/utils.py b/tests/utils.py
+index 63e3fc17..6734d13c 100644
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -16,6 +16,7 @@ from aiohttp import ClientSession
+ async def _fake_sleep(time: float = None, loop=None):
+     async def dummy():
+         _fake_sleep._sleep_time.insert(0, time)
++        _fake_sleep._total_sleep += time
+ 
+     await asyncio.ensure_future(dummy())
+ 
+@@ -28,6 +29,7 @@ def stub_sleep(fn=None) -> float:
+     if asyncio.sleep == _fake_sleep:
+         if not hasattr(asyncio.sleep, "_sleep_time"):
+             asyncio.sleep._sleep_time = [0.0]
++            asyncio.sleep._total_sleep = 0.0
+         if len(asyncio.sleep._sleep_time) == 1:
+             return asyncio.sleep._sleep_time[0]
+         return asyncio.sleep._sleep_time.pop()
+@@ -35,13 +37,21 @@ def stub_sleep(fn=None) -> float:
+     return 0.0
+ 
+ 
+-def unstub_sleep():
++def unstub_sleep() -> None:
+     """Restore original asyncio.sleep method."""
+     if asyncio.sleep == _fake_sleep:
+         asyncio.sleep._sleep_time = [0.0]
++        asyncio.sleep._total_sleep = 0.0
+     asyncio.sleep = real_sleep
+ 
+ 
++def total_sleep_time() -> float:
++    """Return total amount of fake time slept."""
++    if asyncio.sleep == _fake_sleep:
++        return _fake_sleep._total_sleep
++    return 0.0
++
++
+ async def simple_get(url):
+     """Perform a GET-request to a specified URL."""
+     async with ClientSession() as session:

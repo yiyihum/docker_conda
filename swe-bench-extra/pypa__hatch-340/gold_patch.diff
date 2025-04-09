@@ -1,0 +1,162 @@
+diff --git a/docs/history.md b/docs/history.md
+index 513cf80f..20891b80 100644
+--- a/docs/history.md
++++ b/docs/history.md
+@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ - Support the absence of `pyproject.toml` files, as is the case for apps and non-Python projects
+ - Hide scripts that start with an underscore for the `env show` command by default
+ - Ignoring the exit codes of commands by prefixing with hyphens now works with entire named scripts
++- Add a way to require confirmation for publishing
+ - Add `--force-continue` flag to the `env run` command
+ - Make tracebacks colorful and less verbose
+ - When shell configuration has not been defined, attempt to use the current shell based on parent processes before resorting to the defaults
+diff --git a/docs/plugins/publisher/reference.md b/docs/plugins/publisher/reference.md
+index 1b29b336..ae2ce280 100644
+--- a/docs/plugins/publisher/reference.md
++++ b/docs/plugins/publisher/reference.md
+@@ -11,4 +11,5 @@
+       - cache_dir
+       - project_config
+       - plugin_config
++      - disable
+       - publish
+diff --git a/docs/publish.md b/docs/publish.md
+index c568e8a2..5ed3569b 100644
+--- a/docs/publish.md
++++ b/docs/publish.md
+@@ -52,8 +52,33 @@ The `main` repository is used by default.
+ 
+ ## Authentication
+ 
+-The first time you publish to a repository you need to authenticate using the `-u`/`--user` (environment variable `HATCH_PYPI_USER`) and  `-a`/`--auth` (environment variable `HATCH_PYPI_AUTH`) options. You will be prompted if either option is not provided.
++The first time you publish to a repository you need to authenticate using the `-u`/`--user` (environment variable `HATCH_PYPI_USER`) and `-a`/`--auth` (environment variable `HATCH_PYPI_AUTH`) options. You will be prompted if either option is not provided.
+ 
+ The user that most recently published to the chosen repository is [cached](config/hatch.md#cache), with their credentials saved to the system [keyring](https://github.com/jaraco/keyring), so that they will no longer need to provide authentication information.
+ 
+ For automated releases, it is recommended that you use per-project [API tokens](https://pypi.org/help/#apitoken).
++
++## Confirmation
++
++You can require a confirmation prompt or use of the `-y`/`--yes` flag by setting publishers' `disable` option to `true` in either Hatch's [config file](config/hatch.md) or project-specific configuration (which takes precedence):
++
++=== ":octicons-file-code-16: config.toml"
++
++    ```toml
++    [publish.pypi]
++    disable = true
++    ```
++
++=== ":octicons-file-code-16: pyproject.toml"
++
++    ```toml
++    [tool.hatch.publish.pypi]
++    disable = true
++    ```
++
++=== ":octicons-file-code-16: hatch.toml"
++
++    ```toml
++    [publish.pypi]
++    disable = true
++    ```
+diff --git a/src/hatch/cli/application.py b/src/hatch/cli/application.py
+index a54f897e..1c50d791 100644
+--- a/src/hatch/cli/application.py
++++ b/src/hatch/cli/application.py
+@@ -156,4 +156,5 @@ class SafeApplication:
+         self.display_mini_header = app.display_mini_header
+         # Divergence from what the backend provides
+         self.prompt = app.prompt
++        self.confirm = app.confirm
+         self.status_waiting = app.status_waiting
+diff --git a/src/hatch/cli/publish/__init__.py b/src/hatch/cli/publish/__init__.py
+index 1a2d5dcd..0596d07c 100644
+--- a/src/hatch/cli/publish/__init__.py
++++ b/src/hatch/cli/publish/__init__.py
+@@ -20,7 +20,7 @@ from hatch.config.constants import PublishEnvVars
+     envvar=PublishEnvVars.REPO,
+     help='The repository with which to publish artifacts [env var: `HATCH_PYPI_REPO`]',
+ )
+-@click.option('--no-prompt', '-n', is_flag=True, help='Do not prompt for missing required fields')
++@click.option('--no-prompt', '-n', is_flag=True, help='Disable prompts, such as for missing required fields')
+ @click.option(
+     '--publisher',
+     '-p',
+@@ -40,8 +40,9 @@ from hatch.config.constants import PublishEnvVars
+         'times e.g. `-o foo=bar -o baz=23` [env var: `HATCH_PUBLISHER_OPTIONS`]'
+     ),
+ )
++@click.option('--yes', '-y', is_flag=True, help='Confirm without prompting when the plugin is disabled')
+ @click.pass_obj
+-def publish(app, artifacts, user, auth, repo, no_prompt, publisher_name, options):
++def publish(app, artifacts, user, auth, repo, no_prompt, publisher_name, options, yes):
+     """Publish build artifacts."""
+     option_map = {'no_prompt': no_prompt}
+     if publisher_name == 'pypi':
+@@ -70,4 +71,7 @@ def publish(app, artifacts, user, auth, repo, no_prompt, publisher_name, options
+         app.project.config.publish.get(publisher_name, {}),
+         app.config.publish.get(publisher_name, {}),
+     )
++    if publisher.disable and not (yes or (not no_prompt and app.confirm(f'Confirm `{publisher_name}` publishing'))):
++        app.abort(f'Publisher is disabled: {publisher_name}')
++
+     publisher.publish(list(artifacts), option_map)
+diff --git a/src/hatch/cli/terminal.py b/src/hatch/cli/terminal.py
+index 0652a6d3..445d5942 100644
+--- a/src/hatch/cli/terminal.py
++++ b/src/hatch/cli/terminal.py
+@@ -192,6 +192,10 @@ class Terminal:
+     def prompt(text, **kwargs):
+         return click.prompt(text, **kwargs)
+ 
++    @staticmethod
++    def confirm(text, **kwargs):
++        return click.confirm(text, **kwargs)
++
+ 
+ class MockStatus:
+     def stop(self):
+diff --git a/src/hatch/publish/plugin/interface.py b/src/hatch/publish/plugin/interface.py
+index 3134ddf7..b79406e1 100644
+--- a/src/hatch/publish/plugin/interface.py
++++ b/src/hatch/publish/plugin/interface.py
+@@ -42,6 +42,8 @@ class PublisherInterface(ABC):
+         self.__project_config = project_config
+         self.__plugin_config = plugin_config
+ 
++        self.__disable = None
++
+     @property
+     def app(self):
+         """
+@@ -93,6 +95,30 @@ class PublisherInterface(ABC):
+         """
+         return self.__plugin_config
+ 
++    @property
++    def disable(self):
++        """
++        Whether this plugin is disabled, thus requiring confirmation when publishing. Local
++        [project configuration](reference.md#hatch.publish.plugin.interface.PublisherInterface.project_config)
++        takes precedence over global
++        [plugin configuration](reference.md#hatch.publish.plugin.interface.PublisherInterface.plugin_config).
++        """
++        if self.__disable is None:
++            if 'disable' in self.project_config:
++                disable = self.project_config['disable']
++                if not isinstance(disable, bool):
++                    raise TypeError(f'Field `tool.hatch.publish.{self.PLUGIN_NAME}.disable` must be a boolean')
++            else:
++                disable = self.plugin_config.get('disable', False)
++                if not isinstance(disable, bool):
++                    raise TypeError(
++                        f'Global plugin configuration `publish.{self.PLUGIN_NAME}.disable` must be a boolean'
++                    )
++
++            self.__disable = disable
++
++        return self.__disable
++
+     @abstractmethod
+     def publish(self, artifacts: list[str], options: dict):
+         """

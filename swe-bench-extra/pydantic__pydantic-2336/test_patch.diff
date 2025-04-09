@@ -1,0 +1,907 @@
+diff --git a/tests/test_dataclasses.py b/tests/test_dataclasses.py
+--- a/tests/test_dataclasses.py
++++ b/tests/test_dataclasses.py
+@@ -3,9 +3,10 @@
+ from collections.abc import Hashable
+ from datetime import datetime
+ from pathlib import Path
+-from typing import Callable, ClassVar, Dict, FrozenSet, List, Optional
++from typing import Callable, ClassVar, Dict, FrozenSet, List, Optional, Union
+ 
+ import pytest
++from typing_extensions import Literal
+ 
+ import pydantic
+ from pydantic import BaseModel, ValidationError, validator
+@@ -922,6 +923,49 @@ class A2:
+     }
+ 
+ 
++def test_discrimated_union_basemodel_instance_value():
++    @pydantic.dataclasses.dataclass
++    class A:
++        l: Literal['a']
++
++    @pydantic.dataclasses.dataclass
++    class B:
++        l: Literal['b']
++
++    @pydantic.dataclasses.dataclass
++    class Top:
++        sub: Union[A, B] = dataclasses.field(metadata=dict(discriminator='l'))
++
++    t = Top(sub=A(l='a'))
++    assert isinstance(t, Top)
++    assert Top.__pydantic_model__.schema() == {
++        'title': 'Top',
++        'type': 'object',
++        'properties': {
++            'sub': {
++                'title': 'Sub',
++                'discriminator': {'propertyName': 'l', 'mapping': {'a': '#/definitions/A', 'b': '#/definitions/B'}},
++                'anyOf': [{'$ref': '#/definitions/A'}, {'$ref': '#/definitions/B'}],
++            }
++        },
++        'required': ['sub'],
++        'definitions': {
++            'A': {
++                'title': 'A',
++                'type': 'object',
++                'properties': {'l': {'title': 'L', 'enum': ['a'], 'type': 'string'}},
++                'required': ['l'],
++            },
++            'B': {
++                'title': 'B',
++                'type': 'object',
++                'properties': {'l': {'title': 'L', 'enum': ['b'], 'type': 'string'}},
++                'required': ['l'],
++            },
++        },
++    }
++
++
+ def test_keeps_custom_properties():
+     class StandardClass:
+         """Class which modifies instance creation."""
+diff --git a/tests/test_discrimated_union.py b/tests/test_discrimated_union.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_discrimated_union.py
+@@ -0,0 +1,363 @@
++import re
++from enum import Enum
++from typing import Union
++
++import pytest
++from typing_extensions import Annotated, Literal
++
++from pydantic import BaseModel, Field, ValidationError
++from pydantic.errors import ConfigError
++
++
++def test_discriminated_union_only_union():
++    with pytest.raises(TypeError, match='`discriminator` can only be used with `Union` type'):
++
++        class Model(BaseModel):
++            x: str = Field(..., discriminator='qwe')
++
++
++def test_discriminated_union_invalid_type():
++    with pytest.raises(TypeError, match="Type 'str' is not a valid `BaseModel` or `dataclass`"):
++
++        class Model(BaseModel):
++            x: Union[str, int] = Field(..., discriminator='qwe')
++
++
++def test_discriminated_union_defined_discriminator():
++    class Cat(BaseModel):
++        c: str
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++        d: str
++
++    with pytest.raises(ConfigError, match="Model 'Cat' needs a discriminator field for key 'pet_type'"):
++
++        class Model(BaseModel):
++            pet: Union[Cat, Dog] = Field(..., discriminator='pet_type')
++            number: int
++
++
++def test_discriminated_union_literal_discriminator():
++    class Cat(BaseModel):
++        pet_type: int
++        c: str
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++        d: str
++
++    with pytest.raises(ConfigError, match="Field 'pet_type' of model 'Cat' needs to be a `Literal`"):
++
++        class Model(BaseModel):
++            pet: Union[Cat, Dog] = Field(..., discriminator='pet_type')
++            number: int
++
++
++def test_discriminated_union_root_same_discriminator():
++    class BlackCat(BaseModel):
++        pet_type: Literal['blackcat']
++
++    class WhiteCat(BaseModel):
++        pet_type: Literal['whitecat']
++
++    class Cat(BaseModel):
++        __root__: Union[BlackCat, WhiteCat]
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++
++    with pytest.raises(ConfigError, match="Field 'pet_type' is not the same for all submodels of 'Cat'"):
++
++        class Pet(BaseModel):
++            __root__: Union[Cat, Dog] = Field(..., discriminator='pet_type')
++
++
++def test_discriminated_union_validation():
++    class BlackCat(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['black']
++        black_infos: str
++
++    class WhiteCat(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['white']
++        white_infos: str
++
++    class Cat(BaseModel):
++        __root__: Annotated[Union[BlackCat, WhiteCat], Field(discriminator='color')]
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++        d: str
++
++    class Lizard(BaseModel):
++        pet_type: Literal['reptile', 'lizard']
++        l: str
++
++    class Model(BaseModel):
++        pet: Annotated[Union[Cat, Dog, Lizard], Field(discriminator='pet_type')]
++        number: int
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_typ': 'cat'}, 'number': 'x'})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet',),
++            'msg': "Discriminator 'pet_type' is missing in value",
++            'type': 'value_error.discriminated_union.missing_discriminator',
++            'ctx': {'discriminator_key': 'pet_type'},
++        },
++        {'loc': ('number',), 'msg': 'value is not a valid integer', 'type': 'type_error.integer'},
++    ]
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': 'fish', 'number': 2})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet',),
++            'msg': "Discriminator 'pet_type' is missing in value",
++            'type': 'value_error.discriminated_union.missing_discriminator',
++            'ctx': {'discriminator_key': 'pet_type'},
++        },
++    ]
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_type': 'fish'}, 'number': 2})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet',),
++            'msg': (
++                "No match for discriminator 'pet_type' and value 'fish' "
++                "(allowed values: 'cat', 'dog', 'reptile', 'lizard')"
++            ),
++            'type': 'value_error.discriminated_union.invalid_discriminator',
++            'ctx': {
++                'discriminator_key': 'pet_type',
++                'discriminator_value': 'fish',
++                'allowed_values': "'cat', 'dog', 'reptile', 'lizard'",
++            },
++        },
++    ]
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_type': 'lizard'}, 'number': 2})
++    assert exc_info.value.errors() == [
++        {'loc': ('pet', 'Lizard', 'l'), 'msg': 'field required', 'type': 'value_error.missing'},
++    ]
++
++    m = Model.parse_obj({'pet': {'pet_type': 'lizard', 'l': 'pika'}, 'number': 2})
++    assert isinstance(m.pet, Lizard)
++    assert m.dict() == {'pet': {'pet_type': 'lizard', 'l': 'pika'}, 'number': 2}
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_type': 'cat', 'color': 'white'}, 'number': 2})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet', 'Cat', '__root__', 'WhiteCat', 'white_infos'),
++            'msg': 'field required',
++            'type': 'value_error.missing',
++        }
++    ]
++    m = Model.parse_obj({'pet': {'pet_type': 'cat', 'color': 'white', 'white_infos': 'pika'}, 'number': 2})
++    assert isinstance(m.pet.__root__, WhiteCat)
++
++
++def test_discriminated_annotated_union():
++    class BlackCat(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['black']
++        black_infos: str
++
++    class WhiteCat(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['white']
++        white_infos: str
++
++    Cat = Annotated[Union[BlackCat, WhiteCat], Field(discriminator='color')]
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++        dog_name: str
++
++    Pet = Annotated[Union[Cat, Dog], Field(discriminator='pet_type')]
++
++    class Model(BaseModel):
++        pet: Pet
++        number: int
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_typ': 'cat'}, 'number': 'x'})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet',),
++            'msg': "Discriminator 'pet_type' is missing in value",
++            'type': 'value_error.discriminated_union.missing_discriminator',
++            'ctx': {'discriminator_key': 'pet_type'},
++        },
++        {'loc': ('number',), 'msg': 'value is not a valid integer', 'type': 'type_error.integer'},
++    ]
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_type': 'fish'}, 'number': 2})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet',),
++            'msg': "No match for discriminator 'pet_type' and value 'fish' " "(allowed values: 'cat', 'dog')",
++            'type': 'value_error.discriminated_union.invalid_discriminator',
++            'ctx': {'discriminator_key': 'pet_type', 'discriminator_value': 'fish', 'allowed_values': "'cat', 'dog'"},
++        },
++    ]
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_type': 'dog'}, 'number': 2})
++    assert exc_info.value.errors() == [
++        {'loc': ('pet', 'Dog', 'dog_name'), 'msg': 'field required', 'type': 'value_error.missing'},
++    ]
++    m = Model.parse_obj({'pet': {'pet_type': 'dog', 'dog_name': 'milou'}, 'number': 2})
++    assert isinstance(m.pet, Dog)
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_type': 'cat', 'color': 'red'}, 'number': 2})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet', 'Union[BlackCat, WhiteCat]'),
++            'msg': "No match for discriminator 'color' and value 'red' " "(allowed values: 'black', 'white')",
++            'type': 'value_error.discriminated_union.invalid_discriminator',
++            'ctx': {'discriminator_key': 'color', 'discriminator_value': 'red', 'allowed_values': "'black', 'white'"},
++        }
++    ]
++
++    with pytest.raises(ValidationError) as exc_info:
++        Model.parse_obj({'pet': {'pet_type': 'cat', 'color': 'white'}, 'number': 2})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('pet', 'Union[BlackCat, WhiteCat]', 'WhiteCat', 'white_infos'),
++            'msg': 'field required',
++            'type': 'value_error.missing',
++        }
++    ]
++    m = Model.parse_obj({'pet': {'pet_type': 'cat', 'color': 'white', 'white_infos': 'pika'}, 'number': 2})
++    assert isinstance(m.pet, WhiteCat)
++
++
++def test_discriminated_union_basemodel_instance_value():
++    class A(BaseModel):
++        l: Literal['a']
++
++    class B(BaseModel):
++        l: Literal['b']
++
++    class Top(BaseModel):
++        sub: Union[A, B] = Field(..., discriminator='l')
++
++    t = Top(sub=A(l='a'))
++    assert isinstance(t, Top)
++
++
++def test_discriminated_union_int():
++    class A(BaseModel):
++        l: Literal[1]
++
++    class B(BaseModel):
++        l: Literal[2]
++
++    class Top(BaseModel):
++        sub: Union[A, B] = Field(..., discriminator='l')
++
++    assert isinstance(Top.parse_obj({'sub': {'l': 2}}).sub, B)
++    with pytest.raises(ValidationError) as exc_info:
++        Top.parse_obj({'sub': {'l': 3}})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('sub',),
++            'msg': "No match for discriminator 'l' and value 3 (allowed values: 1, 2)",
++            'type': 'value_error.discriminated_union.invalid_discriminator',
++            'ctx': {'discriminator_key': 'l', 'discriminator_value': 3, 'allowed_values': '1, 2'},
++        }
++    ]
++
++
++def test_discriminated_union_enum():
++    class EnumValue(Enum):
++        a = 1
++        b = 2
++
++    class A(BaseModel):
++        l: Literal[EnumValue.a]
++
++    class B(BaseModel):
++        l: Literal[EnumValue.b]
++
++    class Top(BaseModel):
++        sub: Union[A, B] = Field(..., discriminator='l')
++
++    assert isinstance(Top.parse_obj({'sub': {'l': EnumValue.b}}).sub, B)
++    with pytest.raises(ValidationError) as exc_info:
++        Top.parse_obj({'sub': {'l': 3}})
++    assert exc_info.value.errors() == [
++        {
++            'loc': ('sub',),
++            'msg': "No match for discriminator 'l' and value 3 (allowed values: <EnumValue.a: 1>, <EnumValue.b: 2>)",
++            'type': 'value_error.discriminated_union.invalid_discriminator',
++            'ctx': {
++                'discriminator_key': 'l',
++                'discriminator_value': 3,
++                'allowed_values': '<EnumValue.a: 1>, <EnumValue.b: 2>',
++            },
++        }
++    ]
++
++
++def test_alias_different():
++    class Cat(BaseModel):
++        pet_type: Literal['cat'] = Field(alias='U')
++        c: str
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog'] = Field(alias='T')
++        d: str
++
++    with pytest.raises(
++        ConfigError, match=re.escape("Aliases for discriminator 'pet_type' must be the same (got T, U)")
++    ):
++
++        class Model(BaseModel):
++            pet: Union[Cat, Dog] = Field(discriminator='pet_type')
++
++
++def test_alias_same():
++    class Cat(BaseModel):
++        pet_type: Literal['cat'] = Field(alias='typeOfPet')
++        c: str
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog'] = Field(alias='typeOfPet')
++        d: str
++
++    class Model(BaseModel):
++        pet: Union[Cat, Dog] = Field(discriminator='pet_type')
++
++    assert Model(**{'pet': {'typeOfPet': 'dog', 'd': 'milou'}}).pet.pet_type == 'dog'
++
++
++def test_nested():
++    class Cat(BaseModel):
++        pet_type: Literal['cat']
++        name: str
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++        name: str
++
++    CommonPet = Annotated[Union[Cat, Dog], Field(discriminator='pet_type')]
++
++    class Lizard(BaseModel):
++        pet_type: Literal['reptile', 'lizard']
++        name: str
++
++    class Model(BaseModel):
++        pet: Union[CommonPet, Lizard] = Field(..., discriminator='pet_type')
++        n: int
++
++    assert isinstance(Model(**{'pet': {'pet_type': 'dog', 'name': 'Milou'}, 'n': 5}).pet, Dog)
+diff --git a/tests/test_forward_ref.py b/tests/test_forward_ref.py
+--- a/tests/test_forward_ref.py
++++ b/tests/test_forward_ref.py
+@@ -564,6 +564,53 @@ class NestedTuple(BaseModel):
+     assert obj.dict() == {'x': (1, {'x': (2, {'x': (3, None)})})}
+ 
+ 
++def test_discriminated_union_forward_ref(create_module):
++    @create_module
++    def module():
++        from typing import Union
++
++        from typing_extensions import Literal
++
++        from pydantic import BaseModel, Field
++
++        class Pet(BaseModel):
++            __root__: Union['Cat', 'Dog'] = Field(..., discriminator='type')  # noqa: F821
++
++        class Cat(BaseModel):
++            type: Literal['cat']
++
++        class Dog(BaseModel):
++            type: Literal['dog']
++
++    with pytest.raises(ConfigError, match='you might need to call Pet.update_forward_refs()'):
++        module.Pet.parse_obj({'type': 'pika'})
++
++    module.Pet.update_forward_refs()
++
++    with pytest.raises(ValidationError, match="No match for discriminator 'type' and value 'pika'"):
++        module.Pet.parse_obj({'type': 'pika'})
++
++    assert module.Pet.schema() == {
++        'title': 'Pet',
++        'discriminator': {'propertyName': 'type', 'mapping': {'cat': '#/definitions/Cat', 'dog': '#/definitions/Dog'}},
++        'anyOf': [{'$ref': '#/definitions/Cat'}, {'$ref': '#/definitions/Dog'}],
++        'definitions': {
++            'Cat': {
++                'title': 'Cat',
++                'type': 'object',
++                'properties': {'type': {'title': 'Type', 'enum': ['cat'], 'type': 'string'}},
++                'required': ['type'],
++            },
++            'Dog': {
++                'title': 'Dog',
++                'type': 'object',
++                'properties': {'type': {'title': 'Type', 'enum': ['dog'], 'type': 'string'}},
++                'required': ['type'],
++            },
++        },
++    }
++
++
+ @skip_pre_37
+ def test_class_var_as_string(create_module):
+     module = create_module(
+diff --git a/tests/test_main.py b/tests/test_main.py
+--- a/tests/test_main.py
++++ b/tests/test_main.py
+@@ -19,7 +19,6 @@
+ from uuid import UUID, uuid4
+ 
+ import pytest
+-from pytest import param
+ 
+ from pydantic import (
+     BaseConfig,
+@@ -1373,61 +1372,61 @@ class Bar(BaseModel):
+ @pytest.mark.parametrize(
+     'exclude,expected,raises_match',
+     [
+-        param(
++        pytest.param(
+             {'foos': {0: {'a'}, 1: {'a'}}},
+             {'c': 3, 'foos': [{'b': 2}, {'b': 4}]},
+             None,
+             id='excluding fields of indexed list items',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {'a'}},
+             TypeError,
+             'expected integer keys',
+             id='should fail trying to exclude string keys on list field (1).',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {0: ..., 'a': ...}},
+             TypeError,
+             'expected integer keys',
+             id='should fail trying to exclude string keys on list field (2).',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {0: 1}},
+             TypeError,
+             'Unexpected type',
+             id='should fail using integer key to specify list item field name (1)',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {'__all__': 1}},
+             TypeError,
+             'Unexpected type',
+             id='should fail using integer key to specify list item field name (2)',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {'__all__': {'a'}}},
+             {'c': 3, 'foos': [{'b': 2}, {'b': 4}]},
+             None,
+             id='using "__all__" to exclude specific nested field',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {0: {'b'}, '__all__': {'a'}}},
+             {'c': 3, 'foos': [{}, {'b': 4}]},
+             None,
+             id='using "__all__" to exclude specific nested field in combination with more specific exclude',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {'__all__'}},
+             {'c': 3, 'foos': []},
+             None,
+             id='using "__all__" to exclude all list items',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {1, '__all__'}},
+             {'c': 3, 'foos': []},
+             None,
+             id='using "__all__" and other items should get merged together, still excluding all list items',
+         ),
+-        param(
++        pytest.param(
+             {'foos': {1: {'a'}, -1: {'b'}}},
+             {'c': 3, 'foos': [{'a': 1, 'b': 2}, {}]},
+             None,
+@@ -1458,13 +1457,13 @@ class Bar(BaseModel):
+ @pytest.mark.parametrize(
+     'excludes,expected',
+     [
+-        param(
++        pytest.param(
+             {'bars': {0}},
+             {'a': 1, 'bars': [{'y': 2}, {'w': -1, 'z': 3}]},
+             id='excluding first item from list field using index',
+         ),
+-        param({'bars': {'__all__'}}, {'a': 1, 'bars': []}, id='using "__all__" to exclude all list items'),
+-        param(
++        pytest.param({'bars': {'__all__'}}, {'a': 1, 'bars': []}, id='using "__all__" to exclude all list items'),
++        pytest.param(
+             {'bars': {'__all__': {'w'}}},
+             {'a': 1, 'bars': [{'x': 1}, {'y': 2}, {'z': 3}]},
+             id='exclude single dict key from all list items',
+@@ -2094,7 +2093,7 @@ class Model(Base, some_config='new_value'):
+ 
+ @pytest.mark.skipif(sys.version_info < (3, 10), reason='need 3.10 version')
+ def test_new_union_origin():
+-    """On 3.10+, origin of `int | str` is `types.Union`, not `typing.Union`"""
++    """On 3.10+, origin of `int | str` is `types.UnionType`, not `typing.Union`"""
+ 
+     class Model(BaseModel):
+         x: int | str
+diff --git a/tests/test_schema.py b/tests/test_schema.py
+--- a/tests/test_schema.py
++++ b/tests/test_schema.py
+@@ -27,7 +27,7 @@
+ from uuid import UUID
+ 
+ import pytest
+-from typing_extensions import Literal
++from typing_extensions import Annotated, Literal
+ 
+ from pydantic import BaseModel, Extra, Field, ValidationError, confrozenset, conlist, conset, validator
+ from pydantic.color import Color
+@@ -2626,3 +2626,254 @@ def resolve(self) -> 'Model':  # noqa
+         },
+         '$ref': '#/definitions/Model',
+     }
++
++
++def test_discriminated_union():
++    class BlackCat(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['black']
++
++    class WhiteCat(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['white']
++
++    class Cat(BaseModel):
++        __root__: Union[BlackCat, WhiteCat] = Field(..., discriminator='color')
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++
++    class Lizard(BaseModel):
++        pet_type: Literal['reptile', 'lizard']
++
++    class Model(BaseModel):
++        pet: Union[Cat, Dog, Lizard] = Field(..., discriminator='pet_type')
++
++    assert Model.schema() == {
++        'title': 'Model',
++        'type': 'object',
++        'properties': {
++            'pet': {
++                'title': 'Pet',
++                'discriminator': {
++                    'propertyName': 'pet_type',
++                    'mapping': {
++                        'cat': '#/definitions/Cat',
++                        'dog': '#/definitions/Dog',
++                        'reptile': '#/definitions/Lizard',
++                        'lizard': '#/definitions/Lizard',
++                    },
++                },
++                'anyOf': [
++                    {'$ref': '#/definitions/Cat'},
++                    {'$ref': '#/definitions/Dog'},
++                    {'$ref': '#/definitions/Lizard'},
++                ],
++            }
++        },
++        'required': ['pet'],
++        'definitions': {
++            'BlackCat': {
++                'title': 'BlackCat',
++                'type': 'object',
++                'properties': {
++                    'pet_type': {'title': 'Pet Type', 'enum': ['cat'], 'type': 'string'},
++                    'color': {'title': 'Color', 'enum': ['black'], 'type': 'string'},
++                },
++                'required': ['pet_type', 'color'],
++            },
++            'WhiteCat': {
++                'title': 'WhiteCat',
++                'type': 'object',
++                'properties': {
++                    'pet_type': {'title': 'Pet Type', 'enum': ['cat'], 'type': 'string'},
++                    'color': {'title': 'Color', 'enum': ['white'], 'type': 'string'},
++                },
++                'required': ['pet_type', 'color'],
++            },
++            'Cat': {
++                'title': 'Cat',
++                'discriminator': {
++                    'propertyName': 'color',
++                    'mapping': {'black': '#/definitions/BlackCat', 'white': '#/definitions/WhiteCat'},
++                },
++                'anyOf': [{'$ref': '#/definitions/BlackCat'}, {'$ref': '#/definitions/WhiteCat'}],
++            },
++            'Dog': {
++                'title': 'Dog',
++                'type': 'object',
++                'properties': {'pet_type': {'title': 'Pet Type', 'enum': ['dog'], 'type': 'string'}},
++                'required': ['pet_type'],
++            },
++            'Lizard': {
++                'title': 'Lizard',
++                'type': 'object',
++                'properties': {'pet_type': {'title': 'Pet Type', 'enum': ['reptile', 'lizard'], 'type': 'string'}},
++                'required': ['pet_type'],
++            },
++        },
++    }
++
++
++def test_discriminated_annotated_union():
++    class BlackCatWithHeight(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['black']
++        info: Literal['height']
++        black_infos: str
++
++    class BlackCatWithWeight(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['black']
++        info: Literal['weight']
++        black_infos: str
++
++    BlackCat = Annotated[Union[BlackCatWithHeight, BlackCatWithWeight], Field(discriminator='info')]
++
++    class WhiteCat(BaseModel):
++        pet_type: Literal['cat']
++        color: Literal['white']
++        white_infos: str
++
++    Cat = Annotated[Union[BlackCat, WhiteCat], Field(discriminator='color')]
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog']
++        dog_name: str
++
++    Pet = Annotated[Union[Cat, Dog], Field(discriminator='pet_type')]
++
++    class Model(BaseModel):
++        pet: Pet
++        number: int
++
++    assert Model.schema() == {
++        'title': 'Model',
++        'type': 'object',
++        'properties': {
++            'pet': {
++                'title': 'Pet',
++                'discriminator': {
++                    'propertyName': 'pet_type',
++                    'mapping': {
++                        'cat': {
++                            'BlackCatWithHeight': {'$ref': '#/definitions/BlackCatWithHeight'},
++                            'BlackCatWithWeight': {'$ref': '#/definitions/BlackCatWithWeight'},
++                            'WhiteCat': {'$ref': '#/definitions/WhiteCat'},
++                        },
++                        'dog': '#/definitions/Dog',
++                    },
++                },
++                'anyOf': [
++                    {
++                        'anyOf': [
++                            {
++                                'anyOf': [
++                                    {'$ref': '#/definitions/BlackCatWithHeight'},
++                                    {'$ref': '#/definitions/BlackCatWithWeight'},
++                                ]
++                            },
++                            {'$ref': '#/definitions/WhiteCat'},
++                        ]
++                    },
++                    {'$ref': '#/definitions/Dog'},
++                ],
++            },
++            'number': {'title': 'Number', 'type': 'integer'},
++        },
++        'required': ['pet', 'number'],
++        'definitions': {
++            'BlackCatWithHeight': {
++                'title': 'BlackCatWithHeight',
++                'type': 'object',
++                'properties': {
++                    'pet_type': {'title': 'Pet Type', 'enum': ['cat'], 'type': 'string'},
++                    'color': {'title': 'Color', 'enum': ['black'], 'type': 'string'},
++                    'info': {'title': 'Info', 'enum': ['height'], 'type': 'string'},
++                    'black_infos': {'title': 'Black Infos', 'type': 'string'},
++                },
++                'required': ['pet_type', 'color', 'info', 'black_infos'],
++            },
++            'BlackCatWithWeight': {
++                'title': 'BlackCatWithWeight',
++                'type': 'object',
++                'properties': {
++                    'pet_type': {'title': 'Pet Type', 'enum': ['cat'], 'type': 'string'},
++                    'color': {'title': 'Color', 'enum': ['black'], 'type': 'string'},
++                    'info': {'title': 'Info', 'enum': ['weight'], 'type': 'string'},
++                    'black_infos': {'title': 'Black Infos', 'type': 'string'},
++                },
++                'required': ['pet_type', 'color', 'info', 'black_infos'],
++            },
++            'WhiteCat': {
++                'title': 'WhiteCat',
++                'type': 'object',
++                'properties': {
++                    'pet_type': {'title': 'Pet Type', 'enum': ['cat'], 'type': 'string'},
++                    'color': {'title': 'Color', 'enum': ['white'], 'type': 'string'},
++                    'white_infos': {'title': 'White Infos', 'type': 'string'},
++                },
++                'required': ['pet_type', 'color', 'white_infos'],
++            },
++            'Dog': {
++                'title': 'Dog',
++                'type': 'object',
++                'properties': {
++                    'pet_type': {'title': 'Pet Type', 'enum': ['dog'], 'type': 'string'},
++                    'dog_name': {'title': 'Dog Name', 'type': 'string'},
++                },
++                'required': ['pet_type', 'dog_name'],
++            },
++        },
++    }
++
++
++def test_alias_same():
++    class Cat(BaseModel):
++        pet_type: Literal['cat'] = Field(alias='typeOfPet')
++        c: str
++
++    class Dog(BaseModel):
++        pet_type: Literal['dog'] = Field(alias='typeOfPet')
++        d: str
++
++    class Model(BaseModel):
++        pet: Union[Cat, Dog] = Field(discriminator='pet_type')
++        number: int
++
++    assert Model.schema() == {
++        'type': 'object',
++        'title': 'Model',
++        'properties': {
++            'number': {'title': 'Number', 'type': 'integer'},
++            'pet': {
++                'anyOf': [{'$ref': '#/definitions/Cat'}, {'$ref': '#/definitions/Dog'}],
++                'discriminator': {
++                    'mapping': {'cat': '#/definitions/Cat', 'dog': '#/definitions/Dog'},
++                    'propertyName': 'typeOfPet',
++                },
++                'title': 'Pet',
++            },
++        },
++        'required': ['pet', 'number'],
++        'definitions': {
++            'Cat': {
++                'properties': {
++                    'c': {'title': 'C', 'type': 'string'},
++                    'typeOfPet': {'enum': ['cat'], 'title': 'Typeofpet', 'type': 'string'},
++                },
++                'required': ['typeOfPet', 'c'],
++                'title': 'Cat',
++                'type': 'object',
++            },
++            'Dog': {
++                'properties': {
++                    'd': {'title': 'D', 'type': 'string'},
++                    'typeOfPet': {'enum': ['dog'], 'title': 'Typeofpet', 'type': 'string'},
++                },
++                'required': ['typeOfPet', 'd'],
++                'title': 'Dog',
++                'type': 'object',
++            },
++        },
++    }
+diff --git a/tests/test_tools.py b/tests/test_tools.py
+--- a/tests/test_tools.py
++++ b/tests/test_tools.py
+@@ -1,11 +1,11 @@
+ import json
+-from typing import Dict, List, Mapping
++from typing import Dict, List, Mapping, Union
+ 
+ import pytest
+ 
+ from pydantic import BaseModel, ValidationError
+ from pydantic.dataclasses import dataclass
+-from pydantic.tools import parse_file_as, parse_obj_as, parse_raw_as
++from pydantic.tools import parse_file_as, parse_obj_as, parse_raw_as, schema, schema_json
+ 
+ 
+ @pytest.mark.parametrize('obj,type_,parsed', [('1', int, 1), (['1'], List[int], [1])])
+@@ -98,3 +98,23 @@ class Item(BaseModel):
+     item_data = '[{"id": 1, "name": "My Item"}]'
+     items = parse_raw_as(List[Item], item_data)
+     assert items == [Item(id=1, name='My Item')]
++
++
++def test_schema():
++    assert schema(Union[int, str], title='IntOrStr') == {
++        'title': 'IntOrStr',
++        'anyOf': [{'type': 'integer'}, {'type': 'string'}],
++    }
++    assert schema_json(Union[int, str], title='IntOrStr', indent=2) == (
++        '{\n'
++        '  "title": "IntOrStr",\n'
++        '  "anyOf": [\n'
++        '    {\n'
++        '      "type": "integer"\n'
++        '    },\n'
++        '    {\n'
++        '      "type": "string"\n'
++        '    }\n'
++        '  ]\n'
++        '}'
++    )

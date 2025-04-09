@@ -1,0 +1,131 @@
+diff --git a/examples/example1.yaml b/examples/example1.yaml
+index e66c1a4..bf77bb2 100644
+--- a/examples/example1.yaml
++++ b/examples/example1.yaml
+@@ -57,3 +57,16 @@
+         description: List of decoding function types
+         type: string
+         default: gauss
++
++      - name: sql-query
++        type: string
++        default: SELECT * FROM mytable
++        widget: sql
++
++      - name: output-alias
++        type: string
++        default: my-alias
++        widget:
++          type: DatumAlias
++          settings:
++            width: 123
+diff --git a/valohai_yaml/objs/parameter.py b/valohai_yaml/objs/parameter.py
+index a0d12ed..a1f64e7 100644
+--- a/valohai_yaml/objs/parameter.py
++++ b/valohai_yaml/objs/parameter.py
+@@ -4,6 +4,7 @@ from typing import Any, Iterable, List, Optional, Union
+ from valohai_yaml.excs import InvalidType, ValidationErrors
+ from valohai_yaml.lint import LintResult
+ from valohai_yaml.objs.base import Item
++from valohai_yaml.objs.parameter_widget import ParameterWidget
+ from valohai_yaml.types import LintContext, SerializedDict
+ from valohai_yaml.utils import listify
+ 
+@@ -48,7 +49,8 @@ class Parameter(Item):
+         pass_false_as: Optional[str] = None,
+         choices: Optional[Iterable[ValueAtomType]] = None,
+         multiple: Optional[Union[str, MultipleMode]] = None,
+-        multiple_separator: str = ','
++        multiple_separator: str = ',',
++        widget: Optional[ParameterWidget] = None,
+     ) -> None:
+         self.name = name
+         self.type = type
+@@ -62,6 +64,8 @@ class Parameter(Item):
+         self.choices = (list(choices) if choices else None)
+         self.multiple = MultipleMode.cast(multiple)
+         self.multiple_separator = str(multiple_separator or ',')
++        self.widget = widget
++
+         self.default = (listify(default) if self.multiple else default)
+         if self.type == 'flag':
+             self.optional = True
+@@ -194,6 +198,13 @@ class Parameter(Item):
+ 
+         raise NotImplementedError(f'unknown multiple type {self.multiple!r}')
+ 
++    @classmethod
++    def parse(cls, data: SerializedDict) -> 'Parameter':
++        kwargs = data.copy()
++        if 'widget' in data:
++            kwargs['widget'] = ParameterWidget.parse(data['widget'])
++        return super().parse(kwargs)
++
+     def lint(
+         self,
+         lint_result: LintResult,
+diff --git a/valohai_yaml/objs/parameter_widget.py b/valohai_yaml/objs/parameter_widget.py
+new file mode 100644
+index 0000000..0530b97
+--- /dev/null
++++ b/valohai_yaml/objs/parameter_widget.py
+@@ -0,0 +1,38 @@
++from typing import Optional, Union
++
++from valohai_yaml.objs.base import Item
++from valohai_yaml.types import SerializedDict
++
++
++class ParameterWidget(Item):
++    """An UI widget for editing parameter values."""
++
++    def __init__(
++        self,
++        *,
++        type: str,
++        settings: Optional[dict] = None,
++    ) -> None:
++        self.type = str(type).lower()
++        self.settings = dict(settings or {})
++
++    def serialize(self) -> Optional[Union[SerializedDict, str]]:
++        if self.settings:
++            return {
++                'type': self.type,
++                'settings': self.settings,
++            }
++        return self.type
++
++    @classmethod
++    def parse(cls, data: Union['ParameterWidget', dict, str]) -> 'ParameterWidget':
++        if isinstance(data, dict):
++            return cls(
++                type=data['type'],
++                settings=data.get('settings'),
++            )
++
++        if isinstance(data, cls):
++            return data
++
++        return cls(type=str(data))
+diff --git a/valohai_yaml/schema/param-item.yaml b/valohai_yaml/schema/param-item.yaml
+index 25c2334..e315907 100644
+--- a/valohai_yaml/schema/param-item.yaml
++++ b/valohai_yaml/schema/param-item.yaml
+@@ -78,3 +78,16 @@ properties:
+     description: |
+       The separator to use when interpolating multiple values into a command parameter.
+       Defaults to a comma.
++  widget:
++    oneOf:
++      - type: object
++        required:
++        - type
++        properties:
++          type:
++            type: string
++          settings:
++            type: object
++      - type: string
++    description: |
++      UI widget used for editing parameter values

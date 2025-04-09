@@ -1,0 +1,87 @@
+diff --git a/dvc/exceptions.py b/dvc/exceptions.py
+--- a/dvc/exceptions.py
++++ b/dvc/exceptions.py
+@@ -188,17 +188,10 @@ def __init__(self):
+ 
+ 
+ class OverlappingOutputPathsError(DvcException):
+-    def __init__(self, out_1, out_2):
+-        super().__init__(
+-            "Paths for outs:\n'{}'('{}')\n'{}'('{}')\noverlap. To avoid "
+-            "unpredictable behaviour, rerun command with non overlapping outs "
+-            "paths.".format(
+-                str(out_1),
+-                out_1.stage.relpath,
+-                str(out_2),
+-                out_2.stage.relpath,
+-            )
+-        )
++    def __init__(self, parent, overlapping_out, message):
++        self.parent = parent
++        self.overlapping_out = overlapping_out
++        super().__init__(message)
+ 
+ 
+ class CheckoutErrorSuggestGit(DvcException):
+diff --git a/dvc/repo/__init__.py b/dvc/repo/__init__.py
+--- a/dvc/repo/__init__.py
++++ b/dvc/repo/__init__.py
+@@ -334,7 +334,17 @@ def _collect_graph(self, stages=None):
+             for out in stage.outs:
+                 for p in out.path_info.parents:
+                     if p in outs:
+-                        raise OverlappingOutputPathsError(outs[p], out)
++                        msg = (
++                            "Paths for outs:\n'{}'('{}')\n'{}'('{}')\n"
++                            "overlap. To avoid unpredictable behaviour, "
++                            "rerun command with non overlapping outs paths."
++                        ).format(
++                            str(outs[p]),
++                            outs[p].stage.relpath,
++                            str(out),
++                            out.stage.relpath,
++                        )
++                        raise OverlappingOutputPathsError(outs[p], out, msg)
+ 
+         for stage in stages:
+             stage_path_info = PathInfo(stage.path)
+diff --git a/dvc/repo/add.py b/dvc/repo/add.py
+--- a/dvc/repo/add.py
++++ b/dvc/repo/add.py
+@@ -4,7 +4,10 @@
+ import colorama
+ 
+ from . import locked
+-from ..exceptions import RecursiveAddingWhileUsingFilename
++from ..exceptions import (
++    RecursiveAddingWhileUsingFilename,
++    OverlappingOutputPathsError,
++)
+ from ..output.base import OutputDoesNotExistError
+ from ..progress import Tqdm
+ from ..repo.scm_context import scm_context
+@@ -49,7 +52,22 @@ def add(repo, targets, recursive=False, no_commit=False, fname=None):
+ 
+             stages = _create_stages(repo, sub_targets, fname, pbar=pbar)
+ 
+-            repo.check_modified_graph(stages)
++            try:
++                repo.check_modified_graph(stages)
++            except OverlappingOutputPathsError as exc:
++                msg = (
++                    "Cannot add '{out}', because it is overlapping with other "
++                    "DVC tracked output: '{parent}'.\n"
++                    "To include '{out}' in '{parent}', run "
++                    "'dvc commit {parent_stage}'"
++                ).format(
++                    out=exc.overlapping_out.path_info,
++                    parent=exc.parent.path_info,
++                    parent_stage=exc.parent.stage.relpath,
++                )
++                raise OverlappingOutputPathsError(
++                    exc.parent, exc.overlapping_out, msg
++                )
+ 
+             with Tqdm(
+                 total=len(stages),
+

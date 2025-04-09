@@ -1,0 +1,111 @@
+diff --git a/nose2/main.py b/nose2/main.py
+index 67d5483..ea533c6 100644
+--- a/nose2/main.py
++++ b/nose2/main.py
+@@ -155,9 +155,17 @@ class PluggableTestProgram(unittest.TestProgram):
+             dest='exclude_plugins', default=[],
+             help="Do not load this plugin module")
+         self.argparse.add_argument(
+-            '--verbose', '-v', action='count', default=0, help="print test case names and statuses")
+-        self.argparse.add_argument('--quiet', action='store_const',
+-                                   dest='verbose', const=0)
++            '--verbosity', type=int,
++            help=("Set starting verbosity level (int). "
++                  "Applies before -v and -q"))
++        self.argparse.add_argument(
++            '--verbose', '-v', action='count', default=0,
++            help=("Print test case names and statuses. "
++                  "Use multiple '-v's for higher verbosity."))
++        self.argparse.add_argument(
++            '--quiet', '-q', action='count', default=0, dest='quiet',
++            help=("Reduce verbosity. Multiple '-q's result in "
++                  "lower verbosity."))
+         self.argparse.add_argument(
+             '--log-level', default=logging.WARN,
+             help='Set logging level for message logged to console.')
+@@ -172,13 +180,13 @@ class PluggableTestProgram(unittest.TestProgram):
+         self.session.logLevel = util.parse_log_level(cfg_args.log_level)
+         logging.basicConfig(level=self.session.logLevel)
+         log.debug('logging initialized %s', cfg_args.log_level)
+-        if cfg_args.verbose:
+-            self.session.verbosity += cfg_args.verbose
+-        self.session.startDir = cfg_args.start_dir
+         if cfg_args.top_level_directory:
+             self.session.topLevelDir = cfg_args.top_level_directory
+         self.session.loadConfigFiles(*self.findConfigFiles(cfg_args))
+-        self.session.setStartDir()
++        # set verbosity from config + opts
++        self.session.setVerbosity(
++            cfg_args.verbosity, cfg_args.verbose, cfg_args.quiet)
++        self.session.setStartDir(args_start_dir=cfg_args.start_dir)
+         self.session.prepareSysPath()
+         if cfg_args.load_plugins:
+             self.defaultPlugins.extend(cfg_args.plugins)
+diff --git a/nose2/session.py b/nose2/session.py
+index ee47c6d..e6c633c 100644
+--- a/nose2/session.py
++++ b/nose2/session.py
+@@ -72,7 +72,7 @@ class Session(object):
+ 
+     """
+     configClass = config.Config
+-    
++
+     def __init__(self):
+         self.argparse = argparse.ArgumentParser(prog='nose2', add_help=False)
+         self.pluginargs = self.argparse.add_argument_group(
+@@ -81,6 +81,8 @@ class Session(object):
+         self.config = configparser.ConfigParser()
+         self.hooks = events.PluginInterface()
+         self.plugins = []
++        # this will be reset later, whenever handleCfgArgs happens, but it
++        # starts at 1 so that it always has a non-negative integer value
+         self.verbosity = 1
+         self.startDir = None
+         self.topLevelDir = None
+@@ -183,9 +185,32 @@ class Session(object):
+                 log.debug("Register method %s for plugin %s", method, plugin)
+                 self.hooks.register(method, plugin)
+ 
+-    def setStartDir(self):
+-        if self.startDir is None:
+-            self.startDir = self.unittest.as_str('start-dir', '.')
++    def setVerbosity(self, args_verbosity, args_verbose, args_quiet):
++        """
++        Determine verbosity from various (possibly conflicting) sources of info
++
++        :param args_verbosity: The --verbosity argument value
++        :param args_verbose: count of -v options
++        :param args_quiet: count of -q options
++
++        start with config, override with any given --verbosity, then adjust
++        up/down with -vvv -qq, etc
++        """
++        self.verbosity = self.unittest.as_int('verbosity', 1)
++        if args_verbosity is not None:
++            self.verbosity = args_verbosity
++        # adjust up or down, depending on the difference of these counts
++        self.verbosity += args_verbose - args_quiet
++        # floor the value at 0 -- verbosity is always a non-negative integer
++        self.verbosity = max(self.verbosity, 0)
++
++    def setStartDir(self, args_start_dir=None):
++        """
++        start dir comes from config and may be overridden by an argument
++        """
++        self.startDir = self.unittest.as_str('start-dir', '.')
++        if args_start_dir is not None:
++            self.startDir = args_start_dir
+ 
+     def prepareSysPath(self):
+         """Add code directories to sys.path"""
+@@ -220,7 +245,8 @@ class Session(object):
+     def isPluginLoaded(self, pluginName):
+         """Returns ``True`` if a given plugin is loaded.
+ 
+-        :param pluginName: the name of the plugin module: e.g. "nose2.plugins.layers".
++        :param pluginName: the name of the plugin module:
++                           e.g. "nose2.plugins.layers".
+ 
+         """
+         for plugin in self.plugins:

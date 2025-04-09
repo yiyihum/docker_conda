@@ -1,0 +1,210 @@
+diff --git a/docs/source/conf.py b/docs/source/conf.py
+index 8571badb..689c240e 100644
+--- a/docs/source/conf.py
++++ b/docs/source/conf.py
+@@ -60,6 +60,15 @@ extensions = [
+ # You can specify multiple suffix as a list of string:
+ source_suffix = ['.rst', '.md']
+ 
++from traitlets.config import HasTraits
++
++# exclude members inherited from HasTraits by default
++autodoc_default_options = {
++    'members': None,
++    "inherited-members": None,
++    "exclude-members": ','.join(dir(HasTraits)),
++}
++
+ # Add dev disclaimer.
+ if iprelease['version_info'][-1] == 'dev':
+     rst_prolog = """
+diff --git a/ipyparallel/client/asyncresult.py b/ipyparallel/client/asyncresult.py
+index 41ece2c5..cc19f4ff 100644
+--- a/ipyparallel/client/asyncresult.py
++++ b/ipyparallel/client/asyncresult.py
+@@ -269,6 +269,8 @@ class AsyncResult(Future):
+         return self._ready
+ 
+     def _resolve_result(self, f=None):
++        if self.done():
++            return
+         try:
+             if f:
+                 results = f.result()
+diff --git a/ipyparallel/client/client.py b/ipyparallel/client/client.py
+index 5b688e16..01ec4501 100644
+--- a/ipyparallel/client/client.py
++++ b/ipyparallel/client/client.py
+@@ -1103,6 +1103,7 @@ class Client(HasTraits):
+         track=False,
+         header=None,
+         metadata=None,
++        track_outstanding=False,
+     ):
+         """Send a message in the IO thread
+ 
+@@ -1114,6 +1115,22 @@ class Client(HasTraits):
+         )
+         msg_id = msg['header']['msg_id']
+ 
++        if track_outstanding:
++            # add to outstanding, history
++            self.outstanding.add(msg_id)
++            self.history.append(msg_id)
++
++            if ident:
++                # possibly routed to a specific engine
++                ident_str = ident
++                if isinstance(ident_str, list):
++                    ident_str = ident_str[-1]
++                ident_str = ident_str.decode("utf-8")
++                if ident_str in self._engines.values():
++                    # save for later, in case of engine death
++                    self._outstanding_dict[ident_str].add(msg_id)
++            self.metadata['submitted'] = util.utcnow()
++
+         futures = self.create_message_futures(
+             msg_id,
+             async_result=msg_type in {'execute_request', 'apply_request'},
+@@ -1325,6 +1342,8 @@ class Client(HasTraits):
+         if jobs is None:
+             # get futures for results
+             futures = [f for f in self._futures.values() if hasattr(f, 'output')]
++            if not futures:
++                return
+             ar = AsyncResult(self, futures, owner=False)
+         else:
+             ar = self._asyncresult_from_jobs(jobs, owner=False)
+@@ -1597,19 +1616,9 @@ class Client(HasTraits):
+             ident=ident,
+             metadata=metadata,
+             track=track,
++            track_outstanding=True,
+         )
+-
+         msg_id = future.msg_id
+-        self.outstanding.add(msg_id)
+-        if ident:
+-            # possibly routed to a specific engine
+-            if isinstance(ident, list):
+-                ident = ident[-1]
+-            ident = ident.decode("utf-8")
+-            if ident in self._engines.values():
+-                # save for later, in case of engine death
+-                self._outstanding_dict[ident].add(msg_id)
+-        self.history.append(msg_id)
+ 
+         return future
+ 
+@@ -1635,22 +1644,14 @@ class Client(HasTraits):
+         content = dict(code=code, silent=bool(silent), user_expressions={})
+ 
+         future = self._send(
+-            socket, "execute_request", content=content, ident=ident, metadata=metadata
++            socket,
++            "execute_request",
++            content=content,
++            ident=ident,
++            metadata=metadata,
++            track_outstanding=True,
+         )
+ 
+-        msg_id = future.msg_id
+-        self.outstanding.add(msg_id)
+-        if ident:
+-            # possibly routed to a specific engine
+-            if isinstance(ident, list):
+-                ident = ident[-1]
+-            ident = ident.decode("utf-8")
+-            if ident in self._engines.values():
+-                # save for later, in case of engine death
+-                self._outstanding_dict[ident].add(msg_id)
+-        self.history.append(msg_id)
+-        self.metadata[msg_id]['submitted'] = util.utcnow()
+-
+         return future
+ 
+     # --------------------------------------------------------------------------
+diff --git a/ipyparallel/controller/hub.py b/ipyparallel/controller/hub.py
+index 526bdbd7..6b1146b1 100644
+--- a/ipyparallel/controller/hub.py
++++ b/ipyparallel/controller/hub.py
+@@ -277,14 +277,14 @@ class HubFactory(RegistrationFactory):
+         'DictDB',
+         config=True,
+         help="""The class to use for the DB backend
+-        
++
+         Options include:
+-        
++
+         SQLiteDB: SQLite
+         MongoDB : use MongoDB
+         DictDB  : in-memory storage (fastest, but be mindful of memory growth of the Hub)
+         NoDB    : disable database altogether (default)
+-        
++
+         """,
+     )
+ 
+@@ -1100,7 +1100,11 @@ class Hub(SessionFactory):
+         msg_type = msg['header']['msg_type']
+         if msg_type == 'shutdown_reply':
+             session = msg['header']['session']
+-            eid = self.by_ident.get(session, None)
++            uuid_bytes = session.encode("utf8", "replace")
++            eid = self.by_ident.get(uuid_bytes, None)
++            if eid is None:
++                self.log.error(f"Found no engine for {session}")
++                return
+             uuid = self.engines[eid].uuid
+             self.unregister_engine(
+                 ident='shutdown_reply', msg=dict(content=dict(id=eid, queue=uuid))
+diff --git a/ipyparallel/serialize/canning.py b/ipyparallel/serialize/canning.py
+index f2ba4140..b83ef98e 100644
+--- a/ipyparallel/serialize/canning.py
++++ b/ipyparallel/serialize/canning.py
+@@ -193,6 +193,16 @@ class CannedFunction(CannedObject):
+         else:
+             self.defaults = None
+ 
++        if f.__kwdefaults__:
++            self.kwdefaults = can_dict(f.__kwdefaults__)
++        else:
++            self.kwdefaults = None
++
++        if f.__annotations__:
++            self.annotations = can_dict(f.__annotations__)
++        else:
++            self.annotations = None
++
+         closure = py3compat.get_closure(f)
+         if closure:
+             self.closure = tuple(can(cell) for cell in closure)
+@@ -218,11 +228,25 @@ class CannedFunction(CannedObject):
+             defaults = tuple(uncan(cfd, g) for cfd in self.defaults)
+         else:
+             defaults = None
++
++        if self.kwdefaults:
++            kwdefaults = uncan_dict(self.kwdefaults)
++        else:
++            kwdefaults = None
++        if self.annotations:
++            annotations = uncan_dict(self.annotations)
++        else:
++            annotations = {}
++
+         if self.closure:
+             closure = tuple(uncan(cell, g) for cell in self.closure)
+         else:
+             closure = None
+         newFunc = FunctionType(self.code, g, self.__name__, defaults, closure)
++        if kwdefaults:
++            newFunc.__kwdefaults__ = kwdefaults
++        if annotations:
++            newFunc.__annotations__ = annotations
+         return newFunc
+ 
+ 
+

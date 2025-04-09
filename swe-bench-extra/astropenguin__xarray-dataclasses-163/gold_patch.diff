@@ -1,0 +1,416 @@
+diff --git a/xarray_dataclasses/__init__.py b/xarray_dataclasses/__init__.py
+index 81cc1e9..dd19281 100644
+--- a/xarray_dataclasses/__init__.py
++++ b/xarray_dataclasses/__init__.py
+@@ -7,6 +7,7 @@ from .dataarray import *
+ from .dataset import *
+ from .datamodel import *
+ from .dataoptions import *
++from .specs import *
+ from .typing import *
+ 
+ 
+diff --git a/xarray_dataclasses/datamodel.py b/xarray_dataclasses/datamodel.py
+index f488393..06fb0e0 100644
+--- a/xarray_dataclasses/datamodel.py
++++ b/xarray_dataclasses/datamodel.py
+@@ -17,16 +17,16 @@ from typing_extensions import Literal, ParamSpec, get_type_hints
+ from .typing import (
+     AnyDType,
+     AnyField,
+-    DataClass,
+     AnyXarray,
++    DataClass,
+     Dims,
+-    FType,
++    Role,
+     get_annotated,
+     get_dataclass,
+     get_dims,
+     get_dtype,
+-    get_ftype,
+     get_name,
++    get_role,
+ )
+ 
+ 
+@@ -209,29 +209,29 @@ def eval_dataclass(dataclass: AnyDataClass[PInit]) -> None:
+ 
+ def get_entry(field: AnyField, value: Any) -> Optional[AnyEntry]:
+     """Create an entry from a field and its value."""
+-    ftype = get_ftype(field.type)
++    role = get_role(field.type)
+     name = get_name(field.type, field.name)
+ 
+-    if ftype is FType.ATTR or ftype is FType.NAME:
++    if role is Role.ATTR or role is Role.NAME:
+         return AttrEntry(
+             name=name,
+-            tag=ftype.value,
++            tag=role.value,
+             value=value,
+             type=get_annotated(field.type),
+         )
+ 
+-    if ftype is FType.COORD or ftype is FType.DATA:
++    if role is Role.COORD or role is Role.DATA:
+         try:
+             return DataEntry(
+                 name=name,
+-                tag=ftype.value,
++                tag=role.value,
+                 base=get_dataclass(field.type),
+                 value=value,
+             )
+         except TypeError:
+             return DataEntry(
+                 name=name,
+-                tag=ftype.value,
++                tag=role.value,
+                 dims=get_dims(field.type),
+                 dtype=get_dtype(field.type),
+                 value=value,
+diff --git a/xarray_dataclasses/specs.py b/xarray_dataclasses/specs.py
+new file mode 100644
+index 0000000..ce6f3fb
+--- /dev/null
++++ b/xarray_dataclasses/specs.py
+@@ -0,0 +1,201 @@
++__all__ = ["DataOptions", "DataSpec"]
++
++
++# standard library
++from dataclasses import dataclass, field, fields
++from functools import lru_cache
++from typing import Any, Dict, Generic, Hashable, Optional, Type, TypeVar
++
++
++# dependencies
++from typing_extensions import Literal, ParamSpec, TypeAlias, get_type_hints
++
++
++# submodules
++from .typing import (
++    AnyDType,
++    AnyField,
++    AnyXarray,
++    DataClass,
++    Dims,
++    Role,
++    get_annotated,
++    get_dataclass,
++    get_dims,
++    get_dtype,
++    get_name,
++    get_role,
++)
++
++
++# type hints
++AnySpec: TypeAlias = "ArraySpec | ScalarSpec"
++PInit = ParamSpec("PInit")
++TReturn = TypeVar("TReturn", AnyXarray, None)
++
++
++# runtime classes
++@dataclass(frozen=True)
++class ArraySpec:
++    """Specification of an array."""
++
++    name: Hashable
++    """Name of the array."""
++
++    role: Literal["coord", "data"]
++    """Role of the array."""
++
++    dims: Dims
++    """Dimensions of the array."""
++
++    dtype: Optional[AnyDType]
++    """Data type of the array."""
++
++    default: Any
++    """Default value of the array."""
++
++    origin: Optional[Type[DataClass[Any]]] = None
++    """Dataclass as origins of name, dims, and dtype."""
++
++    def __post_init__(self) -> None:
++        """Update name, dims, and dtype if origin exists."""
++        if self.origin is None:
++            return
++
++        dataspec = DataSpec.from_dataclass(self.origin)
++        setattr = object.__setattr__
++
++        for spec in dataspec.specs.of_name.values():
++            setattr(self, "name", spec.default)
++            break
++
++        for spec in dataspec.specs.of_data.values():
++            setattr(self, "dims", spec.dims)
++            setattr(self, "dtype", spec.dtype)
++            break
++
++
++@dataclass(frozen=True)
++class ScalarSpec:
++    """Specification of a scalar."""
++
++    name: Hashable
++    """Name of the scalar."""
++
++    role: Literal["attr", "name"]
++    """Role of the scalar."""
++
++    type: Any
++    """Type (hint) of the scalar."""
++
++    default: Any
++    """Default value of the scalar."""
++
++
++class SpecDict(Dict[str, AnySpec]):
++    """Dictionary of any specifications."""
++
++    @property
++    def of_attr(self) -> Dict[str, ScalarSpec]:
++        """Limit to attribute specifications."""
++        return {k: v for k, v in self.items() if v.role == "attr"}
++
++    @property
++    def of_coord(self) -> Dict[str, ArraySpec]:
++        """Limit to coordinate specifications."""
++        return {k: v for k, v in self.items() if v.role == "coord"}
++
++    @property
++    def of_data(self) -> Dict[str, ArraySpec]:
++        """Limit to data specifications."""
++        return {k: v for k, v in self.items() if v.role == "data"}
++
++    @property
++    def of_name(self) -> Dict[str, ScalarSpec]:
++        """Limit to name specifications."""
++        return {k: v for k, v in self.items() if v.role == "name"}
++
++
++@dataclass(frozen=True)
++class DataOptions(Generic[TReturn]):
++    """Options for xarray data creation."""
++
++    factory: Type[TReturn]
++    """Factory for xarray data creation."""
++
++
++@dataclass(frozen=True)
++class DataSpec:
++    """Data specification of an xarray dataclass."""
++
++    specs: SpecDict = field(default_factory=SpecDict)
++    """Dictionary of any specifications."""
++
++    options: DataOptions[Any] = DataOptions(type(None))
++    """Options for xarray data creation."""
++
++    @classmethod
++    def from_dataclass(
++        cls,
++        dataclass: Type[DataClass[PInit]],
++        dataoptions: Optional[DataOptions[Any]] = None,
++    ) -> "DataSpec":
++        """Create a data specification from a dataclass."""
++        specs = SpecDict()
++
++        for field in fields(eval_types(dataclass)):
++            spec = get_spec(field)
++
++            if spec is not None:
++                specs[field.name] = spec
++
++        if dataoptions is None:
++            return cls(specs)
++        else:
++            return cls(specs, dataoptions)
++
++
++# runtime functions
++@lru_cache(maxsize=None)
++def eval_types(dataclass: Type[DataClass[PInit]]) -> Type[DataClass[PInit]]:
++    """Evaluate field types of a dataclass."""
++    types = get_type_hints(dataclass, include_extras=True)
++
++    for field in fields(dataclass):
++        field.type = types[field.name]
++
++    return dataclass
++
++
++@lru_cache(maxsize=None)
++def get_spec(field: AnyField) -> Optional[AnySpec]:
++    """Convert a dataclass field to a specification."""
++    name = get_name(field.type, field.name)
++    role = get_role(field.type)
++
++    if role is Role.DATA or role is Role.COORD:
++        try:
++            return ArraySpec(
++                name=name,
++                role=role.value,
++                dims=(),  # dummy
++                dtype=None,  # dummy
++                default=field.default,
++                origin=get_dataclass(field.type),
++            )
++        except TypeError:
++            return ArraySpec(
++                name=name,
++                role=role.value,
++                dims=get_dims(field.type),
++                dtype=get_dtype(field.type),
++                default=field.default,
++            )
++
++    if role is Role.ATTR or role is Role.NAME:
++        return ScalarSpec(
++            name=name,
++            role=role.value,
++            type=get_annotated(field.type),
++            default=field.default,
++        )
+diff --git a/xarray_dataclasses/typing.py b/xarray_dataclasses/typing.py
+index bedb65f..4d21d28 100644
+--- a/xarray_dataclasses/typing.py
++++ b/xarray_dataclasses/typing.py
+@@ -64,7 +64,7 @@ THashable = TypeVar("THashable", bound=Hashable)
+ AnyArray: TypeAlias = "np.ndarray[Any, Any]"
+ AnyDType: TypeAlias = "np.dtype[Any]"
+ AnyField: TypeAlias = "Field[Any]"
+-AnyXarray = Union[xr.DataArray, xr.Dataset]
++AnyXarray: TypeAlias = "xr.DataArray | xr.Dataset"
+ Dims = Tuple[str, ...]
+ Order = Literal["C", "F"]
+ Shape = Union[Sequence[int], int]
+@@ -87,7 +87,7 @@ class Labeled(Generic[TDims]):
+ 
+ 
+ # type hints (public)
+-class FType(Enum):
++class Role(Enum):
+     """Annotations for typing dataclass fields."""
+ 
+     ATTR = "attr"
+@@ -107,14 +107,14 @@ class FType(Enum):
+ 
+     @classmethod
+     def annotates(cls, tp: Any) -> bool:
+-        """Check if any ftype annotates a type hint."""
++        """Check if any role annotates a type hint."""
+         if get_origin(tp) is not Annotated:
+             return False
+ 
+         return any(isinstance(arg, cls) for arg in get_args(tp))
+ 
+ 
+-Attr = Annotated[T, FType.ATTR]
++Attr = Annotated[T, Role.ATTR]
+ """Type hint for attribute fields (``Attr[T]``).
+ 
+ Example:
+@@ -137,7 +137,7 @@ Reference:
+ 
+ """
+ 
+-Coord = Annotated[Union[Labeled[TDims], Collection[TDType], TDType], FType.COORD]
++Coord = Annotated[Union[Labeled[TDims], Collection[TDType], TDType], Role.COORD]
+ """Type hint for coordinate fields (``Coord[TDims, TDType]``).
+ 
+ Example:
+@@ -156,7 +156,7 @@ Hint:
+ 
+ """
+ 
+-Coordof = Annotated[Union[TDataClass, Any], FType.COORD]
++Coordof = Annotated[Union[TDataClass, Any], Role.COORD]
+ """Type hint for coordinate fields (``Coordof[TDataClass]``).
+ 
+ Unlike ``Coord``, it specifies a dataclass that defines a DataArray class.
+@@ -188,7 +188,7 @@ Hint:
+ 
+ """
+ 
+-Data = Annotated[Union[Labeled[TDims], Collection[TDType], TDType], FType.DATA]
++Data = Annotated[Union[Labeled[TDims], Collection[TDType], TDType], Role.DATA]
+ """Type hint for data fields (``Coordof[TDims, TDType]``).
+ 
+ Example:
+@@ -209,7 +209,7 @@ Example:
+ 
+ """
+ 
+-Dataof = Annotated[Union[TDataClass, Any], FType.DATA]
++Dataof = Annotated[Union[TDataClass, Any], Role.DATA]
+ """Type hint for data fields (``Coordof[TDataClass]``).
+ 
+ Unlike ``Data``, it specifies a dataclass that defines a DataArray class.
+@@ -236,7 +236,7 @@ Hint:
+ 
+ """
+ 
+-Name = Annotated[THashable, FType.NAME]
++Name = Annotated[THashable, Role.NAME]
+ """Type hint for name fields (``Name[THashable]``).
+ 
+ Example:
+@@ -272,19 +272,19 @@ def find_annotated(tp: Any) -> Iterable[Any]:
+ 
+ 
+ def get_annotated(tp: Any) -> Any:
+-    """Extract the first ftype-annotated type."""
+-    for annotated in filter(FType.annotates, find_annotated(tp)):
++    """Extract the first role-annotated type."""
++    for annotated in filter(Role.annotates, find_annotated(tp)):
+         return deannotate(annotated)
+ 
+-    raise TypeError("Could not find any ftype-annotated type.")
++    raise TypeError("Could not find any role-annotated type.")
+ 
+ 
+ def get_annotations(tp: Any) -> Tuple[Any, ...]:
+-    """Extract annotations of the first ftype-annotated type."""
+-    for annotated in filter(FType.annotates, find_annotated(tp)):
++    """Extract annotations of the first role-annotated type."""
++    for annotated in filter(Role.annotates, find_annotated(tp)):
+         return get_args(annotated)[1:]
+ 
+-    raise TypeError("Could not find any ftype-annotated type.")
++    raise TypeError("Could not find any role-annotated type.")
+ 
+ 
+ def get_dataclass(tp: Any) -> Type[DataClass[Any]]:
+@@ -341,14 +341,6 @@ def get_dtype(tp: Any) -> Optional[AnyDType]:
+     return np.dtype(dtype)
+ 
+ 
+-def get_ftype(tp: Any, default: FType = FType.OTHER) -> FType:
+-    """Extract an ftype if found or return given default."""
+-    try:
+-        return get_annotations(tp)[0]
+-    except TypeError:
+-        return default
+-
+-
+ def get_name(tp: Any, default: Hashable = None) -> Hashable:
+     """Extract a name if found or return given default."""
+     try:
+@@ -361,3 +353,11 @@ def get_name(tp: Any, default: Hashable = None) -> Hashable:
+             return annotation
+ 
+     return default
++
++
++def get_role(tp: Any, default: Role = Role.OTHER) -> Role:
++    """Extract a role if found or return given default."""
++    try:
++        return get_annotations(tp)[0]
++    except TypeError:
++        return default

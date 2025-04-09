@@ -1,0 +1,129 @@
+diff --git a/dandi/cli/cmd_organize.py b/dandi/cli/cmd_organize.py
+index 8c9972d9..9b0c0037 100644
+--- a/dandi/cli/cmd_organize.py
++++ b/dandi/cli/cmd_organize.py
+@@ -25,12 +25,13 @@ from ..consts import dandiset_metadata_file, file_operation_modes
+     "-f",
+     "--files-mode",
+     help="If 'dry' - no action is performed, suggested renames are printed. "
+-    "I 'simulate' - hierarchy of empty files at --local-top-path is created. "
+-    "Note that previous layout should be removed prior this operation.  The "
+-    "other modes (copy, move, symlink, hardlink) define how data files should "
+-    "be made available.",
++    "If 'simulate' - hierarchy of empty files at --local-top-path is created. "
++    "Note that previous layout should be removed prior this operation.  "
++    "If 'auto' - whichever of symlink, hardlink, copy is allowed by system. "
++    "The other modes (copy, move, symlink, hardlink) define how data files "
++    "should be made available.",
+     type=click.Choice(file_operation_modes),
+-    default="dry",
++    default="auto",
+     show_default=True,
+ )
+ @click.argument("paths", nargs=-1, type=click.Path(exists=True))
+@@ -41,7 +42,7 @@ def organize(
+     dandiset_path=None,
+     dandiset_id=None,
+     invalid="fail",
+-    files_mode="dry",
++    files_mode="auto",
+     devel_debug=False,
+ ):
+     """(Re)organize files according to the metadata.
+@@ -84,6 +85,7 @@ def organize(
+         filter_invalid_metadata_rows,
+         populate_dataset_yml,
+         create_dataset_yml_template,
++        detect_link_type,
+     )
+     from ..metadata import get_metadata
+     from ..dandiset import Dandiset
+@@ -210,6 +212,9 @@ def organize(
+     if not op.exists(dandiset_path):
+         act(os.makedirs, dandiset_path)
+ 
++    if files_mode == "auto":
++        files_mode = detect_link_type(dandiset_path)
++
+     dandiset_metadata_filepath = op.join(dandiset_path, dandiset_metadata_file)
+     if op.lexists(dandiset_metadata_filepath):
+         if dandiset_id is not None:
+diff --git a/dandi/consts.py b/dandi/consts.py
+index eab3d3fb..2ed0fb90 100644
+--- a/dandi/consts.py
++++ b/dandi/consts.py
+@@ -108,7 +108,15 @@ known_instances_rev = {vv: k for k, v in known_instances.items() for vv in v if
+ collection_drafts = "drafts"
+ collection_releases = "releases"
+ 
+-file_operation_modes = ["dry", "simulate", "copy", "move", "hardlink", "symlink"]
++file_operation_modes = [
++    "dry",
++    "simulate",
++    "copy",
++    "move",
++    "hardlink",
++    "symlink",
++    "auto",
++]
+ 
+ #
+ # Download (upload?) specific constants
+diff --git a/dandi/organize.py b/dandi/organize.py
+index c8d112e3..bf7277fc 100644
+--- a/dandi/organize.py
++++ b/dandi/organize.py
+@@ -8,7 +8,9 @@ import numpy as np
+ import re
+ from collections import Counter
+ 
++import os
+ import os.path as op
++from pathlib import Path
+ 
+ from .exceptions import OrganizeImpossibleError
+ from . import get_logger
+@@ -572,3 +574,43 @@ def _get_non_unique_paths(metadata):
+                     orig_paths.append(e["path"])
+             non_unique[p] = orig_paths  # overload with the list instead of count
+     return non_unique
++
++
++def detect_link_type(workdir):
++    """
++    Determine what type of links the filesystem will let us make in the
++    directory ``workdir``.  If symlinks are allowed, returns ``"symlink"``.
++    Otherwise, if hard links are allowed, returns ``"hardlink"``.  Otherwise,
++    returns ``"copy"``.
++    """
++    srcfile = Path(workdir, f".dandi.{os.getpid()}.src")
++    destfile = Path(workdir, f".dandi.{os.getpid()}.dest")
++    try:
++        srcfile.touch()
++        try:
++            os.symlink(srcfile, destfile)
++        except OSError:
++            try:
++                os.link(srcfile, destfile)
++            except OSError:
++                lgr.info(
++                    "Symlink and hardlink tests both failed; setting files_mode='copy'"
++                )
++                return "copy"
++            else:
++                lgr.info(
++                    "Hard link support autodetected; setting files_mode='hardlink'"
++                )
++                return "hardlink"
++        else:
++            lgr.info("Symlink support autodetected; setting files_mode='symlink'")
++            return "symlink"
++    finally:
++        try:
++            destfile.unlink()
++        except FileNotFoundError:
++            pass
++        try:
++            srcfile.unlink()
++        except FileNotFoundError:
++            pass

@@ -1,0 +1,118 @@
+diff --git a/tests/test_annotated.py b/tests/test_annotated.py
+--- a/tests/test_annotated.py
++++ b/tests/test_annotated.py
+@@ -1,11 +1,9 @@
+-import sys
+-from typing import get_type_hints
+-
+ import pytest
+ from typing_extensions import Annotated
+ 
+ from pydantic import BaseModel, Field
+ from pydantic.fields import Undefined
++from pydantic.typing import get_all_type_hints
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -43,15 +41,7 @@ class M(BaseModel):
+ 
+     assert M().x == 5
+     assert M(x=10).x == 10
+-
+-    # get_type_hints doesn't recognize typing_extensions.Annotated, so will return the full
+-    # annotation. 3.9 w/ stock Annotated will return the wrapped type by default, but return the
+-    # full thing with the new include_extras flag.
+-    if sys.version_info >= (3, 9):
+-        assert get_type_hints(M)['x'] is int
+-        assert get_type_hints(M, include_extras=True)['x'] == hint
+-    else:
+-        assert get_type_hints(M)['x'] == hint
++    assert get_all_type_hints(M)['x'] == hint
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/test_decorator.py b/tests/test_decorator.py
+--- a/tests/test_decorator.py
++++ b/tests/test_decorator.py
+@@ -3,14 +3,13 @@
+ import sys
+ from pathlib import Path
+ from typing import List
+-from unittest.mock import ANY
+ 
+ import pytest
++from typing_extensions import Annotated
+ 
+ from pydantic import BaseModel, Field, ValidationError, validate_arguments
+ from pydantic.decorator import ValidatedFunction
+ from pydantic.errors import ConfigError
+-from pydantic.typing import Annotated
+ 
+ skip_pre_38 = pytest.mark.skipif(sys.version_info < (3, 8), reason='testing >= 3.8 behaviour only')
+ 
+@@ -154,13 +153,14 @@ def foo(a: int, b: int = Field(default_factory=lambda: 99), *args: int) -> int:
+     assert foo(1, 2, 3) == 6
+ 
+ 
+-@pytest.mark.skipif(not Annotated, reason='typing_extensions not installed')
+ def test_annotated_field_can_provide_factory() -> None:
+     @validate_arguments
+-    def foo2(a: int, b: Annotated[int, Field(default_factory=lambda: 99)] = ANY, *args: int) -> int:
++    def foo2(a: int, b: Annotated[int, Field(default_factory=lambda: 99)], *args: int) -> int:
+         """mypy reports Incompatible default for argument "b" if we don't supply ANY as default"""
+         return a + b + sum(args)
+ 
++    assert foo2(1) == 100
++
+ 
+ @skip_pre_38
+ def test_positional_only(create_module):
+diff --git a/tests/test_edge_cases.py b/tests/test_edge_cases.py
+--- a/tests/test_edge_cases.py
++++ b/tests/test_edge_cases.py
+@@ -1839,3 +1839,19 @@ class Config:
+     with pytest.raises(TypeError):
+         b.a = 'y'
+     assert b.dict() == {'a': 'x'}
++
++
++def test_arbitrary_types_allowed_custom_eq():
++    class Foo:
++        def __eq__(self, other):
++            if other.__class__ is not Foo:
++                raise TypeError(f'Cannot interpret {other.__class__.__name__!r} as a valid type')
++            return True
++
++    class Model(BaseModel):
++        x: Foo = Foo()
++
++        class Config:
++            arbitrary_types_allowed = True
++
++    assert Model().x == Foo()
+diff --git a/tests/test_generics.py b/tests/test_generics.py
+--- a/tests/test_generics.py
++++ b/tests/test_generics.py
+@@ -3,7 +3,7 @@
+ from typing import Any, Callable, ClassVar, Dict, Generic, List, Optional, Sequence, Tuple, Type, TypeVar, Union
+ 
+ import pytest
+-from typing_extensions import Literal
++from typing_extensions import Annotated, Literal
+ 
+ from pydantic import BaseModel, Field, ValidationError, root_validator, validator
+ from pydantic.generics import GenericModel, _generic_types_cache, iter_contained_typevars, replace_types
+@@ -1071,3 +1071,13 @@ class GModel(GenericModel, Generic[FieldType, ValueType]):
+     Fields = Literal['foo', 'bar']
+     m = GModel[Fields, str](field={'foo': 'x'})
+     assert m.dict() == {'field': {'foo': 'x'}}
++
++
++@skip_36
++def test_generic_annotated():
++    T = TypeVar('T')
++
++    class SomeGenericModel(GenericModel, Generic[T]):
++        some_field: Annotated[T, Field(alias='the_alias')]
++
++    SomeGenericModel[str](the_alias='qwe')

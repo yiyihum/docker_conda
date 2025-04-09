@@ -1,0 +1,199 @@
+diff --git a/Makefile b/Makefile
+index e2a65aa..c57faf7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -32,7 +32,7 @@ coverage:
+ 	rm -r $(TESTDIR)
+ 
+ pep8:
+-	flake8 $(PROJECT) setup.py
++	flake8 $(PROJECT) setup.py examples
+ 
+ lint:
+ 	pylint $(PROJECT) setup.py
+diff --git a/examples/scipygridder.py b/examples/scipygridder.py
+new file mode 100644
+index 0000000..4531d15
+--- /dev/null
++++ b/examples/scipygridder.py
+@@ -0,0 +1,84 @@
++"""
++Gridding with Scipy
++===================
++
++Scipy offers a range of interpolation methods in :mod:`scipy.interpolate` and 3
++specifically for 2D data (linear, nearest neighbors, and bicubic). Verde offers
++an interface for these 3 scipy interpolators in :class:`verde.ScipyGridder`.
++
++All of these interpolations work on Cartesian data, so if we want to grid
++geographic data (like our Baja California bathymetry) we need to project them
++into a Cartesian system. We'll use
++`pyproj <https://github.com/jswhit/pyproj>`__ to calculate a Mercator
++projection for the data.
++
++For convenience, Verde still allows us to make geographic grids by passing the
++``projection`` argument to :meth:`verde.ScipyGridder.grid` and the like. When
++doing so, the grid will be generated using geographic coordinates which will be
++projected prior to interpolation.
++"""
++import matplotlib.pyplot as plt
++import cartopy.crs as ccrs
++import cartopy.feature as cfeature
++import pyproj
++import numpy as np
++import verde as vd
++
++# We'll test this on the Baja California shipborne bathymetry data
++data = vd.datasets.fetch_baja_bathymetry()
++
++# Before gridding, we need to decimate the data to avoid aliasing because of
++# the oversampling along the ship tracks. We'll use a blocked median with 5
++# arc-minute blocks.
++spacing = 5/60
++lon, lat, bathymetry = vd.block_reduce(data.longitude, data.latitude,
++                                       data.bathymetry_m, reduction=np.median,
++                                       spacing=spacing)
++
++# Project the data using pyproj so that we can use it as input for the gridder.
++# We'll set the latitude of true scale to the mean latitude of the data.
++projection = pyproj.Proj(proj='merc', lat_ts=data.latitude.mean())
++easting, northing = projection(lon, lat)
++
++# Now we can set up a gridder for the decimated data
++grd = vd.ScipyGridder(method='cubic').fit(easting, northing, bathymetry)
++print("Gridder used:", grd)
++
++# Get the grid region in geographic coordinates
++region = vd.get_region(data.longitude, data.latitude)
++print("Data region:", region)
++
++# The 'grid' method can still make a geographic grid if we pass in a projection
++# function that converts lon, lat into the easting, northing coordinates that
++# we used in 'fit'. This can be any function that takes lon, lat and returns x,
++# y. In our case, it'll be the 'projection' variable that we created above.
++# We'll also set the names of the grid dimensions and the name the data
++# variable in our grid (the default would be 'scalars', which isn't very
++# informative).
++grid = grd.grid(region=region, spacing=spacing, projection=projection,
++                dims=['latitude', 'longitude'], data_names=['bathymetry_m'])
++print("Generated geographic grid:")
++print(grid)
++
++# Cartopy requires setting the coordinate reference system (CRS) of the
++# original data through the transform argument. Their docs say to use
++# PlateCarree to represent geographic data.
++crs = ccrs.PlateCarree()
++
++plt.figure(figsize=(7, 6))
++# Make a Mercator map of our gridded bathymetry
++ax = plt.axes(projection=ccrs.Mercator())
++ax.set_title("Gridded Bathymetry Using Scipy", pad=25)
++# Plot the gridded bathymetry
++pc = ax.pcolormesh(grid.longitude, grid.latitude, grid.bathymetry_m,
++                   transform=crs, vmax=0)
++cb = plt.colorbar(pc, pad=0.08)
++cb.set_label('bathymetry [m]')
++# Plot the locations of the decimated data
++ax.plot(lon, lat, '.k', markersize=0.5, transform=crs)
++# Plot the land as a solid color
++ax.add_feature(cfeature.LAND, edgecolor='black', zorder=2)
++ax.set_extent(region, crs=crs)
++ax.gridlines(draw_labels=True)
++plt.tight_layout()
++plt.show()
+diff --git a/verde/__init__.py b/verde/__init__.py
+index 6c4e8f6..505fb9c 100644
+--- a/verde/__init__.py
++++ b/verde/__init__.py
+@@ -5,7 +5,7 @@ from ._version import get_versions as _get_versions
+ 
+ # Import functions/classes to make the API
+ from .utils import scatter_points, grid_coordinates, profile_coordinates, \
+-    block_reduce, block_region, inside
++    block_reduce, block_region, inside, get_region
+ from . import datasets
+ from .scipy_bridge import ScipyGridder
+ 
+diff --git a/verde/base/gridder.py b/verde/base/gridder.py
+index 58b7ad1..5789398 100644
+--- a/verde/base/gridder.py
++++ b/verde/base/gridder.py
+@@ -212,7 +212,7 @@ class BaseGridder(BaseEstimator):
+         raise NotImplementedError()
+ 
+     def grid(self, region=None, shape=None, spacing=None, adjust='spacing',
+-             dims=None, data_names=None):
++             dims=None, data_names=None, projection=None):
+         """
+         Interpolate the data onto a regular grid.
+ 
+@@ -278,7 +278,10 @@ class BaseGridder(BaseEstimator):
+         region = get_region(self, region)
+         easting, northing = grid_coordinates(region, shape=shape,
+                                              spacing=spacing, adjust=adjust)
+-        data = check_data(self.predict(easting, northing))
++        if projection is None:
++            data = check_data(self.predict(easting, northing))
++        else:
++            data = check_data(self.predict(*projection(easting, northing)))
+         coords = {dims[1]: easting[0, :], dims[0]: northing[:, 0]}
+         attrs = {'metadata': 'Generated by {}'.format(repr(self))}
+         data_vars = {name: (dims, value, attrs)
+@@ -286,7 +289,7 @@ class BaseGridder(BaseEstimator):
+         return xr.Dataset(data_vars, coords=coords, attrs=attrs)
+ 
+     def scatter(self, region=None, size=300, random_state=0, dims=None,
+-                data_names=None):
++                data_names=None, projection=None):
+         """
+         Interpolate values onto a random scatter of points.
+ 
+@@ -331,17 +334,16 @@ class BaseGridder(BaseEstimator):
+         data_names = get_data_names(self, data_names)
+         region = get_region(self, region)
+         east, north = scatter_points(region, size, random_state)
+-        data = check_data(self.predict(east, north))
+-        column_names = [dim for dim in dims]
+-        column_names.extend(data_names)
+-        columns = [north, east]
+-        columns.extend(data)
+-        table = pd.DataFrame(
+-            {name: value for name, value in zip(column_names, columns)},
+-            columns=column_names)
+-        return table
+-
+-    def profile(self, point1, point2, size, dims=None, data_names=None):
++        if projection is None:
++            data = check_data(self.predict(east, north))
++        else:
++            data = check_data(self.predict(*projection(east, north)))
++        columns = [(dims[0], north), (dims[1], east)]
++        columns.extend(zip(data_names, data))
++        return pd.DataFrame(dict(columns), columns=[c[0] for c in columns])
++
++    def profile(self, point1, point2, size, dims=None, data_names=None,
++                projection=None):
+         """
+         Interpolate data along a profile between two points.
+ 
+@@ -388,13 +390,10 @@ class BaseGridder(BaseEstimator):
+         data_names = get_data_names(self, data_names)
+         east, north, distances = profile_coordinates(
+             point1, point2, size, coordinate_system=coordsys)
+-        data = check_data(self.predict(east, north))
+-        column_names = [dim for dim in dims]
+-        column_names.append('distance')
+-        column_names.extend(data_names)
+-        columns = [north, east, distances]
+-        columns.extend(data)
+-        table = pd.DataFrame(
+-            {name: value for name, value in zip(column_names, columns)},
+-            columns=column_names)
+-        return table
++        if projection is None:
++            data = check_data(self.predict(east, north))
++        else:
++            data = check_data(self.predict(*projection(east, north)))
++        columns = [(dims[0], north), (dims[1], east), ('distance', distances)]
++        columns.extend(zip(data_names, data))
++        return pd.DataFrame(dict(columns), columns=[c[0] for c in columns])

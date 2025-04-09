@@ -1,0 +1,334 @@
+diff --git a/ipyparallel/client/asyncresult.py b/ipyparallel/client/asyncresult.py
+index e2ee8605..41ece2c5 100644
+--- a/ipyparallel/client/asyncresult.py
++++ b/ipyparallel/client/asyncresult.py
+@@ -7,7 +7,9 @@ import sys
+ import threading
+ import time
+ from concurrent.futures import Future
++from contextlib import contextmanager
+ from datetime import datetime
++from functools import partial
+ from threading import Event
+ 
+ try:
+@@ -134,6 +136,49 @@ class AsyncResult(Future):
+         self._output_future.add_done_callback(self._resolve_output)
+         self.add_done_callback(self._finalize_result)
+ 
++    def _iopub_streaming_output_callback(self, eid, msg):
++        """Callback registered during AsyncResult.stream_output()"""
++        msg_type = msg['header']['msg_type']
++        if msg_type == 'stream':
++            msg_content = msg['content']
++            stream_name = msg_content['name']
++            stream = getattr(sys, stream_name, sys.stdout)
++            self._display_stream(
++                msg_content['text'],
++                f'[{stream_name}:{eid}] ',
++                file=stream,
++            )
++
++        if get_ipython() is None:
++            return
++
++        if msg_type == 'display_data':
++            msg_content = msg['content']
++            _raw_text('[output:%i]' % eid)
++            self._republish_displaypub(msg_content, eid)
++
++    @contextmanager
++    def stream_output(self):
++        """Stream output for this result as it arrives.
++
++        Returns a context manager, during which output is streamed.
++        """
++
++        # Keep a handle on the futures so we can remove the callback later
++        future_callbacks = {}
++        for eid, msg_id in zip(self._targets, self.msg_ids):
++            callback_func = partial(self._iopub_streaming_output_callback, eid)
++            f = self._client._futures[msg_id]
++            future_callbacks[f] = callback_func
++            f.iopub_callbacks.append(callback_func)
++
++        try:
++            yield
++        finally:
++            # Remove the callback
++            for msg_future, callback in future_callbacks.items():
++                msg_future.iopub_callbacks.remove(callback)
++
+     def __repr__(self):
+         if self._ready:
+             return "<%s: %s:finished>" % (self.__class__.__name__, self._fname)
+@@ -558,21 +603,23 @@ class AsyncResult(Future):
+             prefix = prefix + '\n'
+         print("%s%s" % (prefix, text), file=file, end=end)
+ 
+-    def _display_single_result(self):
+-        self._display_stream(self.stdout)
+-        self._display_stream(self.stderr, file=sys.stderr)
++    def _display_single_result(self, result_only=False):
++        if not result_only:
++            self._display_stream(self.stdout)
++            self._display_stream(self.stderr, file=sys.stderr)
+         if get_ipython() is None:
+             # displaypub is meaningless outside IPython
+             return
+ 
+-        for output in self.outputs:
+-            self._republish_displaypub(output, self.engine_id)
++        if not result_only:
++            for output in self.outputs:
++                self._republish_displaypub(output, self.engine_id)
+ 
+         if self.execute_result is not None:
+             display(self.get())
+ 
+     @check_ready
+-    def display_outputs(self, groupby="type"):
++    def display_outputs(self, groupby="type", result_only=False):
+         """republish the outputs of the computation
+ 
+         Parameters
+@@ -598,10 +645,15 @@ class AsyncResult(Future):
+                 outputs.  This is meant for cases of each command producing
+                 several plots, and you would like to see all of the first
+                 plots together, then all of the second plots, and so on.
++
++        result_only: boolean [default: False]
++            Only display the execution result and skip stdout, stderr and
++            display-outputs. Usually used when using streaming output
++            since these outputs would have already been displayed.
+         """
+         self.wait_for_output()
+         if self._single_result:
+-            self._display_single_result()
++            self._display_single_result(result_only=result_only)
+             return
+ 
+         stdouts = self.stdout
+@@ -616,53 +668,57 @@ class AsyncResult(Future):
+             for eid, stdout, stderr, outputs, r, execute_result in zip(
+                 targets, stdouts, stderrs, output_lists, results, execute_results
+             ):
+-                self._display_stream(stdout, '[stdout:%i] ' % eid)
+-                self._display_stream(stderr, '[stderr:%i] ' % eid, file=sys.stderr)
++                if not result_only:
++                    self._display_stream(stdout, '[stdout:%i] ' % eid)
++                    self._display_stream(stderr, '[stderr:%i] ' % eid, file=sys.stderr)
+ 
+                 if get_ipython() is None:
+                     # displaypub is meaningless outside IPython
+                     continue
+ 
+-                if outputs or execute_result is not None:
++                if (outputs and not result_only) or execute_result is not None:
+                     _raw_text('[output:%i]' % eid)
+ 
+-                for output in outputs:
+-                    self._republish_displaypub(output, eid)
++                if not result_only:
++                    for output in outputs:
++                        self._republish_displaypub(output, eid)
+ 
+                 if execute_result is not None:
+                     display(r)
+ 
+         elif groupby in ('type', 'order'):
+-            # republish stdout:
+-            for eid, stdout in zip(targets, stdouts):
+-                self._display_stream(stdout, '[stdout:%i] ' % eid)
++            if not result_only:
++                # republish stdout:
++                for eid, stdout in zip(targets, stdouts):
++                    self._display_stream(stdout, '[stdout:%i] ' % eid)
+ 
+-            # republish stderr:
+-            for eid, stderr in zip(targets, stderrs):
+-                self._display_stream(stderr, '[stderr:%i] ' % eid, file=sys.stderr)
++                # republish stderr:
++                for eid, stderr in zip(targets, stderrs):
++                    self._display_stream(stderr, '[stderr:%i] ' % eid, file=sys.stderr)
+ 
+             if get_ipython() is None:
+                 # displaypub is meaningless outside IPython
+                 return
+ 
+-            if groupby == 'order':
+-                output_dict = dict(
+-                    (eid, outputs) for eid, outputs in zip(targets, output_lists)
+-                )
+-                N = max(len(outputs) for outputs in output_lists)
+-                for i in range(N):
+-                    for eid in targets:
+-                        outputs = output_dict[eid]
+-                        if len(outputs) >= N:
++            if not result_only:
++                if groupby == 'order':
++                    output_dict = dict(
++                        (eid, outputs) for eid, outputs in zip(targets, output_lists)
++                    )
++                    N = max(len(outputs) for outputs in output_lists)
++                    for i in range(N):
++                        for eid in targets:
++                            outputs = output_dict[eid]
++                            if len(outputs) >= N:
++                                _raw_text('[output:%i]' % eid)
++                                self._republish_displaypub(outputs[i], eid)
++                else:
++                    # republish displaypub output
++                    for eid, outputs in zip(targets, output_lists):
++                        if outputs:
+                             _raw_text('[output:%i]' % eid)
+-                            self._republish_displaypub(outputs[i], eid)
+-            else:
+-                # republish displaypub output
+-                for eid, outputs in zip(targets, output_lists):
+-                    if outputs:
+-                        _raw_text('[output:%i]' % eid)
+-                    for output in outputs:
+-                        self._republish_displaypub(output, eid)
++                        for output in outputs:
++                            self._republish_displaypub(output, eid)
+ 
+             # finally, add execute_result:
+             for eid, r, execute_result in zip(targets, results, execute_results):
+diff --git a/ipyparallel/client/client.py b/ipyparallel/client/client.py
+index 7484b00e..5b688e16 100644
+--- a/ipyparallel/client/client.py
++++ b/ipyparallel/client/client.py
+@@ -1071,6 +1071,12 @@ class Client(HasTraits):
+             # unhandled msg_type (status, etc.)
+             pass
+ 
++        msg_future = self._futures.get(msg_id, None)
++        if msg_future:
++            # Run any callback functions
++            for callback in msg_future.iopub_callbacks:
++                callback(msg)
++
+     def create_message_futures(self, msg_id, async_result=False, track=False):
+         msg_future = MessageFuture(msg_id, track=track)
+         futures = [msg_future]
+diff --git a/ipyparallel/client/futures.py b/ipyparallel/client/futures.py
+index 35773f0d..1b14bca7 100644
+--- a/ipyparallel/client/futures.py
++++ b/ipyparallel/client/futures.py
+@@ -18,6 +18,7 @@ class MessageFuture(Future):
+         self.track = track
+         self._tracker = None
+         self.tracker = Future()
++        self.iopub_callbacks = []
+         if not track:
+             self.tracker.set_result(None)
+         self.add_done_callback(lambda f: self._evt.set())
+diff --git a/ipyparallel/client/magics.py b/ipyparallel/client/magics.py
+index 2aab5de5..ac2701ef 100644
+--- a/ipyparallel/client/magics.py
++++ b/ipyparallel/client/magics.py
+@@ -29,6 +29,13 @@ Usage
+ from __future__ import print_function
+ 
+ import ast
++from contextlib import contextmanager
++
++# Python 3.6 doesn't have nullcontext, so we define our own
++@contextmanager
++def nullcontext():
++    yield
++
+ 
+ # -----------------------------------------------------------------------------
+ #  Copyright (C) 2008 The IPython Development Team
+@@ -97,6 +104,20 @@ def exec_args(f):
+             dest='block',
+             help="use non-blocking (async) execution",
+         ),
++        magic_arguments.argument(
++            '--stream',
++            action="store_const",
++            const=True,
++            dest='stream',
++            help="stream stdout/stderr in real-time (only valid when using blocking execution)",
++        ),
++        magic_arguments.argument(
++            '--no-stream',
++            action="store_const",
++            const=False,
++            dest='stream',
++            help="do not stream stdout/stderr in real-time",
++        ),
+         magic_arguments.argument(
+             '-t',
+             '--targets',
+@@ -157,9 +178,9 @@ def output_args(f):
+             choices=['engine', 'order', 'type'],
+             default='type',
+             help="""Group the outputs in a particular way.
+-            
++
+             Choices are:
+-            
++
+             **type**: group outputs of all engines by type (stdout, stderr, displaypub, etc.).
+             **engine**: display all output for each engine together.
+             **order**: like type, but individual displaypub output from each engine is collated.
+@@ -199,6 +220,8 @@ class ParallelMagics(Magics):
+     last_result = None
+     # verbose flag
+     verbose = False
++    # streaming output flag
++    stream_ouput = True
+ 
+     def __init__(self, shell, view, suffix=''):
+         self.view = view
+@@ -242,6 +265,8 @@ class ParallelMagics(Magics):
+             self.view.block = args.block
+         if args.set_verbose is not None:
+             self.verbose = args.set_verbose
++        if args.stream is not None:
++            self.stream_ouput = args.stream
+ 
+     @magic_arguments.magic_arguments()
+     @output_args
+@@ -290,11 +315,14 @@ class ParallelMagics(Magics):
+         """
+         return self.parallel_execute(line)
+ 
+-    def parallel_execute(self, cell, block=None, groupby='type', save_name=None):
++    def parallel_execute(
++        self, cell, block=None, groupby='type', save_name=None, stream_output=None
++    ):
+         """implementation used by %px and %%parallel"""
+ 
+         # defaults:
+         block = self.view.block if block is None else block
++        stream_output = self.stream_ouput if stream_output is None else stream_output
+ 
+         base = "Parallel" if block else "Async parallel"
+ 
+@@ -313,8 +341,12 @@ class ParallelMagics(Magics):
+             self.shell.user_ns[save_name] = result
+ 
+         if block:
+-            result.get()
+-            result.display_outputs(groupby)
++            cm = result.stream_output() if stream_output else nullcontext()
++            with cm:
++                result.wait_for_output()
++                result.get()
++            # Skip stdout/stderr if streaming output
++            result.display_outputs(groupby, result_only=stream_output)
+         else:
+             # return AsyncResult only on non-blocking submission
+             return result
+@@ -354,6 +386,7 @@ class ParallelMagics(Magics):
+                 block=block,
+                 groupby=args.groupby,
+                 save_name=args.save_name,
++                stream_output=args.stream,
+             )
+         finally:
+             if args.targets:

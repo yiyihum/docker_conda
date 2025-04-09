@@ -1,0 +1,127 @@
+diff --git a/beeline/propagation/test_honeycomb.py b/beeline/propagation/test_honeycomb.py
+index 23f321a..d5ddd43 100644
+--- a/beeline/propagation/test_honeycomb.py
++++ b/beeline/propagation/test_honeycomb.py
+@@ -1,4 +1,5 @@
+ import unittest
++import beeline.propagation
+ from beeline.propagation import DictRequest, PropagationContext
+ import beeline.propagation.honeycomb as hc
+ 
+@@ -21,6 +22,7 @@ class TestMarshalUnmarshal(unittest.TestCase):
+ 
+     def test_roundtrip_with_dataset(self):
+         '''Verify that we can successfully roundtrip (marshal and unmarshal)'''
++        beeline.propagation.propagate_dataset = True
+         dataset = "blorp blorp"
+         trace_id = "bloop"
+         parent_id = "scoop"
+@@ -34,6 +36,22 @@ class TestMarshalUnmarshal(unittest.TestCase):
+         self.assertEqual(parent_id, new_parent_id)
+         self.assertEqual(trace_fields, new_trace_fields)
+ 
++    def test_roundtrip_with_dataset_propagation_disabled(self):
++        '''Verify that we can successfully roundtrip (marshal and unmarshal) without dataset propagation'''
++        beeline.propagation.propagate_dataset = False
++        dataset = "blorp blorp"
++        trace_id = "bloop"
++        parent_id = "scoop"
++        trace_fields = {"key": "value"}
++        pc = PropagationContext(trace_id, parent_id, trace_fields, dataset)
++        header = hc.marshal_propagation_context(pc)
++        new_trace_id, new_parent_id, new_trace_fields, new_dataset = hc.unmarshal_propagation_context_with_dataset(
++            header)
++        self.assertIsNone(new_dataset)
++        self.assertEqual(trace_id, new_trace_id)
++        self.assertEqual(parent_id, new_parent_id)
++        self.assertEqual(trace_fields, new_trace_fields)
++
+ 
+ class TestHoneycombHTTPTraceParserHook(unittest.TestCase):
+     def test_has_header(self):
+@@ -55,6 +73,7 @@ class TestHoneycombHTTPTraceParserHook(unittest.TestCase):
+ 
+ class TestHoneycombHTTPTracePropagationHook(unittest.TestCase):
+     def test_generates_correct_header(self):
++        beeline.propagation.propagate_dataset = True
+         dataset = "blorp blorp"
+         trace_id = "bloop"
+         parent_id = "scoop"
+@@ -65,3 +84,16 @@ class TestHoneycombHTTPTracePropagationHook(unittest.TestCase):
+         self.assertIn('X-Honeycomb-Trace', headers)
+         self.assertEqual(headers['X-Honeycomb-Trace'],
+                          "1;dataset=blorp%20blorp,trace_id=bloop,parent_id=scoop,context=eyJrZXkiOiAidmFsdWUifQ==")
++
++    def test_generates_correct_header_with_dataset_propagation_disabled(self):
++        beeline.propagation.propagate_dataset = False
++        dataset = "blorp blorp"
++        trace_id = "bloop"
++        parent_id = "scoop"
++        trace_fields = {"key": "value"}
++        pc = PropagationContext(
++            trace_id, parent_id, trace_fields, dataset)
++        headers = hc.http_trace_propagation_hook(pc)
++        self.assertIn('X-Honeycomb-Trace', headers)
++        self.assertEqual(headers['X-Honeycomb-Trace'],
++                         "1;trace_id=bloop,parent_id=scoop,context=eyJrZXkiOiAidmFsdWUifQ==")
+diff --git a/beeline/test_trace.py b/beeline/test_trace.py
+index 5033618..84ef4d1 100644
+--- a/beeline/test_trace.py
++++ b/beeline/test_trace.py
+@@ -7,6 +7,7 @@ import unittest
+ import re
+ import os
+ import binascii
++import beeline.propagation
+ 
+ from libhoney import Event
+ 
+@@ -624,6 +625,7 @@ class TestSpan(unittest.TestCase):
+ 
+ class TestPropagationHooks(unittest.TestCase):
+     def test_propagate_and_start_trace_uses_honeycomb_header(self):
++        beeline.propagation.propagate_dataset = True
+         # FIXME: Test basics, including error handling and custom hooks
+ 
+         # implicitly tests finish_span
+@@ -653,6 +655,40 @@ class TestPropagationHooks(unittest.TestCase):
+         # ensure that there is no current trace
+         self.assertIsNone(tracer._trace)
+ 
++    def test_propagate_and_start_trace_uses_honeycomb_header_with_dataset_propagation_disabled(self):
++        beeline.propagation.propagate_dataset = False
++        # FIXME: Test basics, including error handling and custom hooks
++
++        # implicitly tests finish_span
++        m_client = Mock()
++        # these values are used before sending
++        m_client.new_event.return_value.start_time = datetime.datetime.now()
++        m_client.new_event.return_value.sample_rate = 1
++        tracer = SynchronousTracer(m_client)
++
++        header_value = '1;dataset=flibble,trace_id=bloop,parent_id=scoop,context=e30K'
++        req = DictRequest({
++            # case shouldn't matter
++            'X-HoNEyComb-TrACE': header_value,
++        })
++
++        span = tracer.propagate_and_start_trace(
++            context={'big': 'important_stuff'}, request=req)
++        self.assertEqual(tracer._trace.stack[0], span)
++        self.assertEqual(span.trace_id, "bloop")
++        self.assertEqual(span.parent_id, "scoop")
++
++        tracer.finish_trace(span)
++
++        # testing the absence of dataset
++        self.assertNotEqual(getattr(span.event, 'dataset'), "flibble")
++        self.assertNotIsInstance(span.event.dataset, str)
++
++        # ensure the event is sent
++        span.event.send_presampled.assert_called_once_with()
++        # ensure that there is no current trace
++        self.assertIsNone(tracer._trace)
++
+     def test_propagate_and_start_trace_uses_w3c_header_as_fallback(self):
+         # implicitly tests finish_span
+         m_client = Mock()

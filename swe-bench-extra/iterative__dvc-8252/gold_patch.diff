@@ -1,0 +1,190 @@
+diff --git a/dvc/cli/actions.py b/dvc/cli/actions.py
+--- a/dvc/cli/actions.py
++++ b/dvc/cli/actions.py
+@@ -1,6 +1,15 @@
+ from argparse import _AppendAction
+ 
+ 
++class CommaSeparatedArgs(_AppendAction):  # pylint: disable=protected-access
++    def __call__(self, parser, namespace, values, option_string=None):
++        from funcy import ldistinct
++
++        items = getattr(namespace, self.dest) or []
++        items.extend(map(str.strip, values.split(",")))
++        setattr(namespace, self.dest, ldistinct(items))
++
++
+ class KeyValueArgs(_AppendAction):
+     def __call__(self, parser, namespace, values, option_string=None):
+         items = getattr(namespace, self.dest) or {}
+diff --git a/dvc/commands/data.py b/dvc/commands/data.py
+--- a/dvc/commands/data.py
++++ b/dvc/commands/data.py
+@@ -1,9 +1,12 @@
+ import argparse
+ import logging
+-from typing import TYPE_CHECKING
++from operator import itemgetter
++from typing import TYPE_CHECKING, Any, Dict, Iterable, Set
+ 
+ from funcy import chunks, compact, log_durations
+ 
++from dvc.cli import completion
++from dvc.cli.actions import CommaSeparatedArgs
+ from dvc.cli.command import CmdBase
+ from dvc.cli.utils import append_doc_link, fix_subparsers
+ from dvc.ui import ui
+@@ -124,6 +127,65 @@ def run(self) -> int:
+         return self._show_status(status)
+ 
+ 
++class CmdDataLs(CmdBase):
++    @staticmethod
++    def _show_table(
++        d: Iterable[Dict[str, Any]],
++        filter_types: Set[str],
++        filter_labels: Set[str],
++        markdown: bool = False,
++    ) -> None:
++        from rich.style import Style
++
++        from dvc.compare import TabularData
++
++        td = TabularData(
++            columns=["Path", "Type", "Labels", "Description"], fill_value="-"
++        )
++        for entry in sorted(d, key=itemgetter("path")):
++            typ = entry.get("type", "")
++            desc = entry.get("desc", "-")
++            labels = entry.get("labels", [])
++
++            if filter_types and typ not in filter_types:
++                continue
++            if filter_labels and filter_labels.isdisjoint(labels):
++                continue
++
++            rich_label = ui.rich_text()
++            for index, label in enumerate(labels):
++                if index:
++                    rich_label.append(",")
++                style = Style(bold=label in filter_labels, color="green")
++                rich_label.append(label, style=style)
++
++            if markdown and desc:
++                desc = desc.partition("\n")[0]
++
++            path = ui.rich_text(entry["path"], style="cyan")
++            type_style = Style(bold=typ in filter_types, color="yellow")
++            typ = ui.rich_text(entry.get("type", ""), style=type_style)
++            td.append([path, typ or "-", rich_label or "-", desc])
++
++        td.render(markdown=markdown, rich_table=True)
++
++    def run(self):
++        from dvc.repo.data import ls
++
++        filter_labels = set(self.args.labels)
++        filter_types = set(self.args.type)
++        d = ls(
++            self.repo, targets=self.args.targets, recursive=self.args.recursive
++        )
++        self._show_table(
++            d,
++            filter_labels=filter_labels,
++            filter_types=filter_types,
++            markdown=self.args.markdown,
++        )
++        return 0
++
++
+ def add_parser(subparsers, parent_parser):
+     data_parser = subparsers.add_parser(
+         "data",
+@@ -181,3 +243,51 @@ def add_parser(subparsers, parent_parser):
+         help="Show untracked files.",
+     )
+     data_status_parser.set_defaults(func=CmdDataStatus)
++
++    DATA_LS_HELP = "List data tracked by DVC with its metadata."
++    data_ls_parser = data_subparsers.add_parser(
++        "ls",
++        aliases=["list"],
++        parents=[parent_parser],
++        description=append_doc_link(DATA_LS_HELP, "data/ls"),
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        help=DATA_LS_HELP,
++    )
++    data_ls_parser.add_argument(
++        "--md",
++        "--show-md",
++        dest="markdown",
++        action="store_true",
++        default=False,
++        help="Show tabulated output in the Markdown format (GFM).",
++    )
++    data_ls_parser.add_argument(
++        "--type",
++        action=CommaSeparatedArgs,
++        default=[],
++        help="Comma-separated list of type to filter.",
++    )
++    data_ls_parser.add_argument(
++        "--labels",
++        action=CommaSeparatedArgs,
++        default=[],
++        help="Comma-separated list of labels to filter.",
++    )
++    data_ls_parser.add_argument(
++        "-R",
++        "--recursive",
++        action="store_true",
++        default=False,
++        help="Recursively list from the specified directories.",
++    )
++    data_ls_parser.add_argument(
++        "targets",
++        default=None,
++        nargs="*",
++        help=(
++            "Limit command scope to these tracked files/directories, "
++            ".dvc files, or stage names."
++        ),
++    ).complete = completion.DVCFILES_AND_STAGE
++
++    data_ls_parser.set_defaults(func=CmdDataLs)
+diff --git a/dvc/repo/data.py b/dvc/repo/data.py
+--- a/dvc/repo/data.py
++++ b/dvc/repo/data.py
+@@ -1,11 +1,13 @@
+ import os
+ import posixpath
+ from collections import defaultdict
++from itertools import chain
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+     Dict,
+     Iterable,
++    Iterator,
+     List,
+     Optional,
+     TypedDict,
+@@ -300,3 +302,18 @@ def status(repo: "Repo", untracked_files: str = "no", **kwargs: Any) -> Status:
+         unchanged=list(unchanged),
+         git=git_info,
+     )
++
++
++def ls(
++    repo: "Repo",
++    targets: List[Optional[str]] = None,
++    recursive: bool = False,
++) -> Iterator[Dict[str, Any]]:
++    targets = targets or [None]
++    pairs = chain.from_iterable(
++        repo.stage.collect_granular(target, recursive=recursive)
++        for target in targets
++    )
++    for stage, filter_info in pairs:
++        for out in stage.filter_outs(filter_info):
++            yield {"path": str(out), **out.annot.to_dict()}

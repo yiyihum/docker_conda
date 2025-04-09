@@ -1,0 +1,373 @@
+diff --git a/.gitignore b/.gitignore
+index 6bd96e5..3534373 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,8 @@
+ .coverage
+ .DS_Store
+ .idea
++.env
++venv
+ *.db
+ *.egg-info
+ *.pyc
+diff --git a/README.rst b/README.rst
+index 20f5f27..212923c 100644
+--- a/README.rst
++++ b/README.rst
+@@ -142,6 +142,7 @@ other formats.
+ 
+     import responses
+     import requests
++    from responses import matchers
+ 
+     @responses.activate
+     def test_calc_api():
+@@ -150,15 +151,44 @@ other formats.
+             url='http://calc.com/sum',
+             body="4",
+             match=[
+-                responses.urlencoded_params_matcher({"left": "1", "right": "3"})
++                matchers.urlencoded_params_matcher({"left": "1", "right": "3"})
+             ]
+         )
+         requests.post("http://calc.com/sum", data={"left": 1, "right": 3})
+ 
+-Matching JSON encoded data can be done with ``responses.json_params_matcher()``.
++Matching JSON encoded data can be done with ``matchers.json_params_matcher()``.
+ If your application uses other encodings you can build your own matcher that
+ returns ``True`` or ``False`` if the request parameters match. Your matcher can
+-expect a ``request_body`` parameter to be provided by responses.
++expect a ``request`` parameter to be provided by responses.
++
++Similarly, you can use the ``matchers.query_param_matcher`` function to match
++against the ``params`` request parameter.
++Note, you must set ``match_querystring=False``
++
++.. code-block:: python
++
++    import responses
++    import requests
++    from responses import matchers
++
++    @responses.activate
++    def test_calc_api():
++        url = "http://example.com/test"
++        params = {"hello": "world", "I am": "a big test"}
++        responses.add(
++            method=responses.GET,
++            url=url,
++            body="test",
++            match=[matchers.query_param_matcher(params)],
++            match_querystring=False,
++        )
++
++        resp = requests.get(url, params=params)
++
++        constructed_url = r"http://example.com/test?I+am=a+big+test&hello=world"
++        assert resp.url == constructed_url
++        assert resp.request.url == constructed_url
++        assert resp.request.params == params
+ 
+ Dynamic Responses
+ -----------------
+diff --git a/responses/__init__.py b/responses/__init__.py
+index 68fd7a3..139e670 100644
+--- a/responses/__init__.py
++++ b/responses/__init__.py
+@@ -15,6 +15,9 @@ from requests.adapters import HTTPAdapter
+ from requests.exceptions import ConnectionError
+ from requests.sessions import REDIRECT_STATI
+ from requests.utils import cookiejar_from_dict
++from responses.matchers import json_params_matcher as _json_params_matcher
++from responses.matchers import urlencoded_params_matcher as _urlencoded_params_matcher
++from warnings import warn
+ 
+ try:
+     from collections.abc import Sequence, Sized
+@@ -59,11 +62,6 @@ except AttributeError:
+     # Python 3.7
+     Pattern = re.Pattern
+ 
+-try:
+-    from json.decoder import JSONDecodeError
+-except ImportError:
+-    JSONDecodeError = ValueError
+-
+ UNSET = object()
+ 
+ Call = namedtuple("Call", ["request", "response"])
+@@ -73,6 +71,22 @@ _real_send = HTTPAdapter.send
+ logger = logging.getLogger("responses")
+ 
+ 
++def urlencoded_params_matcher(params):
++    warn(
++        "Function is deprecated. Use 'from responses.matchers import urlencoded_params_matcher'",
++        DeprecationWarning,
++    )
++    return _urlencoded_params_matcher(params)
++
++
++def json_params_matcher(params):
++    warn(
++        "Function is deprecated. Use 'from responses.matchers import json_params_matcher'",
++        DeprecationWarning,
++    )
++    return _json_params_matcher(params)
++
++
+ def _is_string(s):
+     return isinstance(s, six.string_types)
+ 
+@@ -240,33 +254,6 @@ def _handle_body(body):
+ _unspecified = object()
+ 
+ 
+-def urlencoded_params_matcher(params):
+-    def match(request_body):
+-        return (
+-            params is None
+-            if request_body is None
+-            else sorted(params.items()) == sorted(parse_qsl(request_body))
+-        )
+-
+-    return match
+-
+-
+-def json_params_matcher(params):
+-    def match(request_body):
+-        try:
+-            if isinstance(request_body, bytes):
+-                request_body = request_body.decode("utf-8")
+-            return (
+-                params is None
+-                if request_body is None
+-                else params == json_module.loads(request_body)
+-            )
+-        except JSONDecodeError:
+-            return False
+-
+-    return match
+-
+-
+ class BaseResponse(object):
+     content_type = None
+     headers = None
+@@ -345,12 +332,14 @@ class BaseResponse(object):
+         else:
+             return False
+ 
+-    def _body_matches(self, match, request_body):
++    @staticmethod
++    def _req_attr_matches(match, request):
+         for matcher in match:
+-            if not matcher(request_body):
+-                return False
++            valid, reason = matcher(request)
++            if not valid:
++                return False, reason
+ 
+-        return True
++        return True, ""
+ 
+     def get_headers(self):
+         headers = HTTPHeaderDict()  # Duplicate headers are legal
+@@ -370,8 +359,9 @@ class BaseResponse(object):
+         if not self._url_matches(self.url, request.url, self.match_querystring):
+             return False, "URL does not match"
+ 
+-        if not self._body_matches(self.match, request.body):
+-            return False, "Parameters do not match"
++        valid, reason = self._req_attr_matches(self.match, request)
++        if not valid:
++            return False, "Parameters do not match. " + reason
+ 
+         return True, ""
+ 
+@@ -717,9 +707,9 @@ class RequestsMock(object):
+         return params
+ 
+     def _on_request(self, adapter, request, **kwargs):
++        request.params = self._parse_request_params(request.path_url)
+         match, match_failed_reasons = self._find_match(request)
+         resp_callback = self.response_callback
+-        request.params = self._parse_request_params(request.path_url)
+ 
+         if match is None:
+             if any(
+diff --git a/responses/__init__.pyi b/responses/__init__.pyi
+index 571b5e1..dc3dbba 100644
+--- a/responses/__init__.pyi
++++ b/responses/__init__.pyi
+@@ -5,22 +5,24 @@ from typing import (
+     Iterator,
+     Mapping,
+     Optional,
+-    Pattern,
+     NamedTuple,
+     Protocol,
+     TypeVar,
++    Dict,
++    List,
++    Tuple,
++    Union
+ )
+ from io import BufferedReader, BytesIO
+ from re import Pattern
+ from requests.adapters import HTTPResponse, PreparedRequest
+ from requests.cookies import RequestsCookieJar
+-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+ from typing_extensions import Literal
+ from unittest import mock as std_mock
+ from urllib.parse import quote as quote
+ from urllib3.response import HTTPHeaderDict
++from .matchers import urlencoded_params_matcher, json_params_matcher
+ 
+-JSONDecodeError = ValueError
+ 
+ def _clean_unicode(url: str) -> str: ...
+ def _cookies_from_headers(headers: Dict[str, str]) -> RequestsCookieJar: ...
+@@ -36,12 +38,7 @@ def _is_string(s: Union[Pattern[str], str]) -> bool: ...
+ def get_wrapped(
+     func: Callable[..., Any], responses: RequestsMock
+ ) -> Callable[..., Any]: ...
+-def json_params_matcher(
+-    params: Optional[Dict[str, Any]]
+-) -> Callable[..., Any]: ...
+-def urlencoded_params_matcher(
+-    params: Optional[Dict[str, str]]
+-) -> Callable[..., Any]: ...
++
+ 
+ class Call(NamedTuple):
+     request: PreparedRequest
+@@ -75,7 +72,7 @@ class BaseResponse:
+     ) -> None: ...
+     def __eq__(self, other: Any) -> bool: ...
+     def __ne__(self, other: Any) -> bool: ...
+-    def _body_matches(
++    def _req_attr_matches(
+         self, match: List[Callable[..., Any]], request_body: Optional[Union[bytes, str]]
+     ) -> bool: ...
+     def _should_match_querystring(
+diff --git a/responses/matchers.py b/responses/matchers.py
+new file mode 100644
+index 0000000..8508c96
+--- /dev/null
++++ b/responses/matchers.py
+@@ -0,0 +1,87 @@
++import six
++import json as json_module
++
++if six.PY2:
++    from urlparse import parse_qsl
++else:
++    from urllib.parse import parse_qsl
++
++try:
++    from json.decoder import JSONDecodeError
++except ImportError:
++    JSONDecodeError = ValueError
++
++
++def urlencoded_params_matcher(params):
++    """
++    Matches URL encoded data
++    :param params: (dict) data provided to 'data' arg of request
++    :return: (func) matcher
++    """
++
++    def match(request):
++        request_body = request.body
++        valid = (
++            params is None
++            if request_body is None
++            else sorted(params.items()) == sorted(parse_qsl(request_body))
++        )
++        if not valid:
++            return False, "%s doesn't match %s" % (request_body, params)
++
++        return valid, ""
++
++    return match
++
++
++def json_params_matcher(params):
++    """
++    Matches JSON encoded data
++    :param params: (dict) JSON data provided to 'json' arg of request
++    :return: (func) matcher
++    """
++
++    def match(request):
++        request_body = request.body
++        try:
++            if isinstance(request_body, bytes):
++                request_body = request_body.decode("utf-8")
++            valid = (
++                params is None
++                if request_body is None
++                else params == json_module.loads(request_body)
++            )
++            if not valid:
++                return False, "%s doesn't match %s" % (request_body, params)
++
++            return valid, ""
++        except JSONDecodeError:
++            return False, "JSONDecodeError: Cannot parse request.body"
++
++    return match
++
++
++def query_param_matcher(params):
++    """
++    Matcher to match 'params' argument in request
++    :param params: (dict), same as provided to request
++    :return: (func) matcher
++    """
++
++    def match(request):
++        request_params = request.params
++        valid = (
++            params is None
++            if request_params is None
++            else sorted(params.items()) == sorted(request_params.items())
++        )
++
++        if not valid:
++            return False, "%s doesn't match %s" % (
++                sorted(request_params.items()),
++                sorted(params.items()),
++            )
++
++        return valid, ""
++
++    return match
+diff --git a/responses/matchers.pyi b/responses/matchers.pyi
+new file mode 100644
+index 0000000..8851303
+--- /dev/null
++++ b/responses/matchers.pyi
+@@ -0,0 +1,21 @@
++from typing import (
++    Any,
++    Callable,
++    Optional,
++    Dict,
++)
++
++JSONDecodeError = ValueError
++
++
++def json_params_matcher(
++    params: Optional[Dict[str, Any]]
++) -> Callable[..., Any]: ...
++
++def urlencoded_params_matcher(
++    params: Optional[Dict[str, str]]
++) -> Callable[..., Any]: ...
++
++def query_param_matcher(
++    params: Optional[Dict[str, str]]
++) -> Callable[..., Any]: ...

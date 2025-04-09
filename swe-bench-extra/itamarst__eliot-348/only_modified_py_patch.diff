@@ -1,0 +1,94 @@
+diff --git a/eliot/__init__.py b/eliot/__init__.py
+index 2d998fc..d21ecbb 100644
+--- a/eliot/__init__.py
++++ b/eliot/__init__.py
+@@ -47,6 +47,18 @@ add_destinations = Logger._destinations.add
+ remove_destination = removeDestination
+ add_global_fields = addGlobalFields
+ 
++# Backwards compatibility for old versions of eliot-tree, which rely on
++# eliot._parse:
++def _parse_compat():
++    # Force eliot.parse to be imported in way that works with old Python:
++    from .parse import Parser
++    del Parser
++    import sys
++    sys.modules["eliot._parse"] = sys.modules["eliot.parse"]
++    return sys.modules["eliot.parse"]
++_parse = _parse_compat()
++del _parse_compat
++
+ 
+ __all__ = [
+     "Message",
+@@ -83,7 +95,11 @@ __all__ = [
+     "to_file",
+     "log_call",
+     "__version__",
++
++    # Backwards compat for eliot-tree:
++    "_parse",
+ ]
+ 
++
+ __version__ = get_versions()['version']
+ del get_versions
+diff --git a/eliot/_action.py b/eliot/_action.py
+index b15c050..9549ca2 100644
+--- a/eliot/_action.py
++++ b/eliot/_action.py
+@@ -23,7 +23,7 @@ from pyrsistent import (
+     pvector_field,
+     pvector, )
+ from boltons.funcutils import wraps
+-from six import text_type as unicode, integer_types
++from six import text_type as unicode, integer_types, PY3
+ 
+ from ._message import (
+     Message,
+@@ -896,12 +896,29 @@ def log_call(
+                        include_result=include_result)
+ 
+     if action_type is None:
+-        action_type = wrapped_function.__name__
++        if PY3:
++            action_type = "{}.{}".format(wrapped_function.__module__,
++                                         wrapped_function.__qualname__)
++        else:
++            action_type = wrapped_function.__name__
++
++    if PY3 and include_args is not None:
++        from inspect import signature
++        sig = signature(wrapped_function)
++        if set(include_args) - set(sig.parameters):
++            raise ValueError(
++                ("include_args ({}) lists arguments not in the "
++                 "wrapped function").format(include_args)
++            )
+ 
+     @wraps(wrapped_function)
+     def logging_wrapper(*args, **kwargs):
+         callargs = getcallargs(wrapped_function, *args, **kwargs)
+ 
++        # Remove self is it's included:
++        if "self" in callargs:
++            callargs.pop("self")
++
+         # Filter arguments to log, if necessary:
+         if include_args is not None:
+             callargs = {k: callargs[k] for k in include_args}
+diff --git a/eliot/_parse.py b/eliot/parse.py
+similarity index 98%
+rename from eliot/_parse.py
+rename to eliot/parse.py
+index 91474d0..bca580c 100644
+--- a/eliot/_parse.py
++++ b/eliot/parse.py
+@@ -181,3 +181,6 @@ class Parser(PClass):
+                 yield task
+         for task in parser.incomplete_tasks():
+             yield task
++
++
++__all__ = ["Parser", "Task", "TaskLevel", "WrittenMessage", "WrittenAction"]
+

@@ -1,0 +1,107 @@
+diff --git a/docker/api/service.py b/docker/api/service.py
+index 0d8421ec..d2621e68 100644
+--- a/docker/api/service.py
++++ b/docker/api/service.py
+@@ -1,5 +1,6 @@
+ import warnings
+ from .. import auth, errors, utils
++from ..types import ServiceMode
+ 
+ 
+ class ServiceApiMixin(object):
+@@ -18,8 +19,8 @@ class ServiceApiMixin(object):
+             name (string): User-defined name for the service. Optional.
+             labels (dict): A map of labels to associate with the service.
+                 Optional.
+-            mode (string): Scheduling mode for the service (``replicated`` or
+-                ``global``). Defaults to ``replicated``.
++            mode (ServiceMode): Scheduling mode for the service (replicated
++                or global). Defaults to replicated.
+             update_config (UpdateConfig): Specification for the update strategy
+                 of the service. Default: ``None``
+             networks (:py:class:`list`): List of network names or IDs to attach
+@@ -49,6 +50,9 @@ class ServiceApiMixin(object):
+             raise errors.DockerException(
+                 'Missing mandatory Image key in ContainerSpec'
+             )
++        if mode and not isinstance(mode, dict):
++            mode = ServiceMode(mode)
++
+         registry, repo_name = auth.resolve_repository_name(image)
+         auth_header = auth.get_config_header(self, registry)
+         if auth_header:
+@@ -191,8 +195,8 @@ class ServiceApiMixin(object):
+             name (string): New name for the service. Optional.
+             labels (dict): A map of labels to associate with the service.
+                 Optional.
+-            mode (string): Scheduling mode for the service (``replicated`` or
+-                ``global``). Defaults to ``replicated``.
++            mode (ServiceMode): Scheduling mode for the service (replicated
++                or global). Defaults to replicated.
+             update_config (UpdateConfig): Specification for the update strategy
+                 of the service. Default: ``None``.
+             networks (:py:class:`list`): List of network names or IDs to attach
+@@ -222,6 +226,8 @@ class ServiceApiMixin(object):
+         if labels is not None:
+             data['Labels'] = labels
+         if mode is not None:
++            if not isinstance(mode, dict):
++                mode = ServiceMode(mode)
+             data['Mode'] = mode
+         if task_template is not None:
+             image = task_template.get('ContainerSpec', {}).get('Image', None)
+diff --git a/docker/types/__init__.py b/docker/types/__init__.py
+index 7230723e..8e2fc174 100644
+--- a/docker/types/__init__.py
++++ b/docker/types/__init__.py
+@@ -4,6 +4,6 @@ from .healthcheck import Healthcheck
+ from .networks import EndpointConfig, IPAMConfig, IPAMPool, NetworkingConfig
+ from .services import (
+     ContainerSpec, DriverConfig, EndpointSpec, Mount, Resources, RestartPolicy,
+-    TaskTemplate, UpdateConfig
++    ServiceMode, TaskTemplate, UpdateConfig
+ )
+ from .swarm import SwarmSpec, SwarmExternalCA
+diff --git a/docker/types/services.py b/docker/types/services.py
+index 6e1ad321..ec0fcb15 100644
+--- a/docker/types/services.py
++++ b/docker/types/services.py
+@@ -348,3 +348,38 @@ def convert_service_ports(ports):
+ 
+         result.append(port_spec)
+     return result
++
++
++class ServiceMode(dict):
++    """
++        Indicate whether a service should be deployed as a replicated or global
++        service, and associated parameters
++
++        Args:
++            mode (string): Can be either ``replicated`` or ``global``
++            replicas (int): Number of replicas. For replicated services only.
++    """
++    def __init__(self, mode, replicas=None):
++        if mode not in ('replicated', 'global'):
++            raise errors.InvalidArgument(
++                'mode must be either "replicated" or "global"'
++            )
++        if mode != 'replicated' and replicas is not None:
++            raise errors.InvalidArgument(
++                'replicas can only be used for replicated mode'
++            )
++        self[mode] = {}
++        if replicas:
++            self[mode]['Replicas'] = replicas
++
++    @property
++    def mode(self):
++        if 'global' in self:
++            return 'global'
++        return 'replicated'
++
++    @property
++    def replicas(self):
++        if self.mode != 'replicated':
++            return None
++        return self['replicated'].get('Replicas')

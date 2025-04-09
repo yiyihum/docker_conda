@@ -1,0 +1,113 @@
+diff --git a/tests/test_emitter.py b/tests/test_emitter.py
+index 3e414cc..792267d 100644
+--- a/tests/test_emitter.py
++++ b/tests/test_emitter.py
+@@ -41,7 +41,7 @@ if platform.is_linux():
+         InotifyFullEmitter,
+     )
+ elif platform.is_darwin():
+-    pytestmark = pytest.mark.skip("FIXME: It is a matter of bad comparisons between bytes and str.")
++    pytestmark = pytest.mark.skip("FIXME: issue #546.")
+     from watchdog.observers.fsevents2 import FSEventsEmitter as Emitter
+ elif platform.is_windows():
+     from watchdog.observers.read_directory_changes import (
+diff --git a/tests/test_observer.py b/tests/test_observer.py
+index 26229cc..f40570d 100644
+--- a/tests/test_observer.py
++++ b/tests/test_observer.py
+@@ -115,3 +115,30 @@ def test_2_observers_on_the_same_path(observer, observer2):
+ 
+     observer2.schedule(None, '')
+     assert len(observer2.emitters) == 1
++
++
++def test_start_failure_should_not_prevent_further_try(monkeypatch, observer):
++    observer.schedule(None, '')
++    emitters = observer.emitters
++    assert len(emitters) == 1
++
++    # Make the emitter to fail on start()
++
++    def mocked_start():
++        raise OSError()
++
++    emitter = next(iter(emitters))
++    monkeypatch.setattr(emitter, "start", mocked_start)
++    with pytest.raises(OSError):
++        observer.start()
++    # The emitter should be removed from the list
++    assert len(observer.emitters) == 0
++
++    # Restoring the original behavior should work like there never be emitters
++    monkeypatch.undo()
++    observer.start()
++    assert len(observer.emitters) == 0
++
++    # Re-schduling the watch should work
++    observer.schedule(None, '')
++    assert len(observer.emitters) == 1
+diff --git a/tests/test_observers_polling.py b/tests/test_observers_polling.py
+index f94041a..109163b 100644
+--- a/tests/test_observers_polling.py
++++ b/tests/test_observers_polling.py
+@@ -65,12 +65,14 @@ def event_queue():
+ @pytest.fixture
+ def emitter(event_queue):
+     watch = ObservedWatch(temp_dir, True)
+-    yield Emitter(event_queue, watch, timeout=0.2)
++    em = Emitter(event_queue, watch, timeout=0.2)
++    em.start()
++    yield em
++    em.stop()
+ 
+ 
+ def test___init__(event_queue, emitter):
+     SLEEP_TIME = 0.4
+-    emitter.start()
+ 
+     sleep(SLEEP_TIME)
+     mkdir(p('project'))
+@@ -165,7 +167,6 @@ def test___init__(event_queue, emitter):
+ def test_delete_watched_dir(event_queue, emitter):
+     SLEEP_TIME = 0.4
+ 
+-    emitter.start()
+     rm(p(''), recursive=True)
+ 
+     sleep(SLEEP_TIME)
+diff --git a/tests/test_observers_winapi.py b/tests/test_observers_winapi.py
+index 52367e3..4be47c5 100644
+--- a/tests/test_observers_winapi.py
++++ b/tests/test_observers_winapi.py
+@@ -59,14 +59,14 @@ def event_queue():
+ @pytest.fixture
+ def emitter(event_queue):
+     watch = ObservedWatch(temp_dir, True)
+-    yield WindowsApiEmitter(event_queue, watch, timeout=0.2)
++    em = WindowsApiEmitter(event_queue, watch, timeout=0.2)
++    yield em
++    em.stop()
+ 
+ 
+-def test___init__():
++def test___init__(event_queue, emitter):
+     SLEEP_TIME = 2
+ 
+-    emitter.start()
+-
+     sleep(SLEEP_TIME)
+     mkdir(p('fromdir'))
+ 
+@@ -81,10 +81,10 @@ def test___init__():
+     #   * unordered
+     #   * non-unique
+     # A multiset! Python's collections.Counter class seems appropriate.
+-    expected = {[
++    expected = {
+         DirCreatedEvent(p('fromdir')),
+         DirMovedEvent(p('fromdir'), p('todir')),
+-    ]}
++    }
+ 
+     got = set()
+ 

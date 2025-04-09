@@ -1,0 +1,132 @@
+diff --git a/docs/source/format.rst b/docs/source/format.rst
+index c12d3b2..de15bbb 100644
+--- a/docs/source/format.rst
++++ b/docs/source/format.rst
+@@ -274,7 +274,8 @@ All of these variables may be used in all of the following fields:
+ * ``data``
+ * ``request_headers``
+ * ``response_strings``
+-* ``response_json_paths`` (on the value side of the key value pair)
++* ``response_json_paths`` (in both the key and value, see
++  :ref:`json path substitution <json-subs>` for more info)
+ * ``response_headers`` (on the value side of the key value pair)
+ * ``response_forbidden_headers``
+ * ``count`` and ``delay`` fields of ``poll``
+diff --git a/docs/source/jsonpath.rst b/docs/source/jsonpath.rst
+index 15d4e1d..317603b 100644
+--- a/docs/source/jsonpath.rst
++++ b/docs/source/jsonpath.rst
+@@ -64,8 +64,48 @@ lead to difficult to read tests and it also indicates that your
+ gabbi tests are being used to test your serializers and data models,
+ not just your API interactions.
+ 
++It is also possible to read raw JSON from disk for either all or
++some of a JSON response::
++
++    response_json_paths:
++        $: @<data.json
++
++or::
++
++    response_json_paths:
++        $.pets: <@pets.json
++        $.pets[0]: <@cat.json
++
++Examples like this can be found in one of gabbi's `own tests`_.
++
+ There are more JSONPath examples in :doc:`example` and in the
+ `jsonpath_rw`_ and `jsonpath_rw_ext`_ documentation.
+ 
++.. _json-subs:
++
++Substitution
++------------
++
++:ref:`Substitutions <state-substitution>` can be made in both the
++left (query) and right (expected) hand sides of the json path
++expression. When subtitutions are used in the query, care must be
++taken to ensure proper quoting of the resulting value. For example
++if there is a uuid (with hyphens) at ``$RESPONSE['$.id']`` then this
++expression may fail::
++
++    $.nested.structure.$RESPONSE['$.id'].name: foobar
++
++as it will evaluate to something like::
++
++   $.nested.structure.ADC8AAFC-D564-40D1-9724-7680D3C010C2.name: foobar
++
++which may be treated as an arithemtic expression by the json path
++parser. The test author should write::
++
++    $.nested.structure["$RESPONSE['$.id']"].name: foobar
++
++to quote the result of the substitution.
++
+ .. _jsonpath_rw: http://jsonpath-rw.readthedocs.io/en/latest/
+ .. _jsonpath_rw_ext: https://python-jsonpath-rw-ext.readthedocs.io/en/latest/
++.. _own tests: https://github.com/cdent/gabbi/blob/master/gabbi/tests/gabbits_intercept/data.yaml
+diff --git a/gabbi/case.py b/gabbi/case.py
+index d903dd5..79c18c9 100644
+--- a/gabbi/case.py
++++ b/gabbi/case.py
+@@ -174,6 +174,10 @@ class HTTPTestCase(testtools.TestCase):
+ 
+         return message
+ 
++    def load_data_file(self, filename):
++        """Read a file from the current test directory."""
++        return self._load_data_file(filename)
++
+     def _assert_response(self):
+         """Compare the response with expected data."""
+         self._test_status(self.test_data['status'], self.response['status'])
+@@ -505,7 +509,7 @@ class HTTPTestCase(testtools.TestCase):
+         """
+         if isinstance(data, str):
+             if data.startswith('<@'):
+-                info = self._load_data_file(data.replace('<@', '', 1))
++                info = self.load_data_file(data.replace('<@', '', 1))
+                 if utils.not_binary(content_type):
+                     data = six.text_type(info, 'UTF-8')
+                 else:
+diff --git a/gabbi/handlers/jsonhandler.py b/gabbi/handlers/jsonhandler.py
+index 5b45720..2f85360 100644
+--- a/gabbi/handlers/jsonhandler.py
++++ b/gabbi/handlers/jsonhandler.py
+@@ -14,6 +14,8 @@
+ 
+ import json
+ 
++import six
++
+ from gabbi.handlers import base
+ from gabbi import json_parser
+ 
+@@ -73,11 +75,8 @@ class JSONHandler(base.ContentHandler):
+ 
+     def action(self, test, path, value=None):
+         """Test json_paths against json data."""
+-        # NOTE: This process has some advantages over other process that
+-        # might come along because the JSON data has already been
+-        # processed (to provided for the magic template replacing).
+-        # Other handlers that want access to data structures will need
+-        # to do their own processing.
++        # Do template expansion in the left hand side.
++        path = test.replace_template(path)
+         try:
+             match = self.extract_json_path_value(
+                 test.response_data, path)
+@@ -86,6 +85,13 @@ class JSONHandler(base.ContentHandler):
+         except ValueError:
+             raise AssertionError('json path %s cannot match %s' %
+                                  (path, test.response_data))
++
++        # read data from disk if the value starts with '<@'
++        if isinstance(value, str) and value.startswith('<@'):
++            info = test.load_data_file(value.replace('<@', '', 1))
++            info = six.text_type(info, 'UTF-8')
++            value = self.loads(info)
++
+         expected = test.replace_template(value)
+         # If expected is a string, check to see if it is a regex.
+         if (hasattr(expected, 'startswith') and expected.startswith('/')

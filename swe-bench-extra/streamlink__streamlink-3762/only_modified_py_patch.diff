@@ -1,0 +1,315 @@
+diff --git a/src/streamlink/plugins/olympicchannel.py b/src/streamlink/plugins/olympicchannel.py
+index 7ea41a80..d91924ff 100644
+--- a/src/streamlink/plugins/olympicchannel.py
++++ b/src/streamlink/plugins/olympicchannel.py
+@@ -1,58 +1,67 @@
+-import json
+ import logging
+ import re
++from html import unescape as html_unescape
+ from time import time
+ from urllib.parse import urljoin, urlparse
+ 
+ from streamlink.plugin import Plugin
+ from streamlink.plugin.api import validate
+ from streamlink.stream import HLSStream
++from streamlink.utils import parse_json
+ 
+ log = logging.getLogger(__name__)
+ 
+ 
+ class OlympicChannel(Plugin):
+-    _url_re = re.compile(r"https?://(\w+\.)olympicchannel.com/../(?P<type>live|video|original-series|films)/?(?:\w?|[-\w]+)")
+-    _tokenizationApiDomainUrl = """"tokenizationApiDomainUrl" content="/OcsTokenization/api/v1/tokenizedUrl">"""
+-    _live_api_path = "/OcsTokenization/api/v1/tokenizedUrl?url={url}&domain={netloc}&_ts={time}"
+-
++    _url_re = re.compile(r"https?://(\w+\.)?(?:olympics|olympicchannel)\.com/(?:[\w-]+/)?../.+")
++    _token_api_path = "/tokenGenerator?url={url}&domain={netloc}&_ts={time}"
+     _api_schema = validate.Schema(
+-        validate.text,
+-        validate.transform(lambda v: json.loads(v)),
+-        validate.url()
++        validate.transform(parse_json),
++        [{
++            validate.optional("src"): validate.url(),
++            validate.optional("srcType"): "HLS",
++        }],
++        validate.transform(lambda v: v[0].get("src")),
++    )
++    _data_url_re = re.compile(r'data-content-url="([^"]+)"')
++    _data_content_re = re.compile(r'data-d3vp-plugin="THEOplayer"\s*data-content="([^"]+)"')
++    _data_content_schema = validate.Schema(
++        validate.any(
++            validate.all(
++                validate.transform(_data_url_re.search),
++                validate.any(None, validate.get(1)),
++            ),
++            validate.all(
++                validate.transform(_data_content_re.search),
++                validate.any(None, validate.get(1)),
++            ),
++        ),
++        validate.any(None, validate.transform(html_unescape)),
+     )
+-    _video_url_re = re.compile(r""""video_url"\scontent\s*=\s*"(?P<value>[^"]+)""")
+-    _video_url_schema = validate.Schema(
+-        validate.contains(_tokenizationApiDomainUrl),
+-        validate.transform(_video_url_re.search),
+-        validate.any(None, validate.get("value")),
+-        validate.url()
++    _stream_schema = validate.Schema(
++        validate.transform(parse_json),
++        validate.url(),
+     )
+ 
+     @classmethod
+     def can_handle_url(cls, url):
+         return cls._url_re.match(url)
+ 
+-    def _get_vod_streams(self):
+-        stream_url = self.session.http.get(self.url, schema=self._video_url_schema)
+-        return HLSStream.parse_variant_playlist(self.session, stream_url)
++    def _get_streams(self):
++        api_url = self.session.http.get(self.url, schema=self._data_content_schema)
++        if api_url and (api_url.startswith("/") or api_url.startswith("http")):
++            api_url = urljoin(self.url, api_url)
++            stream_url = self.session.http.get(api_url, schema=self._api_schema, headers={"Referer": self.url})
++        elif api_url and api_url.startswith("[{"):
++            stream_url = self._api_schema.validate(api_url)
++        else:
++            return
+ 
+-    def _get_live_streams(self):
+-        video_url = self.session.http.get(self.url, schema=self._video_url_schema)
+-        parsed = urlparse(video_url)
+-        api_url = urljoin(self.url, self._live_api_path.format(url=video_url,
++        parsed = urlparse(stream_url)
++        api_url = urljoin(self.url, self._token_api_path.format(url=stream_url,
+                           netloc="{0}://{1}".format(parsed.scheme, parsed.netloc), time=int(time())))
+-        stream_url = self.session.http.get(api_url, schema=self._api_schema)
++        stream_url = self.session.http.get(api_url, schema=self._stream_schema, headers={"Referer": self.url})
+         return HLSStream.parse_variant_playlist(self.session, stream_url)
+ 
+-    def _get_streams(self):
+-        match = self._url_re.match(self.url)
+-        type_of_stream = match.group('type')
+-
+-        if type_of_stream == 'live':
+-            return self._get_live_streams()
+-        elif type_of_stream in ('video', 'original-series', 'films'):
+-            return self._get_vod_streams()
+-
+ 
+ __plugin__ = OlympicChannel
+diff --git a/src/streamlink/plugins/twitch.py b/src/streamlink/plugins/twitch.py
+index 4b067620..4ef7f1d1 100644
+--- a/src/streamlink/plugins/twitch.py
++++ b/src/streamlink/plugins/twitch.py
+@@ -15,6 +15,7 @@ from streamlink.stream import HLSStream, HTTPStream
+ from streamlink.stream.hls import HLSStreamReader, HLSStreamWorker, HLSStreamWriter
+ from streamlink.stream.hls_playlist import M3U8, M3U8Parser, load as load_hls_playlist
+ from streamlink.utils.times import hours_minutes_seconds
++from streamlink.utils.url import update_qsd
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -346,47 +347,89 @@ class TwitchAPI:
+         ))
+ 
+     def clips(self, clipname):
+-        query = """{{
+-            clip(slug: "{clipname}") {{
+-                broadcaster {{
+-                    displayName
+-                }}
+-                title
+-                game {{
+-                    name
+-                }}
+-                videoQualities {{
+-                    quality
+-                    sourceURL
+-                }}
+-            }}
+-        }}""".format(clipname=clipname)
+-
+-        return self.call_gql({"query": query}, schema=validate.Schema(
+-            {"data": {
+-                "clip": validate.any(None, validate.all({
+-                    "broadcaster": validate.all({"displayName": validate.text}, validate.get("displayName")),
+-                    "title": validate.text,
+-                    "game": validate.all({"name": validate.text}, validate.get("name")),
+-                    "videoQualities": [validate.all({
+-                        "quality": validate.all(
+-                            validate.text,
+-                            validate.transform(lambda q: "{0}p".format(q))
+-                        ),
+-                        "sourceURL": validate.url()
+-                    }, validate.union((
+-                        validate.get("quality"),
+-                        validate.get("sourceURL")
+-                    )))]
+-                }, validate.union((
+-                    validate.get("broadcaster"),
+-                    validate.get("title"),
+-                    validate.get("game"),
+-                    validate.get("videoQualities")
+-                ))))
+-            }},
+-            validate.get("data"),
+-            validate.get("clip")
++        queries = [
++            {
++                "operationName": "VideoAccessToken_Clip",
++                "extensions": {
++                    "persistedQuery": {
++                        "version": 1,
++                        "sha256Hash": "36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4c35796eb11"
++                    }
++                },
++                "variables": {"slug": clipname}
++            },
++            {
++                "operationName": "ClipsView",
++                "extensions": {
++                    "persistedQuery": {
++                        "version": 1,
++                        "sha256Hash": "4480c1dcc2494a17bb6ef64b94a5213a956afb8a45fe314c66b0d04079a93a8f"
++                    }
++                },
++                "variables": {"slug": clipname}
++            },
++            {
++                "operationName": "ClipsTitle",
++                "extensions": {
++                    "persistedQuery": {
++                        "version": 1,
++                        "sha256Hash": "f6cca7f2fdfbfc2cecea0c88452500dae569191e58a265f97711f8f2a838f5b4"
++                    }
++                },
++                "variables": {"slug": clipname}
++            }
++        ]
++
++        return self.call_gql(queries, schema=validate.Schema(
++            [
++                validate.all(
++                    {"data": {
++                        "clip": validate.all({
++                            "playbackAccessToken": validate.all({
++                                "__typename": "PlaybackAccessToken",
++                                "signature": str,
++                                "value": str
++                            }, validate.union((
++                                validate.get("signature"),
++                                validate.get("value")
++                            ))),
++                            "videoQualities": [validate.all({
++                                "frameRate": validate.any(int, float),
++                                "quality": str,
++                                "sourceURL": validate.url()
++                            }, validate.union((
++                                validate.transform(lambda q: f"{q['quality']}p{int(q['frameRate'])}"),
++                                validate.get("sourceURL")
++                            )))]
++                        }, validate.union((
++                            validate.get("playbackAccessToken"),
++                            validate.get("videoQualities")
++                        )))
++                    }},
++                    validate.get("data"),
++                    validate.get("clip")
++                ),
++                validate.all(
++                    {"data": {
++                        "clip": validate.all({
++                            "broadcaster": validate.all({"displayName": str}, validate.get("displayName")),
++                            "game": validate.all({"name": str}, validate.get("name"))
++                        }, validate.union((
++                            validate.get("broadcaster"),
++                            validate.get("game")
++                        )))
++                    }},
++                    validate.get("data"),
++                    validate.get("clip")
++                ),
++                validate.all(
++                    {"data": {
++                        "clip": validate.all({"title": str}, validate.get("title"))
++                    }},
++                    validate.get("data"),
++                    validate.get("clip")
++                )
++            ]
+         ))
+ 
+     def stream_metadata(self, channel):
+@@ -662,12 +705,12 @@ class Twitch(Plugin):
+ 
+     def _get_clips(self):
+         try:
+-            (self.author, self.title, self.category, streams) = self.api.clips(self.clip_name)
++            (((sig, token), streams), (self.author, self.category), self.title) = self.api.clips(self.clip_name)
+         except (PluginError, TypeError):
+             return
+ 
+         for quality, stream in streams:
+-            yield quality, HTTPStream(self.session, stream)
++            yield quality, HTTPStream(self.session, update_qsd(stream, {"sig": sig, "token": token}))
+ 
+     def _get_streams(self):
+         if self.video_id:
+diff --git a/src/streamlink/utils/url.py b/src/streamlink/utils/url.py
+index 7776c648..bc967126 100644
+--- a/src/streamlink/utils/url.py
++++ b/src/streamlink/utils/url.py
+@@ -1,24 +1,38 @@
++import re
+ from collections import OrderedDict
+ from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlparse, urlunparse
+ 
+ 
+-def update_scheme(current, target):
++_re_uri_implicit_scheme = re.compile(r"""^[a-z0-9][a-z0-9.+-]*://""", re.IGNORECASE)
++
++
++def update_scheme(current: str, target: str) -> str:
+     """
+-    Take the scheme from the current URL and applies it to the
+-    target URL if the target URL startswith // or is missing a scheme
++    Take the scheme from the current URL and apply it to the
++    target URL if the target URL starts with // or is missing a scheme
+     :param current: current URL
+     :param target: target URL
+     :return: target URL with the current URLs scheme
+     """
+     target_p = urlparse(target)
++
++    if (
++        # target URLs with implicit scheme and netloc including a port: ("http://", "foo.bar:1234") -> "http://foo.bar:1234"
++        # urllib.parse.urlparse has incorrect behavior in py<3.9, so we'll have to use a regex here
++        # py>=3.9: urlparse("127.0.0.1:1234") == ParseResult(scheme='127.0.0.1', netloc='', path='1234', ...)
++        # py<3.9 : urlparse("127.0.0.1:1234") == ParseResult(scheme='', netloc='', path='127.0.0.1:1234', ...)
++        not _re_uri_implicit_scheme.search(target) and not target.startswith("//")
++        # target URLs without scheme and netloc: ("http://", "foo.bar/foo") -> "http://foo.bar/foo"
++        or not target_p.scheme and not target_p.netloc
++    ):
++        return f"{urlparse(current).scheme}://{urlunparse(target_p)}"
++
++    # target URLs without scheme but with netloc: ("http://", "//foo.bar/foo") -> "http://foo.bar/foo"
+     if not target_p.scheme and target_p.netloc:
+-        return "{0}:{1}".format(urlparse(current).scheme,
+-                                urlunparse(target_p))
+-    elif not target_p.scheme and not target_p.netloc:
+-        return "{0}://{1}".format(urlparse(current).scheme,
+-                                  urlunparse(target_p))
+-    else:
+-        return target
++        return f"{urlparse(current).scheme}:{urlunparse(target_p)}"
++
++    # target URLs with scheme
++    return target
+ 
+ 
+ def url_equal(first, second, ignore_scheme=False, ignore_netloc=False, ignore_path=False, ignore_params=False,
+

@@ -1,0 +1,83 @@
+diff --git a/pipelib/core.py b/pipelib/core.py
+index 36f7b37..ec31d3e 100644
+--- a/pipelib/core.py
++++ b/pipelib/core.py
+@@ -80,17 +80,17 @@ class Dataset:
+             yield from chain(dataset, *others)
+         return PipelinedDataset(self, f)
+ 
+-    def map_parallel(self, map_func, n=None, chunksize=1):
++    def map_parallel(self, map_func, n=None, chunksize=1, unordered=False):
+         return PipelinedDataset(
+-            self, parallel.MapParallel(map_func, n, chunksize))
++            self, parallel.MapParallel(map_func, n, chunksize, unordered))
+ 
+-    def flat_map_parallel(self, map_func, n=None, chunksize=1):
++    def flat_map_parallel(self, map_func, n=None, chunksize=1, unordered=False):
+         return PipelinedDataset(
+-            self, parallel.FlatMapParallel(map_func, n, chunksize))
++            self, parallel.FlatMapParallel(map_func, n, chunksize, unordered))
+ 
+-    def filter_parallel(self, predicate, n=None, chunksize=1):
++    def filter_parallel(self, predicate, n=None, chunksize=1, unordered=False):
+         return PipelinedDataset(
+-            self, parallel.FilterParallel(predicate, n, chunksize))
++            self, parallel.FilterParallel(predicate, n, chunksize, unordered))
+ 
+     def all(self):
+         return list(self)
+diff --git a/pipelib/parallel.py b/pipelib/parallel.py
+index 98dfdd8..c7433ee 100644
+--- a/pipelib/parallel.py
++++ b/pipelib/parallel.py
+@@ -4,21 +4,27 @@ import multiprocess
+ 
+ 
+ class MapParallel:
+-    def __init__(self, func, n=None, chunksize=1):
++    def __init__(self, func, n=None, chunksize=1, unordered=False):
+         self._func = func
+         self._n = n
+         self._chunksize = chunksize
++        if not unordered:
++            self._map_method = 'imap'
++        else:
++            self._map_method = 'imap_unordered'
+ 
+     def __call__(self, dataset):
+         with multiprocess.Pool(self._n) as p:
+-            yield from p.imap_unordered(self._func, dataset, self._chunksize)
++            yield from getattr(p, self._map_method)(
++                self._func, dataset, self._chunksize)
+ 
+ 
+ class FlatMapParallel(MapParallel):
+     def __call__(self, dataset):
+         with multiprocess.Pool(self._n) as p:
+             yield from chain.from_iterable(
+-                p.imap_unordered(self._func, dataset, self._chunksize))
++                getattr(p, self._map_method)(
++                    self._func, dataset, self._chunksize))
+ 
+ 
+ class FilterParallel(MapParallel):
+@@ -37,4 +43,5 @@ class FilterParallel(MapParallel):
+ 
+         with multiprocess.Pool(self._n) as p:
+             yield from (x for x, keep in
+-                        p.imap_unordered(task, dataset, self._chunksize) if keep)
++                        getattr(p, self._map_method)(
++                            task, dataset, self._chunksize) if keep)
+diff --git a/setup.py b/setup.py
+index eba6daf..0854f8a 100644
+--- a/setup.py
++++ b/setup.py
+@@ -7,7 +7,7 @@ except ImportError:
+ 
+ setup(
+     name='pipelib',
+-    version='0.2.2',
++    version='0.2.3',
+     description='pipeline architecture data library',
+     long_description=open('./README.md', encoding='utf-8').read(),
+     long_description_content_type='text/markdown',

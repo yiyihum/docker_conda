@@ -1,0 +1,125 @@
+diff --git a/quantulum3/_lang/en_US/parser.py b/quantulum3/_lang/en_US/parser.py
+index 6f5ebe8..c2caad4 100644
+--- a/quantulum3/_lang/en_US/parser.py
++++ b/quantulum3/_lang/en_US/parser.py
+@@ -57,6 +57,7 @@ def clean_surface(surface, span):
+ 
+ ###############################################################################
+ def split_spellout_sequence(text, span):
++    negatives = reg.negatives(lang)
+     units = reg.units(lang)
+     tens = reg.tens(lang)
+     scales = reg.scales(lang)
+@@ -78,19 +79,22 @@ def split_spellout_sequence(text, span):
+         )
+         # if should start a new seqquence
+         # split on:
++        #   a minus word (minus ten)
+         #   unit -> unit (one two three)
+         #   unit -> tens (five twenty)
+         #   tens -> tens (twenty thirty)
+         #   same scale starts  (hundred and one hundred and two)
+         should_split = False
+-        if prev_word_rank == 1 and rank in [1, 2]:
++        if word in negatives:
++            should_split = True
++        elif prev_word_rank == 1 and rank in [1, 2]:
+             should_split = True
+         elif prev_word_rank == 2 and rank == 2:
+             should_split = True
+         elif rank >= 3 and rank == prev_scale:
+             should_split = True
+             prev_scale = rank
+-        if should_split:
++        if should_split and last_word_end > 0:
+             # yield up to here
+             adjust = 0
+             if prev_word.lower() in [
+@@ -141,6 +145,7 @@ def extract_spellout_values(text):
+         ):
+             continue
+         try:
++            is_negative = False
+             surface, span = clean_surface(seq, span)
+             if not surface:
+                 continue
+@@ -160,6 +165,9 @@ def extract_spellout_values(text):
+                 except ValueError:
+                     match = re.search(reg.numberwords_regex(), word)
+                     scale, increment = reg.numberwords(lang)[match.group(0)]
++                if scale < 0:  # negative, must be the first word in the sequence
++                    is_negative = True
++                    continue
+                 if (
+                     scale > 0
+                     and increment == 0
+@@ -178,11 +186,14 @@ def extract_spellout_values(text):
+                 if scale > 100 or word == "and":
+                     result += curr
+                     curr = 0.0
++            value = result + curr
++            if is_negative:
++                value = -value
+             values.append(
+                 {
+                     "old_surface": surface,
+                     "old_span": span,
+-                    "new_surface": str(result + curr),
++                    "new_surface": str(value),
+                 }
+             )
+         except (KeyError, AttributeError):
+diff --git a/quantulum3/_lang/en_US/regex.py b/quantulum3/_lang/en_US/regex.py
+index 2bb8506..f2d995f 100644
+--- a/quantulum3/_lang/en_US/regex.py
++++ b/quantulum3/_lang/en_US/regex.py
+@@ -64,6 +64,8 @@ MULTIPLICATION_OPERATORS = {" times "}
+ 
+ DIVISION_OPERATORS = {" per ", " a "}
+ 
++NEGATIVES = {"minus", "negative"}
++
+ GROUPING_OPERATORS = {",", " "}
+ DECIMAL_OPERATORS = {"."}
+ 
+diff --git a/quantulum3/_lang/en_US/speak.py b/quantulum3/_lang/en_US/speak.py
+index de40fca..68236c7 100644
+--- a/quantulum3/_lang/en_US/speak.py
++++ b/quantulum3/_lang/en_US/speak.py
+@@ -37,6 +37,10 @@ def unit_to_spoken(unit, count=1):
+         # derived unit
+         denominator_dimensions = [i for i in unit.dimensions if i["power"] > 0]
+         denominator_string = parser.name_from_dimensions(denominator_dimensions, lang)
+-        plural_denominator_string = load.pluralize(denominator_string)
++        if denominator_string:
++            plural_denominator_string = load.pluralize(denominator_string)
++        else:
++            # in case the denominator is empty, its plural is, too
++            plural_denominator_string = denominator_string
+         unit_string = unit.name.replace(denominator_string, plural_denominator_string)
+     return unit_string
+diff --git a/quantulum3/regex.py b/quantulum3/regex.py
+index 42b02fd..750eaf7 100644
+--- a/quantulum3/regex.py
++++ b/quantulum3/regex.py
+@@ -46,6 +46,10 @@ def powers(lang="en_US"):
+     return _get_regex(lang).POWERS
+ 
+ 
++def negatives(lang="en_US"):
++    return _get_regex(lang).NEGATIVES
++
++
+ def exponents_regex(lang="en_US"):
+     return _get_regex(lang).EXPONENTS_REGEX
+ 
+@@ -75,6 +79,8 @@ def numberwords(lang="en_US"):
+ 
+     numwords.update(miscnum(lang))
+ 
++    for word in negatives(lang):
++        numwords[word] = (-1, 0)
+     for idx, word in enumerate(units(lang)):
+         numwords[word] = (1, idx)
+     for idx, word in enumerate(tens(lang)):
+

@@ -1,0 +1,97 @@
+diff --git a/oqupy/mps_mpo.py b/oqupy/mps_mpo.py
+index 29e080c..6a24a85 100644
+--- a/oqupy/mps_mpo.py
++++ b/oqupy/mps_mpo.py
+@@ -198,14 +198,13 @@ def compute_nn_gate(
+     nn_gate: NnGate
+         Nearest neighbor gate.
+     """
+-    # exponentiate and transpose such that
+-    # axis 0 is the input and axis 1 is the output leg of the propagator.
+-    propagator = linalg.expm(dt*liouvillian).T
++    # exponentiate the liouvillian to become a propagator
++    propagator = linalg.expm(dt*liouvillian)
+     # split leg 0 and leg 1 each into left and right.
+-    propagator.shape = [hs_dim_l**2,
+-                        hs_dim_r**2,
+-                        hs_dim_l**2,
+-                        hs_dim_r**2]
++    propagator.shape = [hs_dim_l**2, # left output
++                        hs_dim_r**2, # right output
++                        hs_dim_l**2, # left input
++                        hs_dim_r**2] # right input
+     temp = np.swapaxes(propagator, 1, 2)
+     temp = temp.reshape([hs_dim_l**2 * hs_dim_l**2,
+                             hs_dim_r**2 * hs_dim_r**2])
+@@ -217,7 +216,9 @@ def compute_nn_gate(
+     sqrt_s = np.sqrt(s)
+     u_sqrt_s = u * sqrt_s
+     sqrt_s_vh =(sqrt_s * vh.T).T
++    # left tensor with legs: left output, left input, bond
+     tensor_l = u_sqrt_s.reshape(hs_dim_l**2, hs_dim_l**2, chi)
++    # right tensor with legs: bond, right output, right input
+     tensor_r = sqrt_s_vh.reshape(chi, hs_dim_r**2, hs_dim_r**2)
+ 
+     return NnGate(site=site, tensors=(tensor_l, tensor_r))
+diff --git a/oqupy/operators.py b/oqupy/operators.py
+index 2566dcf..8dde09e 100644
+--- a/oqupy/operators.py
++++ b/oqupy/operators.py
+@@ -197,7 +197,7 @@ def cross_left_right_super(
+         operator_2_l: ndarray,
+         operator_2_r: ndarray) -> ndarray:
+     """
+-    Construct anit-commutator of cross term (acting on two Hilbert spaces).
++    Contruct map from rho to [(op1l x op2l) rho (op1r x op2r)].
+     """
+     op1l_op1r = np.kron(operator_1_l, operator_1_r.T)
+     op2l_op2r = np.kron(operator_2_l, operator_2_r.T)
+diff --git a/oqupy/system.py b/oqupy/system.py
+index a7d11c1..184a68b 100644
+--- a/oqupy/system.py
++++ b/oqupy/system.py
+@@ -429,7 +429,8 @@ class SystemChain(BaseAPIClass):
+         self._nn_liouvillians = []
+         for hs_dim_l, hs_dim_r in zip(self._hs_dims[:-1], self._hs_dims[1:]):
+             self._nn_liouvillians.append(
+-                np.zeros((hs_dim_l**4, hs_dim_r**4), dtype=NpDtype))
++                np.zeros((hs_dim_l**2 * hs_dim_r**2, hs_dim_l**2 * hs_dim_r**2),
++                dtype=NpDtype))
+ 
+         super().__init__(name, description)
+ 
+@@ -496,7 +497,7 @@ class SystemChain(BaseAPIClass):
+         liouvillian: ndarray
+             Liouvillian acting on the single site.
+         """
+-        raise NotImplementedError()
++        self._site_liouvillians[site] += np.array(liouvillian, dtype=NpDtype)
+ 
+     def add_site_dissipation(
+             self,
+@@ -525,12 +526,13 @@ class SystemChain(BaseAPIClass):
+         gamma: float
+             Optional multiplicative factor :math:`\gamma`.
+         """
+-        op = lindblad_operator
++        op = np.array(lindblad_operator, dtype=NpDtype)
+         op_dagger = op.conjugate().T
+         self._site_liouvillians[site] += \
+-            gamma * (opr.left_right_super(op, op_dagger)
++            gamma * (opr.left_right_super(op, op_dagger) \
+                       - 0.5 * opr.acommutator(np.dot(op_dagger, op)))
+ 
++
+     def add_nn_hamiltonian(
+             self,
+             site: int,
+@@ -585,7 +587,7 @@ class SystemChain(BaseAPIClass):
+         liouvillian_l_r: ndarray
+             Liouvillian acting on sites :math:`n` and :math:`n+1`.
+         """
+-        self._nn_liouvillians[site] += liouvillian_l_r
++        self._nn_liouvillians[site] += np.array(liouvillian_l_r, dtype=NpDtype)
+ 
+     def add_nn_dissipation(
+             self,
+

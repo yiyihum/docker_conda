@@ -1,0 +1,199 @@
+diff --git a/.appveyor.yml b/.appveyor.yml
+deleted file mode 100644
+index 2f7748a0..00000000
+--- a/.appveyor.yml
++++ /dev/null
+@@ -1,39 +0,0 @@
+-environment:
+-  AV_PROJECTS: 'c:\projects'
+-  AV_OME_M2: 'c:\projects\m2'
+-  AV_OME_PYTHON: 'c:\projects\python'
+-  AV_OME_SOURCE: 'c:\projects\source'
+-
+-# Note that only Oracle JDK is provided.
+-  matrix:
+-    - java: 10
+-    - java: 1.8
+-    - java: 1.7
+-
+-cache:
+-  - '%AV_OME_M2% -> appveyor.yml'
+-  - '%AV_OME_PYTHON% -> appveyor.yml'
+-
+-os: 'Visual Studio 2015'
+-clone_folder: '%AV_OME_SOURCE%'
+-clone_depth: 5
+-platform: x64
+-
+-init:
+-  - git config --global core.autocrlf input
+-  - refreshenv
+-  - 'if [%java%] == [1.7] set "JAVA_HOME=C:\Program Files\Java\jdk1.7.0"'
+-  - 'if [%java%] == [1.8] set "JAVA_HOME=C:\Program Files\Java\jdk1.8.0"'
+-  - 'if [%java%] == [10] set "JAVA_HOME=C:\Program Files\Java\jdk10"'
+-  - PATH=%JAVA_HOME%\bin;%PATH%
+-  - 'set "MAVEN_OPTS=-Dmaven.repo.local=%AV_OME_M2%"'
+-  - 'if [%java%] == [1.7] set "MAVEN_OPTS=%MAVEN_OPTS% -Dhttps.protocols=TLSv1.2"'
+-
+-build_script:
+-  # Cached venv is available from this point.
+-  - 'if NOT EXIST "%AV_OME_PYTHON%\" set AV_OME_CREATE_VENV=true'
+-  - 'if [%AV_OME_CREATE_VENV%] == [true] C:\Python27-x64\python -m pip install virtualenv'
+-  - 'if [%AV_OME_CREATE_VENV%] == [true] C:\Python27-x64\python -m virtualenv %AV_OME_PYTHON%'
+-  - PATH=%AV_OME_PYTHON%;%AV_OME_PYTHON%\scripts;%PATH%
+-  - 'if [%AV_OME_CREATE_VENV%] == [true] python -m pip install sphinx'
+-  - mvn install
+diff --git a/ome-xml/src/main/java/ome/xml/meta/MetadataConverter.java b/ome-xml/src/main/java/ome/xml/meta/MetadataConverter.java
+index e76c1160..c787950a 100644
+--- a/ome-xml/src/main/java/ome/xml/meta/MetadataConverter.java
++++ b/ome-xml/src/main/java/ome/xml/meta/MetadataConverter.java
+@@ -2301,7 +2301,7 @@ public final class MetadataConverter {
+ 
+         int wellAnnotationRefCount = 0;
+         try {
+-          src.getWellAnnotationRefCount(i, q);
++          wellAnnotationRefCount = src.getWellAnnotationRefCount(i, q);
+         }
+         catch (NullPointerException e) { }
+         for (int a=0; a<wellAnnotationRefCount; a++) {
+diff --git a/ome_model/experimental.py b/ome_model/experimental.py
+index e5f4ecfd..aa9f8630 100644
+--- a/ome_model/experimental.py
++++ b/ome_model/experimental.py
+@@ -102,7 +102,7 @@ class Image(object):
+     def __init__(self,
+                  name,
+                  sizeX, sizeY, sizeZ, sizeC, sizeT,
+-                 tiffs=[],
++                 tiffs=None,
+                  order="XYZTC",
+                  type="uint16",
+                  ):
+@@ -123,8 +123,9 @@ class Image(object):
+             'Planes': [],
+         }
+         Image.ID += 1
+-        for tiff in tiffs:
+-            self.add_tiff(tiff)
++        if tiffs:
++            for tiff in tiffs:
++                self.add_tiff(tiff)
+ 
+     def add_channel(self, name=None, color=None, samplesPerPixel=1):
+         self.data["Channels"].append(
+@@ -223,12 +224,16 @@ def parse_tiff(tiff):
+     return (m.group("channel"), m.group("time"), m.group("slice"))
+ 
+ 
+-def create_companion(plates=[], images=[], out=None):
++def create_companion(plates=None, images=None, out=None):
+     """
+     Create a companion OME-XML for a given experiment.
+     Assumes 2D TIFFs
+     """
+     root = ET.Element("OME", attrib=OME_ATTRIBUTES)
++    if not plates:
++        plates = []
++    if not images:
++        images = []
+ 
+     for plate in plates:
+         p = ET.SubElement(root, "Plate", attrib=plate.data['Plate'])
+diff --git a/specification/src/main/resources/transforms/2008-09-to-2009-09.xsl b/specification/src/main/resources/transforms/2008-09-to-2009-09.xsl
+index 53c1d1ab..8e6a5c52 100644
+--- a/specification/src/main/resources/transforms/2008-09-to-2009-09.xsl
++++ b/specification/src/main/resources/transforms/2008-09-to-2009-09.xsl
+@@ -154,6 +154,25 @@
+         </xsl:element>
+       </xsl:for-each>
+ 
++      <!-- Transform the CustomAttributes into XMLAnnotation -->
++      <xsl:if test="(count(//*[local-name() = 'StructuredAnnotations'])) = 0">
++        <xsl:if test="(count(//*[local-name() = 'CustomAttributes'])) &gt; 0">
++          <xsl:element name="StructuredAnnotations" namespace="{$newSANS}">
++            <xsl:comment>Append Custom Attributes as XMLAnnotation</xsl:comment>
++            <xsl:for-each select="//*[local-name() = 'CustomAttributes']">
++              <xsl:if test="count(@*|node()) &gt; 0">
++                <xsl:variable name="annotationIndex" select="position()" />
++                <xsl:element name="XMLAnnotation" namespace="{$newSANS}">
++                  <xsl:attribute name="ID"><xsl:value-of select="concat('Annotation:CustomAttributes', $annotationIndex)"/></xsl:attribute>
++                  <xsl:element name="Value" namespace="{$newSANS}">
++                    <xsl:apply-templates select="@*|node()"/>
++                  </xsl:element>
++                </xsl:element>
++              </xsl:if>
++            </xsl:for-each>
++          </xsl:element>
++        </xsl:if>
++      </xsl:if>
+     </OME>
+   </xsl:template>
+ 
+@@ -181,6 +200,27 @@
+     </xsl:element>
+   </xsl:template>
+ 
++  <xsl:template match="SA:StructuredAnnotations">
++    <xsl:element name="{name()}" namespace="{$newSANS}">
++      <xsl:apply-templates select="@*|node()"/>
++      <!-- Transform the CustomAttributes into XMLAnnotation -->
++      <xsl:if test="(count(//*[local-name() = 'CustomAttributes'])) &gt; 0">
++        <xsl:comment>Append Custom Attributes as XMLAnnotation</xsl:comment>
++        <xsl:for-each select="//*[local-name() = 'CustomAttributes']">
++          <xsl:if test="count(@*|node()) &gt; 0">
++          <xsl:variable name="annotationIndex" select="position()" />
++            <xsl:element name="XMLAnnotation" namespace="{$newSANS}">
++              <xsl:attribute name="ID"><xsl:value-of select="concat('Annotation:CustomAttributes', $annotationIndex)"/></xsl:attribute>
++              <xsl:element name="Value" namespace="{$newSANS}">
++                <xsl:apply-templates select="@*|node()"/>
++              </xsl:element>
++            </xsl:element>
++          </xsl:if>
++        </xsl:for-each>
++      </xsl:if>
++    </xsl:element>
++  </xsl:template>
++
+   <xsl:template match="SA:List">
+     <xsl:apply-templates select="*"/>
+   </xsl:template>
+@@ -849,18 +889,12 @@
+     </xsl:element>
+   </xsl:template>
+ 
+-  <!-- Transform the CustomAttributes into XMLAnnotation -->
++  <!-- Remove CustomAttributes -->
+   <xsl:template match="CA:CustomAttributes">
+-    <xsl:if test="count(@*|node()) &gt; 0">
+-      <xsl:element name="StructuredAnnotations" namespace="{$newSANS}">
+-        <xsl:element name="XMLAnnotation" namespace="{$newSANS}">
+-          <xsl:attribute name="ID">Annotation:1</xsl:attribute>
+-          <xsl:element name="Value" namespace="{$newSANS}">
+-            <xsl:apply-templates select="@*|node()"/>
+-          </xsl:element>
+-        </xsl:element>
+-      </xsl:element>
+-    </xsl:if>
++    <xsl:variable name="caCount" select="count(preceding::CA:CustomAttributes | ancestor::CA:CustomAttributes) + 1"/> 
++    <xsl:element name="SA:AnnotationRef" namespace="{$newSANS}">
++      <xsl:attribute name="ID"><xsl:value-of select="concat('Annotation:CustomAttributes', $caCount)"/></xsl:attribute>
++    </xsl:element>
+   </xsl:template>
+ 
+   <!--
+@@ -886,8 +920,14 @@
+       <xsl:apply-templates
+           select="@* [not(name() = 'DefaultPixels' or name() = 'AcquiredPixels')]"/>
+       <xsl:for-each
+-          select="* [not(local-name(.) = 'Thumbnail' or local-name(.) = 'DisplayOptions' or local-name(.) = 'Region' or local-name(.) = 'CustomAttributes' or local-name(.) = 'LogicalChannel')]">
++          select="* [not(local-name(.) = 'Thumbnail' or local-name(.) = 'DisplayOptions' or local-name(.) = 'Region' or local-name(.) = 'LogicalChannel')]">
+         <xsl:choose>
++          <xsl:when test="local-name(.) ='CustomAttributes'">
++            <xsl:variable name="caCount" select="count(preceding::CA:CustomAttributes | ancestor::CA:CustomAttributes) + 1"/> 
++            <xsl:element name="SA:AnnotationRef" namespace="{$newSANS}">
++              <xsl:attribute name="ID"><xsl:value-of select="concat('Annotation:CustomAttributes', $caCount)"/></xsl:attribute>
++            </xsl:element>
++          </xsl:when>
+           <xsl:when test="local-name(.) ='Description'">
+             <xsl:apply-templates select="current()"/>
+           </xsl:when>

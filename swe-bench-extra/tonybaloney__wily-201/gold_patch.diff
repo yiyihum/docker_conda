@@ -1,0 +1,338 @@
+diff --git a/src/wily/__main__.py b/src/wily/__main__.py
+index 067f643..377c7c8 100644
+--- a/src/wily/__main__.py
++++ b/src/wily/__main__.py
+@@ -154,7 +154,13 @@ def build(ctx, max_revisions, targets, operators, archiver):
+ @click.option(
+     "-m", "--message/--no-message", default=False, help=_("Include revision message")
+ )
+-def index(ctx, message):
++@click.option(
++    "-w",
++    "--wrap/--no-wrap",
++    default=True,
++    help=_("Wrap index text to fit in terminal"),
++)
++def index(ctx, message, wrap):
+     """Show the history archive in the .wily/ folder."""
+     config = ctx.obj["CONFIG"]
+ 
+@@ -163,7 +169,7 @@ def index(ctx, message):
+ 
+     from wily.commands.index import index
+ 
+-    index(config=config, include_message=message)
++    index(config=config, include_message=message, wrap=wrap)
+ 
+ 
+ @cli.command(
+@@ -206,8 +212,14 @@ def index(ctx, message):
+     help=_("Return a non-zero exit code under the specified threshold"),
+     type=click.INT,
+ )
++@click.option(
++    "-w",
++    "--wrap/--no-wrap",
++    default=True,
++    help=_("Wrap rank text to fit in terminal"),
++)
+ @click.pass_context
+-def rank(ctx, path, metric, revision, limit, desc, threshold):
++def rank(ctx, path, metric, revision, limit, desc, threshold, wrap):
+     """Rank files, methods and functions in order of any metrics, e.g. complexity."""
+     config = ctx.obj["CONFIG"]
+ 
+@@ -225,6 +237,7 @@ def rank(ctx, path, metric, revision, limit, desc, threshold):
+         limit=limit,
+         threshold=threshold,
+         descending=desc,
++        wrap=wrap,
+     )
+ 
+ 
+@@ -260,9 +273,15 @@ def rank(ctx, path, metric, revision, limit, desc, threshold):
+     default=False,
+     help=_("Only show revisions that have changes"),
+ )
++@click.option(
++    "-w",
++    "--wrap/--no-wrap",
++    default=True,
++    help=_("Wrap report text to fit in terminal"),
++)
+ @click.pass_context
+ def report(
+-    ctx, file, metrics, number, message, format, console_format, output, changes
++    ctx, file, metrics, number, message, format, console_format, output, changes, wrap
+ ):
+     """Show metrics for a given file."""
+     config = ctx.obj["CONFIG"]
+@@ -297,6 +316,7 @@ def report(
+         format=ReportFormat[format],
+         console_format=style,
+         changes_only=changes,
++        wrap=wrap,
+     )
+ 
+ 
+@@ -322,8 +342,14 @@ def report(
+ @click.option(
+     "-r", "--revision", help=_("Compare against specific revision"), type=click.STRING
+ )
++@click.option(
++    "-w",
++    "--wrap/--no-wrap",
++    default=True,
++    help=_("Wrap diff text to fit in terminal"),
++)
+ @click.pass_context
+-def diff(ctx, files, metrics, all, detail, revision):
++def diff(ctx, files, metrics, all, detail, revision, wrap):
+     """Show the differences in metrics for each file."""
+     config = ctx.obj["CONFIG"]
+ 
+@@ -347,6 +373,7 @@ def diff(ctx, files, metrics, all, detail, revision):
+         changes_only=not all,
+         detail=detail,
+         revision=revision,
++        wrap=wrap,
+     )
+ 
+ 
+@@ -432,8 +459,14 @@ def clean(ctx, yes):
+ 
+ 
+ @cli.command("list-metrics", help=_("""List the available metrics."""))
++@click.option(
++    "-w",
++    "--wrap/--no-wrap",
++    default=True,
++    help=_("Wrap metrics text to fit in terminal"),
++)
+ @click.pass_context
+-def list_metrics(ctx):
++def list_metrics(ctx, wrap):
+     """List the available metrics."""
+     config = ctx.obj["CONFIG"]
+ 
+@@ -442,7 +475,7 @@ def list_metrics(ctx):
+ 
+     from wily.commands.list_metrics import list_metrics
+ 
+-    list_metrics()
++    list_metrics(wrap)
+ 
+ 
+ @cli.command("setup", help=_("""Run a guided setup to build the wily cache."""))
+diff --git a/src/wily/commands/diff.py b/src/wily/commands/diff.py
+index fc19c6f..ec0768b 100644
+--- a/src/wily/commands/diff.py
++++ b/src/wily/commands/diff.py
+@@ -15,7 +15,7 @@ from wily import format_date, format_revision, logger
+ from wily.archivers import resolve_archiver
+ from wily.commands.build import run_operator
+ from wily.config import DEFAULT_PATH
+-from wily.helper import get_style
++from wily.helper import get_maxcolwidth, get_style
+ from wily.operators import (
+     BAD_COLORS,
+     GOOD_COLORS,
+@@ -27,7 +27,9 @@ from wily.operators import (
+ from wily.state import State
+ 
+ 
+-def diff(config, files, metrics, changes_only=True, detail=True, revision=None):
++def diff(
++    config, files, metrics, changes_only=True, detail=True, revision=None, wrap=False
++):
+     """
+     Show the differences in metrics for each of the files.
+ 
+@@ -161,8 +163,15 @@ def diff(config, files, metrics, changes_only=True, detail=True, revision=None):
+     descriptions = [metric.description for operator, metric in metrics]
+     headers = ("File", *descriptions)
+     if len(results) > 0:
++        maxcolwidth = get_maxcolwidth(headers, wrap)
+         style = get_style()
+         print(
+             # But it still makes more sense to show the newest at the top, so reverse again
+-            tabulate.tabulate(headers=headers, tabular_data=results, tablefmt=style)
++            tabulate.tabulate(
++                headers=headers,
++                tabular_data=results,
++                tablefmt=style,
++                maxcolwidths=maxcolwidth,
++                maxheadercolwidths=maxcolwidth,
++            )
+         )
+diff --git a/src/wily/commands/index.py b/src/wily/commands/index.py
+index e7f1a55..d8bebc9 100644
+--- a/src/wily/commands/index.py
++++ b/src/wily/commands/index.py
+@@ -6,11 +6,11 @@ Print information about the wily cache and what is in the index.
+ import tabulate
+ 
+ from wily import MAX_MESSAGE_WIDTH, format_date, format_revision, logger
+-from wily.helper import get_style
++from wily.helper import get_maxcolwidth, get_style
+ from wily.state import State
+ 
+ 
+-def index(config, include_message=False):
++def index(config, include_message=False, wrap=False):
+     """
+     Show information about the cache and runtime.
+ 
+@@ -54,6 +54,14 @@ def index(config, include_message=False):
+         headers = ("Revision", "Author", "Message", "Date")
+     else:
+         headers = ("Revision", "Author", "Date")
+-
++    maxcolwidth = get_maxcolwidth(headers, wrap)
+     style = get_style()
+-    print(tabulate.tabulate(headers=headers, tabular_data=data, tablefmt=style))
++    print(
++        tabulate.tabulate(
++            headers=headers,
++            tabular_data=data,
++            tablefmt=style,
++            maxcolwidths=maxcolwidth,
++            maxheadercolwidths=maxcolwidth,
++        )
++    )
+diff --git a/src/wily/commands/list_metrics.py b/src/wily/commands/list_metrics.py
+index d9b81d1..572b0ee 100644
+--- a/src/wily/commands/list_metrics.py
++++ b/src/wily/commands/list_metrics.py
+@@ -5,20 +5,24 @@ TODO : Only show metrics for the operators that the cache has?
+ """
+ import tabulate
+ 
+-from wily.helper import get_style
++from wily.helper import get_maxcolwidth, get_style
+ from wily.operators import ALL_OPERATORS
+ 
+ 
+-def list_metrics():
++def list_metrics(wrap):
+     """List metrics available."""
++    headers = ("Name", "Description", "Type", "Measure", "Aggregate")
++    maxcolwidth = get_maxcolwidth(headers, wrap)
+     style = get_style()
+     for name, operator in ALL_OPERATORS.items():
+         print(f"{name} operator:")
+         if len(operator.cls.metrics) > 0:
+             print(
+                 tabulate.tabulate(
+-                    headers=("Name", "Description", "Type"),
++                    headers=headers,
+                     tabular_data=operator.cls.metrics,
+                     tablefmt=style,
++                    maxcolwidths=maxcolwidth,
++                    maxheadercolwidths=maxcolwidth,
+                 )
+             )
+diff --git a/src/wily/commands/rank.py b/src/wily/commands/rank.py
+index 29c63cf..8f11710 100644
+--- a/src/wily/commands/rank.py
++++ b/src/wily/commands/rank.py
+@@ -18,12 +18,12 @@ import tabulate
+ from wily import format_date, format_revision, logger
+ from wily.archivers import resolve_archiver
+ from wily.config import DEFAULT_PATH
+-from wily.helper import get_style
++from wily.helper import get_maxcolwidth, get_style
+ from wily.operators import resolve_metric_as_tuple
+ from wily.state import State
+ 
+ 
+-def rank(config, path, metric, revision_index, limit, threshold, descending):
++def rank(config, path, metric, revision_index, limit, threshold, descending, wrap):
+     """
+     Rank command ordering files, methods or functions using metrics.
+ 
+@@ -121,8 +121,17 @@ def rank(config, path, metric, revision_index, limit, threshold, descending):
+     data.append(["Total", total])
+ 
+     headers = ("File", metric.description)
++    maxcolwidth = get_maxcolwidth(headers, wrap)
+     style = get_style()
+-    print(tabulate.tabulate(headers=headers, tabular_data=data, tablefmt=style))
++    print(
++        tabulate.tabulate(
++            headers=headers,
++            tabular_data=data,
++            tablefmt=style,
++            maxcolwidths=maxcolwidth,
++            maxheadercolwidths=maxcolwidth,
++        )
++    )
+ 
+     if threshold and total < threshold:
+         logger.error(
+diff --git a/src/wily/commands/report.py b/src/wily/commands/report.py
+index 2dd0bfa..50a99ea 100644
+--- a/src/wily/commands/report.py
++++ b/src/wily/commands/report.py
+@@ -11,6 +11,7 @@ from string import Template
+ import tabulate
+ 
+ from wily import MAX_MESSAGE_WIDTH, format_date, format_revision, logger
++from wily.helper import get_maxcolwidth
+ from wily.helper.custom_enums import ReportFormat
+ from wily.lang import _
+ from wily.operators import MetricType, resolve_metric_as_tuple
+@@ -31,6 +32,7 @@ def report(
+     format=ReportFormat.CONSOLE,
+     console_format=None,
+     changes_only=False,
++    wrap=False,
+ ):
+     """
+     Show metrics for a given file.
+@@ -211,8 +213,13 @@ def report(
+ 
+         logger.info(f"wily report was saved to {report_path}")
+     else:
++        maxcolwidth = get_maxcolwidth(headers, wrap)
+         print(
+             tabulate.tabulate(
+-                headers=headers, tabular_data=data[::-1], tablefmt=console_format
++                headers=headers,
++                tabular_data=data[::-1],
++                tablefmt=console_format,
++                maxcolwidths=maxcolwidth,
++                maxheadercolwidths=maxcolwidth,
+             )
+         )
+diff --git a/src/wily/helper/__init__.py b/src/wily/helper/__init__.py
+index 7c52235..d8c8347 100644
+--- a/src/wily/helper/__init__.py
++++ b/src/wily/helper/__init__.py
+@@ -1,9 +1,26 @@
+ """Helper package for wily."""
++import shutil
+ import sys
+ 
+ from wily.config import DEFAULT_GRID_STYLE
+ 
+ 
++def get_maxcolwidth(headers, wrap=True):
++    """Calculate the maximum column width for a given terminal width."""
++    if not wrap:
++        return
++    width = shutil.get_terminal_size()[0]
++    columns = len(headers)
++    if width < 80:
++        padding = columns + 2
++    elif width < 120:
++        padding = columns - 2
++    else:
++        padding = columns - 4
++    maxcolwidth = (width // columns) - padding
++    return max(maxcolwidth, 1)
++
++
+ def get_style(style=DEFAULT_GRID_STYLE):
+     """Select the tablefmt style for tabulate according to what sys.stdout can handle."""
+     if style == DEFAULT_GRID_STYLE:

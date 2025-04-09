@@ -1,0 +1,125 @@
+diff --git a/aiosmtpd/lmtp.py b/aiosmtpd/lmtp.py
+index 8d763fd..5a7ba40 100644
+--- a/aiosmtpd/lmtp.py
++++ b/aiosmtpd/lmtp.py
+@@ -9,7 +9,7 @@ class LMTP(SMTP):
+     @syntax('LHLO hostname')
+     async def smtp_LHLO(self, arg):
+         """The LMTP greeting, used instead of HELO/EHLO."""
+-        await super().smtp_HELO(arg)
++        await super().smtp_EHLO(arg)
+ 
+     async def smtp_HELO(self, arg):
+         """HELO is not a valid LMTP command."""
+diff --git a/aiosmtpd/smtp.py b/aiosmtpd/smtp.py
+index 1564d9b..5447640 100644
+--- a/aiosmtpd/smtp.py
++++ b/aiosmtpd/smtp.py
+@@ -59,7 +59,7 @@ __all__ = [
+     "AuthMechanismType",
+     "MISSING",
+ ]  # Will be added to by @public
+-__version__ = '1.2.3a4'
++__version__ = '1.2.3a5'
+ __ident__ = 'Python SMTP {}'.format(__version__)
+ log = logging.getLogger('mail.log')
+ 
+@@ -71,6 +71,9 @@ MISSING = _Missing()
+ NEWLINE = '\n'
+ VALID_AUTHMECH = re.compile(r"[A-Z0-9_-]+\Z")
+ 
++# https://tools.ietf.org/html/rfc3207.html#page-3
++ALLOWED_BEFORE_STARTTLS = {"NOOP", "EHLO", "STARTTLS", "QUIT"}
++
+ # endregion
+ 
+ 
+@@ -447,7 +450,7 @@ class SMTP(asyncio.StreamReaderProtocol):
+                     continue
+                 if (self.require_starttls
+                         and not self._tls_protocol
+-                        and command not in ['EHLO', 'STARTTLS', 'QUIT']):
++                        and command not in ALLOWED_BEFORE_STARTTLS):
+                     # RFC3207 part 4
+                     await self.push('530 Must issue a STARTTLS command first')
+                     continue
+diff --git a/housekeep.py b/housekeep.py
+index f1e6acf..cf35a3f 100644
+--- a/housekeep.py
++++ b/housekeep.py
+@@ -31,6 +31,8 @@ except ImportError:
+ TOX_ENV_NAME = os.environ.get("TOX_ENV_NAME", None)
+ 
+ WORKDIRS = (
++    ".mypy_cache",
++    ".pytype",
+     ".pytest-cache",
+     ".pytest_cache",
+     ".tox",
+@@ -41,6 +43,14 @@ WORKDIRS = (
+     "prof",
+ )
+ 
++WORKFILES = (
++    ".coverage",
++    "coverage.xml",
++    "diffcov.html",
++    "coverage-*.xml",
++    "diffcov-*.html",
++)
++
+ 
+ # region #### Helper funcs ############################################################
+ 
+@@ -79,11 +89,13 @@ def dump_env():
+ def move_prof():
+     """Move profiling files to per-testenv dirs"""
+     profpath = Path("prof")
++    # fmt: off
+     prof_files = [
+-        f
+-        for p in ("*.prof", "*.svg")
+-        for f in profpath.glob(p)
++        filepath
++        for fileglob in ("*.prof", "*.svg")
++        for filepath in profpath.glob(fileglob)
+     ]
++    # fmt: on
+     if not prof_files:
+         return
+     targpath = profpath / TOX_ENV_NAME
+@@ -119,17 +131,10 @@ def rm_work():
+         deldir(Path(dd))
+         print(" ", end="", flush=True)
+     print(f"\n{Style.BRIGHT}Removing work files ...", end="")
+-    for fn in (".coverage", "coverage.xml", "diffcov.html"):
+-        print(".", end="", flush=True)
+-        fp = Path(fn)
+-        if fp.exists():
+-            fp.unlink()
+-    for fp in Path(".").glob("coverage-*.xml"):
+-        print(".", end="", flush=True)
+-        fp.unlink()
+-    for fp in Path(".").glob("diffcov-*.html"):
+-        print(".", end="", flush=True)
+-        fp.unlink()
++    for fnglob in WORKFILES:
++        for fp in Path(".").glob(fnglob):
++            print(".", end="", flush=True)
++            fp.exists() and fp.unlink()
+     print()
+ 
+ 
+@@ -197,10 +202,11 @@ def get_opts(argv):
+     parser.add_argument(
+         "--force", "-F", action="store_true", help="Force action even if in CI"
+     )
++
++    # From: https://stackoverflow.com/a/49999185/149900
+     parser.add_argument(
+         "cmd", metavar="COMMAND", choices=sorted(dispers.keys()), help="(See below)"
+     )
+-
+     cgrp = parser.add_argument_group(title="COMMAND is one of")
+     for name, doc in sorted(dispers.items()):
+         cgrp.add_argument(name, help=doc, action="no_action")

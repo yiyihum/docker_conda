@@ -1,0 +1,174 @@
+diff --git a/src/syrupy/assertion.py b/src/syrupy/assertion.py
+index 35c301d..328afb4 100644
+--- a/src/syrupy/assertion.py
++++ b/src/syrupy/assertion.py
+@@ -45,6 +45,7 @@ class AssertionResult:
+     updated: bool
+     success: bool
+     exception: Optional[Exception]
++    test_location: "PyTestLocation"
+ 
+     @property
+     def final_data(self) -> Optional["SerializedData"]:
+@@ -303,14 +304,15 @@ class SnapshotAssertion:
+             snapshot_updated = matches is False and assertion_success
+             self._execution_name_index[self.index] = self._executions
+             self._execution_results[self._executions] = AssertionResult(
++                asserted_data=serialized_data,
++                created=snapshot_created,
++                exception=assertion_exception,
++                recalled_data=snapshot_data,
+                 snapshot_location=snapshot_location,
+                 snapshot_name=snapshot_name,
+-                recalled_data=snapshot_data,
+-                asserted_data=serialized_data,
+                 success=assertion_success,
+-                created=snapshot_created,
++                test_location=self.test_location,
+                 updated=snapshot_updated,
+-                exception=assertion_exception,
+             )
+             self._executions += 1
+             self._post_assert()
+diff --git a/src/syrupy/location.py b/src/syrupy/location.py
+index 3d8fe2d..0f955bb 100644
+--- a/src/syrupy/location.py
++++ b/src/syrupy/location.py
+@@ -15,7 +15,7 @@ from syrupy.constants import PYTEST_NODE_SEP
+ 
+ @dataclass
+ class PyTestLocation:
+-    _node: "pytest.Item"
++    item: "pytest.Item"
+     nodename: Optional[str] = field(init=False)
+     testname: str = field(init=False)
+     methodname: str = field(init=False)
+@@ -28,16 +28,16 @@ class PyTestLocation:
+         self.__attrs_post_init_def__()
+ 
+     def __attrs_post_init_def__(self) -> None:
+-        node_path: Path = getattr(self._node, "path")  # noqa: B009
++        node_path: Path = getattr(self.item, "path")  # noqa: B009
+         self.filepath = str(node_path.absolute())
+-        obj = getattr(self._node, "obj")  # noqa: B009
++        obj = getattr(self.item, "obj")  # noqa: B009
+         self.modulename = obj.__module__
+         self.methodname = obj.__name__
+-        self.nodename = getattr(self._node, "name", None)
++        self.nodename = getattr(self.item, "name", None)
+         self.testname = self.nodename or self.methodname
+ 
+     def __attrs_post_init_doc__(self) -> None:
+-        doctest = getattr(self._node, "dtest")  # noqa: B009
++        doctest = getattr(self.item, "dtest")  # noqa: B009
+         self.filepath = doctest.filename
+         test_relfile, test_node = self.nodeid.split(PYTEST_NODE_SEP)
+         test_relpath = Path(test_relfile)
+@@ -64,7 +64,7 @@ class PyTestLocation:
+         :raises: `AttributeError` if node has no node id
+         :return: test node id
+         """
+-        return str(getattr(self._node, "nodeid"))  # noqa: B009
++        return str(getattr(self.item, "nodeid"))  # noqa: B009
+ 
+     @property
+     def basename(self) -> str:
+@@ -78,7 +78,7 @@ class PyTestLocation:
+ 
+     @property
+     def is_doctest(self) -> bool:
+-        return self.__is_doctest(self._node)
++        return self.__is_doctest(self.item)
+ 
+     def __is_doctest(self, node: "pytest.Item") -> bool:
+         return hasattr(node, "dtest")
+diff --git a/src/syrupy/report.py b/src/syrupy/report.py
+index 4088be4..5eaa4b6 100644
+--- a/src/syrupy/report.py
++++ b/src/syrupy/report.py
+@@ -22,6 +22,8 @@ from typing import (
+     Set,
+ )
+ 
++from _pytest.skipping import xfailed_key
++
+ from .constants import PYTEST_NODE_SEP
+ from .data import (
+     Snapshot,
+@@ -70,6 +72,7 @@ class SnapshotReport:
+     used: "SnapshotCollections" = field(default_factory=SnapshotCollections)
+     _provided_test_paths: Dict[str, List[str]] = field(default_factory=dict)
+     _keyword_expressions: Set["Expression"] = field(default_factory=set)
++    _num_xfails: int = field(default=0)
+ 
+     @property
+     def update_snapshots(self) -> bool:
+@@ -89,6 +92,14 @@ class SnapshotReport:
+             getattr(item, "nodeid"): item for item in self.collected_items  # noqa: B009
+         }
+ 
++    def _has_xfail(self, item: "pytest.Item") -> bool:
++        # xfailed_key is 'private'. I'm open to a better way to do this:
++        if xfailed_key in item.stash:
++            result = item.stash[xfailed_key]
++            if result:
++                return result.run
++        return False
++
+     def __post_init__(self) -> None:
+         self.__parse_invocation_args()
+ 
+@@ -113,6 +124,7 @@ class SnapshotReport:
+                     Snapshot(name=result.snapshot_name, data=result.final_data)
+                 )
+                 self.used.update(snapshot_collection)
++
+                 if result.created:
+                     self.created.update(snapshot_collection)
+                 elif result.updated:
+@@ -120,6 +132,9 @@ class SnapshotReport:
+                 elif result.success:
+                     self.matched.update(snapshot_collection)
+                 else:
++                    has_xfail = self._has_xfail(item=result.test_location.item)
++                    if has_xfail:
++                        self._num_xfails += 1
+                     self.failed.update(snapshot_collection)
+ 
+     def __parse_invocation_args(self) -> None:
+@@ -161,7 +176,7 @@ class SnapshotReport:
+     def num_created(self) -> int:
+         return self._count_snapshots(self.created)
+ 
+-    @property
++    @cached_property
+     def num_failed(self) -> int:
+         return self._count_snapshots(self.failed)
+ 
+@@ -256,14 +271,22 @@ class SnapshotReport:
+         ```
+         """
+         summary_lines: List[str] = []
+-        if self.num_failed:
++        if self.num_failed and self._num_xfails < self.num_failed:
+             summary_lines.append(
+                 ngettext(
+                     "{} snapshot failed.",
+                     "{} snapshots failed.",
+-                    self.num_failed,
+-                ).format(error_style(self.num_failed))
++                    self.num_failed - self._num_xfails,
++                ).format(error_style(self.num_failed - self._num_xfails)),
+             )
++            if self._num_xfails:
++                summary_lines.append(
++                    ngettext(
++                        "{} snapshot xfailed.",
++                        "{} snapshots xfailed.",
++                        self._num_xfails,
++                    ).format(warning_style(self._num_xfails)),
++                )
+         if self.num_matched:
+             summary_lines.append(
+                 ngettext(
+

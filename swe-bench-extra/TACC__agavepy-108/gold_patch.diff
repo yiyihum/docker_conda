@@ -1,0 +1,143 @@
+diff --git a/agavepy/agave.py b/agavepy/agave.py
+index 2d73cf2..26d0b79 100644
+--- a/agavepy/agave.py
++++ b/agavepy/agave.py
+@@ -25,8 +25,8 @@ from agavepy.clients import (clients_create, clients_delete, clients_list,
+ from agavepy.tokens import token_create, refresh_token
+ from agavepy.utils import load_config, save_config
+ from agavepy.files import (files_copy, files_delete, files_download, 
+-    files_list, files_mkdir, files_move, files_pems_delete, files_pems_list, 
+-    files_pems_update, files_upload)
++    files_history, files_list, files_mkdir, files_move, files_pems_delete, 
++    files_pems_list, files_pems_update, files_upload)
+ 
+ 
+ import sys
+@@ -513,7 +513,7 @@ class Agave(object):
+         return list(set(base))
+ 
+ 
+-    def init(self, tenantsurl="https://agaveapi.co/tenants"):
++    def init(self, tenantsurl="https://api.tacc.utexas.edu/tenants"):
+         """ Initilize a session
+ 
+         Initialize a session by setting parameters refering to the tenant you
+@@ -619,7 +619,7 @@ class Agave(object):
+         self.expires_at    = session_context["expires_at"]
+ 
+ 
+-    def list_tenants(self, tenantsurl="https://agaveapi.co/tenants"):
++    def list_tenants(self, tenantsurl="https://api.tacc.utexas.edu/tenants"):
+         """ List Agave tenants
+ 
+         PARAMETERS
+@@ -816,6 +816,16 @@ class Agave(object):
+         files_download(self.api_server, self.token, source, destination)
+ 
+ 
++    def files_history(self, path):
++        """ List the history of events for a specific file/folder
++        """
++        # Check if tokens need to be refreshed.
++        self.refresh_tokens()
++
++        # List events for path.
++        files_history(self.api_server, self.token, path)
++
++
+     def files_list(self, system_path, long_format=False):
+         """ List files on remote system
+         """
+diff --git a/agavepy/files/__init__.py b/agavepy/files/__init__.py
+index 1daf53e..5aedd4e 100644
+--- a/agavepy/files/__init__.py
++++ b/agavepy/files/__init__.py
+@@ -1,6 +1,7 @@
+ from .copy import files_copy
+ from .delete import files_delete
+ from .download import files_download
++from .history import files_history
+ from .list import files_list
+ from .mkdir import files_mkdir
+ from .move import files_move
+diff --git a/agavepy/files/history.py b/agavepy/files/history.py
+new file mode 100644
+index 0000000..0a5fe12
+--- /dev/null
++++ b/agavepy/files/history.py
+@@ -0,0 +1,37 @@
++"""
++    history.py
++"""
++import requests
++from .exceptions import AgaveFilesError
++from ..utils import handle_bad_response_status_code
++
++
++def files_history(tenant_url, access_token, path):
++    """ List the history of events for a specific file/folder
++    """
++    # Set request url.
++    endpoint = "{0}/{1}/{2}".format(tenant_url, "files/v2/history/system", path)
++
++    # Obtain file path. "path" should include the system name at the begining,
++    # so we get rid of it.
++    destination = '/'.join( path.split('/')[1:] )
++
++    # Make request.
++    try:
++        headers  = {"Authorization":"Bearer {0}".format(access_token)}
++        params   = {"pretty": "true"}
++        resp = requests.get(endpoint, headers=headers, params=params)
++    except Exception as err:
++        raise AgaveFilesError(err)
++
++    # Handle bad status code.
++    handle_bad_response_status_code(resp)
++
++    print("{0:<13} {1:<20} {2:<32} {3:<}".format("USER", "EVENT", "DATE", "DESCRIPTION"))
++    for msg in resp.json()["result"]:
++        user        = msg["createdBy"]
++        event       = msg["status"]
++        date        = msg["created"]
++        description = msg["description"]
++
++        print("{0:<13} {1:<20} {2:<32} {3:<}".format(user, event, date, description))
+diff --git a/agavepy/tenants/tenants.py b/agavepy/tenants/tenants.py
+index 77dde1a..196e20d 100644
+--- a/agavepy/tenants/tenants.py
++++ b/agavepy/tenants/tenants.py
+@@ -38,7 +38,7 @@ def get_tenants(url):
+     return resp.json()
+ 
+ 
+-def tenant_list(tenantsurl="https://agaveapi.co/tenants"):
++def tenant_list(tenantsurl="https://api.tacc.utexas.edu/tenants"):
+     """ List Agave tenants
+ 
+     List all Agave tenants for a given Agave host. Information listed is the
+diff --git a/docs/docsite/files/admin.rst b/docs/docsite/files/admin.rst
+index d120f34..81f4fab 100644
+--- a/docs/docsite/files/admin.rst
++++ b/docs/docsite/files/admin.rst
+@@ -34,3 +34,20 @@ of the specified directory (hence the ``recursive=True`` option).
+ Valid values for setting permission are ``READ``, ``WRITE``, ``EXECUTE``, 
+ ``READ_WRITE``, ``READ_EXECUTE``, ``WRITE_EXECUTE``, ``ALL``, and ``NONE``.
+ This same action can be performed recursively on directories using ``recursive=True``.
++
++
++File or Directory History
++#########################
++You can list the history of events for a specific file or folder. 
++This will give more descriptive information (when applicable) related to number
++of retries, permission grants and revocations, reasons for failure, and hiccups
++that may have occurred in a recent process.
++
++.. code-block:: pycon
++
++    >>> ag.files_history("system-id/path/to/dir")
++    USER          EVENT                DATE                             DESCRIPTION
++    username      CREATED              2018-11-02T10:08:54.000-05:00    New directory created at https://api.sd2e.org/files/v2/media/system/system-id//path/to/dir
++    username      PERMISSION_REVOKE    2018-11-30T11:22:01.000-06:00    All permissions revoked
++    username      PERMISSION_GRANT     2018-12-03T10:11:07.000-06:00    OWNER permission granted to collaborator
++

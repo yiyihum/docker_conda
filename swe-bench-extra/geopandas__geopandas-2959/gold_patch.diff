@@ -1,0 +1,62 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8bf10b9..14041df 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,9 +16,12 @@ New features and improvements:
+ - Added ``exclusive`` parameter to ``sjoin_nearest`` method for Shapely >= 2.0 (#2877)
+ 
+ Bug fixes:
++- Fix ambiguous error when GeoDataFrame is initialised with a column called "crs" (#2944)
+ 
+ - Fix a color assignment in ``explore`` when using ``UserDefined`` bins (#2923)
+ - ``assert_geodataframe_equal`` now handles GeoDataFrames with no active geometry (#2498)
++- Fix bug in `apply` with `axis=1` where the given user defined function returns nested 
++  data in the geometry column (#2959)
+ 
+ ## Version 0.13.2 (Jun 6, 2023)
+ 
+diff --git a/geopandas/geodataframe.py b/geopandas/geodataframe.py
+index ed4a360..41991a7 100644
+--- a/geopandas/geodataframe.py
++++ b/geopandas/geodataframe.py
+@@ -3,6 +3,7 @@ import warnings
+ 
+ import numpy as np
+ import pandas as pd
++import shapely.errors
+ from pandas import DataFrame, Series
+ from pandas.core.accessor import CachedAccessor
+ 
+@@ -19,6 +20,11 @@ from geopandas.explore import _explore
+ from . import _compat as compat
+ from ._decorator import doc
+ 
++if compat.SHAPELY_GE_18:
++    geometry_type_error = shapely.errors.GeometryTypeError
++else:
++    geometry_type_error = ValueError
++
+ 
+ def _geodataframe_constructor_with_fallback(*args, **kwargs):
+     """
+@@ -1529,7 +1535,10 @@ individually so that features may have different properties
+             if pd.api.types.is_scalar(value) or isinstance(value, BaseGeometry):
+                 value = [value] * self.shape[0]
+             try:
+-                crs = getattr(self, "crs", None)
++                if self._geometry_column_name is not None:
++                    crs = getattr(self, "crs", None)
++                else:  # don't use getattr, because a col "crs" might exist
++                    crs = None
+                 value = _ensure_geometry(value, crs=crs)
+                 if key == "geometry":
+                     self._persist_old_default_geometry_colname()
+@@ -1613,7 +1622,7 @@ individually so that features may have different properties
+                     # not enough info about func to preserve CRS
+                     result = _ensure_geometry(result)
+ 
+-                except TypeError:
++                except (TypeError, geometry_type_error):
+                     pass
+ 
+         return result

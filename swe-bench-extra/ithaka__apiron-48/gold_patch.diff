@@ -1,0 +1,204 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8772bb3..4e5503e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## [Unreleased]
++### Added
++- Ability to use regular keyword arguments when calling an endpoint (instead of `path_kwargs`)
++
+ ## [2.4.0] - 2019-04-09
+ ### Changed
+ - Simplify imports so that all commonly-used classes can be imported with `from apiron import <class>`
+diff --git a/README.md b/README.md
+index 7cc25aa..6af0476 100644
+--- a/README.md
++++ b/README.md
+@@ -40,13 +40,11 @@ class GitHub(Service):
+ Once your service definition is in place, you can interact with its endpoints:
+ 
+ ```python
+-response = GitHub.user(
+-    path_kwargs={'username': 'defunkt'},
+-)  # {"name": "Chris Wanstrath", ...}
++response = GitHub.user(username='defunkt')
++# {"name": "Chris Wanstrath", ...}
+ 
+-response = GitHub.repo(
+-    path_kwargs={'org': 'github', 'repo': 'hub'},
+-)  # {"description": "hub helps you win at git.", ...}
++response = GitHub.repo(org='github', repo='hub')
++# {"description": "hub helps you win at git.", ...}
+ ```
+ 
+ To learn more about building clients, head over to [the docs](https://apiron.readthedocs.io).
+diff --git a/apiron/client.py b/apiron/client.py
+index 8070302..333e30b 100644
+--- a/apiron/client.py
++++ b/apiron/client.py
+@@ -1,6 +1,7 @@
+ import collections
+ import logging
+ import random
++import warnings
+ from urllib import parse
+ 
+ import requests
+@@ -108,10 +109,20 @@ class ServiceCaller:
+         headers=None,
+         cookies=None,
+         auth=None,
++        **kwargs
+     ):
+         host = cls.choose_host(service=service)
+ 
++        if path_kwargs:
++            warnings.warn(
++                'path_kwargs is no longer necessary and will be removed in a future version of apiron. '
++                'You can call endpoints using plain keyword arguments instead!',
++                RuntimeWarning,
++                stacklevel=4
++            )
++
+         path_kwargs = path_kwargs or {}
++        path_kwargs.update(**kwargs)
+         path = endpoint.get_formatted_path(**path_kwargs)
+ 
+         merged_params = endpoint.get_merged_params(params)
+@@ -148,6 +159,7 @@ class ServiceCaller:
+         retry_spec=DEFAULT_RETRY,
+         timeout_spec=DEFAULT_TIMEOUT,
+         logger=None,
++        **kwargs
+     ):
+         """
+         :param Service service:
+@@ -240,6 +252,7 @@ class ServiceCaller:
+             headers=headers,
+             cookies=cookies,
+             auth=auth,
++            **kwargs
+         )
+ 
+         logger.info('{method} {url}'.format(
+diff --git a/apiron/endpoint/endpoint.py b/apiron/endpoint/endpoint.py
+index 9dc84be..26c4df6 100644
+--- a/apiron/endpoint/endpoint.py
++++ b/apiron/endpoint/endpoint.py
+@@ -1,4 +1,5 @@
+ import logging
++import string
+ import warnings
+ 
+ from apiron.exceptions import UnfulfilledParameterException
+@@ -85,8 +86,38 @@ class Endpoint:
+         :rtype:
+             str
+         """
++        self._validate_path_placeholders(self.path_placeholders, kwargs)
++
+         return self.path.format(**kwargs)
+ 
++    @property
++    def path_placeholders(self):
++        """
++        The formattable placeholders from this endpoint's path, in the order they appear.
++
++        Example:
++
++            >>> endpoint = Endpoint(path='/api/{foo}/{bar}')
++            >>> endpoint.path_placeholders
++            ['foo', 'bar']
++        """
++
++        parser = string.Formatter()
++        return [
++            placeholder_name
++            for _, placeholder_name, _, _ in parser.parse(self.path)
++            if placeholder_name
++        ]
++
++    def _validate_path_placeholders(self, placeholder_names, path_kwargs):
++        if any(path_kwarg not in placeholder_names for path_kwarg in path_kwargs):
++            warnings.warn(
++                'An unknown path kwarg was supplied to {}. '
++                'kwargs supplied: {}'.format(self, path_kwargs),
++                RuntimeWarning,
++                stacklevel=6,
++            )
++
+     def get_merged_params(self, supplied_params=None):
+         """
+         Merge this endpoint's default parameters with the supplied parameters
+@@ -116,7 +147,7 @@ class Endpoint:
+                     empty_params=empty_params,
+                 ),
+                 RuntimeWarning,
+-                stacklevel=4,
++                stacklevel=5,
+             )
+ 
+         unfulfilled_params = {
+diff --git a/dev-requirements.txt b/dev-requirements.txt
+index 819389c..b119b39 100644
+--- a/dev-requirements.txt
++++ b/dev-requirements.txt
+@@ -1,5 +1,6 @@
+ -r requirements.txt
+ 
++pytest==4.2.0
+ pytest-cov==2.6.1
+ sphinx==1.7.6
+ sphinx-autobuild==0.7.1
+diff --git a/docs/advanced-usage.rst b/docs/advanced-usage.rst
+index d56ff28..ac7d2c7 100644
+--- a/docs/advanced-usage.rst
++++ b/docs/advanced-usage.rst
+@@ -46,11 +46,11 @@ Using all the features
+     HttpBin.poster(data={'foo': 'bar'})
+ 
+     # A GET call with parameters formatted into the path
+-    HttpBin.anything(path_kwargs={'anything': 42})
++    HttpBin.anything(anything=42)
+ 
+     # A GET call with a 500 response, raises RetryError since we successfully tried but got a bad response
+     try:
+-        HttpBin.status(path_kwargs={'status_code': 500})
++        HttpBin.status(status_code=500)
+     except requests.exceptions.RetryError:
+         pass
+ 
+@@ -66,7 +66,7 @@ Using all the features
+     )
+ 
+     # A streaming response
+-    response = HttpBin.streamer(path_kwargs={'num_lines': 20})
++    response = HttpBin.streamer(num_lines=20)
+     for chunk in response:
+         print(chunk)
+ 
+diff --git a/docs/getting-started.rst b/docs/getting-started.rst
+index 2b0c9f1..db185d2 100644
+--- a/docs/getting-started.rst
++++ b/docs/getting-started.rst
+@@ -38,13 +38,11 @@ using the :class:`ServiceCaller <apiron.client.ServiceCaller>`:
+ 
+ .. code-block:: python
+ 
+-    response = GitHub.user(
+-        path_kwargs={'username': 'defunkt'},
+-    )  # {"name": "Chris Wanstrath", ...}
++    response = GitHub.user(username='defunkt')
++    # {"name": "Chris Wanstrath", ...}
+ 
+-    response = GitHub.repo(
+-        path_kwargs={'org': 'github', 'repo': 'hub'},
+-    )  # {"description": "hub helps you win at git.", ...}
++    response = GitHub.repo(org='github', repo='hub')
++    # {"description": "hub helps you win at git.", ...}
+ 
+ 
+ **********

@@ -1,0 +1,76 @@
+diff --git a/tests/dialects/test_postgres.py b/tests/dialects/test_postgres.py
+index 5a55a7d6..1ed7d82f 100644
+--- a/tests/dialects/test_postgres.py
++++ b/tests/dialects/test_postgres.py
+@@ -314,6 +314,12 @@ class TestPostgres(Validator):
+         )
+         self.validate_identity("SELECT * FROM t1*", "SELECT * FROM t1")
+ 
++        self.validate_all(
++            "CREATE TABLE t (c INT)",
++            read={
++                "mysql": "CREATE TABLE t (c INT COMMENT 'comment')",
++            },
++        )
+         self.validate_all(
+             'SELECT * FROM "test_table" ORDER BY RANDOM() LIMIT 5',
+             write={
+diff --git a/tests/test_lineage.py b/tests/test_lineage.py
+index c782d9ae..cbadf7bb 100644
+--- a/tests/test_lineage.py
++++ b/tests/test_lineage.py
+@@ -224,16 +224,50 @@ class TestLineage(unittest.TestCase):
+             downstream.source.sql(dialect="snowflake"),
+             "LATERAL FLATTEN(INPUT => TEST_TABLE.RESULT, OUTER => TRUE) AS FLATTENED(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+         )
+-        self.assertEqual(
+-            downstream.expression.sql(dialect="snowflake"),
+-            "VALUE",
+-        )
++        self.assertEqual(downstream.expression.sql(dialect="snowflake"), "VALUE")
+         self.assertEqual(len(downstream.downstream), 1)
+ 
+         downstream = downstream.downstream[0]
+         self.assertEqual(downstream.name, "TEST_TABLE.RESULT")
+         self.assertEqual(downstream.source.sql(dialect="snowflake"), "TEST_TABLE AS TEST_TABLE")
+ 
++        node = lineage(
++            "FIELD",
++            "SELECT FLATTENED.VALUE:field::text AS FIELD FROM SNOWFLAKE.SCHEMA.MODEL AS MODEL_ALIAS, LATERAL FLATTEN(INPUT => MODEL_ALIAS.A) AS FLATTENED",
++            schema={"SNOWFLAKE": {"SCHEMA": {"TABLE": {"A": "integer"}}}},
++            sources={"SNOWFLAKE.SCHEMA.MODEL": "SELECT A FROM SNOWFLAKE.SCHEMA.TABLE"},
++            dialect="snowflake",
++        )
++        self.assertEqual(node.name, "FIELD")
++
++        downstream = node.downstream[0]
++        self.assertEqual(downstream.name, "FLATTENED.VALUE")
++        self.assertEqual(
++            downstream.source.sql(dialect="snowflake"),
++            "LATERAL FLATTEN(INPUT => MODEL_ALIAS.A) AS FLATTENED(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
++        )
++        self.assertEqual(downstream.expression.sql(dialect="snowflake"), "VALUE")
++        self.assertEqual(len(downstream.downstream), 1)
++
++        downstream = downstream.downstream[0]
++        self.assertEqual(downstream.name, "MODEL_ALIAS.A")
++        self.assertEqual(downstream.source_name, "SNOWFLAKE.SCHEMA.MODEL")
++        self.assertEqual(
++            downstream.source.sql(dialect="snowflake"),
++            "SELECT TABLE.A AS A FROM SNOWFLAKE.SCHEMA.TABLE AS TABLE",
++        )
++        self.assertEqual(downstream.expression.sql(dialect="snowflake"), "TABLE.A AS A")
++        self.assertEqual(len(downstream.downstream), 1)
++
++        downstream = downstream.downstream[0]
++        self.assertEqual(downstream.name, "TABLE.A")
++        self.assertEqual(
++            downstream.source.sql(dialect="snowflake"), "SNOWFLAKE.SCHEMA.TABLE AS TABLE"
++        )
++        self.assertEqual(
++            downstream.expression.sql(dialect="snowflake"), "SNOWFLAKE.SCHEMA.TABLE AS TABLE"
++        )
++
+     def test_subquery(self) -> None:
+         node = lineage(
+             "output",

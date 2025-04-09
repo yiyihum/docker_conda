@@ -1,0 +1,177 @@
+diff --git a/.azure_pipeline.yml b/.azure_pipeline.yml
+index 47178e4..1e2648c 100644
+--- a/.azure_pipeline.yml
++++ b/.azure_pipeline.yml
+@@ -2,7 +2,7 @@ jobs:
+ - job: linting
+   displayName: Linting
+   pool:
+-    vmImage: ubuntu-20.04
++    vmImage: ubuntu-latest
+   steps:
+     - task: UsePythonVersion@0
+       inputs:
+@@ -19,46 +19,46 @@ jobs:
+   strategy:
+     matrix:
+ 
+-      windows-py310:
++      windows-py311:
+         imageName: windows-latest
+-        python.version: "3.10"
+-        tox.env: py310
+-      windows-py37:
++        python.version: "3.11"
++        tox.env: py311
++      windows-py38:
+         imageName: windows-latest
+         python.version: "3.8"
+         tox.env: py38
+ 
+-      macos-py310:
++      macos-py311:
+         imageName: "macos-latest"
+-        python.version: "3.10"
+-        tox.env: py310
+-      macos-py37:
++        python.version: "3.11"
++        tox.env: py311
++      macos-py38:
+         imageName: "macos-latest"
+-        python.version: "3.7"
+-        tox.env: py37
++        python.version: "3.8"
++        tox.env: py38
+ 
+       linux-pypy3:
+-        imageName: "ubuntu-20.04"
++        imageName: "ubuntu-latest"
+         python.version: "pypy3"
+         tox.env: pypy3
+         LOKY_MAX_CPU_COUNT: "2"
+ 
+-      linux-py310:
+-        imageName: "ubuntu-20.04"
+-        python.version: "3.10"
+-        tox.env: py310
++      linux-py311:
++        imageName: "ubuntu-latest"
++        python.version: "3.11"
++        tox.env: py311
+       linux-py39-joblib-tests:
+-        imageName: "ubuntu-20.04"
++        imageName: "ubuntu-latest"
+         python.version: "3.9"
+         tox.env: "py39"
+         joblib.tests: "true"
+       linux-python-py39-high-memory:
+-        imageName: "ubuntu-20.04"
++        imageName: "ubuntu-latest"
+         python.version: "3.9"
+         tox.env: py39
+         RUN_MEMORY: "true"
+       linux-py38:
+-        imageName: "ubuntu-20.04"
++        imageName: "ubuntu-latest"
+         python.version: "3.8"
+         tox.env: py38
+ 
+diff --git a/CHANGES.md b/CHANGES.md
+index 7b56908..0dff38f 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -6,6 +6,10 @@
+ - Fix handling of CPU affinity  by using `psutil`'s `cpu_affinity` on platforms
+   that do not implement `os.sched_getaffinity`, such as PyPy (#381).
+ 
++- Fix crash when using `max_workers > 61` on Windows. Loky will no longer
++  attempt to use more than 61 workers on that platform (or 60 depending on the
++  Python version). (#390).
++
+ ### 3.3.0 - 2022-09-15
+ 
+ - Fix worker management logic in `get_reusable_executor` to ensure
+diff --git a/loky/backend/context.py b/loky/backend/context.py
+index af7be78..433d6f5 100644
+--- a/loky/backend/context.py
++++ b/loky/backend/context.py
+@@ -18,9 +18,15 @@ import warnings
+ import multiprocessing as mp
+ from multiprocessing import get_context as mp_get_context
+ from multiprocessing.context import BaseContext
++from concurrent.futures.process import _MAX_WINDOWS_WORKERS
+ 
+ from .process import LokyProcess, LokyInitMainProcess
+ 
++# Apparently, on older Python versions, loky cannot work 61 workers on Windows
++# but instead 60: ¯\_(ツ)_/¯
++if sys.version_info < (3, 10):
++    _MAX_WINDOWS_WORKERS = _MAX_WINDOWS_WORKERS - 1
++
+ START_METHODS = ["loky", "loky_init_main", "spawn"]
+ if sys.platform != "win32":
+     START_METHODS += ["fork", "forkserver"]
+@@ -88,10 +94,21 @@ def cpu_count(only_physical_cores=False):
+     or the LOKY_MAX_CPU_COUNT environment variable. If the number of physical
+     cores is not found, return the number of logical cores.
+ 
++    Note that on Windows, the returned number of CPUs cannot exceed 61 (or 60 for
++    Python < 3.10), see:
++    https://bugs.python.org/issue26903.
++
+     It is also always larger or equal to 1.
+     """
+     # Note: os.cpu_count() is allowed to return None in its docstring
+     os_cpu_count = os.cpu_count() or 1
++    if sys.platform == "win32":
++        # On Windows, attempting to use more than 61 CPUs would result in a
++        # OS-level error. See https://bugs.python.org/issue26903. According to
++        # https://learn.microsoft.com/en-us/windows/win32/procthread/processor-groups
++        # it might be possible to go beyond with a lot of extra work but this
++        # does not look easy.
++        os_cpu_count = min(os_cpu_count, _MAX_WINDOWS_WORKERS)
+ 
+     cpu_count_user = _cpu_count_user(os_cpu_count)
+     aggregate_cpu_count = max(min(os_cpu_count, cpu_count_user), 1)
+diff --git a/loky/process_executor.py b/loky/process_executor.py
+index 9176afe..6e42258 100644
+--- a/loky/process_executor.py
++++ b/loky/process_executor.py
+@@ -79,7 +79,7 @@ from multiprocessing.connection import wait
+ 
+ from ._base import Future
+ from .backend import get_context
+-from .backend.context import cpu_count
++from .backend.context import cpu_count, _MAX_WINDOWS_WORKERS
+ from .backend.queues import Queue, SimpleQueue
+ from .backend.reduction import set_loky_pickler, get_loky_pickler_name
+ from .backend.utils import kill_process_tree, get_exitcodes_terminated_worker
+@@ -1064,6 +1064,16 @@ class ProcessPoolExecutor(Executor):
+                 raise ValueError("max_workers must be greater than 0")
+             self._max_workers = max_workers
+ 
++        if (
++            sys.platform == "win32"
++            and self._max_workers > _MAX_WINDOWS_WORKERS
++        ):
++            warnings.warn(
++                f"On Windows, max_workers cannot exceed {_MAX_WINDOWS_WORKERS} "
++                "due to limitations of the operating system."
++            )
++            self._max_workers = _MAX_WINDOWS_WORKERS
++
+         if context is None:
+             context = get_context()
+         self._context = context
+diff --git a/tox.ini b/tox.ini
+index 650b7dc..91bb53e 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,6 +1,6 @@
+ # content of: tox.ini , put in same dir as setup.py
+ [tox]
+-envlist = py37, py38, py39, py310, pypy3
++envlist = py38, py39, py310, py311, pypy3
+ skip_missing_interpreters=True
+ 
+ [testenv]

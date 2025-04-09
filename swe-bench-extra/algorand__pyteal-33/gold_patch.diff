@@ -1,0 +1,222 @@
+diff --git a/.gitignore b/.gitignore
+index be31d1f..daf823c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -125,3 +125,6 @@ dmypy.json
+ 
+ # Pyre type checker
+ .pyre/
++
++# IDE
++.idea
+diff --git a/docs/index.rst b/docs/index.rst
+index 9853a51..c5f1a36 100644
+--- a/docs/index.rst
++++ b/docs/index.rst
+@@ -39,6 +39,7 @@ PyTeal **hasn't been security audited**. Use it at your own risk.
+    byte_expression
+    accessing_transaction_field
+    crypto
++   scratch
+    control_structures
+    state
+ 
+diff --git a/docs/scratch.rst b/docs/scratch.rst
+new file mode 100644
+index 0000000..752f138
+--- /dev/null
++++ b/docs/scratch.rst
+@@ -0,0 +1,33 @@
++.. _scratch:
++
++Scratch Space
++========================
++
++`Scratch space <https://developer.algorand.org/docs/reference/teal/specification/#scratch-space>`_
++is a temporary place to store values for later use in your program. It is temporary because any
++changes to scratch space do not persist beyond the current tranasaction. Scratch space can be used
++in both Application and Signature mode.
++
++Scratch space consists of 256 scratch slots, each capable of storing one integer or byte slice. When
++using the :any:`ScratchVar` class to work with scratch space, a slot is automatically assigned to
++each variable.
++
++Writing and Reading
++~~~~~~~~~~~~~~~~~~~~~~
++
++To write to scratch space, first create a :any:`ScratchVar` object and pass in the :any:`TealType`
++of the values that you will store there. It is possible to create a :any:`ScratchVar` that can store
++both integers and byte slices by passing no arguments to the :any:`ScratchVar` constructor, but note
++that no type checking takes places in this situation.
++
++To write or read values, use the corresponding :any:`ScratchVar.store` or :any:`ScratchVar.load` methods.
++
++For example:
++
++.. code-block:: python
++
++    myvar = ScratchVar(TealType.uint64)
++    program = Seq([
++        myvar.store(Int(5)),
++        Assert(myvar.load() == Int(5))
++    ])
+diff --git a/pyteal/ast/__init__.py b/pyteal/ast/__init__.py
+index 362d006..122e92a 100644
+--- a/pyteal/ast/__init__.py
++++ b/pyteal/ast/__init__.py
+@@ -39,7 +39,8 @@ from .seq import Seq
+ from .assert_ import Assert
+ 
+ # misc
+-from .scratch import ScratchSlot, ScratchLoad, ScratchStore
++from .scratch import ScratchSlot, ScratchLoad, ScratchStore, ScratchStackStore
++from .scratchvar import ScratchVar
+ from .maybe import MaybeValue
+ 
+ __all__ = [
+@@ -112,5 +113,7 @@ __all__ = [
+     "ScratchSlot",
+     "ScratchLoad",
+     "ScratchStore",
++    "ScratchStackStore",
++    "ScratchVar",
+     "MaybeValue",
+ ]
+diff --git a/pyteal/ast/scratch.py b/pyteal/ast/scratch.py
+index e12077c..6b8795c 100644
+--- a/pyteal/ast/scratch.py
++++ b/pyteal/ast/scratch.py
+@@ -10,11 +10,19 @@ class ScratchSlot:
+         self.id = ScratchSlot.slotId
+         ScratchSlot.slotId += 1
+ 
+-    def store(self):
+-        """Get an expression to store a value in this slot."""
+-        return ScratchStore(self)
++    def store(self, value: Expr = None) -> Expr:
++        """Get an expression to store a value in this slot.
++        
++        Args:
++            value (optional): The value to store in this slot. If not included, the last value on
++            the stack will be stored. NOTE: storing the last value on the stack breaks the typical
++            semantics of PyTeal, only use if you know what you're doing.
++        """
++        if value is not None:
++            return ScratchStore(self, value)
++        return ScratchStackStore(self)
+ 
+-    def load(self, type: TealType = TealType.anytype):
++    def load(self, type: TealType = TealType.anytype) -> 'ScratchLoad':
+         """Get an expression to load a value from this slot.
+ 
+         Args:
+@@ -66,23 +74,53 @@ ScratchLoad.__module__ = "pyteal"
+ class ScratchStore(Expr):
+     """Expression to store a value in scratch space."""
+ 
+-    def __init__(self, slot: ScratchSlot):
++    def __init__(self, slot: ScratchSlot, value: Expr):
+         """Create a new ScratchStore expression.
+ 
+         Args:
+             slot: The slot to store the value in.
++            value: The value to store.
+         """
+         self.slot = slot
++        self.value = value
+ 
+     def __str__(self):
+-        return "(Store {})".format(self.slot.__str__())
++        return "(Store {} {})".format(str(self.slot), str(self.value))
+ 
+     def __teal__(self):
+         from ..ir import TealOp, Op, TealBlock
+         op = TealOp(Op.store, self.slot)
+-        return TealBlock.FromOp(op)
++        return TealBlock.FromOp(op, self.value)
+ 
+     def type_of(self):
+         return TealType.none
+ 
+ ScratchStore.__module__ = "pyteal"
++
++class ScratchStackStore(Expr):
++    """Expression to store a value from the stack in scratch space.
++    
++    NOTE: This expression breaks the typical semantics of PyTeal, only use if you know what you're
++    doing.
++    """
++
++    def __init__(self, slot: ScratchSlot):
++        """Create a new ScratchStackStore expression.
++
++        Args:
++            slot: The slot to store the value in.
++        """
++        self.slot = slot
++
++    def __str__(self):
++        return "(StackStore {})".format(str(self.slot))
++
++    def __teal__(self):
++        from ..ir import TealOp, Op, TealBlock
++        op = TealOp(Op.store, self.slot)
++        return TealBlock.FromOp(op)
++
++    def type_of(self):
++        return TealType.none
++
++ScratchStackStore.__module__ = "pyteal"
+diff --git a/pyteal/ast/scratchvar.py b/pyteal/ast/scratchvar.py
+new file mode 100644
+index 0000000..888bded
+--- /dev/null
++++ b/pyteal/ast/scratchvar.py
+@@ -0,0 +1,47 @@
++from ..types import TealType, require_type
++from .expr import Expr
++from .scratch import ScratchSlot, ScratchLoad
++
++class ScratchVar:
++    """
++    Interface around Scratch space, similiar to get/put local/global state
++
++    Example:
++        .. code-block:: python
++
++            myvar = ScratchVar(TealType.uint64)
++            Seq([
++                myvar.store(Int(5)),
++                Assert(myvar.load() == Int(5))
++            ])
++    """
++
++    def __init__(self, type: TealType = TealType.anytype):
++        """Create a new ScratchVar with an optional type.
++
++        Args:
++            type (optional): The type that this variable can hold. An error will be thrown if an
++                expression with an incompatiable type is stored in this variable. Defaults to
++                TealType.anytype.
++        """
++        self.slot = ScratchSlot()
++        self.type = type
++    
++    def storage_type(self) -> TealType:
++        """Get the type of expressions that can be stored in this ScratchVar."""
++        return self.type
++
++    def store(self, value: Expr) -> Expr:
++        """Store value in Scratch Space
++        
++        Args:
++            value: The value to store. Must conform to this ScratchVar's type.
++        """
++        require_type(value.type_of(), self.type)
++        return self.slot.store(value)
++
++    def load(self) -> ScratchLoad:
++        """Load value from Scratch Space"""
++        return self.slot.load(self.type)
++
++ScratchVar.__module__ = "pyteal"

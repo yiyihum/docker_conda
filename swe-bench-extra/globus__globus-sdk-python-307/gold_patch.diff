@@ -1,0 +1,234 @@
+diff --git a/globus_sdk/auth/client_types/base.py b/globus_sdk/auth/client_types/base.py
+index 07f26d0a..4554ebb7 100644
+--- a/globus_sdk/auth/client_types/base.py
++++ b/globus_sdk/auth/client_types/base.py
+@@ -360,7 +360,7 @@ class AuthClient(BaseClient):
+ 
+         **Parameters**
+ 
+-            ``response_type``
++            ``response_class``
+               Defaults to :class:`OAuthTokenResponse \
+               <globus_sdk.auth.token_response.OAuthTokenResponse>`. This is
+               used by calls to the oauth2_token endpoint which need to
+diff --git a/globus_sdk/auth/client_types/confidential_client.py b/globus_sdk/auth/client_types/confidential_client.py
+index 2b00cc3c..573e9207 100644
+--- a/globus_sdk/auth/client_types/confidential_client.py
++++ b/globus_sdk/auth/client_types/confidential_client.py
+@@ -139,7 +139,7 @@ class ConfidentialAppAuthClient(AuthClient):
+             state=state, refresh_tokens=refresh_tokens)
+         return self.current_oauth2_flow_manager
+ 
+-    def oauth2_get_dependent_tokens(self, token):
++    def oauth2_get_dependent_tokens(self, token, additional_params=None):
+         """
+         Does a `Dependent Token Grant
+         <https://docs.globus.org/api/auth/reference/#dependent_token_grant_post_v2_oauth2_token>`_
+@@ -166,14 +166,23 @@ class ConfidentialAppAuthClient(AuthClient):
+           ``token`` (*string*)
+             An Access Token as a raw string, being exchanged.
+ 
++          ``additional_params`` (*dict*)
++            A ``dict`` or ``None``, which specifies additional parameters
++            to include in the request body
++
+         :rtype: :class:`OAuthTokenResponse
+                 <globus_sdk.auth.token_response.OAuthTokenResponse>`
+         """
+         self.logger.info('Getting dependent tokens from access token')
+-        return self.oauth2_token({
++        self.logger.debug('additional_params={}'.format(additional_params))
++        form_data = {
+             'grant_type': 'urn:globus:auth:grant_type:dependent_token',
+-            'token': token},
+-            response_class=OAuthDependentTokenResponse)
++            'token': token}
++        if additional_params:
++            form_data.update(additional_params)
++
++        return self.oauth2_token(
++            form_data, response_class=OAuthDependentTokenResponse)
+ 
+     def oauth2_token_introspect(self, token, include=None):
+         """
+diff --git a/globus_sdk/authorizers/client_credentials.py b/globus_sdk/authorizers/client_credentials.py
+index 6f82b4ee..d5649942 100644
+--- a/globus_sdk/authorizers/client_credentials.py
++++ b/globus_sdk/authorizers/client_credentials.py
+@@ -48,8 +48,16 @@ class ClientCredentialsAuthorizer(RenewingAuthorizer):
+           POSIX timestamp (i.e. seconds since the epoch)
+ 
+         ``on_refresh`` (*callable*)
+-          Will be called as fn(token_data) any time this authorizer
+-          fetches a new access_token
++          A callback which is triggered any time this authorizer fetches a new
++          access_token. The ``on_refresh`` callable is invoked on the
++          :class:`OAuthTokenResponse \
++                  <globus_sdk.auth.token_response.OAuthTokenResponse>`
++          object resulting from the token being refreshed.
++          It should take only one argument, the token response object.
++
++          This is useful for implementing storage for Access Tokens, as the
++          ``on_refresh`` callback can be used to update the Access Tokens and
++          their expiration times.
+     """
+     def __init__(self, confidential_client, scopes,
+                  access_token=None, expires_at=None, on_refresh=None):
+diff --git a/globus_sdk/authorizers/refresh_token.py b/globus_sdk/authorizers/refresh_token.py
+index 6ca6e458..1cd35305 100644
+--- a/globus_sdk/authorizers/refresh_token.py
++++ b/globus_sdk/authorizers/refresh_token.py
+@@ -43,8 +43,16 @@ class RefreshTokenAuthorizer(RenewingAuthorizer):
+           POSIX timestamp (i.e. seconds since the epoch)
+ 
+         ``on_refresh`` (*callable*)
+-        Will be called as fn(token_data) any time this authorizer
+-        fetches a new access_token
++          A callback which is triggered any time this authorizer fetches a new
++          access_token. The ``on_refresh`` callable is invoked on the
++          :class:`OAuthTokenResponse \
++                  <globus_sdk.auth.token_response.OAuthTokenResponse>`
++          object resulting from the token being refreshed.
++          It should take only one argument, the token response object.
++
++          This is useful for implementing storage for Access Tokens, as the
++          ``on_refresh`` callback can be used to update the Access Tokens and
++          their expiration times.
+     """
+     def __init__(self, refresh_token, auth_client,
+                  access_token=None, expires_at=None, on_refresh=None):
+diff --git a/globus_sdk/authorizers/renewing.py b/globus_sdk/authorizers/renewing.py
+index 07fe7cd5..e2d711e8 100644
+--- a/globus_sdk/authorizers/renewing.py
++++ b/globus_sdk/authorizers/renewing.py
+@@ -28,6 +28,28 @@ class RenewingAuthorizer(GlobusAuthorizer):
+     To make an authorizer that implements this class implement
+     the _get_token_response and _extract_token_data methods for that
+     authorization type,
++
++    **Parameters**
++
++        ``access_token`` (*string*)
++          Initial Access Token to use. Used only if ``expires_at`` is also set,
++          otherwise ignored.
++
++        ``expires_at`` (*int*)
++          Expiration time for the starting ``access_token`` expressed as a
++          POSIX timestamp (i.e. seconds since the epoch)
++
++        ``on_refresh`` (*callable*)
++          A callback which is triggered any time this authorizer fetches a new
++          access_token. The ``on_refresh`` callable is invoked on the
++          :class:`OAuthTokenResponse \
++                  <globus_sdk.auth.token_response.OAuthTokenResponse>`
++          object resulting from the token being refreshed.
++          It should take only one argument, the token response object.
++
++          This is useful for implementing storage for Access Tokens, as the
++          ``on_refresh`` callback can be used to update the Access Tokens and
++          their expiration times.
+     """
+ 
+     def __init__(self, access_token=None, expires_at=None, on_refresh=None):
+@@ -109,9 +131,14 @@ class RenewingAuthorizer(GlobusAuthorizer):
+             self.on_refresh(res)
+             logger.debug("Invoked on_refresh callback")
+ 
+-    def _check_expiration_time(self):
++    def check_expiration_time(self):
+         """
+         Check if the expiration timer is done, and renew the token if it is.
++
++        This is called implicitly by ``set_authorization_header``, but you can
++        call it explicitly if you want to ensure that a token gets refreshed.
++        This can be useful in order to get at a new, valid token via the
++        ``on_refresh`` handler.
+         """
+         logger.debug("RenewingAuthorizer checking expiration time")
+         if self.access_token is None or (
+@@ -129,7 +156,7 @@ class RenewingAuthorizer(GlobusAuthorizer):
+         Once that's done, sets the ``Authorization`` header to
+         "Bearer <access_token>"
+         """
+-        self._check_expiration_time()
++        self.check_expiration_time()
+         logger.debug(("Setting RefreshToken Authorization Header:"
+                       'Bearer token has hash "{}"')
+                      .format(self.access_token_hash))
+diff --git a/globus_sdk/base.py b/globus_sdk/base.py
+index ec668bcd..8fd51190 100644
+--- a/globus_sdk/base.py
++++ b/globus_sdk/base.py
+@@ -80,16 +80,16 @@ class BaseClient(object):
+                     type(self), self.allowed_authorizer_types,
+                     type(authorizer)))
+ 
+-        # defer this default until instantiation time so that logging can
+-        # capture the execution of the config load
+-        if environment is None:
+-            environment = config.get_default_environ()
++        # if an environment was passed, it will be used, but otherwise lookup
++        # the env var -- and in the special case of `production` translate to
++        # `default`, regardless of the source of that value
++        # logs the environment when it isn't `default`
++        self.environment = config.get_globus_environ(inputenv=environment)
+ 
+-        self.environment = environment
+         self.authorizer = authorizer
+ 
+         if base_url is None:
+-            self.base_url = config.get_service_url(environment, service)
++            self.base_url = config.get_service_url(self.environment, service)
+         else:
+             self.base_url = base_url
+         if base_path is not None:
+@@ -104,13 +104,13 @@ class BaseClient(object):
+         }
+ 
+         # verify SSL? Usually true
+-        self._verify = config.get_ssl_verify(environment)
++        self._verify = config.get_ssl_verify(self.environment)
+         # HTTP connection timeout
+         # this is passed verbatim to `requests`, and we therefore technically
+         # support a tuple for connect/read timeouts, but we don't need to
+         # advertise that... Just declare it as an float value
+         if http_timeout is None:
+-            http_timeout = config.get_http_timeout(environment)
++            http_timeout = config.get_http_timeout(self.environment)
+         self._http_timeout = http_timeout
+         # handle -1 by passing None to requests
+         if self._http_timeout == -1:
+diff --git a/globus_sdk/config.py b/globus_sdk/config.py
+index d1c7147f..1f5bc364 100644
+--- a/globus_sdk/config.py
++++ b/globus_sdk/config.py
+@@ -175,17 +175,25 @@ def _bool_cast(value):
+     raise ValueError("Invalid config bool")
+ 
+ 
+-def get_default_environ():
++def get_globus_environ(inputenv=None):
+     """
+-    Get the default environment to look for in the config, as a string.
++    Get the environment to look for in the config, as a string.
++
+     Typically just "default", but it can be overridden with
+     `GLOBUS_SDK_ENVIRONMENT` in the shell environment. In that case, any client
+     which does not explicitly specify its environment will use this value.
++
++    :param inputenv: An environment which was passed, e.g. to a client
++                     instantiation
+     """
+-    env = os.environ.get('GLOBUS_SDK_ENVIRONMENT', 'default')
++    if inputenv is None:
++        env = os.environ.get('GLOBUS_SDK_ENVIRONMENT', 'default')
++    else:
++        env = inputenv
++
+     if env == 'production':
+         env = 'default'
+     if env != 'default':
+         logger.info(('On lookup, non-default environment: '
+-                     'GLOBUS_SDK_ENVIRONMENT={}'.format(env)))
++                     'globus_environment={}'.format(env)))
+     return env

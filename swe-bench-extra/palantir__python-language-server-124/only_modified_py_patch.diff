@@ -1,0 +1,86 @@
+diff --git a/pyls/language_server.py b/pyls/language_server.py
+index cfd187b..ce11da6 100644
+--- a/pyls/language_server.py
++++ b/pyls/language_server.py
+@@ -37,7 +37,7 @@ def start_tcp_lang_server(bind_addr, port, handler_class):
+         log.info("Serving %s on (%s, %s)", handler_class.__name__, bind_addr, port)
+         server.serve_forever()
+     except KeyboardInterrupt:
+-        server.shutdown()
++        server.exit()
+     finally:
+         log.info("Shutting down")
+         server.server_close()
+@@ -113,7 +113,7 @@ class LanguageServer(MethodJSONRPCServer):
+         self.shutdown()
+ 
+     def m_exit(self, **_kwargs):
+-        self.shutdown()
++        self.exit()
+ 
+ 
+ _RE_FIRST_CAP = re.compile('(.)([A-Z][a-z]+)')
+diff --git a/pyls/plugins/pycodestyle_lint.py b/pyls/plugins/pycodestyle_lint.py
+index a0ee0c7..668096d 100644
+--- a/pyls/plugins/pycodestyle_lint.py
++++ b/pyls/plugins/pycodestyle_lint.py
+@@ -64,12 +64,6 @@ class PyCodeStyleDiagnosticReport(pycodestyle.BaseReport):
+             'range': range,
+             'message': text,
+             'code': code,
+-            'severity': _get_severity(code)
++            # Are style errors really ever errors?
++            'severity': lsp.DiagnosticSeverity.Warning
+         })
+-
+-
+-def _get_severity(code):
+-    if code[0] == 'E':
+-        return lsp.DiagnosticSeverity.Error
+-    elif code[0] == 'W':
+-        return lsp.DiagnosticSeverity.Warning
+diff --git a/pyls/server.py b/pyls/server.py
+index 9e3fcac..83f8002 100644
+--- a/pyls/server.py
++++ b/pyls/server.py
+@@ -14,23 +14,36 @@ class JSONRPCServer(object):
+     def __init__(self, rfile, wfile):
+         self.rfile = rfile
+         self.wfile = wfile
++        self._shutdown = False
+ 
+-    def shutdown(self):
+-        # TODO: we should handle this much better
++    def exit(self):
++        # Exit causes a complete exit of the server
+         self.rfile.close()
+         self.wfile.close()
+ 
++    def shutdown(self):
++        # Shutdown signals the server to stop, but not exit
++        self._shutdown = True
++        log.debug("Server shut down, awaiting exit notification")
++
+     def handle(self):
+         # VSCode wants us to keep the connection open, so let's handle messages in a loop
+         while True:
+             try:
+                 data = self._read_message()
+                 log.debug("Got message: %s", data)
++
++                if self._shutdown:
++                    # Handle only the exit notification when we're shut down
++                    jsonrpc.JSONRPCResponseManager.handle(data, {'exit': self.exit})
++                    break
++
+                 response = jsonrpc.JSONRPCResponseManager.handle(data, self)
++
+                 if response is not None:
+                     self._write_message(response.data)
+             except Exception:
+-                log.exception("Language server shutting down for uncaught exception")
++                log.exception("Language server exiting due to uncaught exception")
+                 break
+ 
+     def call(self, method, params=None):
+

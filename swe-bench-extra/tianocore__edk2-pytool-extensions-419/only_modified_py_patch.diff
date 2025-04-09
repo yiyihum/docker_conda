@@ -1,0 +1,122 @@
+diff --git a/edk2toolext/environment/extdeptypes/git_dependency.py b/edk2toolext/environment/extdeptypes/git_dependency.py
+index 3b67974..be3e94d 100644
+--- a/edk2toolext/environment/extdeptypes/git_dependency.py
++++ b/edk2toolext/environment/extdeptypes/git_dependency.py
+@@ -83,7 +83,17 @@ def clean(self):
+         super().clean()
+ 
+     def verify(self):
+-        """Verifies the clone was successful."""
++        """Verifies the clone was successful.
++
++        !!! Note
++            If verify is set to false in the dependencies state file,
++            it will always skip the verification process.
++        """
++        state_data = self.get_state_file_data()
++        if state_data and state_data['verify'] is False:
++            logging.warn(f'{self.name} is unverified. Unexpected results may occur.')
++            return True
++
+         result = True
+ 
+         if not os.path.isdir(self._local_repo_root_path):
+diff --git a/edk2toolext/environment/external_dependency.py b/edk2toolext/environment/external_dependency.py
+index ef2aec3..0a38bd9 100644
+--- a/edk2toolext/environment/external_dependency.py
++++ b/edk2toolext/environment/external_dependency.py
+@@ -65,7 +65,7 @@ def __init__(self, descriptor):
+         self.contents_dir = os.path.join(
+             self.descriptor_location, self.name + "_extdep")
+         self.state_file_path = os.path.join(
+-            self.contents_dir, "extdep_state.json")
++            self.contents_dir, "extdep_state.yaml")
+         self.published_path = self.compute_published_path()
+ 
+     def set_global_cache_path(self, global_cache_path):
+@@ -177,19 +177,8 @@ def copy_to_global_cache(self, source_path: str):
+     def verify(self):
+         """Verifies the dependency was successfully downloaded."""
+         result = True
+-        state_data = None
++        state_data = self.get_state_file_data()
+ 
+-        # See whether or not the state file exists.
+-        if not os.path.isfile(self.state_file_path):
+-            result = False
+-
+-        # Attempt to load the state file.
+-        if result:
+-            with open(self.state_file_path, 'r') as file:
+-                try:
+-                    state_data = yaml.safe_load(file)
+-                except Exception:
+-                    pass
+         if state_data is None:
+             result = False
+ 
+@@ -202,15 +191,27 @@ def verify(self):
+ 
+     def report_version(self):
+         """Reports the version of the external dependency."""
++        state_data = self.get_state_file_data()
++        version = self.version
++        if state_data and state_data['verify'] is False:
++            version = "UNVERIFIED"
+         version_aggregator.GetVersionAggregator().ReportVersion(self.name,
+-                                                                self.version,
++                                                                version,
+                                                                 version_aggregator.VersionTypes.INFO,
+                                                                 self.descriptor_location)
+ 
+     def update_state_file(self):
+         """Updates the file representing the state of the dependency."""
+         with open(self.state_file_path, 'w+') as file:
+-            yaml.dump({'version': self.version}, file)
++            yaml.dump({'version': self.version, 'verify': True}, file)
++
++    def get_state_file_data(self):
++        """Loads the state file data into a json file and returns it."""
++        try:
++            with open(self.state_file_path, 'r') as file:
++                return yaml.safe_load(file)
++        except Exception:
++            return None
+ 
+ 
+ def ExtDepFactory(descriptor):
+diff --git a/edk2toolext/invocables/edk2_platform_build.py b/edk2toolext/invocables/edk2_platform_build.py
+index 6bec14d..b24f2cd 100644
+--- a/edk2toolext/invocables/edk2_platform_build.py
++++ b/edk2toolext/invocables/edk2_platform_build.py
+@@ -68,12 +68,29 @@ def AddCommandLineOptions(self, parserObj):
+             except (TypeError):
+                 raise RuntimeError(f"UefiBuild not found in module:\n{dir(self.PlatformModule)}")
+ 
++        parserObj.add_argument('-nv', '-NV', '--noverify', '--NOVERIFY', '--NoVerify',
++                               dest="verify", default=True, action='store_false',
++                               help='Skip verifying external dependencies before build.')
+         self.PlatformBuilder.AddPlatformCommandLineOptions(parserObj)
+ 
+     def RetrieveCommandLineOptions(self, args):
+         """Retrieve command line options from the argparser."""
++        self.verify = args.verify
+         self.PlatformBuilder.RetrievePlatformCommandLineOptions(args)
+ 
++    def GetVerifyCheckRequired(self) -> bool:
++        """Will call self_describing_environment.VerifyEnvironment if this returns True.
++
++        !!! hint
++            Optional override in a subclass
++
++        Returns:
++            (bool): whether verify check is required or not
++        """
++        if not self.verify:
++            logging.warning("Skipping Environment Verification. Unexpected results may occur.")
++        return self.verify
++
+     def GetSettingsClass(self):
+         """Returns the BuildSettingsManager class.
+ 
+

@@ -1,0 +1,92 @@
+diff --git a/reproject/interpolation/tests/test_core.py b/reproject/interpolation/tests/test_core.py
+index 2dac25c5..1941eefb 100644
+--- a/reproject/interpolation/tests/test_core.py
++++ b/reproject/interpolation/tests/test_core.py
+@@ -672,8 +672,9 @@ def test_broadcast_reprojection(input_extra_dims, output_shape, input_as_wcs, ou
+ @pytest.mark.parametrize("input_extra_dims", (1, 2))
+ @pytest.mark.parametrize("output_shape", (None, "single", "full"))
+ @pytest.mark.parametrize("parallel", [True, False])
++@pytest.mark.parametrize("header_or_wcs", (lambda x: x, WCS))
+ @pytest.mark.filterwarnings("ignore::astropy.wcs.wcs.FITSFixedWarning")
+-def test_blocked_broadcast_reprojection(input_extra_dims, output_shape, parallel):
++def test_blocked_broadcast_reprojection(input_extra_dims, output_shape, parallel, header_or_wcs):
+     image_stack, array_ref, footprint_ref, header_in, header_out = _setup_for_broadcast_test()
+     # Test both single and multiple dimensions being broadcast
+     if input_extra_dims == 2:
+@@ -689,6 +690,9 @@ def test_blocked_broadcast_reprojection(input_extra_dims, output_shape, parallel
+         # Provide the broadcast dimensions as part of the output shape
+         output_shape = image_stack.shape
+ 
++    # test different behavior when the output projection is a WCS
++    header_out = header_or_wcs(header_out)
++
+     array_broadcast, footprint_broadcast = reproject_interp(
+         (image_stack, header_in), header_out, output_shape, parallel=parallel, block_size=[5, 5]
+     )
+@@ -701,9 +705,12 @@ def test_blocked_broadcast_reprojection(input_extra_dims, output_shape, parallel
+ @pytest.mark.parametrize("block_size", [[500, 500], [500, 100], None])
+ @pytest.mark.parametrize("return_footprint", [False, True])
+ @pytest.mark.parametrize("existing_outputs", [False, True])
++@pytest.mark.parametrize("header_or_wcs", (lambda x: x, WCS))
+ @pytest.mark.remote_data
+ @pytest.mark.filterwarnings("ignore::astropy.wcs.wcs.FITSFixedWarning")
+-def test_blocked_against_single(parallel, block_size, return_footprint, existing_outputs):
++def test_blocked_against_single(
++    parallel, block_size, return_footprint, existing_outputs, header_or_wcs
++):
+     # Ensure when we break a reprojection down into multiple discrete blocks
+     # it has the same result as if all pixels where reprejcted at once
+ 
+@@ -727,7 +734,7 @@ def test_blocked_against_single(parallel, block_size, return_footprint, existing
+ 
+     result_test = reproject_interp(
+         hdu2,
+-        hdu1.header,
++        header_or_wcs(hdu1.header),
+         parallel=parallel,
+         block_size=block_size,
+         return_footprint=return_footprint,
+@@ -737,7 +744,7 @@ def test_blocked_against_single(parallel, block_size, return_footprint, existing
+ 
+     result_reference = reproject_interp(
+         hdu2,
+-        hdu1.header,
++        header_or_wcs(hdu1.header),
+         parallel=False,
+         block_size=None,
+         return_footprint=return_footprint,
+diff --git a/reproject/tests/test_utils.py b/reproject/tests/test_utils.py
+index 88c2510d..d842cb94 100644
+--- a/reproject/tests/test_utils.py
++++ b/reproject/tests/test_utils.py
+@@ -7,6 +7,7 @@ from astropy.wcs import WCS
+ 
+ from reproject.tests.helpers import assert_wcs_allclose
+ from reproject.utils import parse_input_data, parse_input_shape, parse_output_projection
++from reproject.wcs_utils import has_celestial
+ 
+ 
+ @pytest.mark.filterwarnings("ignore:unclosed file:ResourceWarning")
+@@ -89,3 +90,22 @@ def test_parse_output_projection_invalid_header(simple_celestial_fits_wcs):
+ def test_parse_output_projection_invalid_wcs(simple_celestial_fits_wcs):
+     with pytest.raises(ValueError, match="Need to specify shape"):
+         parse_output_projection(simple_celestial_fits_wcs)
++
++
++@pytest.mark.filterwarnings("ignore::astropy.utils.exceptions.AstropyUserWarning")
++@pytest.mark.filterwarnings("ignore::astropy.wcs.wcs.FITSFixedWarning")
++def test_has_celestial():
++    from .test_high_level import INPUT_HDR
++
++    hdr = fits.Header.fromstring(INPUT_HDR)
++    ww = WCS(hdr)
++    assert ww.has_celestial
++    assert has_celestial(ww)
++
++    from astropy.wcs.wcsapi import HighLevelWCSWrapper, SlicedLowLevelWCS
++
++    wwh = HighLevelWCSWrapper(SlicedLowLevelWCS(ww, Ellipsis))
++    assert has_celestial(wwh)
++
++    wwh2 = HighLevelWCSWrapper(SlicedLowLevelWCS(ww, [slice(0, 1), slice(0, 1)]))
++    assert has_celestial(wwh2)

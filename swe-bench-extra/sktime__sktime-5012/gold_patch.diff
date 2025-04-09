@@ -1,0 +1,81 @@
+diff --git a/.all-contributorsrc b/.all-contributorsrc
+index 3441d6560..ed91edebc 100644
+--- a/.all-contributorsrc
++++ b/.all-contributorsrc
+@@ -1740,6 +1740,7 @@
+       "name": "Benedikt Heidrich",
+       "profile": "https://github.com/benheid",
+       "contributions": [
++        "bug",
+         "code"
+       ]
+     },
+diff --git a/CONTRIBUTORS.md b/CONTRIBUTORS.md
+index ad94a9858..238a9a1e6 100644
+--- a/CONTRIBUTORS.md
++++ b/CONTRIBUTORS.md
+@@ -50,7 +50,7 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
+     <tr>
+       <td align="center" valign="top" width="11.11%"><a href="https://github.com/BandaSaiTejaReddy"><img src="https://avatars0.githubusercontent.com/u/31387911?v=4?s=100" width="100px;" alt="BANDASAITEJAREDDY"/><br /><sub><b>BANDASAITEJAREDDY</b></sub></a><br /><a href="https://github.com/sktime/sktime/commits?author=BandaSaiTejaReddy" title="Code">💻</a> <a href="https://github.com/sktime/sktime/commits?author=BandaSaiTejaReddy" title="Documentation">📖</a></td>
+       <td align="center" valign="top" width="11.11%"><a href="https://github.com/badrmarani"><img src="https://avatars.githubusercontent.com/badrmarani?s=100" width="100px;" alt="Badr-Eddine Marani"/><br /><sub><b>Badr-Eddine Marani</b></sub></a><br /><a href="https://github.com/sktime/sktime/commits?author=badrmarani" title="Code">💻</a></td>
+-      <td align="center" valign="top" width="11.11%"><a href="https://github.com/benheid"><img src="?s=100" width="100px;" alt="Benedikt Heidrich"/><br /><sub><b>Benedikt Heidrich</b></sub></a><br /><a href="https://github.com/sktime/sktime/commits?author=benheid" title="Code">💻</a></td>
++      <td align="center" valign="top" width="11.11%"><a href="https://github.com/benheid"><img src="?s=100" width="100px;" alt="Benedikt Heidrich"/><br /><sub><b>Benedikt Heidrich</b></sub></a><br /><a href="https://github.com/sktime/sktime/issues?q=author%3Abenheid" title="Bug reports">🐛</a> <a href="https://github.com/sktime/sktime/commits?author=benheid" title="Code">💻</a></td>
+       <td align="center" valign="top" width="11.11%"><a href="https://github.com/benjaminbluhm"><img src="?s=100" width="100px;" alt="Benjamin Bluhm"/><br /><sub><b>Benjamin Bluhm</b></sub></a><br /><a href="https://github.com/sktime/sktime/commits?author=benjaminbluhm" title="Code">💻</a> <a href="https://github.com/sktime/sktime/commits?author=benjaminbluhm" title="Documentation">📖</a> <a href="#example-benjaminbluhm" title="Examples">💡</a></td>
+       <td align="center" valign="top" width="11.11%"><a href="https://haskarb.github.io/"><img src="https://avatars.githubusercontent.com/u/20501023?v=4?s=100" width="100px;" alt="Bhaskar Dhariyal"/><br /><sub><b>Bhaskar Dhariyal</b></sub></a><br /><a href="https://github.com/sktime/sktime/commits?author=haskarb" title="Code">💻</a> <a href="https://github.com/sktime/sktime/commits?author=haskarb" title="Tests">⚠️</a></td>
+       <td align="center" valign="top" width="11.11%"><a href="https://github.com/BINAYKUMAR943"><img src="https://avatars.githubusercontent.com/u/38756834?v=4?s=100" width="100px;" alt="Binay Kumar"/><br /><sub><b>Binay Kumar</b></sub></a><br /><a href="https://github.com/sktime/sktime/commits?author=BINAYKUMAR943" title="Code">💻</a> <a href="https://github.com/sktime/sktime/commits?author=BINAYKUMAR943" title="Documentation">📖</a> <a href="https://github.com/sktime/sktime/commits?author=BINAYKUMAR943" title="Tests">⚠️</a></td>
+diff --git a/sktime/forecasting/model_selection/_split.py b/sktime/forecasting/model_selection/_split.py
+index 9fca2a4da..81f7c2907 100644
+--- a/sktime/forecasting/model_selection/_split.py
++++ b/sktime/forecasting/model_selection/_split.py
+@@ -1089,12 +1089,38 @@ class BaseWindowSplitter(BaseSplitter):
+         n_splits : int
+             The number of splits.
+         """
++        from sktime.datatypes import check_is_scitype, convert
++
+         if y is None:
+             raise ValueError(
+                 f"{self.__class__.__name__} requires `y` to compute the "
+                 f"number of splits."
+             )
+-        return len(self.get_cutoffs(y))
++
++        multi_scitypes = ["Hierarchical", "Panel"]
++        is_non_single, _, metadata = check_is_scitype(y, multi_scitypes, [])
++
++        # n_splits based on the first instance of the lowest level series cutoffs
++        if is_non_single:
++            from_mtype = metadata.get("mtype")
++            scitype = metadata.get("scitype")
++            if scitype == "Panel":
++                to_mtype = "pd-multiindex"
++            else:
++                to_mtype = "pd_multiindex_hier"
++
++            y = convert(y, from_type=from_mtype, to_type=to_mtype, as_scitype=scitype)
++
++            index = self._coerce_to_index(y)
++            for _, values in y.groupby(index.droplevel(-1)):
++                # convert to a single ts
++                instance_series = values.reset_index().iloc[:, -2:]
++                instance_series.set_index(instance_series.columns[0], inplace=True)
++                n_splits = len(self.get_cutoffs(instance_series))
++                break
++        else:
++            n_splits = len(self.get_cutoffs(y))
++        return n_splits
+ 
+     def get_cutoffs(self, y: Optional[ACCEPTED_Y_TYPES] = None) -> np.ndarray:
+         """Return the cutoff points in .iloc[] context.
+diff --git a/sktime/transformations/series/subset.py b/sktime/transformations/series/subset.py
+index a578e966d..d82b6a0ee 100644
+--- a/sktime/transformations/series/subset.py
++++ b/sktime/transformations/series/subset.py
+@@ -160,6 +160,7 @@ class ColumnSelect(BaseTransformer):
+         "fit_is_empty": True,
+         "univariate-only": False,
+         "capability:inverse_transform": False,
++        "skip-inverse-transform": True,
+     }
+ 
+     def __init__(self, columns=None, integer_treatment="col", index_treatment="remove"):

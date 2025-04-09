@@ -1,0 +1,179 @@
+diff --git a/eBCSgen/Parsing/ParseBCSL.py b/eBCSgen/Parsing/ParseBCSL.py
+index 4bb2843..8368f44 100644
+--- a/eBCSgen/Parsing/ParseBCSL.py
++++ b/eBCSgen/Parsing/ParseBCSL.py
+@@ -3,7 +3,7 @@ import json
+ import numpy as np
+ from numpy import inf
+ from copy import deepcopy
+-from lark import Lark, Token, Transformer, Tree
++from lark import Lark, Transformer, Tree
+ from lark import UnexpectedCharacters, UnexpectedToken, UnexpectedEOF
+ from lark.load_grammar import _TERMINAL_NAMES
+ import regex
+@@ -106,17 +106,18 @@ class SideHelper:
+ 
+ GRAMMAR = r"""
+     model: (sections)* rules (sections | rules)*
+-    sections: inits | definitions | complexes | regulation
++    sections: inits | definitions | complexes | regulation | observables
+ 
+     rules: RULES_START _NL+ (rule _NL+)* rule _NL*
+     inits: INITS_START _NL+ (init _NL+)* init _NL*
+     definitions: DEFNS_START _NL+ (definition _NL+)* definition _NL*
+     complexes: COMPLEXES_START _NL+ (cmplx_dfn _NL+)* cmplx_dfn _NL*
+     regulation: REGULATION_START _NL+ regulation_def _NL*
++    observables: OBSERVABLES_START _NL+ (observable _NL+)* observable _NL*
+ 
+     init: const? rate_complex 
+     definition: def_param "=" number
+-    rule: ((label)? side ARROW side ("@" rate)? (";" variable)?) | ((label)? side BI_ARROW side ("@" rate "|" rate )? (";" variable)?)
++    rule: ((label)? side arrow side ("@" rate)? (";" variable)?) | ((label)? side BI_ARROW side ("@" rate "|" rate )? (";" variable)?)
+     cmplx_dfn: cmplx_name "=" value
+ 
+     side: (const? complex "+")* (const? complex)?
+@@ -131,13 +132,16 @@ GRAMMAR = r"""
+ 
+     COM: "//"
+     POW: "**"
+-    ARROW: "=>"
++    arrow: SINGLE_ARROW | REPLICATION_ARROW
++    SINGLE_ARROW: "=>"
+     BI_ARROW: "<=>"
++    REPLICATION_ARROW: "=*>"
+     RULES_START: "#! rules"
+     INITS_START: "#! inits"
+     DEFNS_START: "#! definitions"
+     COMPLEXES_START: "#! complexes"
+     REGULATION_START: "#! regulation"
++    OBSERVABLES_START: "#! observables"
+     _NL: /(\r?\n[\t ]*)+/
+ 
+     !label: CNAME "~"
+@@ -239,6 +243,11 @@ REGEX_GRAMMAR = r"""
+     REGEX_CHAR: /[^\\^$().*+?{}\[\]|]/
+ """
+ 
++OBSERVABLES_GRAMMAR = """
++    observable: CNAME ":" observable_pattern
++    !observable_pattern: const | complex | observable_pattern "+" observable_pattern | observable_pattern "-" observable_pattern | observable_pattern "*" observable_pattern | observable_pattern "/" observable_pattern | observable_pattern POW const | "(" observable_pattern ")"
++"""
++
+ 
+ class TransformRegulations(Transformer):
+     def regulation(self, matches):
+@@ -647,31 +656,38 @@ class TreeToObjects(Transformer):
+             )
+         )
+         pairs = [(i, i + lhs.counter) for i in range(min(lhs.counter, rhs.counter))]
+-        if lhs.counter > rhs.counter:
++        if type(arrow) is Tree and arrow.children[0].value == "=*>":
++            if lhs.counter >= rhs.counter or lhs.counter != 1 or rhs.counter <= 1:
++                raise UnspecifiedParsingError("Rule does not contain replication")
++            
++            for i in range(lhs.counter, rhs.counter):
++                if lhs.seq[pairs[-1][0]] == rhs.seq[pairs[-1][1] - lhs.counter]:
++                    if rhs.seq[pairs[-1][1] - lhs.counter] == rhs.seq[i]:
++                        pairs += [(pairs[-1][0], i + lhs.counter)]
++                    else:
++                        raise UnspecifiedParsingError("Rule does not contain replication")
++
++        elif lhs.counter > rhs.counter:
+             pairs += [(i, None) for i in range(rhs.counter, lhs.counter)]
+         elif lhs.counter < rhs.counter:
+-            for i in range(lhs.counter, rhs.counter):
+-                replication = False
+-                if lhs.counter == 1 and rhs.counter > 1:
+-                    if lhs.seq[pairs[-1][0]] == rhs.seq[pairs[-1][1] - lhs.counter]:
+-                        if rhs.seq[pairs[-1][1] - lhs.counter] == rhs.seq[i]:
+-                            pairs += [(pairs[-1][0], i + lhs.counter)]
+-                            replication = True
+-                if not replication:
+-                    pairs += [(None, i + lhs.counter)]
++            pairs += [(None, i + lhs.counter) for i in range(lhs.counter, rhs.counter)]
+ 
+         reversible = False
+         if arrow == "<=>":
+             reversible = True
+-        return reversible, Rule(
+-            agents,
+-            mid,
+-            compartments,
+-            complexes,
+-            pairs,
+-            Rate(rate1) if rate1 else None,
+-            label,
+-        ), Rate(rate2) if rate2 else None
++        return (
++            reversible,
++            Rule(
++                agents,
++                mid,
++                compartments,
++                complexes,
++                pairs,
++                Rate(rate1) if rate1 else None,
++                label,
++            ),
++            Rate(rate2) if rate2 else None,
++        )
+ 
+     def rules(self, matches):
+         rules = []
+@@ -703,6 +719,15 @@ class TreeToObjects(Transformer):
+                 result[init[0].children[0]] = 1
+         return {"inits": result}
+ 
++    def observable(self, matches):
++        return {str(matches[0]): matches[1].children}
++
++    def observables(self, matches):
++        result = dict()
++        for observable in matches[1:]:
++            result.update(observable)
++        return {"observables": result}
++
+     def param(self, matches):
+         self.params.add(str(matches[0]))
+         return Tree("param", matches)
+@@ -712,6 +737,7 @@ class TreeToObjects(Transformer):
+         definitions = dict()
+         regulation = None
+         inits = collections.Counter()
++        observables = dict()
+         for match in matches:
+             if type(match) == dict:
+                 key, value = list(match.items())[0]
+@@ -728,6 +754,8 @@ class TreeToObjects(Transformer):
+                 inits.update(value)
+             elif key == "definitions":
+                 definitions.update(value)
++            elif key == "observables":
++                observables.update(value)
+             elif key == "regulation":
+                 if regulation:
+                     raise UnspecifiedParsingError("Multiple regulations")
+@@ -749,9 +777,13 @@ class Parser:
+             + EXTENDED_GRAMMAR
+             + REGULATIONS_GRAMMAR
+             + REGEX_GRAMMAR
++            + OBSERVABLES_GRAMMAR
+         )
+         self.parser = Lark(
+-            grammar, parser="earley", propagate_positions=False, maybe_placeholders=False
++            grammar,
++            parser="earley",
++            propagate_positions=False,
++            maybe_placeholders=False,
+         )
+ 
+         self.terminals = dict((v, k) for k, v in _TERMINAL_NAMES.items())
+@@ -856,7 +888,7 @@ class Parser:
+             return Result(
+                 False,
+                 {
+-                    "unexpected": str(u.token), 
++                    "unexpected": str(u.token),
+                     "expected": self.replace(u.expected),
+                     "line": u.line,
+                     "column": u.column,

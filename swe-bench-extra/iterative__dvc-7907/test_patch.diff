@@ -1,0 +1,103 @@
+diff --git a/tests/func/parsing/test_errors.py b/tests/func/parsing/test_errors.py
+--- a/tests/func/parsing/test_errors.py
++++ b/tests/func/parsing/test_errors.py
+@@ -119,18 +119,34 @@ def test_wdir_failed_to_interpolate(tmp_dir, dvc, wdir, expected_msg):
+ 
+ def test_interpolate_non_string(tmp_dir, dvc):
+     definition = make_entry_definition(
+-        tmp_dir, "build", {"cmd": "echo ${models}"}, Context(models={})
++        tmp_dir, "build", {"outs": "${models}"}, Context(models={})
+     )
+     with pytest.raises(ResolveError) as exc_info:
+         definition.resolve()
+ 
+     assert str(exc_info.value) == (
+-        "failed to parse 'stages.build.cmd' in 'dvc.yaml':\n"
++        "failed to parse 'stages.build.outs' in 'dvc.yaml':\n"
+         "Cannot interpolate data of type 'dict'"
+     )
+     assert definition.context == {"models": {}}
+ 
+ 
++def test_interpolate_nested_iterable(tmp_dir, dvc):
++    definition = make_entry_definition(
++        tmp_dir,
++        "build",
++        {"cmd": "echo ${models}"},
++        Context(models={"list": [1, [2, 3]]}),
++    )
++    with pytest.raises(ResolveError) as exc_info:
++        definition.resolve()
++
++    assert str(exc_info.value) == (
++        "failed to parse 'stages.build.cmd' in 'dvc.yaml':\n"
++        "Cannot interpolate nested iterable in 'list'"
++    )
++
++
+ def test_partial_vars_doesnot_exist(tmp_dir, dvc):
+     (tmp_dir / "test_params.yaml").dump({"sub1": "sub1", "sub2": "sub2"})
+ 
+diff --git a/tests/func/parsing/test_interpolated_entry.py b/tests/func/parsing/test_interpolated_entry.py
+--- a/tests/func/parsing/test_interpolated_entry.py
++++ b/tests/func/parsing/test_interpolated_entry.py
+@@ -259,3 +259,59 @@ def test_vars_load_partial(tmp_dir, dvc, local, vars_):
+         d["vars"] = vars_
+     resolver = DataResolver(dvc, tmp_dir.fs_path, d)
+     resolver.resolve()
++
++
++@pytest.mark.parametrize(
++    "bool_config, list_config",
++    [(None, None), ("store_true", "nargs"), ("boolean_optional", "append")],
++)
++def test_cmd_dict(tmp_dir, dvc, bool_config, list_config):
++    with dvc.config.edit() as conf:
++        if bool_config:
++            conf["parsing"]["bool"] = bool_config
++        if list_config:
++            conf["parsing"]["list"] = list_config
++
++    data = {
++        "dict": {
++            "foo": "foo",
++            "bar": 2,
++            "string": "spaced string",
++            "bool": True,
++            "bool-false": False,
++            "list": [1, 2, "foo"],
++            "nested": {"foo": "foo"},
++        }
++    }
++    (tmp_dir / DEFAULT_PARAMS_FILE).dump(data)
++    resolver = DataResolver(
++        dvc,
++        tmp_dir.fs_path,
++        {"stages": {"stage1": {"cmd": "python script.py ${dict}"}}},
++    )
++
++    if bool_config is None or bool_config == "store_true":
++        bool_resolved = " --bool"
++    else:
++        bool_resolved = " --bool --no-bool-false"
++
++    if list_config is None or list_config == "nargs":
++        list_resolved = " --list 1 2 'foo'"
++    else:
++        list_resolved = " --list 1 --list 2 --list 'foo'"
++
++    assert_stage_equal(
++        resolver.resolve(),
++        {
++            "stages": {
++                "stage1": {
++                    "cmd": "python script.py"
++                    " --foo 'foo' --bar 2"
++                    " --string 'spaced string'"
++                    f"{bool_resolved}"
++                    f"{list_resolved}"
++                    " --nested.foo 'foo'"
++                }
++            }
++        },
++    )

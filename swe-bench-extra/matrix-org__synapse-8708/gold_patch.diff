@@ -1,0 +1,133 @@
+diff --git a/changelog.d/8706.doc b/changelog.d/8706.doc
+new file mode 100644
+index 000000000..96a0427e7
+--- /dev/null
++++ b/changelog.d/8706.doc
+@@ -0,0 +1,1 @@
++Document experimental support for running multiple event persisters.
+diff --git a/changelog.d/8708.misc b/changelog.d/8708.misc
+new file mode 100644
+index 000000000..be679fb0f
+--- /dev/null
++++ b/changelog.d/8708.misc
+@@ -0,0 +1,1 @@
++Block attempts by clients to send server ACLs, or redactions of server ACLs, that would result in the local server being blocked from the room.
+diff --git a/docs/workers.md b/docs/workers.md
+index cd1f823b7..4e046bdb3 100644
+--- a/docs/workers.md
++++ b/docs/workers.md
+@@ -319,6 +319,18 @@ stream_writers:
+     events: event_persister1
+ ```
+ 
++The `events` stream also experimentally supports having multiple writers, where
++work is sharded between them by room ID. Note that you *must* restart all worker
++instances when adding or removing event persisters. An example `stream_writers`
++configuration with multiple writers:
++
++```yaml
++stream_writers:
++    events:
++        - event_persister1
++        - event_persister2
++```
++
+ #### Background tasks
+ 
+ There is also *experimental* support for moving background tasks to a separate
+diff --git a/mypy.ini b/mypy.ini
+index 1ece2ba08..fc9f8d805 100644
+--- a/mypy.ini
++++ b/mypy.ini
+@@ -13,6 +13,7 @@ files =
+   synapse/config,
+   synapse/event_auth.py,
+   synapse/events/builder.py,
++  synapse/events/validator.py,
+   synapse/events/spamcheck.py,
+   synapse/federation,
+   synapse/handlers/_base.py,
+diff --git a/synapse/events/validator.py b/synapse/events/validator.py
+index 5f9af8529..f8f3b1a31 100644
+--- a/synapse/events/validator.py
++++ b/synapse/events/validator.py
+@@ -13,20 +13,26 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from typing import Union
++
+ from synapse.api.constants import MAX_ALIAS_LENGTH, EventTypes, Membership
+ from synapse.api.errors import Codes, SynapseError
+ from synapse.api.room_versions import EventFormatVersions
++from synapse.config.homeserver import HomeServerConfig
++from synapse.events import EventBase
++from synapse.events.builder import EventBuilder
+ from synapse.events.utils import validate_canonicaljson
++from synapse.federation.federation_server import server_matches_acl_event
+ from synapse.types import EventID, RoomID, UserID
+ 
+ 
+ class EventValidator:
+-    def validate_new(self, event, config):
++    def validate_new(self, event: EventBase, config: HomeServerConfig):
+         """Validates the event has roughly the right format
+ 
+         Args:
+-            event (FrozenEvent): The event to validate.
+-            config (Config): The homeserver's configuration.
++            event: The event to validate.
++            config: The homeserver's configuration.
+         """
+         self.validate_builder(event)
+ 
+@@ -76,12 +82,18 @@ class EventValidator:
+         if event.type == EventTypes.Retention:
+             self._validate_retention(event)
+ 
+-    def _validate_retention(self, event):
++        if event.type == EventTypes.ServerACL:
++            if not server_matches_acl_event(config.server_name, event):
++                raise SynapseError(
++                    400, "Can't create an ACL event that denies the local server"
++                )
++
++    def _validate_retention(self, event: EventBase):
+         """Checks that an event that defines the retention policy for a room respects the
+         format enforced by the spec.
+ 
+         Args:
+-            event (FrozenEvent): The event to validate.
++            event: The event to validate.
+         """
+         if not event.is_state():
+             raise SynapseError(code=400, msg="must be a state event")
+@@ -116,13 +128,10 @@ class EventValidator:
+                 errcode=Codes.BAD_JSON,
+             )
+ 
+-    def validate_builder(self, event):
++    def validate_builder(self, event: Union[EventBase, EventBuilder]):
+         """Validates that the builder/event has roughly the right format. Only
+         checks values that we expect a proto event to have, rather than all the
+         fields an event would have
+-
+-        Args:
+-            event (EventBuilder|FrozenEvent)
+         """
+ 
+         strings = ["room_id", "sender", "type"]
+diff --git a/synapse/handlers/message.py b/synapse/handlers/message.py
+index ca5602c13..c6791fb91 100644
+--- a/synapse/handlers/message.py
++++ b/synapse/handlers/message.py
+@@ -1138,6 +1138,9 @@ class EventCreationHandler:
+                 if original_event.room_id != event.room_id:
+                     raise SynapseError(400, "Cannot redact event from a different room")
+ 
++                if original_event.type == EventTypes.ServerACL:
++                    raise AuthError(403, "Redacting server ACL events is not permitted")
++
+             prev_state_ids = await context.get_prev_state_ids()
+             auth_events_ids = self.auth.compute_auth_events(
+                 event, prev_state_ids, for_verification=True

@@ -1,0 +1,128 @@
+diff --git a/pydantic/fields.py b/pydantic/fields.py
+--- a/pydantic/fields.py
++++ b/pydantic/fields.py
+@@ -30,7 +30,6 @@
+ from .errors import ConfigError, NoneIsNotAllowedError
+ from .types import Json, JsonWrapper
+ from .typing import (
+-    NONE_TYPES,
+     Callable,
+     ForwardRef,
+     NoArgAnyCallable,
+@@ -40,6 +39,7 @@
+     get_origin,
+     is_literal_type,
+     is_new_type,
++    is_none_type,
+     is_typeddict,
+     is_union_origin,
+     new_type_supertype,
+@@ -739,7 +739,7 @@ def validate(
+                 return v, errors
+ 
+         if v is None:
+-            if self.type_ in NONE_TYPES:
++            if is_none_type(self.type_):
+                 # keep validating
+                 pass
+             elif self.allow_none:
+diff --git a/pydantic/schema.py b/pydantic/schema.py
+--- a/pydantic/schema.py
++++ b/pydantic/schema.py
+@@ -63,7 +63,6 @@
+     constr,
+ )
+ from .typing import (
+-    NONE_TYPES,
+     ForwardRef,
+     all_literal_values,
+     get_args,
+@@ -71,6 +70,7 @@
+     is_callable_type,
+     is_literal_type,
+     is_namedtuple,
++    is_none_type,
+     is_union_origin,
+ )
+ from .utils import ROOT_KEY, get_model, lenient_issubclass, sequence_like
+@@ -788,7 +788,7 @@ def field_singleton_schema(  # noqa: C901 (ignore complexity)
+         )
+     if field_type is Any or field_type.__class__ == TypeVar:
+         return {}, definitions, nested_models  # no restrictions
+-    if field_type in NONE_TYPES:
++    if is_none_type(field_type):
+         return {'type': 'null'}, definitions, nested_models
+     if is_callable_type(field_type):
+         raise SkipField(f'Callable {field.name} was excluded from schema since JSON schema has no equivalent type.')
+diff --git a/pydantic/typing.py b/pydantic/typing.py
+--- a/pydantic/typing.py
++++ b/pydantic/typing.py
+@@ -227,7 +227,7 @@ def is_union_origin(origin: Type[Any]) -> bool:
+     'AnyCallable',
+     'NoArgAnyCallable',
+     'NoneType',
+-    'NONE_TYPES',
++    'is_none_type',
+     'display_as_type',
+     'resolve_annotations',
+     'is_callable_type',
+@@ -260,7 +260,29 @@ def is_union_origin(origin: Type[Any]) -> bool:
+ 
+ 
+ NoneType = None.__class__
+-NONE_TYPES: Set[Any] = {None, NoneType, Literal[None]}
++
++
++NONE_TYPES: Tuple[Any, Any, Any] = (None, NoneType, Literal[None])
++
++
++if sys.version_info < (3, 8):  # noqa: C901 (ignore complexity)
++    # Even though this implementation is slower, we need it for python 3.6/3.7:
++    # In python 3.6/3.7 "Literal" is not a builtin type and uses a different
++    # mechanism.
++    # for this reason `Literal[None] is Literal[None]` evaluates to `False`,
++    # breaking the faster implementation used for the other python versions.
++
++    def is_none_type(type_: Any) -> bool:
++        return type_ in NONE_TYPES
++
++
++else:
++
++    def is_none_type(type_: Any) -> bool:
++        for none_type in NONE_TYPES:
++            if type_ is none_type:
++                return True
++        return False
+ 
+ 
+ def display_as_type(v: Type[Any]) -> str:
+diff --git a/pydantic/validators.py b/pydantic/validators.py
+--- a/pydantic/validators.py
++++ b/pydantic/validators.py
+@@ -31,7 +31,6 @@
+ from . import errors
+ from .datetime_parse import parse_date, parse_datetime, parse_duration, parse_time
+ from .typing import (
+-    NONE_TYPES,
+     AnyCallable,
+     ForwardRef,
+     all_literal_values,
+@@ -40,6 +39,7 @@
+     is_callable_type,
+     is_literal_type,
+     is_namedtuple,
++    is_none_type,
+     is_typeddict,
+ )
+ from .utils import almost_equal_floats, lenient_issubclass, sequence_like
+@@ -657,7 +657,8 @@ def find_validators(  # noqa: C901 (ignore complexity)
+     type_type = type_.__class__
+     if type_type == ForwardRef or type_type == TypeVar:
+         return
+-    if type_ in NONE_TYPES:
++
++    if is_none_type(type_):
+         yield none_validator
+         return
+     if type_ is Pattern:

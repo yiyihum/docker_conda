@@ -1,0 +1,204 @@
+diff --git a/adam/curriculum/phase1_curriculum.py b/adam/curriculum/phase1_curriculum.py
+index 63b89730..ea46cfa8 100644
+--- a/adam/curriculum/phase1_curriculum.py
++++ b/adam/curriculum/phase1_curriculum.py
+@@ -8,7 +8,7 @@ from adam.language.dependency import LinearizedDependencyTree
+ from adam.language_specific.english.english_language_generator import (
+     GAILA_PHASE_1_LANGUAGE_GENERATOR,
+ )
+-from adam.ontology.phase1_ontology import GAILA_PHASE_1_ONTOLOGY
++from adam.ontology.phase1_ontology import GAILA_PHASE_1_ONTOLOGY, LEARNER
+ from adam.perception.developmental_primitive_perception import (
+     DevelopmentalPrimitivePerceptionFrame,
+ )
+@@ -50,8 +50,10 @@ def _phase1_instances(
+ 
+ # Show each object once by itself
+ 
++_LEARNER_OBJECT = object_variable("learner", LEARNER)
++
+ SINGLE_OBJECT_TEMPLATE = Phase1SituationTemplate(
+-    object_variables=[object_variable("object")]
++    object_variables=[object_variable("object"), _LEARNER_OBJECT]
+ )
+ 
+ EACH_OBJECT_BY_ITSELF_SUB_CURRICULUM = _phase1_instances(
+@@ -65,7 +67,9 @@ EACH_OBJECT_BY_ITSELF_SUB_CURRICULUM = _phase1_instances(
+ 
+ _COLOR = color_variable("color")
+ _COLOR_OBJECT = object_variable("object", added_properties=[_COLOR])
+-_OBJECT_WITH_COLOR_TEMPLATE = Phase1SituationTemplate(object_variables=[_COLOR_OBJECT])
++_OBJECT_WITH_COLOR_TEMPLATE = Phase1SituationTemplate(
++    object_variables=[_COLOR_OBJECT, _LEARNER_OBJECT]
++)
+ 
+ OBJECTS_WITH_COLORS_SUB_CURRICULUM = _phase1_instances(
+     "objects with colors",
+diff --git a/adam/language_specific/english/english_language_generator.py b/adam/language_specific/english/english_language_generator.py
+index 8c4ae4fe..16f4d4a5 100644
+--- a/adam/language_specific/english/english_language_generator.py
++++ b/adam/language_specific/english/english_language_generator.py
+@@ -34,7 +34,7 @@ from adam.language_specific.english.english_syntax import (
+ )
+ from adam.language_specific.english.english_phase_1_lexicon import MASS_NOUN
+ from adam.ontology import OntologyNode
+-from adam.ontology.phase1_ontology import AGENT, PATIENT, THEME, DESTINATION, ON
++from adam.ontology.phase1_ontology import AGENT, PATIENT, THEME, DESTINATION, ON, LEARNER
+ from adam.random_utils import SequenceChooser
+ from adam.situation import (
+     SituationObject,
+@@ -100,7 +100,10 @@ class SimpleRuleBasedEnglishLanguageGenerator(
+ 
+         def generate(self) -> ImmutableSet[LinearizedDependencyTree]:
+             for _object in self.situation.objects:
+-                self._translate_object_to_noun(_object)
++                # We put the learner in the situation to express certain perceivable relations
++                # relative to them, but we don't talk about the learner itself.
++                if not _object.ontology_node == LEARNER:
++                    self._translate_object_to_noun(_object)
+ 
+             if len(self.situation.actions) > 1:
+                 raise RuntimeError(
+diff --git a/adam/ontology/phase1_ontology.py b/adam/ontology/phase1_ontology.py
+index 7549b4cb..c22e2504 100644
+--- a/adam/ontology/phase1_ontology.py
++++ b/adam/ontology/phase1_ontology.py
+@@ -73,14 +73,15 @@ subtype(SENTIENT, PERCEIVABLE_PROPERTY)
+ LIQUID = OntologyNode("liquid", [BINARY])
+ subtype(LIQUID, PERCEIVABLE_PROPERTY)
+ 
+-RECOGNIZED_PARTICULAR = OntologyNode("recognized-particular", [BINARY])
++RECOGNIZED_PARTICULAR_PROPERTY = OntologyNode("recognized-particular", [BINARY, ABSTRACT])
+ """
+-Indicates that a node in the ontology corresponds to a particular (rather than a class)
++Indicates that a property in the ontology indicates the identity of an object
++as a known particular object (rather than a class)
+ which is assumed to be known to the `LanguageLearner`. 
+ The prototypical cases here are *Mom* and *Dad*.
+ """
+ 
+-subtype(RECOGNIZED_PARTICULAR, PERCEIVABLE_PROPERTY)
++subtype(RECOGNIZED_PARTICULAR_PROPERTY, PERCEIVABLE_PROPERTY)
+ 
+ IS_SPEAKER = OntologyNode("is-speaker", [BINARY])
+ """
+@@ -181,13 +182,29 @@ PERSON = OntologyNode(
+     "person", inheritable_properties=[ANIMATE], non_inheritable_properties=[ABSTRACT]
+ )
+ subtype(PERSON, THING)
+-MOM = OntologyNode("mom", [RECOGNIZED_PARTICULAR])
++IS_MOM = OntologyNode("is-mom")
++subtype(IS_MOM, RECOGNIZED_PARTICULAR_PROPERTY)
++MOM = OntologyNode("mom", [IS_MOM])
+ subtype(MOM, PERSON)
+-DAD = OntologyNode("dad", [RECOGNIZED_PARTICULAR])
++
++IS_DAD = OntologyNode("is-dad")
++subtype(IS_DAD, RECOGNIZED_PARTICULAR_PROPERTY)
++DAD = OntologyNode("dad", [IS_DAD])
+ subtype(DAD, PERSON)
++
+ BABY = OntologyNode("baby")
+ subtype(BABY, PERSON)
+ 
++IS_LEARNER = OntologyNode("is-learner")
++subtype(IS_LEARNER, RECOGNIZED_PARTICULAR_PROPERTY)
++LEARNER = OntologyNode("learner", [IS_LEARNER])
++"""
++We represent the language learner itself in the situation,
++because the size or position of objects relative to the learner itself
++may be significant for learning.
++"""
++subtype(LEARNER, BABY)
++
+ NONHUMAN_ANIMAL = OntologyNode(
+     "animal", inheritable_properties=[ANIMATE], non_inheritable_properties=[ABSTRACT]
+ )
+diff --git a/adam/perception/developmental_primitive_perception.py b/adam/perception/developmental_primitive_perception.py
+index 976dd177..8f9e70cb 100644
+--- a/adam/perception/developmental_primitive_perception.py
++++ b/adam/perception/developmental_primitive_perception.py
+@@ -1,5 +1,4 @@
+ from abc import ABC
+-
+ from attr import attrib, attrs
+ from attr.validators import in_, instance_of
+ from immutablecollections import ImmutableSet, immutableset
+@@ -7,8 +6,6 @@ from immutablecollections.converter_utils import _to_immutableset
+ from vistautils.range import Range
+ 
+ from adam.ontology import OntologyNode
+-from adam.ontology.ontology import Ontology
+-from adam.ontology.phase1_ontology import RECOGNIZED_PARTICULAR
+ from adam.perception import PerceptualRepresentationFrame
+ 
+ 
+@@ -140,30 +137,3 @@ class HasColor(PropertyPerception):
+ 
+     def __repr__(self) -> str:
+         return f"hasColor({self.perceived_object}, {self.color})"
+-
+-
+-@attrs(slots=True, frozen=True, repr=False)
+-class IsRecognizedParticular(PropertyPerception):
+-    """
+-    A learner's perception that the *perceived_object* is some particular instance that it knows,
+-    given by an `OntologyNode` which must have the `RECOGNIZED_PARTICULAR` property.
+-
+-    The canonical examples here are "Mom" and "Dad".
+-
+-    An `Ontology` must be provided to verify that the node is a `RECOGNIZED_PARTICULAR`.
+-    """
+-
+-    particular_ontology_node: OntologyNode = attrib(validator=instance_of(OntologyNode))
+-    ontology: Ontology = attrib(validator=instance_of(Ontology), kw_only=True)
+-
+-    def __attrs_post_init__(self) -> None:
+-        if not self.ontology.has_all_properties(
+-            self.particular_ontology_node, [RECOGNIZED_PARTICULAR]
+-        ):
+-            raise RuntimeError(
+-                "The learner can only perceive the ontology node of an object "
+-                "if it is a recognized particular (e.g. Mom, Dad)"
+-            )
+-
+-    def __repr__(self) -> str:
+-        return f"recognizedAs({self.perceived_object}, {self.particular_ontology_node})"
+diff --git a/adam/situation/templates/phase1_templates.py b/adam/situation/templates/phase1_templates.py
+index 8637f2db..a084a5e0 100644
+--- a/adam/situation/templates/phase1_templates.py
++++ b/adam/situation/templates/phase1_templates.py
+@@ -17,7 +17,12 @@ from vistautils.preconditions import check_arg
+ 
+ from adam.ontology import ABSTRACT, OntologyNode, PROPERTY, THING
+ from adam.ontology.ontology import Ontology
+-from adam.ontology.phase1_ontology import COLOR, GAILA_PHASE_1_ONTOLOGY
++from adam.ontology.phase1_ontology import (
++    COLOR,
++    GAILA_PHASE_1_ONTOLOGY,
++    IS_LEARNER,
++    LEARNER,
++)
+ from adam.ontology.selectors import ByHierarchyAndProperties, Is, OntologyNodeSelector
+ from adam.random_utils import RandomChooser, SequenceChooser
+ from adam.situation import SituationObject
+@@ -216,12 +221,17 @@ def object_variable(
+     Use *added_properties* for things like
+     "whatever fills this variable, make it red."
+     """
++    banned_properties = [ABSTRACT]
++    if root_node is not LEARNER:
++        # we never use the learner to fill an object variable in a situation
++        # unless explicitly request. Our learner is an observer, not a participant.
++        banned_properties.append(IS_LEARNER)
+     return TemplateObjectVariable(
+         debug_handle,
+         ByHierarchyAndProperties(
+             descendents_of=root_node,
+             required_properties=required_properties,
+-            banned_properties=immutableset([ABSTRACT]),
++            banned_properties=banned_properties,
+         ),
+         asserted_properties=[
+             property_
+
