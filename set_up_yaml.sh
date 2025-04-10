@@ -109,15 +109,15 @@ git show
 
 echo "Environment set up"
 
-: ">>>>> Start Applying Test Patch"
-git apply --verbose "$TEST_PATCH_PATH"
-if [ $? -ne 0 ]; then
-    # 如果失败，尝试强制应用
-    echo "Warning: Normal apply failed, trying force apply..."
-    git apply --reject --verbose $TEST_PATCH_PATH
-    if [ $? -ne 0 ]; then
-        echo "ERROR: Failed to apply patch even with force: $TEST_PATCH_PATH"
-        exit 1
-    fi
-fi
-: ">>>>> End Applying Test Patch"
+# : ">>>>> Start Applying Test Patch"
+# git apply --verbose "$TEST_PATCH_PATH"
+# if [ $? -ne 0 ]; then
+#     # 如果失败，尝试强制应用
+#     echo "Warning: Normal apply failed, trying force apply..."
+#     git apply --reject --verbose $TEST_PATCH_PATH
+#     if [ $? -ne 0 ]; then
+#         echo "ERROR: Failed to apply patch even with force: $TEST_PATCH_PATH"
+#         exit 1
+#     fi
+# fi
+# : ">>>>> End Applying Test Patch"

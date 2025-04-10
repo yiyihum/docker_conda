@@ -1,0 +1,34 @@
+#!/bin/bash 
+set -x
+bash set_up_yaml.sh scrapinghub__spidermon-234 "scrapinghub/spidermon" deecd7527971a1dfd3aa646de88acbc81696da81 >/tmp/setup_log/scrapinghub__spidermon-234.log 2>&1
+bash set_up_yaml.sh scrapinghub__spidermon-365 "scrapinghub/spidermon" 9c2091304779cfb751ed3238f7ce78dbc7e82735 >/tmp/setup_log/scrapinghub__spidermon-365.log 2>&1
+bash set_up_yaml.sh scrapinghub__web-poet-142 "scrapinghub/web-poet" a369635f3d4cf1acc22acf967625fe51c8cd57ae >/tmp/setup_log/scrapinghub__web-poet-142.log 2>&1
+bash set_up_yaml.sh scrapinghub__web-poet-184 "scrapinghub/web-poet" 90eba4b94614b16a75821dfbb3223b5f5d602a77 >/tmp/setup_log/scrapinghub__web-poet-184.log 2>&1
+bash set_up_yaml.sh scrapy__itemadapter-18 "scrapy/itemadapter" 2cafd11aecd169810471eb5fc3ccb3b7429d6be1 >/tmp/setup_log/scrapy__itemadapter-18.log 2>&1
+bash set_up_yaml.sh scrapy__itemadapter-35 "scrapy/itemadapter" 755933624695739d0f414b2218bca431a775b301 >/tmp/setup_log/scrapy__itemadapter-35.log 2>&1
+bash set_up_yaml.sh scrapy__itemloaders-22 "scrapy/itemloaders" 98ad3a5678d1a2fe373a052266675da1fff9e1f5 >/tmp/setup_log/scrapy__itemloaders-22.log 2>&1
+bash set_up_yaml.sh scrapy__parsel-247 "scrapy/parsel" 96fc3d7b6f0abd4958bc70a4fdc345904caf21c2 >/tmp/setup_log/scrapy__parsel-247.log 2>&1
+bash set_up_yaml.sh scrapy__scrapy-2065 "scrapy/scrapy" d43a35735a062a4260b002cfbcd3236c77ef9399 >/tmp/setup_log/scrapy__scrapy-2065.log 2>&1
+bash set_up_yaml.sh scrapy__scrapy-4052 "scrapy/scrapy" 74b4a5c77c0017106f6ba65b21b8bf2a1ed02f7b >/tmp/setup_log/scrapy__scrapy-4052.log 2>&1
+bash set_up_yaml.sh scrapy__scrapy-5118 "scrapy/scrapy" 00527fdcbe042ae5b3ea06e93e03a8a353d0524c >/tmp/setup_log/scrapy__scrapy-5118.log 2>&1
+bash set_up_yaml.sh scrapy__scrapy-5384 "scrapy/scrapy" 30d5779ea94ed1e9343a4590895a3f5e65e444b9 >/tmp/setup_log/scrapy__scrapy-5384.log 2>&1
+bash set_up_yaml.sh scrapy__scrapy-5589 "scrapy/scrapy" 92be5ba2572ec14e2580abe12d276e8aa24247b6 >/tmp/setup_log/scrapy__scrapy-5589.log 2>&1
+bash set_up_yaml.sh sdispater__pendulum-593 "sdispater/pendulum" 8012a7e8600c2348f1978eebb22fdd2535a8cca9 >/tmp/setup_log/sdispater__pendulum-593.log 2>&1
+bash set_up_yaml.sh sdispater__pendulum-726 "sdispater/pendulum" 377dc2f808ac2bcf77ec5a4b87004b3a425aa0aa >/tmp/setup_log/sdispater__pendulum-726.log 2>&1
+bash set_up_yaml.sh sec-edgar__sec-edgar-118 "sec-edgar/sec-edgar" 4e1f9597946d4cedceabc1ea3c5526dc17e46e91 >/tmp/setup_log/sec-edgar__sec-edgar-118.log 2>&1
+bash set_up_yaml.sh sec-edgar__sec-edgar-249 "sec-edgar/sec-edgar" 65320eae7c5b256cd197da00c16348824aadc807 >/tmp/setup_log/sec-edgar__sec-edgar-249.log 2>&1
+bash set_up_yaml.sh sedders123__phial-169 "sedders123/phial" 36d86f63670e9872c618eb13b6dbc4c7fb31b42c >/tmp/setup_log/sedders123__phial-169.log 2>&1
+bash set_up_yaml.sh sendgrid__sendgrid-python-233 "sendgrid/sendgrid-python" ca96c8dcd66224e13b38ab8fd2d2b429dd07dd02 >/tmp/setup_log/sendgrid__sendgrid-python-233.log 2>&1
+bash set_up_yaml.sh sensein__cmixf-2 "sensein/cmixf" 3e2e9d713584dda9bc3e9f7cb7a82e38a22f76c3 >/tmp/setup_log/sensein__cmixf-2.log 2>&1
+bash set_up_yaml.sh sepandhaghighi__pyrgg-74 "sepandhaghighi/pyrgg" 35906852a56e2ff81e485b60cb731db85510dfbb >/tmp/setup_log/sepandhaghighi__pyrgg-74.log 2>&1
+bash set_up_yaml.sh seperman__deepdiff-239 "seperman/deepdiff" f1429a03a040f01f7807b074172fdfea0f805a4b >/tmp/setup_log/seperman__deepdiff-239.log 2>&1
+bash set_up_yaml.sh seperman__deepdiff-76 "seperman/deepdiff" d4918e17c555df1b46827f865c5c105097199f80 >/tmp/setup_log/seperman__deepdiff-76.log 2>&1
+bash set_up_yaml.sh shaarli__python-shaarli-client-54 "shaarli/python-shaarli-client" 1748cdfef3c356c7775f1c2dd3fdb9a37ef40d5b >/tmp/setup_log/shaarli__python-shaarli-client-54.log 2>&1
+bash set_up_yaml.sh sibson__redbeat-245 "sibson/redbeat" d698cc3eae8b26f011836bb6f2e1ab87e9019951 >/tmp/setup_log/sibson__redbeat-245.log 2>&1
+bash set_up_yaml.sh simonsobs__ocs-269 "simonsobs/ocs" bc67d6132e9806c7b482f39466feecce8deae965 >/tmp/setup_log/simonsobs__ocs-269.log 2>&1
+bash set_up_yaml.sh simonsobs__ocs-297 "simonsobs/ocs" 3a998daaa394daccedb25bbdef87cbd0c44e5700 >/tmp/setup_log/simonsobs__ocs-297.log 2>&1
+bash set_up_yaml.sh simonw__sqlite-utils-51 "simonw/sqlite-utils" 9b7be79c86b4283f24a64f62257c918f12542997 >/tmp/setup_log/simonw__sqlite-utils-51.log 2>&1
+bash set_up_yaml.sh simphony__simphony-remote-117 "simphony/simphony-remote" 61ec23ffe44463cbc41f6fa54b4247963093ed79 >/tmp/setup_log/simphony__simphony-remote-117.log 2>&1
+bash set_up_yaml.sh simphony__tornado-webapi-19 "simphony/tornado-webapi" 95ad403cd70109fb94727a119545567593d8203d >/tmp/setup_log/simphony__tornado-webapi-19.log 2>&1
+bash set_up_yaml.sh singingwolfboy__flask-dance-107 "singingwolfboy/flask-dance" 588509a9ea35b9121680d7cccdafedc44d81b741 >/tmp/setup_log/singingwolfboy__flask-dance-107.log 2>&1
+bash set_up_yaml.sh ska-sa__aiokatcp-8 "ska-sa/aiokatcp" f5210d50ba01ff27f307f143ccbecaa2f53fa1cd >/tmp/setup_log/ska-sa__aiokatcp-8.log 2>&1

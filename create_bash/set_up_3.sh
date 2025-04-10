@@ -1,0 +1,35 @@
+#!/bin/bash 
+set -x
+bash set_up_yaml.sh RemDelaporteMathurin__h-transport-materials-118 "RemDelaporteMathurin/h-transport-materials" 387c90817433e6f4fa5829f3bba0efa5b59f3169 >/tmp/setup_log/RemDelaporteMathurin__h-transport-materials-118.log 2>&1
+bash set_up_yaml.sh RemDelaporteMathurin__h-transport-materials-121 "RemDelaporteMathurin/h-transport-materials" fdb8f77447762bb38161f86352c0e7d0684ba803 >/tmp/setup_log/RemDelaporteMathurin__h-transport-materials-121.log 2>&1
+bash set_up_yaml.sh RemDelaporteMathurin__h-transport-materials-169 "RemDelaporteMathurin/h-transport-materials" 1ccf5a11ffbb6a013c50540c1b20cde2ee5302e5 >/tmp/setup_log/RemDelaporteMathurin__h-transport-materials-169.log 2>&1
+bash set_up_yaml.sh RemDelaporteMathurin__h-transport-materials-247 "RemDelaporteMathurin/h-transport-materials" bfc9ed605514d9fce7b1faae4744553c9ab5fb6c >/tmp/setup_log/RemDelaporteMathurin__h-transport-materials-247.log 2>&1
+bash set_up_yaml.sh RemDelaporteMathurin__h-transport-materials-36 "RemDelaporteMathurin/h-transport-materials" 9434449539499a14ea2bf0b2c00f2a5080a1c7f7 >/tmp/setup_log/RemDelaporteMathurin__h-transport-materials-36.log 2>&1
+bash set_up_yaml.sh ReproNim__reproman-508 "ReproNim/reproman" 2ffa1759a8ced87169f3422bb2a0b0b9fb8e46b9 >/tmp/setup_log/ReproNim__reproman-508.log 2>&1
+bash set_up_yaml.sh ResearchObject__ro-crate-py-100 "ResearchObject/ro-crate-py" 8eab329b27faad0836bcff7f2c7a40c679340cc7 >/tmp/setup_log/ResearchObject__ro-crate-py-100.log 2>&1
+bash set_up_yaml.sh ReviewNB__treon-25 "ReviewNB/treon" c90f964ae714cb7ac78aede2f86753e3d21104ec >/tmp/setup_log/ReviewNB__treon-25.log 2>&1
+bash set_up_yaml.sh RobinL__fuzzymatcher-50 "RobinL/fuzzymatcher" 5f0b19d50d5dcbcd930f9634d2bf429007b5efcc >/tmp/setup_log/RobinL__fuzzymatcher-50.log 2>&1
+bash set_up_yaml.sh Roguelazer__muttdown-14 "Roguelazer/muttdown" 61809de9a445bda848d4933822070e0dd705c192 >/tmp/setup_log/Roguelazer__muttdown-14.log 2>&1
+bash set_up_yaml.sh Sceptre__sceptre-1249 "Sceptre/sceptre" 880fba9bd11e5167adfee0167608aede2439228a >/tmp/setup_log/Sceptre__sceptre-1249.log 2>&1
+bash set_up_yaml.sh Sceptre__sceptre-1260 "Sceptre/sceptre" b67fe16600d2c62481e59c03418418445e1d7e28 >/tmp/setup_log/Sceptre__sceptre-1260.log 2>&1
+bash set_up_yaml.sh Sceptre__sceptre-1296 "Sceptre/sceptre" 855a030c7cff5ffb7dc447c14ab0ae9d9befa267 >/tmp/setup_log/Sceptre__sceptre-1296.log 2>&1
+bash set_up_yaml.sh Sceptre__sceptre-1372 "Sceptre/sceptre" 64ab818cb9be16276689932b7a15072c3fa6c86e >/tmp/setup_log/Sceptre__sceptre-1372.log 2>&1
+bash set_up_yaml.sh Sceptre__sceptre-1391 "Sceptre/sceptre" 3f16beda2a51db8bf7b7de87fbaad2582387897f >/tmp/setup_log/Sceptre__sceptre-1391.log 2>&1
+bash set_up_yaml.sh SciTools__nc-time-axis-80 "SciTools/nc-time-axis" 59c567d307eb8ced44f2c95b393c93ba571e486c >/tmp/setup_log/SciTools__nc-time-axis-80.log 2>&1
+bash set_up_yaml.sh Senth__minecraft-mod-manager-36 "Senth/minecraft-mod-manager" bed8d27f3e6ca6570c6d21faf8959d92c753b7b8 >/tmp/setup_log/Senth__minecraft-mod-manager-36.log 2>&1
+bash set_up_yaml.sh ShawHahnLab__igseq-2 "ShawHahnLab/igseq" 3f0407f10e41f98acad8283d4f66e4adf1a4e3fc >/tmp/setup_log/ShawHahnLab__igseq-2.log 2>&1
+bash set_up_yaml.sh ShawHahnLab__igseq-37 "ShawHahnLab/igseq" 2e36b272d6170625d96b3df3fb6a513ff37b7a27 >/tmp/setup_log/ShawHahnLab__igseq-37.log 2>&1
+bash set_up_yaml.sh Shopify__shopify_python_api-136 "Shopify/shopify_python_api" a78109e725cf9e400f955062399767f36f3a1f44 >/tmp/setup_log/Shopify__shopify_python_api-136.log 2>&1
+bash set_up_yaml.sh SmileyChris__django-countries-339 "SmileyChris/django-countries" 72040a01239681bf0a8b1da93e46154fbaac6a48 >/tmp/setup_log/SmileyChris__django-countries-339.log 2>&1
+bash set_up_yaml.sh SteadBytes__aocpy-13 "SteadBytes/aocpy" 7dc93d4ba672699aba83918ebe9b1f5f3ff0e175 >/tmp/setup_log/SteadBytes__aocpy-13.log 2>&1
+bash set_up_yaml.sh StevenLooman__async_upnp_client-62 "StevenLooman/async_upnp_client" e76f7f3296c8351106625b6d013e0620fdf16f7e >/tmp/setup_log/StevenLooman__async_upnp_client-62.log 2>&1
+bash set_up_yaml.sh Stranger6667__pyanyapi-42 "Stranger6667/pyanyapi" aebee636ad26f387850a6c8ab820ce4aac3f9adb >/tmp/setup_log/Stranger6667__pyanyapi-42.log 2>&1
+bash set_up_yaml.sh Stratoscale__skipper-164 "Stratoscale/skipper" 26e65ac0956d19f4f4a73a95d9547039c746a6b2 >/tmp/setup_log/Stratoscale__skipper-164.log 2>&1
+bash set_up_yaml.sh SymbiFlow__FPGA-Tool-Performance-Visualization-Library-24 "SymbiFlow/FPGA-Tool-Performance-Visualization-Library" 0d5464c63006ae08e299e2aba15968d584bab1b7 >/tmp/setup_log/SymbiFlow__FPGA-Tool-Performance-Visualization-Library-24.log 2>&1
+bash set_up_yaml.sh TACC__agavepy-62 "TACC/agavepy" 08b6bb088b95b0c71c9404b220df1b9d0915b770 >/tmp/setup_log/TACC__agavepy-62.log 2>&1
+bash set_up_yaml.sh TRoboto__Maha-103 "TRoboto/Maha" 8908cd383ec4af6805be25bfe04ec3e4df6f7939 >/tmp/setup_log/TRoboto__Maha-103.log 2>&1
+bash set_up_yaml.sh Tadaboody__doctree-14 "Tadaboody/doctree" a456abbbb7bafa561035adda3739ef9f02ac7ae3 >/tmp/setup_log/Tadaboody__doctree-14.log 2>&1
+bash set_up_yaml.sh TheUncleKai__bbutils-20 "TheUncleKai/bbutils" 79e59c76c09b1f76cc67a3d2b1bcad484ce0029b >/tmp/setup_log/TheUncleKai__bbutils-20.log 2>&1
+bash set_up_yaml.sh TomasTomecek__ansible-bender-82 "TomasTomecek/ansible-bender" 1f005b0e6b5b442f522247b6159c5bed802f6822 >/tmp/setup_log/TomasTomecek__ansible-bender-82.log 2>&1
+bash set_up_yaml.sh UCREL__pymusas-22 "UCREL/pymusas" 834473086bb588498ab03870eb497a03caa868d5 >/tmp/setup_log/UCREL__pymusas-22.log 2>&1
+bash set_up_yaml.sh ValvePython__steam-309 "ValvePython/steam" caa7072cf0148d21593383e52ebd00a1ae8cf9ff >/tmp/setup_log/ValvePython__steam-309.log 2>&1

@@ -1,0 +1,31 @@
+#!/bin/bash 
+set -x
+bash set_up_yaml.sh napalm-automation-community__napalm-s350-39 "napalm-automation-community/napalm-s350" efc48421d4d975d790feaaa73a6151372ce5b10a >/tmp/setup_log/napalm-automation-community__napalm-s350-39.log 2>&1
+bash set_up_yaml.sh nathan-v__aws_okta_keyman-72 "nathan-v/aws_okta_keyman" 9dee43b01e5650f12ba9fdc33ce911a10fa723ca >/tmp/setup_log/nathan-v__aws_okta_keyman-72.log 2>&1
+bash set_up_yaml.sh nathandines__SPF2IP-3 "nathandines/SPF2IP" 7e3593a6f322c39a02c1c0f4a108b046ec6c1a20 >/tmp/setup_log/nathandines__SPF2IP-3.log 2>&1
+bash set_up_yaml.sh neogeny__TatSu-121 "neogeny/TatSu" bd7fea0ba31234ca49f6ce0b401677849483f329 >/tmp/setup_log/neogeny__TatSu-121.log 2>&1
+bash set_up_yaml.sh neogeny__TatSu-309 "neogeny/TatSu" 51d9f70b4cf068142e719ebeabaeab766e0a9b92 >/tmp/setup_log/neogeny__TatSu-309.log 2>&1
+bash set_up_yaml.sh netsiphd__netrd-264 "netsiphd/netrd" fa2c163376a88ed72ba15649190b1a2b23b1cb9a >/tmp/setup_log/netsiphd__netrd-264.log 2>&1
+bash set_up_yaml.sh networkx__networkx-4753 "networkx/networkx" 63f550fef6712d5ea3ae09bbc341d696d65e55e3 >/tmp/setup_log/networkx__networkx-4753.log 2>&1
+bash set_up_yaml.sh networkx__networkx-5287 "networkx/networkx" 0cc70051fa0a979b1f1eab4af5b6587a6ebf8334 >/tmp/setup_log/networkx__networkx-5287.log 2>&1
+bash set_up_yaml.sh newrelic__newrelic-lambda-cli-110 "newrelic/newrelic-lambda-cli" 8e5399c6072a052c0df445ccb06559f5e2df5b3d >/tmp/setup_log/newrelic__newrelic-lambda-cli-110.log 2>&1
+bash set_up_yaml.sh nickw444__nessclient-29 "nickw444/nessclient" 3c59b0d2f49984bab822f995e57c3e05bef4880e >/tmp/setup_log/nickw444__nessclient-29.log 2>&1
+bash set_up_yaml.sh niedakh__pqdm-56 "niedakh/pqdm" 40cf767613ff87e15eab8eb0aa810909b333d20e >/tmp/setup_log/niedakh__pqdm-56.log 2>&1
+bash set_up_yaml.sh niftycode__imessage_reader-12 "niftycode/imessage_reader" 3a972bebf1c16e02e12322d3e81a7ea60400d5a2 >/tmp/setup_log/niftycode__imessage_reader-12.log 2>&1
+bash set_up_yaml.sh nion-software__nionutils-19 "nion-software/nionutils" c4b09457ab9433dde6f224279fe8f35265c6c041 >/tmp/setup_log/nion-software__nionutils-19.log 2>&1
+bash set_up_yaml.sh nipy__heudiconv-306 "nipy/heudiconv" b85e5e18d6e15b36fcfa59f606eac5f3660a1143 >/tmp/setup_log/nipy__heudiconv-306.log 2>&1
+bash set_up_yaml.sh nipy__heudiconv-424 "nipy/heudiconv" 75f2850f7f07a95ff5875aba1dfd76c09e4be201 >/tmp/setup_log/nipy__heudiconv-424.log 2>&1
+bash set_up_yaml.sh nipype__pydra-222 "nipype/pydra" 349d954add42e4297ce127c2fa61f49346cc19a1 >/tmp/setup_log/nipype__pydra-222.log 2>&1
+bash set_up_yaml.sh nipype__pydra-261 "nipype/pydra" 0067eeee42a8db39a80653e3821056c6ad87ead2 >/tmp/setup_log/nipype__pydra-261.log 2>&1
+bash set_up_yaml.sh nirum__tableprint-17 "nirum/tableprint" 0e658c09c0fd2e77c52b5403e4326093ac5fdff5 >/tmp/setup_log/nirum__tableprint-17.log 2>&1
+bash set_up_yaml.sh nokia__moler-191 "nokia/moler" c0ca25a34f537640c26534e2c05e1955f241fcf5 >/tmp/setup_log/nokia__moler-191.log 2>&1
+bash set_up_yaml.sh nteract__vdom-22 "nteract/vdom" faae2c2c4e74d02a6227277675eae03822a18926 >/tmp/setup_log/nteract__vdom-22.log 2>&1
+bash set_up_yaml.sh numpy__numpydoc-283 "numpy/numpydoc" fd17df0c96e107f7550b91e2680e76d2be796e0c >/tmp/setup_log/numpy__numpydoc-283.log 2>&1
+bash set_up_yaml.sh nutechsoftware__alarmdecoder-60 "nutechsoftware/alarmdecoder" 8a1a917dc04b60e03fa641f30000f5d8d23f94e6 >/tmp/setup_log/nutechsoftware__alarmdecoder-60.log 2>&1
+bash set_up_yaml.sh nylas__nylas-python-318 "nylas/nylas-python" f2bb44ec3f465ab93deadfc0249972eaa7b5df53 >/tmp/setup_log/nylas__nylas-python-318.log 2>&1
+bash set_up_yaml.sh nylas__nylas-python-78 "nylas/nylas-python" 6a9b1e5c0774b2a198496daedb980b5bbc091d30 >/tmp/setup_log/nylas__nylas-python-78.log 2>&1
+bash set_up_yaml.sh nylas__nylas-python-80 "nylas/nylas-python" 726fad7765850a7d9d964c5412d86c6120ea3d9d >/tmp/setup_log/nylas__nylas-python-80.log 2>&1
+bash set_up_yaml.sh oasis-open__cti-pattern-validator-10 "oasis-open/cti-pattern-validator" 82956eaff8caf5af323b0c712550bfc5840fbd62 >/tmp/setup_log/oasis-open__cti-pattern-validator-10.log 2>&1
+bash set_up_yaml.sh oasis-open__cti-pattern-validator-71 "oasis-open/cti-pattern-validator" 45f81f0c5b9481054ba28aea2ecb372faee7fe2b >/tmp/setup_log/oasis-open__cti-pattern-validator-71.log 2>&1
+bash set_up_yaml.sh oasis-open__cti-python-stix2-127 "oasis-open/cti-python-stix2" b1a020bb38d74c407ac125b1e032850acfe7a880 >/tmp/setup_log/oasis-open__cti-python-stix2-127.log 2>&1
+bash set_up_yaml.sh oasis-open__cti-python-stix2-172 "oasis-open/cti-python-stix2" f778a45b33f9b74c5a3b62c38db477bb504c2202 >/tmp/setup_log/oasis-open__cti-python-stix2-172.log 2>&1

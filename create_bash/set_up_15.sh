@@ -1,0 +1,35 @@
+#!/bin/bash 
+set -x
+bash set_up_yaml.sh iqbal-lab-org__make_prg-25 "iqbal-lab-org/make_prg" c02adc35f3a746dfcf45fd01060d7b28f5a72a24 >/tmp/setup_log/iqbal-lab-org__make_prg-25.log 2>&1
+bash set_up_yaml.sh iris-hep__func_adl-100 "iris-hep/func_adl" a8b3e1ff5e397f4dcd156e255bd3f26e819f53d0 >/tmp/setup_log/iris-hep__func_adl-100.log 2>&1
+bash set_up_yaml.sh iris-hep__qastle-44 "iris-hep/qastle" bc8cbb7a0a284e877b4f5c81d17fdd79a4b6e1a0 >/tmp/setup_log/iris-hep__qastle-44.log 2>&1
+bash set_up_yaml.sh ishepard__pydriller-231 "ishepard/pydriller" 02161a5144330d6d8d9c5fcd2f68e2c08376f0cd >/tmp/setup_log/ishepard__pydriller-231.log 2>&1
+bash set_up_yaml.sh isi-vista__adam-164 "isi-vista/adam" 1870442e49b6b35b291946b8f79517684ded16e5 >/tmp/setup_log/isi-vista__adam-164.log 2>&1
+bash set_up_yaml.sh isi-vista__immutablecollections-26 "isi-vista/immutablecollections" b908abb2a664c9e96ee60cb8587592934c15afd3 >/tmp/setup_log/isi-vista__immutablecollections-26.log 2>&1
+bash set_up_yaml.sh isi-vista__immutablecollections-36 "isi-vista/immutablecollections" 6ffb09a875bf45f364eb252ff1f2d5527003d9cf >/tmp/setup_log/isi-vista__immutablecollections-36.log 2>&1
+bash set_up_yaml.sh isi-vista__immutablecollections-51 "isi-vista/immutablecollections" 6985a25ffcd34bccc59ed423aceef257cdc681f5 >/tmp/setup_log/isi-vista__immutablecollections-51.log 2>&1
+bash set_up_yaml.sh isi-vista__immutablecollections-9 "isi-vista/immutablecollections" 4a57a2045afe93ae07955845b468092ba82cbfb9 >/tmp/setup_log/isi-vista__immutablecollections-9.log 2>&1
+bash set_up_yaml.sh isi-vista__vistautils-72 "isi-vista/vistautils" 72d50c45e0366d70b2de113913cda52f541ad69a >/tmp/setup_log/isi-vista__vistautils-72.log 2>&1
+bash set_up_yaml.sh itamarst__crochet-109 "itamarst/crochet" 20f0e95848760ba6859576d1713739c8734a539c >/tmp/setup_log/itamarst__crochet-109.log 2>&1
+bash set_up_yaml.sh iterative__shtab-166 "iterative/shtab" 2be59e41c1566446cc2a5a8dfefcad164cde8f15 >/tmp/setup_log/iterative__shtab-166.log 2>&1
+bash set_up_yaml.sh j4c0bs__spectron-19 "j4c0bs/spectron" 88e2e1748ede8ec9bdb9243e3b477b4159bb14ea >/tmp/setup_log/j4c0bs__spectron-19.log 2>&1
+bash set_up_yaml.sh jackdewinter__pyscan-12 "jackdewinter/pyscan" 05ea9bff0aaf4d53aa401c51526bb847accec56a >/tmp/setup_log/jackdewinter__pyscan-12.log 2>&1
+bash set_up_yaml.sh jameslamb__doppel-cli-109 "jameslamb/doppel-cli" f03bfda7ae46aa9ec2f844ee6a9dc36e9d6f14fe >/tmp/setup_log/jameslamb__doppel-cli-109.log 2>&1
+bash set_up_yaml.sh jamesoff__simplemonitor-487 "jamesoff/simplemonitor" af57a6bebe388fa362417a0f4f28f084c9e0b99a >/tmp/setup_log/jamesoff__simplemonitor-487.log 2>&1
+bash set_up_yaml.sh jamielennox__requests-mock-116 "jamielennox/requests-mock" 7a5fc638b606507a9a1dd2dc88e95df87dd2baa7 >/tmp/setup_log/jamielennox__requests-mock-116.log 2>&1
+bash set_up_yaml.sh janehmueller__python-json-config-20 "janehmueller/python-json-config" 1afd82e9c11a0dde17cf094fd0ca4b9b0530a614 >/tmp/setup_log/janehmueller__python-json-config-20.log 2>&1
+bash set_up_yaml.sh jaraco__portend-11 "jaraco/portend" 077939464de072bb0caf1d88ac607381e012779e >/tmp/setup_log/jaraco__portend-11.log 2>&1
+bash set_up_yaml.sh jaraco__zipp-59 "jaraco/zipp" 8ad959e61cd4be40baab93528775c2bf03c8f4e1 >/tmp/setup_log/jaraco__zipp-59.log 2>&1
+bash set_up_yaml.sh jaraco__zipp-8 "jaraco/zipp" 4715556d5cad2cc106dd808eb5ce66fbada07434 >/tmp/setup_log/jaraco__zipp-8.log 2>&1
+bash set_up_yaml.sh jbasko__configmanager-96 "jbasko/configmanager" dbdd2467741f0875fca53d0062f4dca1f307df8a >/tmp/setup_log/jbasko__configmanager-96.log 2>&1
+bash set_up_yaml.sh jcklie__slurmee-4 "jcklie/slurmee" 17d54f91f677829b2327da4ea11276697d3b45e4 >/tmp/setup_log/jcklie__slurmee-4.log 2>&1
+bash set_up_yaml.sh jd__daiquiri-14 "jd/daiquiri" dd83419910bd6e6e156332fe63b8eda599721ba8 >/tmp/setup_log/jd__daiquiri-14.log 2>&1
+bash set_up_yaml.sh jd__tenacity-342 "jd/tenacity" f6465c082fc153ec389b281aabc323f3c2d0ced9 >/tmp/setup_log/jd__tenacity-342.log 2>&1
+bash set_up_yaml.sh jdkandersson__OpenAlchemy-108 "jdkandersson/OpenAlchemy" 123cc73aecfe79cd6bc46d829d388917c9df9e43 >/tmp/setup_log/jdkandersson__OpenAlchemy-108.log 2>&1
+bash set_up_yaml.sh jdkandersson__OpenAlchemy-63 "jdkandersson/OpenAlchemy" efb83519b59586ce725b34eeb345f22a53fb58c3 >/tmp/setup_log/jdkandersson__OpenAlchemy-63.log 2>&1
+bash set_up_yaml.sh jendrikseipp__vulture-220 "jendrikseipp/vulture" 899a49e6f08e628caf47e886c5d9917374e522c2 >/tmp/setup_log/jendrikseipp__vulture-220.log 2>&1
+bash set_up_yaml.sh jendrikseipp__vulture-340 "jendrikseipp/vulture" b6fae7161611e0b820231d1e80432ee746adee50 >/tmp/setup_log/jendrikseipp__vulture-340.log 2>&1
+bash set_up_yaml.sh jitsi__jiwer-63 "jitsi/jiwer" 332e6a14840b989942cf3467e4003f2b7d0c24ed >/tmp/setup_log/jitsi__jiwer-63.log 2>&1
+bash set_up_yaml.sh jitsi__jiwer-77 "jitsi/jiwer" 6e620ab7ab658955dafef55300a160fd7a636ea8 >/tmp/setup_log/jitsi__jiwer-77.log 2>&1
+bash set_up_yaml.sh jmwri__ioccontainer-4 "jmwri/ioccontainer" 9155dbf9030df7bd911a5bc93feb397d1f545feb >/tmp/setup_log/jmwri__ioccontainer-4.log 2>&1
+bash set_up_yaml.sh joanvila__aioredlock-77 "joanvila/aioredlock" cf2ffca3df65decb64de6dd93bcd139244db930e >/tmp/setup_log/joanvila__aioredlock-77.log 2>&1
