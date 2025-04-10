@@ -12,7 +12,7 @@ REPO="$2"
 COMMIT="$3"
 
 # Path setup
-EXPR_PATH=/opt/tiger/test_expr
+EXPR_PATH=/opt/tiger/expr
 ENV_PATH="${EXPR_PATH}/conda_env/${TASK_ID}"
 TEST_BED_PATH="${EXPR_PATH}/testbed/${TASK_ID}"
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")  
